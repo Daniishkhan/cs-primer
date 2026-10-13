@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TCP Deep Dive · Networking from Zero</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/tcp-sim.css">
+</head>
+<body data-root="../.." data-course="net" data-chapter="08">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>TCP Deep Dive</h1>
+  <p class="lede">The network underneath is a sloppy courier that loses, duplicates and shuffles packets. TCP sits on top of it and, with nothing but numbers, acknowledgements and timers, turns it into a perfectly reliable, in-order stream of bytes. This is one of the most elegant pieces of engineering in computing, and you're going to build it from scratch.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Almost everything you do online (web pages, email, file transfers, database queries, API calls) rides on TCP. When a page loads slowly, when a connection "hangs", when a server is out of connections, when a download starts slow and speeds up: that's TCP. It's also the best case study there is for the central problem of distributed systems: <em>how do you build reliability out of unreliable parts?</em> Every trick in this chapter (sequence numbers, acknowledgements, timeouts, retransmission, back-off) returns in disguise in chapters 16 to 20.</p>
+</div>
+
+<h2>The problem: IP is best effort</h2>
+
+<p>Chapters 4 and 5 gave us IP, which can carry a packet from any computer to any other. But IP makes no promises. It's a <span class="term">best-effort</span> service: it tries, and that's all. Any of these can happen to a packet, and the sender isn't told:</p>
+
+<ul>
+  <li><strong>Lost.</strong> A router's queue is full, so it drops the packet. A link flips a bit and the checksum fails. A route changes mid-flight (chapter 5).</li>
+  <li><strong>Duplicated.</strong> A retransmission at a lower layer, or a path quirk, delivers two copies.</li>
+  <li><strong>Reordered.</strong> Packets 1, 2 and 3 take different paths, and 3 arrives first.</li>
+  <li><strong>Corrupted.</strong> Bits get flipped and (rarely) slip past the checks.</li>
+</ul>
+
+<p>But an application wants something much simpler: <em>"I write bytes in at one end; the same bytes come out of the other end, in the same order, with nothing missing."</em> That's the service TCP (the <span class="term">Transmission Control Protocol</span>) provides: a <strong>reliable, ordered byte stream</strong> between two programs. In the UDP chapter we saw the raw network; TCP is the layer that hides the mess.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: mailing a book as numbered postcards, with a pen pal</p>
+  <p>Remember the book posted as postcards in chapter 0? To make it work, you number every card and your friend writes back regularly: <em>"I've got everything up to card 17."</em> If a reply doesn't come after a reasonable wait, you resend the cards after 17. Your friend files the cards in numerical order, discards doubles, and only reads the book once the pages are in sequence. That's TCP in one paragraph. The rest of this chapter is the fine print.</p>
+  <p><em>Where it breaks down:</em> postcards don't have to worry about overloading the post office, and your friend has a finite desk to put cards on. TCP has to deal with both, which is why we'll need flow control and congestion control.</p>
+</div>
+
+<h2>Building TCP from first principles</h2>
+
+<h3>Step 1: number the bytes</h3>
+
+<p>To detect loss, reordering and duplicates, you need to be able to <em>tell the pieces apart</em>. So TCP gives every byte of the stream a number, called its <span class="term">sequence number</span>. A <span class="term">segment</span> (a chunk of the stream, the unit that TCP puts in an IP packet) carries the sequence number of <em>its first byte</em>. If the stream starts at byte 1 and each segment holds 1,460 bytes (the maximum that fits in an Ethernet packet after the IP and TCP headers, as computed in chapter 3):</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Segment</th><th>Sequence number</th><th>Bytes carried</th><th>Next sequence number</th></tr></thead>
+  <tbody>
+    <tr><td>A</td><td>1</td><td>1 to 1,460</td><td>1,461</td></tr>
+    <tr><td>B</td><td>1,461</td><td>1,461 to 2,920</td><td>2,921</td></tr>
+    <tr><td>C</td><td>2,921</td><td>2,921 to 4,380</td><td>4,381</td></tr>
+  </tbody>
+</table></div>
+
+<p>With these numbers, the receiver can sort segments back into order, spot gaps, and recognise duplicates. (Counting bytes, rather than segments, lets TCP re-chop the stream into different sized segments when it retransmits.)</p>
+
+<h3>Step 2: acknowledge what you got</h3>
+
+<p>The receiver tells the sender how far it has got. The <span class="term">acknowledgement number</span> in a TCP segment means: <strong>"I have received every byte before this number; the next byte I expect is this one."</strong> After receiving segment A above, the receiver replies <code>ACK 1461</code>. After B, <code>ACK 2921</code>.</p>
+
+<p>These are <span class="term">cumulative acknowledgements</span>: one number covers everything up to that point. That makes ACKs cheap and robust: if ACK 1461 is lost but ACK 2921 arrives, the sender learns that both A and B made it. A later ACK can stand in for an earlier lost one.</p>
+
+<h3>Step 3: a timer and retransmission</h3>
+
+<p>When the sender transmits a segment, it starts a timer. If the matching acknowledgement doesn't arrive in time, the sender assumes the segment (or its ACK) was lost and sends it again. This is <span class="term">retransmission</span>, and the timer is the <span class="term">retransmission timeout</span> (<span class="term">RTO</span>). Its value matters a lot, and we'll come back to it.</p>
+
+<p>That's already a complete reliable protocol! It's called <em>stop-and-wait</em>: send one segment, wait for its ACK, send the next. And it works. The only problem is that it's terribly slow.</p>
+
+<h3>Step 4: why stop-and-wait is too slow</h3>
+
+<p>Suppose a client in New York talks to a server in London. The round-trip time (RTT) is about 80 ms. With stop-and-wait, the sender sends 1,460 bytes, then sits idle for a whole round trip waiting for the ACK:</p>
+
+<p style="text-align:center"><code>throughput = 1,460 bytes ÷ 0.080 s ≈ 18,000 bytes/s ≈ 146 kbit/s</code></p>
+
+<p>That's the case <em>regardless of how fast the link is</em>. Plug in a gigabit connection (1,000,000 kbit/s) and you're using about 0.015% of it. The cable is mostly empty: the bottleneck isn't bandwidth, it's waiting. (Remember bandwidth versus latency from chapter 1.)</p>
+
+<h3>Step 5: keep many segments in flight (the sliding window)</h3>
+
+<p>The fix is <span class="term">pipelining</span>: don't wait for each ACK. Send several segments back to back, and keep sending as ACKs return. The number of bytes the sender is allowed to have "in flight" (sent but not yet acknowledged) is the <span class="term">window</span>. As ACKs arrive, the window <em>slides</em> forward and allows more data out.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 280" role="img" aria-label="Time diagram: stop-and-wait sends one segment per round trip, a window of four keeps the link busy">
+<defs><marker id="ah08a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="200" y="20" text-anchor="middle" class="t-sm t-bold">Stop-and-wait: 1 segment per round trip</text>
+<text x="565" y="20" text-anchor="middle" class="t-sm t-bold">Window of 4: 4 segments per round trip</text>
+<text x="70" y="46" text-anchor="middle" class="t-sm t-muted">Sender</text><text x="330" y="46" text-anchor="middle" class="t-sm t-muted">Receiver</text>
+<line x1="70" y1="54" x2="70" y2="262" class="line-thin"/><line x1="330" y1="54" x2="330" y2="262" class="line-thin"/>
+<text x="440" y="46" text-anchor="middle" class="t-sm t-muted">Sender</text><text x="700" y="46" text-anchor="middle" class="t-sm t-muted">Receiver</text>
+<line x1="440" y1="54" x2="440" y2="262" class="line-thin"/><line x1="700" y1="54" x2="700" y2="262" class="line-thin"/>
+<line x1="72" y1="70" x2="328" y2="100" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="86" y="76" class="t-sm tc-blue t-bold">1</text>
+<line x1="328" y1="100" x2="72" y2="130" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="72" y1="130" x2="328" y2="160" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="86" y="136" class="t-sm tc-blue t-bold">2</text>
+<line x1="328" y1="160" x2="72" y2="190" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="72" y1="190" x2="328" y2="220" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="86" y="196" class="t-sm tc-blue t-bold">3</text>
+<line x1="328" y1="220" x2="72" y2="250" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<text x="200" y="272" text-anchor="middle" class="t-sm t-faint">idle most of the time</text>
+<line x1="442" y1="70" x2="698" y2="100" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="74" class="t-sm tc-blue t-bold">1</text>
+<line x1="698" y1="100" x2="442" y2="130" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="442" y1="84" x2="698" y2="114" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="88" class="t-sm tc-blue t-bold">2</text>
+<line x1="698" y1="114" x2="442" y2="144" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="442" y1="98" x2="698" y2="128" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="102" class="t-sm tc-blue t-bold">3</text>
+<line x1="698" y1="128" x2="442" y2="158" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="442" y1="112" x2="698" y2="142" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="116" class="t-sm tc-blue t-bold">4</text>
+<line x1="698" y1="142" x2="442" y2="172" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="442" y1="130" x2="698" y2="160" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="134" class="t-sm tc-blue t-bold">5</text>
+<line x1="698" y1="160" x2="442" y2="190" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="442" y1="144" x2="698" y2="174" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="148" class="t-sm tc-blue t-bold">6</text>
+<line x1="698" y1="174" x2="442" y2="204" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="442" y1="158" x2="698" y2="188" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="162" class="t-sm tc-blue t-bold">7</text>
+<line x1="698" y1="188" x2="442" y2="218" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<line x1="442" y1="172" x2="698" y2="202" class="line s-blue" marker-end="url(#ah08a)"/>
+<text x="452" y="176" class="t-sm tc-blue t-bold">8</text>
+<line x1="698" y1="202" x2="442" y2="232" class="line-dash s-green" marker-end="url(#ah08a)"/>
+<text x="565" y="272" text-anchor="middle" class="t-sm t-faint">always something in flight</text>
+</svg>
+  <figcaption><strong>Stop-and-wait vs a sliding window.</strong> Time flows downward. Blue lines are data segments; green dashed lines are acknowledgements. With a window of four, the sender uses the waiting time to send more, so throughput is four times higher on the same link. Each new segment goes out as soon as an ACK frees a slot.</figcaption>
+</figure>
+
+<p>The rule of thumb: <strong>throughput ≈ window ÷ RTT</strong>. A window of 64 KiB over an 80 ms RTT gives about 800 KB/s (6.5 Mbit/s); a 10 MB window gives about 125 MB/s, which is a full gigabit link. To keep a pipe full, you need a window as big as the <span class="term">bandwidth-delay product</span>: bandwidth × RTT, the amount of data that fits "inside the cable". For 1 Gbit/s and 80 ms that's 10 MB in flight.</p>
+
+<details class="deeper">
+<summary>Go deeper: window scaling and the 16-bit window field <span class="hint">optional</span></summary>
+<p>The TCP header only has 16 bits for the window size, so the largest window it can announce is 65,535 bytes, enough for only about 6.5 Mbit/s at 80 ms RTT. The fix was an option negotiated in the handshake called <strong>window scaling</strong>, which says "multiply my window field by 2<sup>n</sup>". That allows windows up to about a gigabyte. Without it, fast long-distance transfers would have been impossible. It's a nice example of a protocol being stretched far beyond its designers' expectations by adding options to the header.</p>
+</details>
+
+<h3>Play with it: a sliding-window simulator</h3>
+
+<p>Now you try. The simulator below runs real TCP-style logic on a toy link (one-way delay: 3 ticks, so RTT = 6 ticks). Try these experiments:</p>
+<ol>
+  <li>Choose a window of <strong>1</strong> and press Play. Count how many ticks the 12 segments take. That's stop-and-wait. Then try 4, and 8.</li>
+  <li>With window 8, press <strong>Drop next segment</strong>, then Play. Watch what happens: later segments arrive and wait in the receiver's yellow <em>buffer</em>, the ACKs stay stuck at the same number (duplicate ACKs, in yellow), the window stalls, and finally the timer fires and the missing segment is re-sent (orange). The moment it arrives, the ACK jumps forward.</li>
+  <li>Tick the <strong>fast retransmit</strong> box and repeat. The sender reacts to three duplicate ACKs without waiting for the timer.</li>
+  <li>Click an <em>ACK</em> in flight to drop it instead. Often nothing bad happens, because the next cumulative ACK covers it. (Why does stop-and-wait behave differently?)</li>
+</ol>
+
+<div class="widget" id="tcp-sim">
+  <div class="widget-head"><span class="widget-tag">Interactive</span><h4 class="widget-title">Sliding window and loss simulator</h4></div>
+  <p class="widget-help">Loading the simulator… (it needs JavaScript).</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "the ACK is the receiver confirming it processed the data"</p>
+  <p>A TCP acknowledgement only means the receiving <em>operating system</em> has the bytes in its buffer. It says nothing about whether the application has read them, acted on them or saved them. The app may crash a millisecond later. This difference is crucial in chapter 16.</p>
+</div>
+
+<h2>Opening a connection: the three-way handshake</h2>
+
+<p>All of the numbering needs a starting point, and both directions need one: TCP is <em>full duplex</em>, meaning each side sends its own stream, with its own sequence numbers, at the same time. Before any data flows, the two sides set up shared <span class="term">state</span>, a <span class="term">connection</span>, by exchanging three segments. This is the <span class="term">three-way handshake</span>:</p>
+
+<ol>
+  <li><strong>SYN</strong> (synchronise): the client says "I'd like to talk. My byte numbering starts at <em>x</em>."</li>
+  <li><strong>SYN-ACK</strong>: the server says "OK. My numbering starts at <em>y</em>, and I acknowledge yours: send me <em>x</em>+1 next."</li>
+  <li><strong>ACK</strong>: the client says "Got it: send me <em>y</em>+1 next." The connection is established.</li>
+</ol>
+
+<p>Why three, not two? Each side must (a) announce its own starting number and (b) hear that the other side received it. That's four things, but the server's "I acknowledge yours" and "here's mine" fit into the same message (SYN-ACK), so three segments do the work of four. Fewer wouldn't be enough: after two, the server wouldn't know whether its starting number had arrived.</p>
+
+<p>The starting numbers are called <span class="term">initial sequence numbers</span> (ISNs), and each side picks its own. They're deliberately unpredictable rather than starting at 0. A new connection between the same two addresses and ports can follow an old one closely, and the numbering must avoid confusion with stray delayed packets from the previous connection; random ISNs also make it harder for an attacker to forge packets. (Our example uses small, friendly numbers, but real ones are random 32-bit values.) A SYN or FIN counts as using up one sequence number, which is why the acknowledgements below go up by one.</p>
+
+<p>Step through a complete life of a connection below: the handshake, a short exchange of data, and the teardown. The teal labels show the state each side's operating system is in.</p>
+
+<div class="widget stepper" data-autoplay-ms="3000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">A TCP connection from open to close</h4></div>
+  <svg viewBox="0 0 760 470" role="img" aria-label="Sequence diagram with time flowing downward: TCP three-way handshake, a small data exchange, and connection teardown">
+<defs><marker id="ah08b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="60" y="6" width="120" height="26" rx="6" class="box"/><text x="120" y="24" text-anchor="middle" class="t-sm t-bold">💻 Client</text>
+<rect x="580" y="6" width="120" height="26" rx="6" class="box"/><text x="640" y="24" text-anchor="middle" class="t-sm t-bold">🗄️ Server</text>
+<line x1="120" y1="34" x2="120" y2="462" class="line-thin"/><line x1="640" y1="34" x2="640" y2="462" class="line-thin"/>
+<text x="12" y="466" class="t-sm t-faint">time ↓</text>
+<g data-steps="1-" data-active="1">
+<line x1="123" y1="60" x2="637" y2="76" class="line s-blue sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="56" text-anchor="middle" class="t-sm mono tc-blue t-bold">SYN  seq=1000</text>
+</g>
+<g data-steps="2-" data-active="2">
+<line x1="637" y1="100" x2="123" y2="116" class="line s-blue sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="96" text-anchor="middle" class="t-sm mono tc-blue t-bold">SYN-ACK  seq=5000 ack=1001</text>
+</g>
+<g data-steps="3-" data-active="3">
+<line x1="123" y1="140" x2="637" y2="156" class="line s-blue sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="136" text-anchor="middle" class="t-sm mono tc-blue t-bold">ACK  seq=1001 ack=5001</text>
+</g>
+<g data-steps="4-" data-active="4">
+<line x1="123" y1="180" x2="637" y2="196" class="line s-purple sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="176" text-anchor="middle" class="t-sm mono tc-purple t-bold">"HELLO"  seq=1001 len=5</text>
+</g>
+<g data-steps="5-" data-active="5">
+<line x1="637" y1="220" x2="123" y2="236" class="line s-purple sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="216" text-anchor="middle" class="t-sm mono tc-purple t-bold">ACK 1006 + "WORLD!"  seq=5001 len=6</text>
+</g>
+<g data-steps="6-" data-active="6">
+<line x1="123" y1="260" x2="637" y2="276" class="line s-purple sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="256" text-anchor="middle" class="t-sm mono tc-purple t-bold">ACK  ack=5007</text>
+</g>
+<g data-steps="7-" data-active="7">
+<line x1="123" y1="300" x2="637" y2="316" class="line s-orange sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="296" text-anchor="middle" class="t-sm mono tc-orange t-bold">FIN  seq=1006</text>
+</g>
+<g data-steps="8-" data-active="8">
+<line x1="637" y1="340" x2="123" y2="356" class="line s-orange sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="336" text-anchor="middle" class="t-sm mono tc-orange t-bold">ACK  ack=1007</text>
+</g>
+<g data-steps="9-" data-active="9">
+<line x1="637" y1="380" x2="123" y2="396" class="line s-orange sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="376" text-anchor="middle" class="t-sm mono tc-orange t-bold">FIN  seq=5007</text>
+</g>
+<g data-steps="10-" data-active="10">
+<line x1="123" y1="420" x2="637" y2="436" class="line s-orange sw-2" marker-end="url(#ah08b)"/>
+<text x="380" y="416" text-anchor="middle" class="t-sm mono tc-orange t-bold">ACK  ack=5008</text>
+</g>
+<text data-steps="1-" x="112" y="64" text-anchor="end" class="t-sm t-bold tc-teal">SYN_SENT</text>
+<text data-steps="3-" x="112" y="144" text-anchor="end" class="t-sm t-bold tc-teal">ESTABLISHED</text>
+<text data-steps="7-" x="112" y="304" text-anchor="end" class="t-sm t-bold tc-teal">FIN_WAIT_1</text>
+<text data-steps="8-" x="112" y="360" text-anchor="end" class="t-sm t-bold tc-teal">FIN_WAIT_2</text>
+<text data-steps="10-" x="112" y="424" text-anchor="end" class="t-sm t-bold tc-teal">TIME_WAIT</text>
+<text data-steps="1-" x="650" y="64" class="t-sm t-bold tc-teal">LISTEN</text>
+<text data-steps="2-" x="650" y="104" class="t-sm t-bold tc-teal">SYN_RECEIVED</text>
+<text data-steps="3-" x="650" y="160" class="t-sm t-bold tc-teal">ESTABLISHED</text>
+<text data-steps="7-" x="650" y="320" class="t-sm t-bold tc-teal">CLOSE_WAIT</text>
+<text data-steps="9-" x="650" y="384" class="t-sm t-bold tc-teal">LAST_ACK</text>
+<text data-steps="10-" x="650" y="440" class="t-sm t-bold tc-teal">CLOSED</text>
+</svg>
+  <ol class="stepper-captions">
+    <li><strong>SYN.</strong> The client picks an initial sequence number (1000 here) and sends a segment with the SYN flag set and no data. It moves to <code>SYN_SENT</code>; the server was waiting in <code>LISTEN</code> (chapter 7's "listening socket").</li>
+    <li><strong>SYN-ACK.</strong> The server picks its own number (5000) and replies with both SYN and ACK set. <code>ack=1001</code> means "I got your SYN (number 1000); next I expect 1001". The server is now <code>SYN_RECEIVED</code>.</li>
+    <li><strong>ACK.</strong> The client confirms: <code>ack=5001</code>. Both sides are <code>ESTABLISHED</code>. <strong>One full round trip has passed and no data has moved yet.</strong> That's the price of a new connection.</li>
+    <li><strong>Data.</strong> The client sends 5 bytes ("HELLO") starting at sequence number 1001. The segment also repeats <code>ack=5001</code>; every segment after the handshake carries an ACK field.</li>
+    <li><strong>ACK + data.</strong> The server acknowledges the 5 bytes (<code>ack=1006</code>: next expected is byte 1006) and, in the same segment, sends its own 6 bytes starting at 5001. Combining the two is called piggybacking.</li>
+    <li><strong>ACK.</strong> The client acknowledges the server's 6 bytes: <code>ack=5007</code>. Both directions now have everything delivered.</li>
+    <li><strong>FIN.</strong> The client has finished sending, so it sends a FIN ("finish") at sequence number 1006 and moves to <code>FIN_WAIT_1</code>. It can still <em>receive</em>: each direction is closed separately.</li>
+    <li><strong>ACK of the FIN.</strong> The server acknowledges (<code>ack=1007</code>, because the FIN used one number). The server is in <code>CLOSE_WAIT</code>: it knows the client is done, and may still have data to send.</li>
+    <li><strong>The server's FIN.</strong> Once the server application has also closed, the server sends its own FIN (<code>LAST_ACK</code>).</li>
+    <li><strong>Final ACK.</strong> The client acknowledges that FIN and enters <code>TIME_WAIT</code> for a while (see the box below). The server closes immediately. The connection is gone.</li>
+  </ol>
+</div>
+
+<h3>Closing, and abrupt endings</h3>
+
+<p>A graceful close takes four segments, because each direction shuts down on its own (the server's ACK and FIN can sometimes be combined into one). A side that sends FIN is saying "I won't send any more bytes", not "I won't listen".</p>
+
+<p>There's also a rude way to end a connection: a <span class="term">RST</span> (reset) segment, which means "forget this connection immediately". You get a RST when you connect to a port nobody is listening on (that's the "Connection refused" you saw with <code>nc</code> in chapter 7), when a program crashes with a connection open, or when a segment arrives for a connection the receiver doesn't know about. A RST is not acknowledged and not retransmitted.</p>
+
+<details class="deeper">
+<summary>Go deeper: TIME_WAIT, and why it exists <span class="hint">optional</span></summary>
+<p>After the final ACK, the side that closed first doesn't free the connection immediately. It lingers in <code>TIME_WAIT</code> for roughly twice the maximum time a segment can live in the network (implementations commonly use about 60 seconds). There are two reasons: if its final ACK was lost, the other side will retransmit its FIN and the lingering side must be there to answer it; and any stray delayed segments from the old connection should die out before the same address-and-port combination is reused, so they can't be mistaken for part of a new connection.</p>
+<p>Practical consequence: a busy client or server that opens and closes thousands of short connections per second can pile up many sockets in <code>TIME_WAIT</code>, and run out of ephemeral ports (chapter 7). This is one more reason to reuse connections.</p>
+</details>
+
+<h2>What's in a TCP header?</h2>
+
+<p>Everything above lives in the TCP header, which comes right after the IP header (chapter 3). The minimum size is 20 bytes. Here are the key fields:</p>
+
+<div class="fields">
+  <div class="field" style="--w:16">Source port<small>16 bits</small></div>
+  <div class="field" style="--w:16">Destination port<small>16 bits</small></div>
+</div>
+<div class="fields" style="margin-top:4px">
+  <div class="field" style="--w:32">Sequence number<small>32 bits · number of this segment's first byte</small></div>
+</div>
+<div class="fields" style="margin-top:4px">
+  <div class="field" style="--w:32">Acknowledgement number<small>32 bits · next byte I expect from you</small></div>
+</div>
+<div class="fields" style="margin-top:4px">
+  <div class="field" style="--w:4">Offset<small>4 bits · header length</small></div>
+  <div class="field" style="--w:12">Flags<small>SYN ACK FIN RST PSH …</small></div>
+  <div class="field" style="--w:16">Window<small>16 bits · my free buffer space</small></div>
+</div>
+<div class="fields" style="margin-top:4px">
+  <div class="field" style="--w:16">Checksum<small>16 bits · detects corruption</small></div>
+  <div class="field" style="--w:16">Urgent pointer<small>16 bits · rarely used</small></div>
+</div>
+<div class="fields" style="margin-top:4px">
+  <div class="field" style="--w:32">Options (0 to 40 bytes)<small>maximum segment size, window scale, selective ACK, timestamps…</small></div>
+</div>
+<div class="fields" style="margin-top:4px">
+  <div class="field" style="--w:32; background:var(--purple-soft); border-color:var(--purple)">Your data</div>
+</div>
+
+<p>Compare it with UDP's four fields. TCP's extra 12 bytes are the machinery for reliability. The flags are single-bit switches: <code>SYN</code> (opening), <code>ACK</code> (the acknowledgement field is valid, set on nearly every segment after the first), <code>FIN</code> (I'm done sending), <code>RST</code> (abort), and <code>PSH</code> (please hand this to the application promptly). The <strong>window</strong> field is the key to flow control, which comes next.</p>
+
+<h2>How TCP knows something was lost</h2>
+
+<p>The sender detects loss in two ways.</p>
+
+<h3>1. Timeout</h3>
+
+<p>If no ACK arrives for the oldest unacknowledged segment before the RTO expires, the sender resends it. Choosing the RTO is a delicate balancing act. Too short, and the sender resends data that was merely slow, wasting capacity (<em>spurious retransmissions</em>). Too long, and a real loss stalls the connection for ages.</p>
+
+<p>TCP therefore <strong>measures</strong> the connection's round-trip time on the fly (timing how long ACKs take to come back) and keeps a smoothed average plus an estimate of how much it varies. The RTO is set to a bit more than the average, roughly "average RTT plus a few times its variability", with a lower bound (Linux uses 200 ms; the standard suggests 1 second). If a retransmission also times out, TCP <strong>doubles</strong> the RTO each time (<em>exponential backoff</em>): if the network is really struggling, hammering it is the last thing you want.</p>
+
+<p>Keep this in mind: the RTO is a <em>guess</em> about how long a healthy reply should take. A timeout doesn't prove the packet was lost, only that the answer hasn't come back yet. We'll meet that exact problem again at the application level in chapter 16.</p>
+
+<h3>2. Duplicate ACKs</h3>
+
+<p>Waiting for a timer is slow. If segment B is lost but C, D and E arrive, the receiver keeps repeating <code>ACK 1461</code> ("I'm still waiting for 1461"). The sender sees the same ACK again and again, a strong hint that one specific segment is missing while later ones are getting through.</p>
+
+<details class="deeper">
+<summary>Go deeper: fast retransmit and selective acknowledgements <span class="hint">optional</span></summary>
+<p>TCP exploits the hint: after <strong>three duplicate ACKs</strong> for the same number, the sender immediately retransmits the missing segment without waiting for the timer. This is <strong>fast retransmit</strong>. (Three, rather than one, because simple reordering also produces the occasional duplicate ACK.) Example, with 1,460-byte segments:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Segment arrives at receiver</th><th>Receiver replies</th><th>Sender's view</th></tr></thead>
+  <tbody>
+    <tr><td>A (1 to 1,460)</td><td>ACK 1461</td><td>A is safe</td></tr>
+    <tr><td>B (1,461 to 2,920): <strong>lost</strong></td><td>(nothing)</td><td>waiting…</td></tr>
+    <tr><td>C (2,921 to 4,380)</td><td>ACK 1461</td><td>duplicate #1</td></tr>
+    <tr><td>D (4,381 to 5,840)</td><td>ACK 1461</td><td>duplicate #2</td></tr>
+    <tr><td>E (5,841 to 7,300)</td><td>ACK 1461</td><td>duplicate #3: resend B now</td></tr>
+    <tr><td>B arrives (resent)</td><td>ACK 7301</td><td>one ACK covers B, C, D and E</td></tr>
+  </tbody>
+</table></div>
+<p>A modern extension, <strong>selective acknowledgement (SACK)</strong>, lets the receiver also say "I have 2,921 to 7,300 too", so the sender can resend precisely what's missing and nothing more. Both sides must agree to use it during the handshake (it's an option), and nearly everyone does.</p>
+</details>
+
+<h2>Two different speed limits: flow control and congestion control</h2>
+
+<p>Sending as much as possible, as fast as possible, isn't always wise. There are two <em>different</em> things the sender must not overwhelm, and TCP has a separate mechanism for each. Beginners often mix them up.</p>
+
+<div class="cols">
+  <div class="card accent-blue"><h4>Flow control: protect the receiver</h4><p>The receiver has a limited buffer for incoming data (until the application reads it). If the app is slow, the buffer fills up. Every ACK therefore carries a <strong>receive window</strong> field: "I have this much free space". The sender never has more data in flight than that.</p></div>
+  <div class="card accent-orange"><h4>Congestion control: protect the network</h4><p>The links and routers between the two machines are shared with millions of others. If everyone blasts at full speed, queues overflow and packets are dropped. The sender keeps its own estimate of what the <em>network</em> can take, the <strong>congestion window</strong>, and never exceeds it.</p></div>
+</div>
+
+<p>At any moment, the sender may have at most <code>min(receive window, congestion window)</code> bytes in flight. Whichever limit is tighter wins.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the mailbox and the roads</p>
+  <p>You're mailing lots of parcels to a friend. <strong>Flow control</strong> is your friend saying "my mailbox only holds ten parcels, stop until I've emptied it". <strong>Congestion control</strong> is you noticing that the roads are jammed and some of your earlier parcels got lost, so you send fewer per day until traffic eases. The friend can't see the roads and the roads don't see the friend's mailbox, so two separate controls are needed.</p>
+  <p><em>Where it breaks down:</em> roads don't send you a message saying "I'm full". TCP has to <em>infer</em> congestion indirectly, mostly from lost packets.</p>
+</div>
+
+<p>If the receiver's window reaches zero (buffer full), the sender must pause, and periodically send tiny "window probe" segments to find out when space opens up again.</p>
+
+<h2>Congestion control: probing for the right speed</h2>
+
+<p>In the 1980s, as the early Internet grew, there were episodes of <em>congestion collapse</em>: the network was so overloaded that most of the traffic was retransmissions of data that was already clogging it, and useful throughput plunged. The fix, added to TCP in the late 1980s, is why the Internet still works today. The sender keeps a variable called the <span class="term">congestion window</span> (<code>cwnd</code>), measured in segments, and adjusts it constantly:</p>
+
+<ol>
+  <li><strong>Slow start.</strong> A new connection has no idea how fast the network is, so it starts small (modern systems start with about 10 segments) and increases <code>cwnd</code> aggressively: every ACK adds one segment, which means the window <strong>doubles every round trip</strong>. The name is ironic: it's the "slow" start compared with just blasting at full speed, but exponentially fast compared with anything gentler.</li>
+  <li><strong>Congestion avoidance.</strong> When <code>cwnd</code> reaches a threshold (<code>ssthresh</code>), or something goes wrong, TCP switches to a careful mode: it grows by only about <strong>one segment per round trip</strong>, gently probing for more capacity.</li>
+  <li><strong>React to loss.</strong> When a loss is detected, TCP takes it as a sign of congestion and <strong>halves</strong> <code>cwnd</code>, then resumes the gentle climb. After a full timeout (a worse sign) the classic response is to collapse back to a tiny window and start slow start again.</li>
+</ol>
+
+<p>The rule "increase by one, decrease by half" is called <span class="term">AIMD</span>: <em>additive increase, multiplicative decrease</em>. Plotted over time, it produces a famous sawtooth:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Chart of congestion window over time: exponential slow start, then linear growth, then halving at each packet loss, forming a sawtooth">
+<defs><marker id="ah08c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<line x1="70" y1="232" x2="740" y2="232" class="line"/><line x1="70" y1="232" x2="70" y2="14" class="line"/>
+<line x1="66" y1="232.0" x2="70" y2="232.0" class="line-thin"/><text x="62" y="236.0" text-anchor="end" class="t-sm t-muted">0</text>
+<line x1="66" y1="180.0" x2="70" y2="180.0" class="line-thin"/><text x="62" y="184.0" text-anchor="end" class="t-sm t-muted">8</text>
+<line x1="66" y1="128.0" x2="70" y2="128.0" class="line-thin"/><text x="62" y="132.0" text-anchor="end" class="t-sm t-muted">16</text>
+<line x1="66" y1="76.0" x2="70" y2="76.0" class="line-thin"/><text x="62" y="80.0" text-anchor="end" class="t-sm t-muted">24</text>
+<line x1="66" y1="24.0" x2="70" y2="24.0" class="line-thin"/><text x="62" y="28.0" text-anchor="end" class="t-sm t-muted">32</text>
+<text x="14" y="132" class="t-sm t-muted" transform="rotate(-90 14 132)">cwnd (segments)</text>
+<text x="405" y="272" text-anchor="middle" class="t-sm t-muted">time, measured in round trips →</text>
+<line x1="70" y1="128.0" x2="182.5" y2="128.0" class="line-dash s-yellow" style="stroke-width:1.5"/>
+<text x="76" y="123.0" class="t-sm tc-yellow">ssthresh = 16</text>
+<polyline points="70.0,225.5 92.5,219.0 115.0,206.0 137.5,180.0 160.0,128.0 182.5,121.5 205.0,115.0 227.5,108.5 250.0,102.0 272.5,95.5 295.0,89.0 317.5,82.5 340.0,76.0 362.5,154.0 385.0,147.5 407.5,141.0 430.0,134.5 452.5,128.0 475.0,121.5 497.5,115.0 520.0,108.5 542.5,102.0 565.0,95.5 587.5,89.0 610.0,82.5 632.5,76.0 655.0,154.0 677.5,147.5 700.0,141.0 722.5,134.5" class="line s-blue" style="stroke-width:3;stroke-linejoin:round"/>
+<circle cx="70.0" cy="225.5" r="2.5" class="f-blue"/>
+<circle cx="92.5" cy="219.0" r="2.5" class="f-blue"/>
+<circle cx="115.0" cy="206.0" r="2.5" class="f-blue"/>
+<circle cx="137.5" cy="180.0" r="2.5" class="f-blue"/>
+<circle cx="160.0" cy="128.0" r="2.5" class="f-blue"/>
+<circle cx="182.5" cy="121.5" r="2.5" class="f-blue"/>
+<circle cx="205.0" cy="115.0" r="2.5" class="f-blue"/>
+<circle cx="227.5" cy="108.5" r="2.5" class="f-blue"/>
+<circle cx="250.0" cy="102.0" r="2.5" class="f-blue"/>
+<circle cx="272.5" cy="95.5" r="2.5" class="f-blue"/>
+<circle cx="295.0" cy="89.0" r="2.5" class="f-blue"/>
+<circle cx="317.5" cy="82.5" r="2.5" class="f-blue"/>
+<circle cx="340.0" cy="76.0" r="2.5" class="f-blue"/>
+<circle cx="362.5" cy="154.0" r="2.5" class="f-blue"/>
+<circle cx="385.0" cy="147.5" r="2.5" class="f-blue"/>
+<circle cx="407.5" cy="141.0" r="2.5" class="f-blue"/>
+<circle cx="430.0" cy="134.5" r="2.5" class="f-blue"/>
+<circle cx="452.5" cy="128.0" r="2.5" class="f-blue"/>
+<circle cx="475.0" cy="121.5" r="2.5" class="f-blue"/>
+<circle cx="497.5" cy="115.0" r="2.5" class="f-blue"/>
+<circle cx="520.0" cy="108.5" r="2.5" class="f-blue"/>
+<circle cx="542.5" cy="102.0" r="2.5" class="f-blue"/>
+<circle cx="565.0" cy="95.5" r="2.5" class="f-blue"/>
+<circle cx="587.5" cy="89.0" r="2.5" class="f-blue"/>
+<circle cx="610.0" cy="82.5" r="2.5" class="f-blue"/>
+<circle cx="632.5" cy="76.0" r="2.5" class="f-blue"/>
+<circle cx="655.0" cy="154.0" r="2.5" class="f-blue"/>
+<circle cx="677.5" cy="147.5" r="2.5" class="f-blue"/>
+<circle cx="700.0" cy="141.0" r="2.5" class="f-blue"/>
+<circle cx="722.5" cy="134.5" r="2.5" class="f-blue"/>
+<text x="74.0" y="37.0" class="t-sm t-bold tc-green">slow start</text>
+<text x="74.0" y="52.0" class="t-sm t-muted">doubles every RTT</text>
+<line x1="124.0" y1="63.0" x2="146.5" y2="167.0" class="line-thin" marker-end="url(#ah08c)"/>
+<text x="216.2" y="37.0" class="t-sm t-bold tc-blue">congestion avoidance</text>
+<text x="216.2" y="52.0" class="t-sm t-muted">+1 segment per RTT</text>
+<text x="334.0" y="66.0" text-anchor="end" class="t-sm t-bold tc-red">✕ loss</text>
+<text x="354.0" y="102.0" class="t-sm tc-red">halve</text>
+<text x="626.5" y="66.0" text-anchor="end" class="t-sm t-bold tc-red">✕ loss</text>
+<text x="646.5" y="102.0" class="t-sm tc-red">halve</text>
+</svg>
+  <figcaption><strong>The TCP sawtooth (a simplified model).</strong> Exponential slow start up to the threshold, then a steady climb of one segment per round trip, until a loss, which halves the window. The cycle repeats. Real graphs are noisier, and newer algorithms are shaped differently, but the idea is the same.</figcaption>
+</figure>
+
+<p>The effect is remarkable. Nobody tells TCP the capacity of the path; each sender <em>feels</em> its way to it, backing off when it overshoots. When several connections share a bottleneck link, AIMD tends to push them toward roughly equal shares. Congestion control is an <strong>emergent, decentralised</strong> agreement among millions of strangers' computers, with no one in charge, which is a perfect preview of distributed systems.</p>
+
+<details class="deeper">
+<summary>Go deeper: loss as a signal, and newer algorithms like BBR <span class="hint">optional</span></summary>
+<p>Classic TCP (the Reno family) and CUBIC, long the default on Linux, treat <em>packet loss</em> as the congestion signal. That's a reasonable guess on wired networks, where loss mostly means a full router queue. But on Wi-Fi or mobile networks, loss can also come from radio interference, and the sender needlessly slows down. And loss-based algorithms keep pushing until a router queue is completely full, which causes extra queueing delay (sometimes called bufferbloat).</p>
+<p>Newer designs such as Google's <strong>BBR</strong> take a different approach: instead of waiting for loss, they try to estimate two properties of the path, the bottleneck bandwidth and the minimum round-trip time, and pace their sending to match, aiming to fill the pipe without filling the queues. Different congestion-control algorithms coexist on the Internet, and the sender alone chooses which one it uses, because the receiver cannot tell the difference. Which is "best" depends on the network and on what you're measuring.</p>
+</details>
+
+<h2>The price of order: head-of-line blocking</h2>
+
+<p>TCP's in-order promise has a cost. The application reads a <em>stream</em>, so TCP can only hand over bytes in sequence. Suppose segments 1 to 6 are sent and segment 3 is lost, while 4, 5 and 6 arrive fine:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 215" role="img" aria-label="Segments 1 to 6 arrive except segment 3, which is lost; segments 4 to 6 sit in the buffer while the application can only read segments 1 and 2">
+    <defs>
+      <marker id="ah08d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="22" class="t-sm t-bold">What arrived at the receiver's operating system</text>
+    <rect x="20" y="34" width="100" height="40" rx="6" class="fs-blue s-blue sw-2"/><text x="70" y="59" text-anchor="middle" class="t-sm t-bold">1</text>
+    <rect x="135" y="34" width="100" height="40" rx="6" class="fs-blue s-blue sw-2"/><text x="185" y="59" text-anchor="middle" class="t-sm t-bold">2</text>
+    <rect x="250" y="34" width="100" height="40" rx="6" class="fs-red s-red sw-2" style="stroke-dasharray:5 4"/><text x="300" y="59" text-anchor="middle" class="t-sm t-bold tc-red">3 ✕ lost</text>
+    <rect x="365" y="34" width="100" height="40" rx="6" class="fs-yellow s-yellow sw-2"/><text x="415" y="59" text-anchor="middle" class="t-sm t-bold">4 (buffered)</text>
+    <rect x="480" y="34" width="100" height="40" rx="6" class="fs-yellow s-yellow sw-2"/><text x="530" y="59" text-anchor="middle" class="t-sm t-bold">5 (buffered)</text>
+    <rect x="595" y="34" width="100" height="40" rx="6" class="fs-yellow s-yellow sw-2"/><text x="645" y="59" text-anchor="middle" class="t-sm t-bold">6 (buffered)</text>
+
+    <text x="20" y="122" class="t-sm t-bold">What the application can read</text>
+    <line x1="70" y1="76" x2="70" y2="140" class="line" marker-end="url(#ah08d)"/>
+    <line x1="185" y1="76" x2="185" y2="140" class="line" marker-end="url(#ah08d)"/>
+    <rect x="20" y="144" width="100" height="40" rx="6" class="fs-green s-green sw-2"/><text x="70" y="169" text-anchor="middle" class="t-sm t-bold">1</text>
+    <rect x="135" y="144" width="100" height="40" rx="6" class="fs-green s-green sw-2"/><text x="185" y="169" text-anchor="middle" class="t-sm t-bold">2</text>
+    <rect x="250" y="144" width="445" height="40" rx="6" class="box" style="stroke-dasharray:5 4"/>
+    <text x="472" y="169" text-anchor="middle" class="t-sm t-muted">stalled: nothing new until a re-sent 3 arrives</text>
+    <text x="380" y="206" text-anchor="middle" class="t-sm t-faint">4, 5 and 6 are already here, but must wait their turn.</text>
+  </svg>
+  <figcaption><strong>Head-of-line blocking.</strong> One lost segment holds up everything behind it in the same stream, even data that has already arrived.</figcaption>
+</figure>
+
+<p>Segments 4, 5 and 6 are sitting in the receiver's buffer, but the application can't see them: it would receive bytes out of order. Everything waits until the sender notices the loss (a timeout or three duplicate ACKs, at least one round trip) and the retransmission arrives. This is called <span class="term">head-of-line blocking</span>. It's a worthwhile trade for a single stream where order matters (a file, a page), but a bad one when a connection carries many <em>independent</em> things at once, because a loss on one blocks all the rest. That's a core weakness behind the move from HTTP/2 over TCP to HTTP/3 over QUIC, which we'll see in chapter 10.</p>
+
+<h2>TCP is a stream, not a list of messages</h2>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: TCP preserves message boundaries</p>
+  <p>If your program calls <code>send("HELLO")</code> and then <code>send("WORLD")</code>, the other side might receive <code>HELLOWORLD</code> in one read, or <code>HEL</code> and then <code>LOWORLD</code>, or anything in between. TCP guarantees the byte <em>sequence</em> and nothing about how it's chopped. Applications that need discrete messages must add their own <span class="term">framing</span>: a length prefix ("the next 5 bytes are a message"), a delimiter (a newline, as in many text protocols), or a structured format such as HTTP's headers with a <code>Content-Length</code>. UDP, by contrast, does keep datagram boundaries.</p>
+</div>
+
+<h2>The cost of a connection</h2>
+
+<p>Now you can see why opening connections is expensive:</p>
+<ul>
+  <li><strong>The handshake costs one round trip</strong> before the server has seen any of your data (the client can attach data to its final ACK, but it must first wait for the SYN-ACK). A request/response over a new connection therefore needs a minimum of <strong>two round trips</strong> (one for the handshake, one for the request and reply) before the first byte of the answer arrives. At an 80 ms RTT that's 160 ms, with no data transfer at all, only waiting for the speed of light. (If the connection is encrypted with TLS, chapter 11 adds more round trips on top.)</li>
+  <li><strong>Slow start</strong> means a fresh connection begins with a small window, so a short download never reaches full speed.</li>
+  <li><strong>State costs memory.</strong> Both sides hold buffers and counters for every open connection, and the server's operating system has limits.</li>
+</ul>
+
+<p>That's why well-behaved software <strong>reuses connections</strong>: browsers keep connections open for several requests ("keep-alive", chapter 10), and database clients use connection pools (chapter 14). Opening a new TCP connection for every tiny request is one of the most common performance mistakes in real systems.</p>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">1. A two-terminal chat over TCP</p>
+  <p>Open two terminals. In the first, run <code>nc -l 9000</code> (listen on port 9000; with some older Linux netcats it's <code>nc -l -p 9000</code>). In the second, run <code>nc localhost 9000</code> (connect). Type a line in either one and press Enter. It appears in the other. Then press <kbd>Ctrl</kbd>+<kbd>C</kbd> in one terminal: the other one ends too, because a FIN arrived. Contrast with the UDP experiment in chapter 7: try running <code>nc localhost 9000</code> <em>without</em> a listener and see "Connection refused" (a RST).</p>
+</div>
+
+<pre class="terminal" data-title="terminal 2 (client)"><code><span class="prompt">$ </span><span class="cmd">nc localhost 9000</span>
+<span class="out">hello server                <span class="cmt"># typed here, shows up in terminal 1</span>
+hi client!                   <span class="cmt"># typed in terminal 1</span></span></code></pre>
+
+<div class="callout try">
+  <p class="callout-title">2. Watch a handshake from curl, and list connections</p>
+  <p><code>curl -v</code> prints a line when the TCP connection is established. <code>netstat -an</code> shows the state of every connection on your machine (the same states as in the stepper above).</p>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">curl -v http://example.com 2&gt;&amp;1 | head -4</span>
+<span class="out">*   Trying 93.184.216.34:80...
+* <span class="hl">Connected to example.com (93.184.216.34) port 80</span>    <span class="cmt"># the handshake is done</span>
+&gt; GET / HTTP/1.1
+&gt; Host: example.com</span>
+
+<span class="prompt">$ </span><span class="cmd">netstat -an | grep -E "ESTABLISHED|TIME_WAIT" | head -4</span>
+<span class="out">tcp4  0  0  192.168.1.20.51234  203.0.113.10.443   <span class="hl2">ESTABLISHED</span>
+tcp4  0  0  192.168.1.20.51310  198.51.100.7.443   <span class="hl3">TIME_WAIT</span></span></code></pre>
+
+<p>(Addresses and states will differ on your machine; on Windows use <code>netstat -an | findstr ESTABLISHED</code>.) <code>TIME_WAIT</code> entries are connections that closed recently, lingering as described earlier.</p>
+
+<div class="callout try">
+  <p class="callout-title">3. (Optional) See the SYN and ACK flags yourself</p>
+  <p><code>tcpdump</code> captures packets. It <strong>needs <code>sudo</code></strong> because it reads raw network traffic, so only run it if you're comfortable doing that, and only on your own machine. With the <code>nc</code> chat from experiment 1 running, in a third terminal run <code>sudo tcpdump -i lo0 -n port 9000</code> (on Linux the loopback interface is <code>lo</code>, not <code>lo0</code>). Then start the client and type one line.</p>
+</div>
+
+<pre class="terminal" data-title="terminal 3 (needs sudo)"><code><span class="prompt">$ </span><span class="cmd">sudo tcpdump -i lo0 -n port 9000</span>
+<span class="out">IP 127.0.0.1.53712 &gt; 127.0.0.1.9000: Flags [<span class="hl">S</span>],  seq 3105218849, win 65535, length 0       <span class="cmt"># SYN</span>
+IP 127.0.0.1.9000 &gt; 127.0.0.1.53712: Flags [<span class="hl">S.</span>], seq 1021774358, ack 3105218850, length 0   <span class="cmt"># SYN-ACK</span>
+IP 127.0.0.1.53712 &gt; 127.0.0.1.9000: Flags [<span class="hl">.</span>],  ack 1, win 6379, length 0           <span class="cmt"># ACK</span>
+IP 127.0.0.1.53712 &gt; 127.0.0.1.9000: Flags [<span class="hl">P.</span>], seq 1:7, ack 1, length 6          <span class="cmt"># "hello\n" (PSH+ACK)</span>
+IP 127.0.0.1.9000 &gt; 127.0.0.1.53712: Flags [<span class="hl">.</span>],  ack 7, win 6379, length 0           <span class="cmt"># ACK of those 6 bytes</span></span></code></pre>
+
+<p>There they are: <code>[S]</code> is SYN, <code>[S.]</code> is SYN-ACK (the dot means ACK), <code>[.]</code> is a bare ACK, <code>[P.]</code> is data with PSH and ACK. After the SYN and SYN-ACK (which show the real random numbers), tcpdump shows <em>relative</em> sequence numbers (so <code>seq 1:7</code> means bytes 1 to 6, the next expected being 7), and the <code>ack 7</code> in the last line is the cumulative acknowledgement from this chapter. Your numbers will differ. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in the <code>nc</code> terminals and you will see <code>[F.]</code> (FIN) segments too.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>TCP is the strongest guarantee the network gives you, and it's worth being precise about how far it goes. It promises reliable, ordered delivery <strong>within one connection, as long as both ends stay alive and connected</strong>. It does not promise anything across connections (reconnect and the sequence numbers start over; there is no memory of what was sent before), nor that the other <em>program</em> acted on what the other <em>machine</em> received. If a connection breaks (a cable is pulled, a server crashes, a NAT table entry expires) you often can't tell whether your last request was processed: the data may have been lost, or processed with only the response lost. A peer that disappears without a FIN or RST (power cut, network partition) may go unnoticed for minutes or longer unless you set timeouts or keepalives. And every timeout is a <em>guess</em>: TCP's RTO guesses when a segment is lost, your application's timeout guesses when a server is dead, and both can be wrong. Surviving this is the subject of chapter 16: <strong>timeouts, retries and idempotency</strong> (making an operation safe to repeat) are the application-level equivalents of what TCP does for bytes.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>IP is best effort (loss, duplication, reordering). <strong>TCP</strong> builds a reliable, ordered byte stream on top using <strong>sequence numbers, cumulative acknowledgements, timers and retransmission</strong>.</li>
+    <li><strong>Stop-and-wait</strong> is correct but slow (one segment per RTT). A <strong>sliding window</strong> keeps many segments in flight: throughput ≈ window ÷ RTT.</li>
+    <li>The <strong>three-way handshake</strong> (SYN, SYN-ACK, ACK) lets both sides choose and confirm initial sequence numbers; it costs <strong>one round trip</strong> before data, which is why connections are reused.</li>
+    <li>Loss is detected by <strong>timeout</strong> (RTO, based on measured RTT, doubled on repeated failure) or by <strong>duplicate ACKs</strong> (fast retransmit).</li>
+    <li><strong>Flow control</strong> (receiver's window) protects the receiver; <strong>congestion control</strong> (slow start, then AIMD, using loss as the signal) protects the network.</li>
+    <li><strong>Head-of-line blocking:</strong> one lost segment stalls everything behind it in the stream.</li>
+    <li>TCP delivers bytes, not messages, and guarantees nothing once the connection breaks: that's where application-level retries and idempotency begin.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A receiver has received bytes 1 through 2,920 contiguously, plus bytes 4,381 to 5,840 (a gap in the middle). What acknowledgement number will it send?</p>
+    <ol class="q-options">
+      <li>2,920</li>
+      <li>2,921</li>
+      <li>5,841</li>
+      <li>4,381</li>
+    </ol>
+    <div class="q-explain">The ACK number is the next byte expected in order: the first byte it hasn't got. Everything up to 2,920 is present, so it's waiting for 2,921, and cumulative acknowledgements don't mention the later data (unless SACK is used).</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Why does the TCP handshake use three segments instead of two?</p>
+    <ol class="q-options">
+      <li>To make connections slow on purpose</li>
+      <li>One segment for each of the three layers</li>
+      <li>Because the server needs time to start up</li>
+      <li>Each side must announce its own starting sequence number and have it acknowledged; the server's acknowledgement and announcement share one segment</li>
+    </ol>
+    <div class="q-explain">Client SYN announces its number; the server's SYN-ACK acknowledges it and announces the server's own; the client's ACK acknowledges that one. With only two segments, the server would never learn whether its starting number was received.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A client in Sydney talks to a server in Frankfurt (RTT ≈ 280 ms) over a 1 Gbit/s link, using stop-and-wait with 1,460-byte segments. What limits the speed?</p>
+    <ol class="q-options">
+      <li>Waiting for each acknowledgement: only one segment per round trip, about 42 kbit/s</li>
+      <li>The 1 Gbit/s link</li>
+      <li>The server's CPU</li>
+      <li>The size of the IP header</li>
+    </ol>
+    <div class="q-explain">Throughput is 1,460 bytes per 0.28 s ≈ 5.2 KB/s ≈ 42 kbit/s. The link is nearly idle. This is why TCP uses a window: keeping many segments in flight hides the round-trip wait.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">What is the difference between flow control and congestion control?</p>
+    <ol class="q-options">
+      <li>Flow control is for UDP, congestion control is for TCP</li>
+      <li>They are two names for the same mechanism</li>
+      <li>Flow control stops the sender overwhelming the receiver's buffer; congestion control stops it overwhelming the network between them</li>
+      <li>Flow control is done by routers, congestion control by the receiver</li>
+    </ol>
+    <div class="q-explain">The receiver advertises its free buffer space in the window field (flow control). The sender estimates network capacity itself with a congestion window and AIMD (congestion control). The sender obeys the smaller of the two.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Segment 3 of 10 is lost, but 4 to 10 all arrive. What does the receiving application see until segment 3 is retransmitted?</p>
+    <ol class="q-options">
+      <li>Segments 4 to 10, then 3 later</li>
+      <li>Only segments 1 and 2: the rest wait in the buffer</li>
+      <li>Nothing at all, not even 1 and 2</li>
+      <li>Segments 1 to 10 with zeros in place of 3</li>
+    </ol>
+    <div class="q-explain">TCP promises an ordered stream, so it holds back 4 to 10 even though they've arrived. That is head-of-line blocking. Segments 1 and 2 were in order, so they were delivered immediately.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Your program calls <code>send()</code> and then the TCP connection drops. The last ACK you saw was for the previous request. What can you conclude about the last request?</p>
+    <ol class="q-options">
+      <li>Nothing for sure: the server may never have received it, or may have processed it and the reply was lost</li>
+      <li>It was definitely not processed</li>
+      <li>It was definitely processed, since TCP is reliable</li>
+      <li>It will be retransmitted automatically over the new connection</li>
+    </ol>
+    <div class="q-explain">TCP's guarantees end with the connection, and an ACK only shows data reached the peer's operating system. After a break you cannot know. That uncertainty is why distributed systems need idempotent operations and careful retry logic (chapter 16).</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/tcp-sim.js"></script>
+</body>
+</html>

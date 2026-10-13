@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Top-K &amp; Trending · System Design Studio</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="design" data-chapter="12">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design Top-K &amp; Trending</h1>
+  <p class="lede">Heavy hitters over streams, count-min sketches, windows and approximate answers. The question "what is popular right now?" sounds like a sorted list, and is really a question about how much accuracy you can afford to give up for a bounded amount of memory, and where in the pipeline you are allowed to give it up.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Top-k is the clean case of <em>approximation as an engineering tool</em>. The exact answer needs state proportional to the number of distinct keys, which grows with the long tail and multiplies with every window and dimension. A sketch needs a fixed amount of memory, with a provable error you choose in advance. The same ideas run under ad-click counting, rate limiting by heavy user, network monitoring, trending topics, "most viewed" lists and cardinality dashboards, and they teach a skill that senior designs depend on: stating <em>how wrong</em> an answer is allowed to be, and proving the system stays inside it.</p>
+</div>
+
+<h2>The problem</h2>
+<p><em>"Show the top 10 trending hashtags (or most-viewed videos) right now, globally and per country, refreshed every minute."</em></p>
+<p>Three words need pinning down. "Top" by what: raw count, distinct users, or growth? "Right now": the last hour, the last five minutes, or a smoothly fading score? And how accurate must it be? A user does not care whether a hashtag has 1,204,311 or 1,204,398 uses; they care whether the list is sensible, fresh and not manipulated. Those answers set the whole design, via the <a href="01-framework.html">framework</a>.</p>
+
+<h2>Clarify requirements</h2>
+<table>
+  <thead><tr><th>Question</th><th>Assumed answer</th></tr></thead>
+  <tbody>
+    <tr><td>Event volume?</td><td>500,000 events per second at peak (views, tweets, searches), arriving from many producers.</td></tr>
+    <tr><td>Key space?</td><td>Hundreds of millions of distinct keys per hour, heavily skewed: a few thousand keys carry most of the traffic.</td></tr>
+    <tr><td>What is "top"?</td><td>Highest count in the last hour for the main list, plus a separate "rising fast" list that measures growth against a baseline.</td></tr>
+    <tr><td>Freshness?</td><td>The list updates every minute; end-to-end delay from event to list under about two minutes.</td></tr>
+    <tr><td>Accuracy?</td><td>Counts within a small relative error for the head of the list; no important key may be missing. Order among near-ties is unimportant.</td></tr>
+    <tr><td>Slices?</td><td>Global and about 50 regions; a handful of categories.</td></tr>
+    <tr><td>Spam?</td><td>Some adversaries inflate counts. Rank by distinct users for the headline list.</td></tr>
+  </tbody>
+</table>
+<p><strong>Functional.</strong> Ingest events; maintain top-k and counts per scope and window; serve the lists; report approximate distinct viewers; allow a correction pass.</p>
+<p><strong>Non-functional.</strong> Bounded memory independent of the number of distinct keys; documented error bound; no single hot key can stall the pipeline; survives processor crashes without wildly wrong output; serving is a cache read.</p>
+<p><strong>Out of scope.</strong> Billing-grade counts (those must be exact and reconciled, see <a href="../studios/studio-07-ad-clicks.html">the ad click aggregator studio</a>), personalised trends, and the downstream search integration (<a href="11-search-typeahead.html">chapter 11</a> uses these counts for its trending overlay).</p>
+
+<h2>Estimate</h2>
+<p>This estimate is about <em>state</em>, not QPS. The script compares what exact counting needs with what sketches need, and derives sketch dimensions from the error you want. Method: <a href="02-estimation.html">chapter 2</a>.</p>
+<pre class="terminal" data-title="napkin.py"><code>&quot;&quot;&quot;Napkin maths for top-k trending: exact counting cost versus sketch size, and parameters from (epsilon, delta).&quot;&quot;&quot;
+import math
+
+events_per_s = 500_000                 # assumption: 500k events/s (views, searches, hashtags) at peak
+window_s = 3600                        # trend over the last hour
+distinct = 200_000_000                 # assumption: distinct keys seen per hour (long tail)
+print(f&quot;events in an hour: {events_per_s*window_s:,.0f}; distinct keys: {distinct:,}&quot;)
+
+entry = 40                             # bytes per exact counter entry in a hash map (key 16 + count 8 + overhead 16), assumed
+exact = distinct * entry
+print(f&quot;exact counts: {distinct:,} x {entry} B = {exact/1e9:.1f} GB per window (and it grows with the tail)&quot;)
+
+for eps, delta in ((0.001, 0.01), (0.0001, 0.01), (0.0001, 0.0001)):
+    w = math.ceil(math.e / eps)
+    d = math.ceil(math.log(1 / delta))
+    size = w * d * 4                   # 4-byte counters
+    err = eps * events_per_s * window_s
+    print(f&quot;count-min eps={eps:&lt;7} delta={delta:&lt;7}: width {w:&gt;6,} x depth {d} x 4 B = {size/1e6:6.2f} MB; &quot;
+          f&quot;overcount &lt;= {err:,.0f} events w.p. &gt;= {1-delta:.2%}&quot;)
+
+print(&quot;\nwhat an overcount of that size means: only keys well above it can be trusted&quot;)
+for eps in (0.001, 0.0001):
+    err = eps * events_per_s * window_s
+    print(f&quot;  eps={eps}: a key with 1M true events is {err/1e6:.1%} off at worst; a key with 10k events could read as {1+err/1e4:.0f}x its count&quot;)
+
+# HyperLogLog: distinct count in a few KB.
+for p in (10, 12, 14):
+    m = 2 ** p
+    print(f&quot;HyperLogLog p={p}: m={m:,} registers x 6 bits = {m*6/8/1024:.1f} KiB, standard error ~ 1.04/sqrt(m) = {1.04/math.sqrt(m):.2%}&quot;)
+
+# Why exact gets expensive: sliding windows and per-key distinct counts multiply the state.
+per_minute_distinct = 20_000_000       # assumption: 20M distinct keys per one-minute bucket
+buckets = 60
+exact_sliding = per_minute_distinct * entry * buckets
+print(f&quot;\nexact, 60 one-minute buckets: {per_minute_distinct:,} keys x {entry} B x {buckets} = {exact_sliding/1e9:.0f} GB (before any per-region split)&quot;)
+sk = math.ceil(math.e / 0.0001) * math.ceil(math.log(100)) * 4
+print(f&quot;count-min per bucket (eps=0.0001, delta=0.01): {sk/1e6:.2f} MB x {buckets} buckets = {sk*buckets/1e6:.0f} MB per partition&quot;)
+hll_bytes = 4096 * 6 // 8
+print(f&quot;HyperLogLog (p=12) for distinct viewers of every key: {distinct:,} x {hll_bytes} B = {distinct*hll_bytes/1e12:.1f} TB; &quot;
+      f&quot;for the 10,000 candidate keys only: {10_000*hll_bytes/1e6:.0f} MB&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>events in an hour: 1,800,000,000; distinct keys: 200,000,000
+exact counts: 200,000,000 x 40 B = 8.0 GB per window (and it grows with the tail)
+count-min eps=0.001   delta=0.01   : width  2,719 x depth 5 x 4 B =   0.05 MB; overcount &lt;= 1,800,000 events w.p. &gt;= 99.00%
+count-min eps=0.0001  delta=0.01   : width 27,183 x depth 5 x 4 B =   0.54 MB; overcount &lt;= 180,000 events w.p. &gt;= 99.00%
+count-min eps=0.0001  delta=0.0001 : width 27,183 x depth 10 x 4 B =   1.09 MB; overcount &lt;= 180,000 events w.p. &gt;= 99.99%
+
+what an overcount of that size means: only keys well above it can be trusted
+  eps=0.001: a key with 1M true events is 180.0% off at worst; a key with 10k events could read as 181x its count
+  eps=0.0001: a key with 1M true events is 18.0% off at worst; a key with 10k events could read as 19x its count
+HyperLogLog p=10: m=1,024 registers x 6 bits = 0.8 KiB, standard error ~ 1.04/sqrt(m) = 3.25%
+HyperLogLog p=12: m=4,096 registers x 6 bits = 3.0 KiB, standard error ~ 1.04/sqrt(m) = 1.62%
+HyperLogLog p=14: m=16,384 registers x 6 bits = 12.0 KiB, standard error ~ 1.04/sqrt(m) = 0.81%
+
+exact, 60 one-minute buckets: 20,000,000 keys x 40 B x 60 = 48 GB (before any per-region split)
+count-min per bucket (eps=0.0001, delta=0.01): 0.54 MB x 60 buckets = 33 MB per partition
+HyperLogLog (p=12) for distinct viewers of every key: 200,000,000 x 3072 B = 0.6 TB; for the 10,000 candidate keys only: 31 MB</code></pre>
+<p>Reading the output. A single exact hour of counts is about 8 GB for 200 million keys. That is not impossible; it is a few machines. Exact counting becomes expensive when the problem multiplies: a sliding window kept as 60 one-minute buckets needs about 48 GB at 20 million keys per minute, a per-region split adds more, and per-key distinct-viewer sets would add terabytes. A count-min sketch of 0.5 MB per bucket covers the same ground in tens of megabytes per partition. That is the honest case for sketches: not that exact is infeasible at one scale, but that it grows with the tail, the window and the number of slices, while a sketch does not.</p>
+<p>The second lesson is in the error column. With ε = 0.0001 and an hour of 1.8 billion events, the worst-case overcount is 180,000. A key with a million events is within 18% in the worst case, but a key with 10,000 events could look 19 times bigger. So the sketch is trustworthy for the <em>head</em> and untrustworthy for the tail, which is exactly the part of the distribution we want it for. And last, HyperLogLog gives distinct counts in 3 KB per key, but 3 KB for every key is 0.6 TB, so distinct counts are kept only for the few thousand candidate keys that might reach the list, about 31 MB.</p>
+
+<h2>API</h2>
+<pre class="terminal" data-title="surfaces"><code>-- Ingest (internal, batched; at-least-once)
+POST /internal/events   [ { "key": "#worldcup", "region": "BR", "user": "u81…", "ts": 1760000000 }, … ]
+
+-- Read
+GET /v1/trending?scope=global|region:BR&amp;window=1h&amp;k=10&amp;by=count|users|rising
+  -&gt; 200 { "as_of": "2026-10-13T10:41:00Z",
+           "items": [ { "key": "#worldcup", "count": 1204311, "count_error_max": 180000,
+                      "viewers": 402113, "rank": 1 }, … ] }</code></pre>
+<ul>
+  <li><strong>Approximation is part of the contract.</strong> The response carries <code>as_of</code> and an error bound. Clients (and your own dashboards) should not treat the numbers as exact, and the bound is what lets a data consumer decide whether to trust a gap between rank 9 and rank 10.</li>
+  <li><strong>Events are batched and carry a timestamp.</strong> The event time, not arrival time, decides the window. Producers retry, so delivery is at-least-once (see failure modes).</li>
+  <li><strong>The read is a cache lookup.</strong> The lists are tiny (ten items per scope per window) and change once a minute. Everything expensive happens before the read.</li>
+</ul>
+
+<h2>Data model</h2>
+<ul>
+  <li><strong>Event log</strong> (partitioned, durable, replayable): events partitioned by a hash of the key. All events for a key land on one partition, which is what lets partition-local counts be exact for that key (Deep dive 4).</li>
+  <li><strong>Per-partition window state</strong> (in the stream processor, checkpointed): for each minute bucket, a count-min sketch plus a small structure of candidate heavy keys (a heap or Space-Saving counters), and for candidates, a HyperLogLog of distinct users.</li>
+  <li><strong>Merged results</strong> (serving cache): <code>trending:{scope}:{window}:{by}</code> → list of items with counts, error bounds and <code>as_of</code>.</li>
+  <li><strong>Raw history</strong> (data lake): the same events kept for exact recounts, backfills and audit.</li>
+</ul>
+<p>Note what is <em>not</em> stored: a counter for every key. The sketch's memory is set by (ε, δ), not by the number of keys.</p>
+
+<h2>High-level design</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 310" role="img" aria-label="Architecture of a top-k pipeline. Event sources go through an ingest API into a partitioned event log; stream processors keep per-minute count-min sketches and heavy-hitter candidates; a merger combines partition results into global and regional top-k lists in a serving cache read by a trending API. A batch path from the log through a data lake and hourly exact recount reconciles the cache.">
+<defs><marker id="ahG12a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="30" width="100" height="44" rx="8" class="fs-green s-green sw-2"/><text x="60" y="49" text-anchor="middle" class="t-sm t-bold">Event</text><text x="60" y="65" text-anchor="middle" class="t-xs t-muted">sources</text></g>
+<g><rect x="150" y="30" width="100" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="200" y="57" text-anchor="middle" class="t-sm t-bold">Ingest API</text></g>
+<g><rect x="290" y="30" width="120" height="44" rx="8" class="fs-orange s-orange sw-2"/><text x="350" y="49" text-anchor="middle" class="t-sm t-bold">Event log</text><text x="350" y="65" text-anchor="middle" class="t-xs t-muted">by key hash</text></g>
+<g><rect x="450" y="30" width="130" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="515" y="49" text-anchor="middle" class="t-sm t-bold">Stream processors</text><text x="515" y="65" text-anchor="middle" class="t-xs t-muted">sketch + heap</text></g>
+<g><rect x="620" y="30" width="120" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="680" y="49" text-anchor="middle" class="t-sm t-bold">Merger</text><text x="680" y="65" text-anchor="middle" class="t-xs t-muted">global top-k</text></g>
+<g><rect x="620" y="130" width="120" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="680" y="149" text-anchor="middle" class="t-sm t-bold">Trending cache</text><text x="680" y="165" text-anchor="middle" class="t-xs t-muted">per scope, window</text></g>
+<g><rect x="470" y="130" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="525" y="157" text-anchor="middle" class="t-sm t-bold">Trending API</text></g>
+<g><rect x="340" y="130" width="90" height="44" rx="8" class="fs-green s-green sw-2"/><text x="385" y="157" text-anchor="middle" class="t-sm t-bold">Readers</text></g>
+<g><rect x="290" y="230" width="120" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="350" y="249" text-anchor="middle" class="t-sm t-bold">Data lake</text><text x="350" y="265" text-anchor="middle" class="t-xs t-muted">raw events</text></g>
+<g><rect x="450" y="230" width="130" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="515" y="249" text-anchor="middle" class="t-sm t-bold">Exact recount</text><text x="515" y="265" text-anchor="middle" class="t-xs t-muted">hourly batch</text></g>
+<line x1="110" y1="52" x2="150" y2="52" class="line" marker-end="url(#ahG12a)"/>
+<line x1="250" y1="52" x2="290" y2="52" class="line" marker-end="url(#ahG12a)"/>
+<line x1="410" y1="52" x2="450" y2="52" class="line" marker-end="url(#ahG12a)"/>
+<line x1="580" y1="52" x2="620" y2="52" class="line" marker-end="url(#ahG12a)"/>
+<text x="600" y="22" text-anchor="middle" class="t-xs t-faint">per minute</text>
+<line x1="680" y1="74" x2="680" y2="130" class="line" marker-end="url(#ahG12a)"/>
+<line x1="620" y1="152" x2="580" y2="152" class="line-dash" marker-end="url(#ahG12a)"/>
+<line x1="470" y1="152" x2="430" y2="152" class="line-dash" marker-end="url(#ahG12a)"/>
+<line x1="310" y1="74" x2="310" y2="230" class="line-dash" marker-end="url(#ahG12a)"/>
+<line x1="410" y1="252" x2="450" y2="252" class="line" marker-end="url(#ahG12a)"/>
+<line x1="560" y1="230" x2="650" y2="174" class="line-dash" marker-end="url(#ahG12a)"/>
+<text x="596" y="228" text-anchor="start" class="t-xs t-faint">corrections</text>
+<text x="450" y="104" text-anchor="start" class="t-xs tc-red">hot key = hot partition: combine locally first</text>
+<text x="10" y="150" text-anchor="start" class="t-xs t-muted">serving path:</text>
+<text x="10" y="166" text-anchor="start" class="t-xs t-muted">a cache read</text>
+  </svg>
+  <figcaption>The streaming path (top) produces approximate lists every minute; the batch path (bottom) recounts exactly and corrects the cache. Orange is the log, blue stateless-or-checkpointed workers, cyan the serving cache, purple the durable raw history. The red label is the main skew risk.</figcaption>
+</figure>
+<p>The streaming path is fast and approximate; the batch path is slow and exact. Following one event through the fast path:</p>
+<div class="widget stepper" data-autoplay-ms="5000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">From one event to a trending list</h4></div>
+  <svg viewBox="0 0 760 270" role="img" aria-label="Event for hashtag x is appended to a log partition, a stream processor increments sketch cells and updates its heap, at the end of the minute it ships its sketch and candidates to the merger, which sums sketches, picks the top keys, slides the window and publishes to the cache; a batch recount corrects it later.">
+<defs><marker id="ahG12d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g data-active="1"><rect x="10" y="95" width="80" height="60" rx="8" class="fs-green s-green sw-2"/><text x="50" y="130" text-anchor="middle" class="t-sm t-bold">Source</text></g>
+<g data-active="1"><rect x="130" y="95" width="100" height="60" rx="8" class="fs-orange s-orange sw-2"/><text x="180" y="122" text-anchor="middle" class="t-sm t-bold">Log</text><text x="180" y="140" text-anchor="middle" class="t-xs t-muted">partition 7</text></g>
+<g data-active="2-4"><rect x="280" y="80" width="150" height="90" rx="8" class="fs-blue s-blue sw-2"/><text x="355" y="118" text-anchor="middle" class="t-sm t-bold">Stream processor</text><text x="355" y="136" text-anchor="middle" class="t-xs t-muted">sketch + heap + HLL</text></g>
+<g data-active="5-6"><rect x="480" y="95" width="110" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="535" y="122" text-anchor="middle" class="t-sm t-bold">Merger</text><text x="535" y="140" text-anchor="middle" class="t-xs t-muted">sum, rank</text></g>
+<g data-active="6-7"><rect x="640" y="95" width="100" height="60" rx="8" class="fs-cyan s-cyan sw-2"/><text x="690" y="122" text-anchor="middle" class="t-sm t-bold">Cache</text><text x="690" y="140" text-anchor="middle" class="t-xs t-muted">top-10 lists</text></g>
+<g data-active="7"><rect x="480" y="200" width="150" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="555" y="227" text-anchor="middle" class="t-sm t-bold">Exact recount</text></g>
+<line x1="90" y1="125" x2="130" y2="125" class="line" marker-end="url(#ahG12d)" data-steps="1-"/>
+<text x="92" y="116" text-anchor="start" class="t-xs t-faint" data-steps="1">#x</text>
+<line x1="230" y1="125" x2="280" y2="125" class="line" marker-end="url(#ahG12d)" data-steps="2-"/>
+<text x="355" y="196" text-anchor="middle" class="t-xs t-faint" data-steps="2">d cells +1, heap update</text>
+<text x="355" y="214" text-anchor="middle" class="t-xs t-faint" data-steps="3">minute closes: seal bucket</text>
+<line x1="430" y1="125" x2="480" y2="125" class="line" marker-end="url(#ahG12d)" data-steps="4-"/>
+<text x="432" y="116" text-anchor="start" class="t-xs t-faint" data-steps="4">sketch + keys</text>
+<text x="535" y="76" text-anchor="middle" class="t-xs t-faint" data-steps="5">add sketches, union keys</text>
+<text x="535" y="178" text-anchor="middle" class="t-xs t-faint" data-steps="6">+ new bucket, - oldest</text>
+<line x1="590" y1="125" x2="640" y2="125" class="line" marker-end="url(#ahG12d)" data-steps="6-"/>
+<line x1="555" y1="200" x2="665" y2="155" class="line-dash" marker-end="url(#ahG12d)" data-steps="7"/>
+<text x="640" y="196" text-anchor="start" class="t-xs t-faint" data-steps="7">hourly correction</text>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Event.</strong> A view of <code>#x</code> is appended to the log partition chosen by <code>hash(key)</code>, so every event for one key goes to the same processor.</li>
+    <li><strong>Count approximately.</strong> The processor hashes the key with each of the sketch's <em>d</em> hash functions and increments one counter in each row of the current minute's sketch. It then reads the key's estimate (the minimum over rows) and offers it to a heap that keeps the top candidates. A HyperLogLog update records the user, for candidates only.</li>
+    <li><strong>Seal the bucket.</strong> When the minute ends (by event time, with a small allowance for late events) the bucket is sealed and no longer changes.</li>
+    <li><strong>Ship.</strong> The processor sends the sealed sketch and its candidate keys to the merger. Both are small and fixed-size.</li>
+    <li><strong>Merge.</strong> Sketches from all partitions add cell by cell. The merger takes the union of candidate keys and estimates each from the merged sketch, then ranks them.</li>
+    <li><strong>Slide and publish.</strong> The window's sketch is the sum of its last 60 minute-buckets: add the new one and subtract the one that just expired. The merger writes the new top-k lists to the cache with a fresh <code>as_of</code>.</li>
+    <li><strong>Correct later.</strong> An hourly batch job recounts exactly from the raw events in the lake and corrects the cached values and ranks of the head, and is also the source of truth for audits and backfills.</li>
+  </ol>
+</div>
+
+<h2>Deep dive 1: exact versus approximate counting</h2>
+<p>Start with the exact approach, because it is the baseline you must beat and the fallback when you are unsure. Keep a hash map from key to count, per window; for the top-k, either scan at the end, or maintain a sorted structure (a sorted set with increment, or a heap with lazy deletion). It is simple, exact, and easy to debug. It fails in these ways: memory grows with distinct keys (the long tail dominates), a sliding window multiplies the state by the number of buckets, splitting by region or category multiplies it again, and distributed counting needs a shuffle of every key to its owner. Per-event cost is cheap; it is state and its merging that hurt.</p>
+<table>
+  <thead><tr><th>Approach</th><th>Memory</th><th>Error</th><th>Mergeable?</th><th>Good for</th></tr></thead>
+  <tbody>
+    <tr><td>Exact hash map (+ heap)</td><td>One entry per distinct key</td><td>None</td><td>Yes, by key (add counts)</td><td>Moderate key spaces; billing; the batch recount</td></tr>
+    <tr><td>Count-Min sketch + heap</td><td>Fixed: w × d counters</td><td>Overcounts by at most εN with probability at least 1 − δ</td><td>Yes: add arrays</td><td>Frequency of <em>any</em> key; sliding windows by subtraction</td></tr>
+    <tr><td>Misra-Gries</td><td>k − 1 counters</td><td>Undercounts by at most N/k; deterministic</td><td>Yes (with a merge step)</td><td>Finding the heavy hitters themselves</td></tr>
+    <tr><td>Space-Saving</td><td>m counters (key, count, error)</td><td>Overcounts by at most N/m; any key above N/m is present</td><td>Yes (isomorphic to Misra-Gries)</td><td>Top-k with known per-item error</td></tr>
+    <tr><td>HyperLogLog</td><td>m registers (a few KB)</td><td>Standard error about 1.04/√m</td><td>Yes: element-wise max</td><td>Distinct counts, not frequencies</td></tr>
+  </tbody>
+</table>
+<p>Pick by the question. "How many times has <em>this</em> key occurred?" is a frequency question for a count-min sketch. "Which keys are the most frequent?" is a heavy-hitter question for Misra-Gries or Space-Saving, or a sketch plus a heap of candidates. "How many <em>different</em> users?" is cardinality, for HyperLogLog. These are different problems with different structures, and a strong answer does not use one where another is needed. A count-min sketch alone cannot list its heavy keys: it only answers queries for keys you ask about, so you pair it with a candidate structure.</p>
+
+<h2>Deep dive 2: the sketches, with their guarantees</h2>
+<h3>Count-Min sketch</h3>
+<p>The count-min sketch, by Cormode and Muthukrishnan (presented at LATIN 2004 and published in the Journal of Algorithms in 2005), is a <em>d</em> × <em>w</em> array of counters with <em>d</em> independent hash functions, each mapping a key to a column in its row. To add a key, increment its cell in every row. To estimate, take the <strong>minimum</strong> of its <em>d</em> cells. Collisions only ever add, so every cell is at least the true count and the minimum is the least-polluted one: the estimate never undercounts.</p>
+<p>The error bound comes from choosing the dimensions. For non-negative counts with total stream weight <em>N</em>, set</p>
+<pre class="terminal" data-title="dimensions"><code>w = ceil(e / ε)          d = ceil(ln(1 / δ))
+
+true(x)  &lt;=  estimate(x)  &lt;=  true(x) + ε·N      with probability at least 1 − δ</code></pre>
+<p>Here is why those formulas work, so that you can reconstruct them rather than recall them. In one row, a given key collides with each of the other <em>N</em> events with probability about 1/<em>w</em> (a pairwise-independent hash), so the expected extra count in its cell is at most <em>N</em>/<em>w</em>, which is ε<em>N</em>/e when <em>w</em> = e/ε. By Markov's inequality, the chance that one row overshoots by more than ε<em>N</em> is at most 1/e. The estimate is wrong by more than ε<em>N</em> only if <em>all d</em> rows overshoot, and with independent rows that has probability at most e<sup>−<em>d</em></sup>, which is at most δ when <em>d</em> = ln(1/δ). So ε controls the width (the error), δ controls the depth (the confidence), and memory grows like (1/ε)·ln(1/δ): halving the error doubles the width; being a hundred times more confident adds only about five rows.</p>
+<p>Two honest cautions. The bound is on the error relative to the <em>total</em> stream weight <em>N</em>, not relative to the key's own count, so small keys can look large (that was the 19× in the estimate). And the sketch is a worst-case guarantee: on skewed data the observed error is usually far smaller. Both facts show up in the run below, where we build a sketch with ε = 0.001, δ = 0.01 over a million Zipf-distributed events, keep a heap of the 10 best candidates, and compare with exact counts.</p>
+<pre class="terminal" data-title="sketch.py"><code>&quot;&quot;&quot;Count-Min sketch + heap top-k versus exact counts on a Zipf stream; the (eps, delta) bound; merging; Misra-Gries.&quot;&quot;&quot;
+import heapq, math, random
+from itertools import accumulate
+from collections import Counter
+
+P = (1 &lt;&lt; 61) - 1                       # prime for the pairwise-independent hash family
+
+class CountMin:
+    def __init__(self, eps, delta, seed=1):
+        self.w = math.ceil(math.e / eps)
+        self.d = math.ceil(math.log(1 / delta))
+        rng = random.Random(seed)
+        self.ab = [(rng.randrange(1, P), rng.randrange(P)) for _ in range(self.d)]
+        self.t = [[0] * self.w for _ in range(self.d)]
+        self.n = 0
+    def add(self, x, c=1):
+        self.n += c
+        for row, (a, b) in zip(self.t, self.ab):
+            row[((a * x + b) % P) % self.w] += c
+    def estimate(self, x):
+        return min(row[((a * x + b) % P) % self.w] for row, (a, b) in zip(self.t, self.ab))
+    def merge(self, other):             # same shape and same hashes: counters just add
+        assert self.ab == other.ab and self.w == other.w
+        out = CountMin.__new__(CountMin)
+        out.w, out.d, out.ab, out.n = self.w, self.d, self.ab, self.n + other.n
+        out.t = [[x + y for x, y in zip(r1, r2)] for r1, r2 in zip(self.t, other.t)]
+        return out
+
+class HeapTopK:
+    &quot;&quot;&quot;Keeps the K keys with the largest sketch estimates. Stale heap entries are skipped lazily.&quot;&quot;&quot;
+    def __init__(self, k):
+        self.k, self.heap, self.member = k, [], {}
+    def offer(self, key, est):
+        if key in self.member:
+            self.member[key] = est; heapq.heappush(self.heap, (est, key)); return
+        if len(self.member) &lt; self.k:
+            self.member[key] = est; heapq.heappush(self.heap, (est, key)); return
+        while self.heap[0][0] != self.member.get(self.heap[0][1]):
+            heapq.heappop(self.heap)    # drop stale entries
+        if est &gt; self.heap[0][0]:
+            _, old = heapq.heappop(self.heap); del self.member[old]
+            self.member[key] = est; heapq.heappush(self.heap, (est, key))
+    def top(self):
+        return sorted(self.member.items(), key=lambda t: -t[1])
+
+def zipf_stream(n_keys, n_events, s, seed):
+    rng = random.Random(seed)
+    cum = list(accumulate(1 / (i ** s) for i in range(1, n_keys + 1)))
+    return rng.choices(range(1, n_keys + 1), cum_weights=cum, k=n_events)
+
+def misra_gries(stream, k):
+    c = {}
+    for x in stream:
+        if x in c: c[x] += 1
+        elif len(c) &lt; k - 1: c[x] = 1
+        else:
+            for key in list(c):
+                c[key] -= 1
+                if c[key] == 0: del c[key]
+    return c
+
+def space_saving(stream, m):
+    &quot;&quot;&quot;m counters. A new key evicts the minimum counter and inherits its count (+1), remembering it as the error.&quot;&quot;&quot;
+    count, err, heap = {}, {}, []
+    for x in stream:
+        if x in count:
+            count[x] += 1; heapq.heappush(heap, (count[x], x))
+        elif len(count) &lt; m:
+            count[x], err[x] = 1, 0; heapq.heappush(heap, (1, x))
+        else:
+            while heap[0][0] != count.get(heap[0][1]):
+                heapq.heappop(heap)             # stale entry
+            low, victim = heapq.heappop(heap)
+            del count[victim], err[victim]
+            count[x], err[x] = low + 1, low
+            heapq.heappush(heap, (low + 1, x))
+    return count, err
+
+N_KEYS, N, K = 100_000, 1_000_000, 10
+stream = zipf_stream(N_KEYS, N, 1.1, seed=42)
+exact = Counter(stream)
+eps, delta = 0.001, 0.01
+cms, topk = CountMin(eps, delta), HeapTopK(K)
+for x in stream:
+    cms.add(x)
+    topk.offer(x, cms.estimate(x))
+
+print(f&quot;stream: {N:,} events over {len(exact):,} distinct keys (Zipf s=1.1)&quot;)
+print(f&quot;exact counter: {len(exact):,} entries; sketch: {cms.d} x {cms.w} = {cms.d*cms.w:,} counters (eps={eps}, delta={delta})&quot;)
+print(f&quot;\n{&#x27;rank&#x27;:&lt;5}{&#x27;key&#x27;:&gt;7}{&#x27;exact&#x27;:&gt;9}{&#x27;sketch&#x27;:&gt;9}{&#x27;error&#x27;:&gt;8}&quot;)
+for r, (key, est) in enumerate(topk.top(), 1):
+    print(f&quot;{r:&lt;5}{key:&gt;7}{exact[key]:&gt;9}{est:&gt;9}{est-exact[key]:&gt;+8}&quot;)
+true_top = {k for k, _ in exact.most_common(K)}
+print(f&quot;\nheap top-{K} matches exact top-{K}: {len(true_top &amp; set(topk.member))}/{K} keys&quot;)
+
+bound = eps * N
+bad = sum(1 for key in exact if cms.estimate(key) - exact[key] &gt; bound)
+under = sum(1 for key in exact if cms.estimate(key) &lt; exact[key])
+print(f&quot;\nguarantee check over all {len(exact):,} keys: allowed overcount eps*N = {bound:,.0f}&quot;)
+print(f&quot;  keys over the bound: {bad} ({bad/len(exact):.3%}, allowed &lt;= {delta:.0%});  keys undercounted: {under} (must be 0)&quot;)
+errs = sorted(cms.estimate(key) - exact[key] for key in exact)
+print(f&quot;  overcount: median {errs[len(errs)//2]}, p99 {errs[int(len(errs)*.99)]}, max {errs[-1]}&quot;)
+
+# Merge: two partitions sketch half of the stream each; the sum equals the sketch of the whole stream.
+a, b = CountMin(eps, delta), CountMin(eps, delta)
+for x in stream[: N // 2]: a.add(x)
+for x in stream[N // 2:]: b.add(x)
+m = a.merge(b)
+print(f&quot;\nmerge of two half-stream sketches equals the single sketch: {m.t == cms.t}&quot;)
+
+# Misra-Gries with k counters: deterministic guarantee, undercount by at most N/k.
+k = 100
+mg = misra_gries(stream, k)
+worst = max(exact[key] - mg.get(key, 0) for key in exact)
+top_mg = sorted(mg.items(), key=lambda t: -t[1])[:5]
+print(f&quot;\nMisra-Gries with k={k} (at most {k-1} counters): worst undercount {worst:,} &lt;= N/k = {N//k:,}; top-5 {top_mg}&quot;)
+print(f&quot;  exact top-5 {exact.most_common(5)}&quot;)
+
+# Space-Saving with 100 counters: never undercounts; count - err &lt;= true &lt;= count; error &lt;= N/m.
+ss, ss_err = space_saving(stream, 100)
+over = max(ss[key] - exact[key] for key in ss)
+top_ss = sorted(ss.items(), key=lambda t: -t[1])[:5]
+print(f&quot;\nSpace-Saving with 100 counters: worst overcount {over:,} &lt;= N/m = {N//100:,}; top-5 {top_ss}&quot;)
+heavy = [key for key, c in exact.items() if c &gt; N / 100]
+print(f&quot;  keys with true count &gt; N/m: {len(heavy)}, all monitored: {all(key in ss for key in heavy)}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>stream: 1,000,000 events over 64,635 distinct keys (Zipf s=1.1)
+exact counter: 64,635 entries; sketch: 5 x 2719 = 13,595 counters (eps=0.001, delta=0.01)
+
+rank     key    exact   sketch   error
+1          1   134758   134828     +70
+2          2    62551    62623     +72
+3          3    39960    40026     +66
+4          4    29393    29466     +73
+5          5    23050    23120     +70
+6          6    18758    18853     +95
+7          7    16046    16114     +68
+8          8    13741    13803     +62
+9          9    12007    12065     +58
+10        10    10787    10847     +60
+
+heap top-10 matches exact top-10: 10/10 keys
+
+guarantee check over all 64,635 keys: allowed overcount eps*N = 1,000
+  keys over the bound: 0 (0.000%, allowed &lt;= 1%);  keys undercounted: 0 (must be 0)
+  overcount: median 64, p99 126, max 269
+
+merge of two half-stream sketches equals the single sketch: True
+
+Misra-Gries with k=100 (at most 99 counters): worst undercount 7,037 &lt;= N/k = 10,000; top-5 [(1, 127721), (2, 55514), (3, 32923), (4, 22356), (5, 16013)]
+  exact top-5 [(1, 134758), (2, 62551), (3, 39960), (4, 29393), (5, 23050)]
+
+Space-Saving with 100 counters: worst overcount 7,037 &lt;= N/m = 10,000; top-5 [(1, 134758), (2, 62551), (3, 39960), (4, 29393), (5, 23050)]
+  keys with true count &gt; N/m: 10, all monitored: True</code></pre>
+<p>Read the output in order. The heap's top 10 matches the exact top 10, and each estimate is above the truth by 58 to 95 events, against an allowed 1,000 (ε<em>N</em>). The all-keys check is the guarantee in action: no key exceeded the bound, none was undercounted. The merge line shows the property that makes sketches fit a distributed pipeline: two sketches built on halves of the data add up to <em>exactly</em> the sketch of the whole, provided they use the same hash functions and dimensions (so seeds must be configuration, never random per process). The same linearity means you can <em>subtract</em> an old bucket to slide a window, valid for the plain version of the sketch; variants that skip some updates to reduce error (conservative update) give up that property.</p>
+<h3>Heavy hitters: Misra-Gries and Space-Saving</h3>
+<p>A heavy-hitter summary keeps a small set of candidate keys and their counts, with a guarantee that any key above a frequency threshold is in the set. <strong>Misra-Gries</strong> (J. Misra and D. Gries, "Finding repeated elements", <em>Science of Computer Programming</em>, 1982; the same algorithm was independently rediscovered in the early 2000s, so you will also see it under other authors' names) keeps <em>k</em> − 1 counters. On a key already tracked, increment it; on a new key with a free slot, start it at 1; otherwise decrement <em>every</em> counter by one and drop zeros. Each decrement round discards <em>k</em> events, so there are at most <em>N</em>/<em>k</em> rounds and every count is an <em>under</em>estimate by at most <em>N</em>/<em>k</em>. Any key with more than <em>N</em>/<em>k</em> occurrences survives.</p>
+<p><strong>Space-Saving</strong> (A. Metwally, D. Agrawal and A. El Abbadi, "Efficient computation of frequent and top-k elements in data streams", ICDT 2005) keeps <em>m</em> counters of (key, count, error). A tracked key is incremented; a new key evicts the counter with the <em>smallest</em> count, inherits that count plus one, and records the old count as its possible error. So its counts only overestimate (<code>count − error ≤ true ≤ count</code>), each overestimate is at most the minimum count, which is at most <em>N</em>/<em>m</em>, and any key with true frequency above <em>N</em>/<em>m</em> is always tracked. Later analysis showed the two algorithms are isomorphic, both can be merged across partitions while keeping their guarantees (Agarwal, Cormode, Huang, Phillips, Wei and Yi, "Mergeable summaries", PODS 2012), and the run above shows the symmetry: the worst Misra-Gries undercount and the worst Space-Saving overcount are the same number, 7,037, because the Space-Saving count is the Misra-Gries count plus the current minimum.</p>
+<p>Which to use? For a trending list, Space-Saving is the natural choice: it gives you the top-k <em>with</em> a per-item error you can show or use ("this count is within 300"), in a fixed number of counters, and handles the heap-of-candidates role without a separate structure. Use a count-min sketch when you also need frequency estimates for keys outside the top (for example to check a specific key), or the subtract-to-slide property.</p>
+<h3>HyperLogLog for distinct counts</h3>
+<p>Counting distinct users per key exactly needs a set per key. HyperLogLog (P. Flajolet, É. Fusy, O. Gandouet and F. Meunier, "HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm", 2007) estimates cardinality from the observation that among <em>n</em> random hash values the longest run of leading zeros is about log<sub>2</sub> <em>n</em>. It hashes each item, uses the first <em>p</em> bits to pick one of <em>m</em> = 2<sup><em>p</em></sup> registers, and stores in that register the largest "position of the first 1 bit" seen in the remaining bits. The estimate combines the registers with a harmonic mean, which tames the outliers that a single maximum would produce. The standard error is about 1.04/√<em>m</em> (the paper's constant is √(3 ln 2 − 1) ≈ 1.039): <em>m</em> = 4,096 registers, a few kilobytes, gives about 1.6%, independent of how many items were counted. Run it, and compare the measured error with the formula:</p>
+<pre class="terminal" data-title="hll.py"><code>&quot;&quot;&quot;HyperLogLog from scratch: m = 2^p registers, harmonic mean, empirical standard error versus 1.04/sqrt(m).&quot;&quot;&quot;
+import math, random
+
+class HLL:
+    def __init__(self, p):
+        self.p, self.m = p, 1 &lt;&lt; p
+        self.reg = [0] * self.m
+        self.alpha = 0.7213 / (1 + 1.079 / self.m)       # constant from the paper for m &gt;= 128
+    def add_hash(self, h):                               # h: a uniformly random 64-bit integer
+        idx = h &gt;&gt; (64 - self.p)                         # first p bits choose the register
+        rest = h &amp; ((1 &lt;&lt; (64 - self.p)) - 1)
+        rho = (64 - self.p) - rest.bit_length() + 1      # position of the leftmost 1 in the remaining bits
+        if rho &gt; self.reg[idx]:
+            self.reg[idx] = rho
+    def estimate(self):
+        e = self.alpha * self.m * self.m / sum(2.0 ** -r for r in self.reg)
+        zeros = self.reg.count(0)
+        if e &lt;= 2.5 * self.m and zeros:                  # small-range correction: linear counting
+            return self.m * math.log(self.m / zeros)
+        return e
+    def merge(self, other):                              # register-wise max
+        out = HLL(self.p); out.reg = [max(a, b) for a, b in zip(self.reg, other.reg)]; return out
+
+rng = random.Random(5)
+print(f&quot;{&#x27;p&#x27;:&gt;3}{&#x27;m&#x27;:&gt;7}{&#x27;true n&#x27;:&gt;10}{&#x27;mean est&#x27;:&gt;11}{&#x27;empirical std err&#x27;:&gt;20}{&#x27;1.04/sqrt(m)&#x27;:&gt;14}&quot;)
+for p in (8, 10, 12):
+    for n in (50_000,):
+        ests = []
+        for _ in range(40):
+            h = HLL(p)
+            for _ in range(n): h.add_hash(rng.getrandbits(64))
+            ests.append(h.estimate())
+        mean = sum(ests) / len(ests)
+        sd = math.sqrt(sum((e - n) ** 2 for e in ests) / len(ests)) / n
+        print(f&quot;{p:&gt;3}{1&lt;&lt;p:&gt;7}{n:&gt;10,}{mean:&gt;11,.0f}{sd:&gt;19.2%}{1.04/math.sqrt(1&lt;&lt;p):&gt;14.2%}&quot;)
+
+# Merge: the union of two overlapping sets, counted without keeping either set.
+universe = [rng.getrandbits(64) for _ in range(30_000)]
+a, b, whole = HLL(12), HLL(12), HLL(12)
+for h in universe[:20_000]: a.add_hash(h); whole.add_hash(h)
+for h in universe[10_000:]: b.add_hash(h); whole.add_hash(h)
+print(f&quot;\nset A 20,000, set B 20,000, overlap 10,000, true union 30,000&quot;)
+print(f&quot;  merged estimate {a.merge(b).estimate():,.0f}; single sketch of the union {whole.estimate():,.0f}; merge == union sketch: {a.merge(b).reg == whole.reg}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>  p      m    true n   mean est   empirical std err  1.04/sqrt(m)
+  8    256    50,000     50,166              6.90%         6.50%
+ 10   1024    50,000     49,992              3.83%         3.25%
+ 12   4096    50,000     49,878              1.81%         1.62%
+
+set A 20,000, set B 20,000, overlap 10,000, true union 30,000
+  merged estimate 29,645; single sketch of the union 29,645; merge == union sketch: True</code></pre>
+<p>The measured errors (6.9%, 3.8%, 1.8%) sit a little above the formula (6.5%, 3.3%, 1.6%): the formula is asymptotic, and 40 trials per row is a small sample; the order of magnitude and the 1/√<em>m</em> scaling are what to take away. The last block shows why HyperLogLog suits a distributed pipeline: the union of two sets is estimated by the register-wise maximum, with no need to know the overlap. That is what lets you count distinct viewers per hour from sixty one-minute sketches without double counting someone who watched in several minutes. Production implementations add refinements for small and large cardinalities; the version here includes only the small-range correction because that is all this experiment needs.</p>
+
+<h2>Deep dive 3: windows, decay and what "trending" means</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Three ways to bound counts in time. Tumbling windows are consecutive non-overlapping blocks that reset. Sliding windows are built from small buckets, with one bucket added and one removed as time advances. Exponential decay is a curve that halves the weight of an event every half-life.">
+<defs><marker id="ahG12b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="40" text-anchor="start" class="t-sm t-bold">Tumbling</text>
+<text x="10" y="56" text-anchor="start" class="t-xs t-muted">reset each hour</text>
+<g><rect x="120" y="24" width="200" height="34" rx="6" class="fs-blue s-blue sw-2"/><text x="220" y="46" text-anchor="middle" class="t-xs t-bold">window 1: 12:00 to 13:00</text></g>
+<g><rect x="330" y="24" width="200" height="34" rx="6" class="fs-blue s-blue sw-2"/><text x="430" y="46" text-anchor="middle" class="t-xs t-bold">window 2: 13:00 to 14:00</text></g>
+<g><rect x="540" y="24" width="190" height="34" rx="6" class="fs-blue s-blue sw-2"/><text x="635" y="46" text-anchor="middle" class="t-xs t-bold">window 3</text></g>
+<text x="120" y="78" text-anchor="start" class="t-xs t-muted">answer only at the boundary; an event just after 13:00 is invisible to the 12:00 list</text>
+<text x="10" y="116" text-anchor="start" class="t-sm t-bold">Sliding</text>
+<text x="10" y="132" text-anchor="start" class="t-xs t-muted">last 6 buckets</text>
+<g><rect x="120" y="100" width="40" height="28" rx="4" class="box"/></g>
+<g><rect x="170" y="100" width="40" height="28" rx="4" class="fs-orange s-orange sw-2"/></g>
+<g><rect x="220" y="100" width="40" height="28" rx="4" class="fs-orange s-orange sw-2"/></g>
+<g><rect x="270" y="100" width="40" height="28" rx="4" class="fs-orange s-orange sw-2"/></g>
+<g><rect x="320" y="100" width="40" height="28" rx="4" class="fs-orange s-orange sw-2"/></g>
+<g><rect x="370" y="100" width="40" height="28" rx="4" class="fs-orange s-orange sw-2"/></g>
+<g><rect x="420" y="100" width="40" height="28" rx="4" class="fs-green s-green sw-2"/></g>
+<g><rect x="470" y="100" width="40" height="28" rx="4" class="box"/></g>
+<text x="140" y="148" text-anchor="middle" class="t-xs tc-red">expired</text>
+<text x="440" y="148" text-anchor="middle" class="t-xs tc-green">newest</text>
+<text x="530" y="116" text-anchor="start" class="t-xs t-muted">each tick: add the newest bucket,</text>
+<text x="530" y="132" text-anchor="start" class="t-xs t-muted">subtract the expired one</text>
+<text x="10" y="196" text-anchor="start" class="t-sm t-bold">Decay</text>
+<text x="10" y="212" text-anchor="start" class="t-xs t-muted">no window edge</text>
+<line x1="120" y1="226" x2="730" y2="226" class="line"/>
+<path d="M120,182 L195,194.6 L270,203.5 L345,209.8 L420,214.3 L495,217.5 L570,219.6 L645,221.1 L720,222.3" fill="none" class="line s-purple sw-3"/>
+<line x1="270" y1="190" x2="270" y2="226" class="line-dash"/>
+<text x="276" y="188" text-anchor="start" class="t-xs t-muted">half-life: the weight is now 1/2</text>
+<text x="124" y="176" text-anchor="start" class="t-xs t-muted">weight of an event, by age</text>
+  </svg>
+  <figcaption>Three ways to bound counts in time. Tumbling windows are simple but blind at the edges; sliding windows built from small buckets stay current; decay replaces the window with a smoothly fading weight.</figcaption>
+</figure>
+<table>
+  <thead><tr><th></th><th>Tumbling</th><th>Sliding (bucketed)</th><th>Exponential decay</th></tr></thead>
+  <tbody>
+    <tr><td>State</td><td>One sketch per window</td><td>One sketch per bucket (for example 60)</td><td>One number per tracked key (and its last-update time)</td></tr>
+    <tr><td>Freshness</td><td>Updates at the window boundary</td><td>Updates every bucket tick</td><td>Updates continuously</td></tr>
+    <tr><td>Edge effect</td><td>Bursts straddling a boundary are split</td><td>Bounded by the bucket width</td><td>None</td></tr>
+    <tr><td>Update step</td><td>Reset</td><td>Add newest, subtract expired (sketch) or recompute from buckets (heap)</td><td><code>s ← s·2^(−Δt/h) + 1</code>, applied lazily</td></tr>
+    <tr><td>Good for</td><td>Hourly and daily reports</td><td>"Last hour, refreshed every minute"</td><td>Trend scores; a hot list that should forget smoothly</td></tr>
+  </tbody>
+</table>
+<p>For the headline "last hour" list, use <strong>bucketed sliding windows</strong>: one-minute buckets, 60 of them. Combine them as in the stepper: add new, subtract old for the sketch; keep per-bucket candidate lists and re-estimate the union of candidates from the window sketch. Memory is 60 sketches per partition, which is the 33 MB per partition in the estimate. For the "rising" list, use <strong>decay or a ratio to a baseline</strong>.</p>
+<h3>Popular is not the same as trending</h3>
+<p>Counted over any window, the top of the list is always the same giants: the keys that are always popular. "Trending" means <em>unusually high compared with what is normal for that key</em>. Practical approaches: compare the current short-window rate with a long-run baseline for the same key (a ratio, or a standardised difference against its recent variability); require a minimum absolute count so that a key that went from 2 to 20 does not outrank a major story; and rank by distinct users, not raw events, so that a single script or a small group repeating an action cannot dominate. This is where HyperLogLog sits in the design: a distinct-user estimate for the few thousand candidates, not for every key. The scoring formula is a product decision; make it configuration with an experiment framework, and show the underlying counts so reviewers can sanity-check outcomes.</p>
+<h3>Event time, late events and duplicates</h3>
+<p>Window by the <em>event time</em> in the record, not arrival time, or an outage that delays events by ten minutes distorts the list. Choose how long to wait for stragglers (a watermark, say two minutes past the bucket end) and what to do with later ones: drop them from the streaming path, since the batch recount will include them. Producers retry, so the same event may arrive twice; for approximate counts, a small overcount is usually acceptable, and where it is not, deduplicate by event id within a short window or rely on the batch recount. The stream mechanics are in <a href="../../data/chapters/19-streams-cdc.html">streams and CDC</a>.</p>
+
+<h2>Deep dive 4: partitioning, merging and the lambda-versus-kappa question</h2>
+<h3>How to partition the stream</h3>
+<table>
+  <thead><tr><th>Partition by</th><th>Each partition sees</th><th>Global top-k comes from</th><th>Risk</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Key hash</strong></td><td>All events for a subset of keys</td><td>The union of the partitions' local top-k lists: since every key lives in exactly one partition, a globally top key is in its partition's top-k (with exact or sketch counts)</td><td>One extremely hot key overloads one partition</td></tr>
+    <tr><td>Round-robin / random</td><td>A slice of every key's events</td><td>Merging sketches or Space-Saving summaries across all partitions (needs the mergeable property)</td><td>Local top-k lists cannot be combined naively (a key mid-ranked everywhere can be globally top but in no local list); summaries must be merged, not just their lists</td></tr>
+    <tr><td>Key hash + local pre-aggregation</td><td>Combined counts per key per short interval, from many upstream producers</td><td>As in the first row, with far fewer events shuffled</td><td>Extra stage; adds a small delay</td></tr>
+  </tbody>
+</table>
+<p>The default is key-hash partitioning with a <strong>combiner</strong>: each upstream node aggregates its own events for a second or two (a small map or a local sketch) before the shuffle, so a viral key arrives as thousands of increments of a large number, not millions of increments of one. That is the same two-phase aggregation as map-reduce (<a href="../../data/chapters/18-batch.html">batch processing</a>). If a single key is still too hot for one partition, salt it (<code>key#0..#7</code>) so eight partitions each count a share, and add the shares when merging, the technique from <a href="05-rate-limiter.html">the rate limiter's hot keys</a> and <a href="06-distributed-cache.html">the cache's hot counters</a>.</p>
+<h3>Merging across partitions</h3>
+<p>This is where the earlier choice of mergeable structures pays off. To produce the global list the merger receives, per partition and minute: a count-min sketch (add the arrays cell by cell), a set of candidate keys (take the union), optionally Space-Saving summaries (merge by adding counts for common keys, then reduce back to <em>m</em> counters by subtracting the (<em>m</em>+1)-th largest count from every counter and dropping those that reach zero, per the mergeable-summaries construction), and HyperLogLog sketches (take the register-wise maximum). All of these combine without any pass over the raw data. Constraints to enforce: every partition must use the <em>same</em> hash seeds and dimensions (carry a sketch version in the payload and reject mismatches), and remember that a merged count-min sketch is exactly the sketch of the combined stream (merging adds no error), so its bound is stated against the combined total weight <em>N</em>, which grows as you merge more partitions. A merge tree (partitions into regions, regions into global) keeps the merger from becoming a bottleneck, and regional lists reuse the regional merge results.</p>
+<h3>Lambda or kappa?</h3>
+<p>The architecture has a fast approximate path and a slow exact one. That is the <strong>lambda</strong> pattern: a batch layer (exact, comprehensive, hours behind) and a speed layer (approximate, minutes behind), with a serving layer that prefers batch results when they exist. It buys correctness and a safety net, and costs two code paths that must compute the same thing, a classic source of drift. The <strong>kappa</strong> alternative has a single streaming pipeline over a replayable log: to recompute, you reprocess the log from an earlier offset with the new logic. It is simpler to maintain, and it requires the log to be retained long enough and the stream engine to handle bulk replay at speed (<a href="../../data/chapters/19-streams-cdc.html">streams and CDC</a>, <a href="../../data/chapters/18-batch.html">batch</a>).</p>
+<table>
+  <thead><tr><th></th><th>Lambda</th><th>Kappa</th></tr></thead>
+  <tbody>
+    <tr><td>Code paths</td><td>Two (batch and streaming), kept in agreement</td><td>One</td></tr>
+    <tr><td>Exact answers</td><td>From the batch layer</td><td>From replaying the stream with exact state, if affordable</td></tr>
+    <tr><td>Reprocessing</td><td>Rerun the batch job</td><td>Replay the log</td></tr>
+    <tr><td>Operational cost</td><td>Two systems</td><td>One system, but needs long log retention and replay capacity</td></tr>
+    <tr><td>Fits when</td><td>Exactness matters and batch tooling already exists</td><td>The stream engine is trusted and logic changes often</td></tr>
+  </tbody>
+</table>
+<p><strong>Recommendation for trending:</strong> a kappa-style streaming path for the live list (it is approximate by nature, and the sketch code is the only code), plus a thin batch recount of the head keys as a verifier and for audit, not as a second implementation of the full pipeline. If the numbers fed billing, I would reverse the emphasis and make the exact batch path authoritative.</p>
+<p>To try the structures on your own streams, with error bounds you can test, see <a href="../labs/lab-04-sketches.html">Lab 4</a>.</p>
+
+<h2>Failure modes &amp; operations</h2>
+<table>
+  <thead><tr><th>What breaks</th><th>Blast radius</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>A stream processor crashes</td><td>Its partitions' counts pause; on restart, replay from the last checkpoint</td><td>Checkpoint sketch state with log offsets; restart replays; the list lags but remains valid</td></tr>
+    <tr><td>Duplicate delivery after restart or retry</td><td>Small overcounts</td><td>Accept for approximate counts; dedupe by event id where it matters; batch recount corrects</td></tr>
+    <tr><td>Hot key (a viral event)</td><td>One partition overloaded; lag grows</td><td>Local combiners, key salting, per-partition backpressure; alert on partition skew</td></tr>
+    <tr><td>Hash-seed or dimension mismatch between versions</td><td>Silent nonsense when sketches are added</td><td>Version tag in every payload; the merger rejects mismatches; deploy seeds as configuration</td></tr>
+    <tr><td>Window too long for the sketch width</td><td>Error εN grows with N and the tail looks inflated</td><td>Size ε for the longest window; or keep the error bound in the output and monitor it</td></tr>
+    <tr><td>Late or out-of-order events</td><td>Counts in sealed buckets are slightly low</td><td>Event-time windows with a watermark; late events go to batch; track late-event rate</td></tr>
+    <tr><td>Spam or coordinated inflation</td><td>Manipulated list</td><td>Rank by distinct users; per-user caps; anomaly detection on sudden uniform growth; manual blocklist</td></tr>
+    <tr><td>Merger lag or failure</td><td>Stale list</td><td>Serve the last good list with its <code>as_of</code>; merge tree; alert on list age</td></tr>
+  </tbody>
+</table>
+<p><strong>SLOs.</strong> List age (<code>now − as_of</code>) under two minutes at p99; read availability 99.9% from the cache (a stale list beats no list); an accuracy SLI from the hourly recount: for the head keys, the fraction whose reported count is within the stated error bound, and the overlap between the streaming top-10 and the exact top-10. <strong>Alert</strong> on list age, consumer lag, partition skew, checkpoint failures, and recount disagreement (<a href="../../reliability/chapters/07-alerting-oncall.html">alerting</a>). <strong>Roll out</strong> new scoring or sketch sizes in shadow: compute both, compare against the exact recount before serving the new one (<a href="../../reliability/chapters/12-deployments.html">deployments</a>).</p>
+
+<h2>Trade-offs &amp; alternatives</h2>
+<ul>
+  <li><strong>Memory versus accuracy.</strong> We pick ε and δ and accept an additive error against total weight. Halving ε doubles memory. If all keys needed tight relative error, including the tail, sketches would be the wrong tool and exact counting (sharded) the right one.</li>
+  <li><strong>Count-Min versus Space-Saving.</strong> Count-Min answers any key and subtracts for sliding windows; Space-Saving lists the top keys with per-item error and no separate heap. Many systems use both: Space-Saving for the list, count-min for spot checks.</li>
+  <li><strong>Exact exists at modest scale.</strong> A sorted set with increment per scope serves a smaller product perfectly well. Introduce sketches when state per window, per slice and per distinct-set stops fitting, not before.</li>
+  <li><strong>If the list drove money</strong> (ad ranking, billing), approximate counts are unacceptable at the point of settlement: use the exact path and reconcile (<a href="../studios/studio-07-ad-clicks.html">ad click aggregator</a>).</li>
+  <li><strong>If real-time mattered more than accuracy,</strong> shorten the buckets and shrink the watermark, accepting more late-event loss; if accuracy mattered more, widen both.</li>
+  <li><strong>Where it breaks down.</strong> Adversarial streams can target a known hash family; seed hashes secretly and rotate them. Keys that appear once never rank, so "emerging" topics need a separate novelty detector, and keys with many spellings need normalisation upstream.</li>
+</ul>
+
+<h2>What a strong answer adds</h2>
+<ul>
+  <li>Clarifies what "top" and "right now" mean before designing, and distinguishes popular from trending.</li>
+  <li>Does the arithmetic on exact state (distinct keys × bytes × buckets × slices) and uses it to justify sketches, rather than asserting that exact is impossible.</li>
+  <li>States the count-min guarantee with its parameters (<em>w</em> = ⌈e/ε⌉, <em>d</em> = ⌈ln(1/δ)⌉), explains the Markov-and-independence argument, and notes that the error is relative to the total, so the tail is unreliable.</li>
+  <li>Knows a count-min sketch cannot enumerate its keys, so it pairs with a heap or uses Space-Saving, and attributes Misra-Gries (1982) and Space-Saving (2005) correctly.</li>
+  <li>Uses HyperLogLog for distinct viewers, quotes its 1.04/√<em>m</em> standard error, and applies it only to candidate keys.</li>
+  <li>Builds sliding windows from mergeable buckets and explains add-and-subtract; mentions decay for smooth trend scores.</li>
+  <li>Partitions by key hash with local combining, handles the hot key, and carries sketch version and seeds as configuration.</li>
+  <li>Puts an exact batch recount beside the streaming path, measures their disagreement as an SLI, and reverses the emphasis when money is involved.</li>
+</ul>
+
+<h2>Follow-up questions</h2>
+<details class="deeper">
+  <summary>How would you choose ε and δ?</summary>
+  <p>Work backwards from the smallest count you must distinguish. If the 10th key on the list has about 100,000 events in the window and you want errors under 1% of that, you need εN ≤ 1,000, so ε = 1,000/N. For N = 1.8 billion that is about 5×10<sup>−7</sup>, a very wide sketch (several million columns), or you shorten the window or partition by region so N per sketch is smaller. δ is cheap: 0.01 means 5 rows, 0.0001 means 10. In practice use Space-Saving for the head, where the error is N/m per partition, and size m the same way.</p>
+</details>
+<details class="deeper">
+  <summary>Why does the count-min sketch never undercount, and when would it?</summary>
+  <p>Every update increments exactly one cell per row, and collisions only add, so each cell is at least the key's true count and so is their minimum. It can undercount if you allow decrements that are not matched to earlier increments (negative updates break the one-sided guarantee and the Markov argument), or if you merge sketches built with different hash functions. Subtracting an expired bucket is safe only because it removes exactly what was added.</p>
+</details>
+<details class="deeper">
+  <summary>How do you get the top-10 per region without 50 times the cost?</summary>
+  <p>Do not run 50 independent pipelines. Partition by key hash, keep a sketch per (region, minute) only for candidate keys, or key the sketch by a (region, key) pair so regional counts are separate cells in the same structure. The global list is the merge of the regional sketches (they add), so regions are slices of one computation. Small regions can use a smaller ε because their N is smaller.</p>
+</details>
+<details class="deeper">
+  <summary>How would you detect a coordinated attempt to manipulate the list?</summary>
+  <p>Look at the structure of the growth, not just the rate: a new key whose distinct-user count rises much more slowly than its event count (few accounts, many events), uniform timing, accounts with similar creation dates, or a sudden jump from near zero. Use distinct users as the ranking input, cap the per-user contribution, and hold suspicious keys for review. Keep the mechanism private, since publishing the exact rule invites adaptation.</p>
+</details>
+<details class="deeper">
+  <summary>What changes if the window is 24 hours instead of one hour?</summary>
+  <p>Buckets become coarser (for example 10-minute buckets), N grows by 24 so ε must shrink or the error bound gets 24 times larger in absolute terms, and the exact recount becomes a heavy daily batch job. A two-level scheme helps: minute buckets for the last hour, hourly sketches for the older 23, merged on demand.</p>
+</details>
+<details class="deeper">
+  <summary>Could you do all this with Redis sorted sets?</summary>
+  <p>Yes at moderate scale: one sorted set per scope and window with <code>ZINCRBY</code> per event and <code>ZREVRANGE</code> for the list, rotated per bucket. It is exact and simple, and a good first version. It stops fitting when the per-window key count exceeds a node's memory, when increments per second exceed what one shard handles (a hot key is one sorted-set member, so key hashing does not help), or when you need sliding windows across many buckets. At that point the sketches and partitioned pipeline above take over.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In the sketch script, shrink the width by changing <code>eps</code> to 0.01 and 0.1 and watch the overcount and the number of keys exceeding the bound. Then change the Zipf exponent from 1.1 to 0.6 (a flatter distribution) and see whether the heap still finds the exact top 10. Finally, run Space-Saving with 20 counters instead of 100 and find the smallest <code>m</code> at which every key above 1% of the stream is still guaranteed to be tracked.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Mergeability is what makes a summary distributable: it turns a global computation into local computations plus a cheap combine, the same property that makes CRDTs and counters convergent (<a href="../../distributed/chapters/15-crdts.html">CRDTs</a>): count-min addition and HyperLogLog's register-wise maximum are both commutative and associative, so merge order does not matter. Only the maximum is idempotent, though: merging the same HyperLogLog twice is harmless, while merging the same count-min sketch twice double counts, so duplicate merges are the thing to guard against. The lambda and kappa patterns are the log-based architectures of <a href="../../distributed/chapters/17-logs-exactly-once.html">logs and exactly-once</a>.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Exact counting state grows with distinct keys, windows and slices; a sketch has fixed size and a stated error. Choose by multiplying the exact state out, not by reflex.</li>
+    <li>Count-Min: <em>w</em> = ⌈e/ε⌉ columns, <em>d</em> = ⌈ln(1/δ)⌉ rows; the estimate never undercounts and overshoots by at most ε·N with probability at least 1 − δ. The error is against the total N, so trust the head, not the tail.</li>
+    <li>A count-min sketch cannot list its keys; pair it with a heap, or use Space-Saving (Metwally, Agrawal, El Abbadi 2005), whose counts are bounded by N/m. Misra-Gries (1982) is its underestimating twin.</li>
+    <li>HyperLogLog counts distinct items with standard error about 1.04/√m in a few kilobytes and merges by register-wise maximum; keep it only for candidate keys.</li>
+    <li>Sliding windows are sums of small buckets: add the newest, subtract the oldest. Decay gives a smooth alternative. "Trending" is growth against a baseline, not raw popularity.</li>
+    <li>Partition by key hash with local combiners, salt a key that is still too hot, and merge sketches with identical seeds and dimensions.</li>
+    <li>Run a fast approximate streaming path with a slow exact recount beside it, measure their disagreement, and make the exact path authoritative whenever money is involved.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A count-min sketch is built with ε = 0.001 and δ = 0.01. Which statement is correct?</p>
+    <ol class="q-options">
+      <li>Estimates may be too high or too low by up to 0.1% of the key's own count</li>
+      <li>Estimates are never below the true count and, with probability at least 99%, exceed it by at most 0.1% of the total stream weight</li>
+      <li>It has width 100 and depth 1,000</li>
+      <li>It guarantees the exact top-10</li>
+    </ol>
+    <div class="q-explain">Width is ⌈e/ε⌉ (about 2,719) and depth ⌈ln 100⌉ = 5. The error is additive against total weight N, one-sided (overcount only), and holds with probability 1 − δ.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Why can a count-min sketch alone not answer "what are the top 10 keys?"</p>
+    <ol class="q-options">
+      <li>It undercounts popular keys</li>
+      <li>It cannot be merged</li>
+      <li>It stores too many counters</li>
+      <li>It only answers queries for keys you present; it does not store the keys, so you need a candidate set such as a heap or Space-Saving</li>
+    </ol>
+    <div class="q-explain">The sketch holds hashed counters, not keys. Pair it with a structure that remembers likely heavy keys.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Space-Saving with m counters over a stream of N events guarantees which of the following?</p>
+    <ol class="q-options">
+      <li>Any key with true frequency above N/m is tracked, and no count exceeds the truth by more than N/m</li>
+      <li>Every count is exact for the top m keys</li>
+      <li>Counts never exceed the truth</li>
+      <li>It works only on sorted streams</li>
+    </ol>
+    <div class="q-explain">Space-Saving overestimates, with each overcount bounded by the minimum counter, which is at most N/m. It is the overestimating counterpart of Misra-Gries (1982).</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">HyperLogLog with m = 4,096 registers has a standard error of roughly:</p>
+    <ol class="q-options">
+      <li>0.01%</li>
+      <li>10%</li>
+      <li>1.6%</li>
+      <li>25%</li>
+    </ol>
+    <div class="q-explain">1.04/√4096 = 1.04/64 ≈ 1.6%, independent of how many distinct items were counted.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">You partition events by key hash, and one hashtag goes viral. What is the most direct first remedy?</p>
+    <ol class="q-options">
+      <li>Add a sketch row</li>
+      <li>Combine counts locally before the shuffle, and if needed salt the key across partitions and add the shares at merge time</li>
+      <li>Switch to tumbling windows</li>
+      <li>Drop events for that key</li>
+    </ol>
+    <div class="q-explain">The problem is load concentration on one partition. Local pre-aggregation reduces the number of events, and salting spreads the rest; counts add, so the shares recombine exactly.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

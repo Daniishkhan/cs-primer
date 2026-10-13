@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Locks, Atomics &amp; Condition Variables · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="sys" data-chapter="12">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+
+<header class="chapter-head">
+  <h1>Locks, Atomics &amp; Condition Variables</h1>
+  <p class="lede">Chapter 11 showed how shared data gets corrupted. This chapter is the toolbox for preventing it: mutexes that let one thread in at a time, atomic CPU instructions that make a single step indivisible, condition variables for waiting politely until something is true, and semaphores for limiting how many threads may do something at once. It ends with why all of this gets harder when the "threads" are on different machines.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Every shared counter, cache, connection pool and job queue in a server is guarded by one of these tools. Choosing wrongly gives you either corrupted data (too little locking), a slow service (too much, or in the wrong place), or a frozen one (the subject of <a href="13-deadlock.html">chapter 13</a>). The same ideas underlie database row locks, optimistic concurrency, and distributed locks, so the vocabulary here is the vocabulary of system design.</p>
+</div>
+
+<h2>Critical sections and the mutex</h2>
+
+<p>In <a href="11-race-conditions.html">chapter 11</a> the trouble came from a multi-step operation being interleaved with another thread's steps. The cure is to declare that operation a <span class="term">critical section</span>: a stretch of code that touches shared data and must therefore run by only one thread at a time. The tool for enforcing that is a <span class="term">mutex</span> (short for <em>mutual exclusion</em>), usually just called a <span class="term">lock</span>. A thread <em>acquires</em> the lock before entering the critical section and <em>releases</em> it afterwards. If the lock is already held, a thread trying to acquire it <em>blocks</em>: the kernel puts it to sleep (<a href="07-scheduling.html">chapter 7</a>) until the holder releases.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 208" role="img" aria-label="Timeline: thread A locks, runs its critical section and unlocks. Thread B tries to lock at the same time, waits blocked until A unlocks, then runs its own critical section.">
+    <text x="20" y="57" class="t-bold tc-blue">Thread A</text>
+    <text x="20" y="101" class="t-bold tc-green">Thread B</text>
+    <text x="20" y="145" class="t-bold tc-orange">The lock</text>
+
+    <rect x="170" y="40" width="60" height="30" rx="4" class="f-orange"/><text x="200" y="59" text-anchor="middle" class="t-xs t-bold t-dark">lock()</text>
+    <rect x="230" y="40" width="170" height="30" class="fs-blue s-blue sw-2"/><text x="315" y="59" text-anchor="middle" class="t-xs">critical section</text>
+    <rect x="400" y="40" width="60" height="30" rx="4" class="f-orange"/><text x="430" y="59" text-anchor="middle" class="t-xs t-bold t-dark">unlock()</text>
+    <rect x="460" y="40" width="270" height="30" class="box"/><text x="595" y="59" text-anchor="middle" class="t-xs t-muted">A carries on with other work</text>
+
+    <rect x="170" y="84" width="60" height="30" rx="4" class="f-orange"/><text x="200" y="103" text-anchor="middle" class="t-xs t-bold t-dark">lock()</text>
+    <rect x="230" y="84" width="230" height="30" class="fs-red s-red sw-1"/><text x="345" y="103" text-anchor="middle" class="t-xs">blocked: asleep, waiting for A</text>
+    <rect x="460" y="84" width="170" height="30" class="fs-green s-green sw-2"/><text x="545" y="103" text-anchor="middle" class="t-xs">critical section</text>
+    <rect x="630" y="84" width="60" height="30" rx="4" class="f-orange"/><text x="660" y="103" text-anchor="middle" class="t-xs t-bold t-dark">unlock()</text>
+
+    <rect x="230" y="128" width="230" height="30" rx="4" class="fs-orange s-orange sw-1"/><text x="345" y="147" text-anchor="middle" class="t-xs">held by A</text>
+    <rect x="460" y="128" width="230" height="30" rx="4" class="fs-orange s-orange sw-1"/><text x="575" y="147" text-anchor="middle" class="t-xs">held by B</text>
+
+    <text x="380" y="190" text-anchor="middle" class="t-sm">At most one thread is inside the critical section at any moment.</text>
+  </svg>
+  <figcaption>Both threads asked for the lock at the same moment; one won, the other slept until it was free.</figcaption>
+</figure>
+
+<p>In Python the lock is <code>threading.Lock</code>, and the right way to use it is the <code>with</code> statement, which acquires on entry and always releases on exit, even if an exception is raised inside:</p>
+
+<pre class="terminal" data-title="counter_lock.py"><code>import threading, time
+
+counter = 0
+lock = threading.Lock()
+
+def work(n):
+    global counter
+    for _ in range(n):
+        with lock:             # only one thread at a time may run this block
+            counter += 1
+
+start = time.perf_counter()
+threads = [threading.Thread(target=work, args=(250_000,)) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"expected 1000000, got {counter}  ({time.perf_counter() - start:.2f} s)")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 counter_lock.py</span>
+expected 1000000, got 1000000  (0.06 s)</code></pre>
+
+<p>Every run gives exactly one million, because the load, add and store of each increment now happen inside one critical section: no other thread can slip between them. (In this tiny loop the GIL happens to make the unlocked version look fine, as we saw; the lock is what makes the guarantee <em>real</em>, on any Python version and any machine.)</p>
+
+<p>Locks also fix the check-then-act bugs of chapter 11. The bank withdrawal becomes safe when the <em>check and the act</em> sit in one critical section:</p>
+
+<pre class="terminal" data-title="bankfix.py"><code>import threading, time
+
+balance = 100
+lock = threading.Lock()
+
+def withdraw(amount, who):
+    global balance
+    with lock:                          # check and act in ONE critical section
+        if balance &gt;= amount:
+            time.sleep(0.01)
+            balance -= amount
+            print(f"{who}: withdrew {amount}")
+        else:
+            print(f"{who}: declined")
+
+a = threading.Thread(target=withdraw, args=(80, "A"))
+b = threading.Thread(target=withdraw, args=(80, "B"))
+a.start(); b.start(); a.join(); b.join()
+print("final balance:", balance)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 bankfix.py</span>
+A: withdrew 80
+B: declined
+final balance: 20</code></pre>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a single-stall bathroom with one key</p>
+  <p>The key hangs on a hook. Whoever takes it goes in; anyone else who arrives waits outside. When the person comes out they hang the key back, and the next in line takes it. While one person is inside, nobody else can be, whatever they were about to do.</p>
+  <p><em>Where it breaks down:</em> a real door physically stops you. A lock in a program is only a <em>convention</em>: it protects the data only if <strong>every</strong> piece of code that touches that data takes the same lock first. One careless function that skips it can still corrupt everything. Also, a real stranger can't carry the key off and vanish, but a thread that crashes while holding a lock can leave everyone else waiting for ever (which is why <code>with</code> matters).</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A lock protects a variable." It doesn't: a lock protects an <em>invariant</em>, a statement that must be true whenever the lock is free (for example "the balance is never negative" or "the counter equals the number of items added"). Decide what the invariant is, then hold the lock across <em>every</em> step that temporarily breaks it, and across every step that reads data relying on it. That's why <code>lockcheck.py</code> in chapter 11 failed despite locking every access.</p>
+</div>
+
+<h2>Lock granularity and contention</h2>
+
+<p>How much should one lock cover? <span class="term">Granularity</span> is the answer's name. A <strong>coarse-grained</strong> lock guards a lot (say, a whole in-memory cache); it's simple and hard to get wrong, but unrelated operations wait for each other. A <strong>fine-grained</strong> scheme uses many locks (one per bucket, per account, per row); threads working on different things don't interfere, but there are more locks to manage, more chances for a deadlock (chapter 13), and operations spanning several items need several locks.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 226" role="img" aria-label="Left: three threads share one lock over a four-bucket table and must queue. Right: each bucket has its own lock, so three threads working on different buckets proceed without waiting.">
+    <defs><marker id="ahS12a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="380" y1="14" x2="380" y2="214" class="line-thin"/>
+    <text x="190" y="20" text-anchor="middle" class="t-bold">Coarse: one lock for the table</text>
+    <text x="570" y="20" text-anchor="middle" class="t-bold">Fine: one lock per bucket</text>
+
+    <circle cx="80" cy="48" r="13" class="f-blue"/><text x="80" y="53" text-anchor="middle" class="t-xs t-bold t-dark">T1</text>
+    <circle cx="185" cy="48" r="13" class="f-green"/><text x="185" y="53" text-anchor="middle" class="t-xs t-bold t-dark">T2</text>
+    <circle cx="290" cy="48" r="13" class="f-pink"/><text x="290" y="53" text-anchor="middle" class="t-xs t-bold t-dark">T3</text>
+    <line x1="80" y1="62" x2="80" y2="84" class="line" marker-end="url(#ahS12a)"/>
+    <line x1="185" y1="62" x2="185" y2="84" class="line" marker-end="url(#ahS12a)"/>
+    <line x1="290" y1="62" x2="290" y2="84" class="line" marker-end="url(#ahS12a)"/>
+    <rect x="30" y="86" width="310" height="28" rx="6" class="fs-orange s-orange sw-2"/><text x="185" y="105" text-anchor="middle" class="t-sm">one lock: everyone queues</text>
+    <rect x="30" y="130" width="70" height="38" rx="6" class="box"/><text x="65" y="153" text-anchor="middle" class="t-xs">bucket 0</text>
+    <rect x="110" y="130" width="70" height="38" rx="6" class="box"/><text x="145" y="153" text-anchor="middle" class="t-xs">bucket 1</text>
+    <rect x="190" y="130" width="70" height="38" rx="6" class="box"/><text x="225" y="153" text-anchor="middle" class="t-xs">bucket 2</text>
+    <rect x="270" y="130" width="70" height="38" rx="6" class="box"/><text x="305" y="153" text-anchor="middle" class="t-xs">bucket 3</text>
+    <text x="185" y="194" text-anchor="middle" class="t-xs t-muted">Simple, but T1 waits even though</text>
+    <text x="185" y="210" text-anchor="middle" class="t-xs t-muted">T2 and T3 touch different buckets.</text>
+
+    <circle cx="440" cy="48" r="13" class="f-blue"/><text x="440" y="53" text-anchor="middle" class="t-xs t-bold t-dark">T1</text>
+    <circle cx="520" cy="48" r="13" class="f-green"/><text x="520" y="53" text-anchor="middle" class="t-xs t-bold t-dark">T2</text>
+    <circle cx="600" cy="48" r="13" class="f-pink"/><text x="600" y="53" text-anchor="middle" class="t-xs t-bold t-dark">T3</text>
+    <line x1="440" y1="62" x2="440" y2="84" class="line" marker-end="url(#ahS12a)"/>
+    <line x1="520" y1="62" x2="520" y2="84" class="line" marker-end="url(#ahS12a)"/>
+    <line x1="600" y1="62" x2="600" y2="84" class="line" marker-end="url(#ahS12a)"/>
+    <rect x="405" y="86" width="70" height="28" rx="6" class="fs-orange s-orange sw-2"/><text x="440" y="105" text-anchor="middle" class="t-xs">lock 0</text>
+    <rect x="485" y="86" width="70" height="28" rx="6" class="fs-orange s-orange sw-2"/><text x="520" y="105" text-anchor="middle" class="t-xs">lock 1</text>
+    <rect x="565" y="86" width="70" height="28" rx="6" class="fs-orange s-orange sw-2"/><text x="600" y="105" text-anchor="middle" class="t-xs">lock 2</text>
+    <rect x="645" y="86" width="70" height="28" rx="6" class="fs-orange s-orange sw-2"/><text x="680" y="105" text-anchor="middle" class="t-xs">lock 3</text>
+    <rect x="405" y="130" width="70" height="38" rx="6" class="box"/><text x="440" y="153" text-anchor="middle" class="t-xs">bucket 0</text>
+    <rect x="485" y="130" width="70" height="38" rx="6" class="box"/><text x="520" y="153" text-anchor="middle" class="t-xs">bucket 1</text>
+    <rect x="565" y="130" width="70" height="38" rx="6" class="box"/><text x="600" y="153" text-anchor="middle" class="t-xs">bucket 2</text>
+    <rect x="645" y="130" width="70" height="38" rx="6" class="box"/><text x="680" y="153" text-anchor="middle" class="t-xs">bucket 3</text>
+    <text x="570" y="194" text-anchor="middle" class="t-xs t-muted">Three threads proceed at once, but there</text>
+    <text x="570" y="210" text-anchor="middle" class="t-xs t-muted">are more locks to get right.</text>
+  </svg>
+  <figcaption>Coarse locks are easy and safe; fine locks scale better. Start coarse and refine only where measurement shows threads waiting.</figcaption>
+</figure>
+
+<p>The waiting has a name too: <span class="term">contention</span> is what happens when many threads want the same lock. Under high contention a program spends its time queuing instead of working, and adding threads can make it slower. The standard advice is to keep critical sections <strong>short</strong>, do slow work (computation, I/O) <em>outside</em> them where possible, and avoid sharing in the first place when you can (give each thread its own counter and add them up at the end).</p>
+
+<h2>What a lock costs</h2>
+
+<p>Taking a lock nobody else wants is cheap: roughly tens of nanoseconds, a handful of atomic CPU operations. In the test above, the locked loop took about three times as long as the same loop without a lock (roughly 0.06 s against 0.02 s for a million increments, measured on Python 3.14), which is cheap per operation but not free. The bigger costs appear under contention: a thread that can't get the lock goes to sleep, the kernel switches to something else, and waking it later costs a context switch of the order of microseconds (<a href="07-scheduling.html">chapter 7</a>). Taking a hundred locks per request is fine; waiting for the same lock on every request, across fifty threads, is how a server stops scaling.</p>
+
+<h3>The classic mistake: holding a lock during I/O</h3>
+
+<p>Because everyone waiting for a lock waits for its holder, the lock's cost is the holder's <em>time inside it</em>. If that time includes a network call or a disk write (milliseconds, millions of times slower than a memory update), every thread queues up behind it:</p>
+
+<pre class="terminal" data-title="ioheld.py"><code>import threading, time
+
+lock = threading.Lock()
+
+def slow_under_lock():
+    with lock:
+        time.sleep(0.2)            # I/O while holding the lock: everyone queues behind it
+
+def slow_outside_lock():
+    time.sleep(0.2)                # do the I/O first...
+    with lock:
+        pass                       # ...hold the lock only for the quick update
+
+def run(fn):
+    ts = [threading.Thread(target=fn) for _ in range(5)]
+    start = time.perf_counter()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return time.perf_counter() - start
+
+print(f"I/O inside the lock:  {run(slow_under_lock):.2f} s")
+print(f"I/O outside the lock: {run(slow_outside_lock):.2f} s")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 ioheld.py</span>
+I/O inside the lock:  1.02 s
+I/O outside the lock: 0.20 s</code></pre>
+
+<p>Five threads, each needing 0.2 s of "I/O". Inside the lock they run one at a time (5 × 0.2 = 1.0 s); outside, their waits overlap and the total is 0.2 s. Keep slow operations out of critical sections: fetch first, then lock briefly to update shared state. (Sometimes you can't, for example when the lock exists precisely to serialise writes to a file. Then at least make it a separate lock for that file alone.)</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"More threads and more locks always means more speed." A lock is a place where threads <em>stop being parallel</em>. If 20% of each request runs inside one lock, no number of threads can make the system more than five times faster (this is Amdahl's law). Measure where threads wait before adding more.</p>
+</div>
+
+<h2>Atomic instructions</h2>
+
+<p>Locks work by making threads wait, which needs help from the kernel. There is a lower, faster layer: the CPU itself provides instructions that read and modify a memory location <span class="term">atomically</span>, meaning no other core can see or interfere with the in-between state. Two are most important:</p>
+
+<dl class="terms">
+  <dt>fetch-and-add</dt><dd>Atomically add a number to a memory location and return the old value. This alone turns <code>counter += 1</code> into one indivisible step. (On x86 this is <code>lock xadd</code>; on newer ARM, <code>LDADD</code>.)</dd>
+  <dt>compare-and-swap (CAS)</dt><dd>"If the location still holds the value I expect, replace it with this new value, and tell me whether you did." One indivisible step. (x86: <code>lock cmpxchg</code>; ARM: <code>CAS</code>, or a load-linked / store-conditional pair on older cores.)</dd>
+</dl>
+
+<p>CAS is the building block of nearly every lock and every lock-free structure, because of the way you use it: the <strong>CAS retry loop</strong>. Read the current value, compute the new one, and try to CAS it in. If the CAS fails, someone else changed the value in the meantime, so read again and retry. Nobody ever holds a lock or waits; the loser just tries again.</p>
+
+<div class="widget stepper" data-autoplay-ms="3200">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">A CAS retry loop: two threads, one counter</h4></div>
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two threads increment a shared value with compare-and-swap. Both read 5. B's compare-and-swap succeeds and the value becomes 6. A's compare-and-swap fails because the value is no longer 5, so A reads 6 and retries, succeeding and making it 7.">
+    <defs><marker id="ahS12b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="300" y="20" width="160" height="80" rx="10" class="fs-yellow s-yellow sw-2"/>
+    <text x="380" y="40" text-anchor="middle" class="t-xs t-muted">shared value in memory</text>
+    <g data-steps="1-2"><text x="380" y="82" text-anchor="middle" class="t-lg t-bold mono">5</text></g>
+    <g data-steps="3-5"><text x="380" y="82" text-anchor="middle" class="t-lg t-bold mono">6</text></g>
+    <g data-steps="6"><text x="380" y="82" text-anchor="middle" class="t-lg t-bold mono">7</text></g>
+
+    <g data-active="1,4,5,6"><rect x="30" y="140" width="200" height="104" rx="10" class="fs-blue s-blue sw-2"/></g>
+    <text x="130" y="162" text-anchor="middle" class="t-bold tc-blue">Thread A</text>
+    <text x="130" y="182" text-anchor="middle" class="t-xs mono">old = load()</text>
+    <text x="130" y="198" text-anchor="middle" class="t-xs mono">CAS(old, old + 1)</text>
+    <g data-steps="1-4"><text x="130" y="226" text-anchor="middle" class="t-sm mono">old = 5</text></g>
+    <g data-steps="5-"><text x="130" y="226" text-anchor="middle" class="t-sm mono">old = 6</text></g>
+
+    <g data-active="2,3"><rect x="530" y="140" width="200" height="104" rx="10" class="fs-green s-green sw-2"/></g>
+    <text x="630" y="162" text-anchor="middle" class="t-bold tc-green">Thread B</text>
+    <text x="630" y="182" text-anchor="middle" class="t-xs mono">old = load()</text>
+    <text x="630" y="198" text-anchor="middle" class="t-xs mono">CAS(old, old + 1)</text>
+    <g data-steps="2-"><text x="630" y="226" text-anchor="middle" class="t-sm mono">old = 5</text></g>
+
+    <g data-steps="1"><line x1="230" y1="150" x2="298" y2="96" class="line" marker-end="url(#ahS12b)"/></g>
+    <g data-steps="2"><line x1="530" y1="150" x2="462" y2="96" class="line" marker-end="url(#ahS12b)"/></g>
+    <g data-steps="3"><line x1="530" y1="150" x2="462" y2="96" class="line s-green" marker-end="url(#ahS12b)"/></g>
+    <g data-steps="4"><line x1="230" y1="150" x2="298" y2="96" class="line s-red" marker-end="url(#ahS12b)"/></g>
+    <g data-steps="5"><line x1="230" y1="150" x2="298" y2="96" class="line" marker-end="url(#ahS12b)"/></g>
+    <g data-steps="6"><line x1="230" y1="150" x2="298" y2="96" class="line s-green" marker-end="url(#ahS12b)"/></g>
+
+    <g data-steps="1"><rect x="282" y="140" width="196" height="56" rx="8" class="box"/><text x="380" y="164" text-anchor="middle" class="t-sm">A reads 5</text><text x="380" y="182" text-anchor="middle" class="t-xs t-muted">a plain read, nothing written</text></g>
+    <g data-steps="2"><rect x="282" y="140" width="196" height="56" rx="8" class="box"/><text x="380" y="164" text-anchor="middle" class="t-sm">B also reads 5</text><text x="380" y="182" text-anchor="middle" class="t-xs t-muted">both hold a copy of 5</text></g>
+    <g data-steps="3"><rect x="282" y="140" width="196" height="56" rx="8" class="fs-green s-green sw-2"/><text x="380" y="164" text-anchor="middle" class="t-sm t-bold">B: CAS(5, 6) succeeds</text><text x="380" y="182" text-anchor="middle" class="t-xs">memory was 5, now 6</text></g>
+    <g data-steps="4"><rect x="282" y="140" width="196" height="56" rx="8" class="fs-red s-red sw-2"/><text x="380" y="164" text-anchor="middle" class="t-sm t-bold">A: CAS(5, 6) fails</text><text x="380" y="182" text-anchor="middle" class="t-xs">memory is 6, not 5: no write</text></g>
+    <g data-steps="5"><rect x="282" y="140" width="196" height="56" rx="8" class="box"/><text x="380" y="164" text-anchor="middle" class="t-sm">A retries: reads 6</text><text x="380" y="182" text-anchor="middle" class="t-xs t-muted">back to the top of the loop</text></g>
+    <g data-steps="6"><rect x="282" y="140" width="196" height="56" rx="8" class="fs-green s-green sw-2"/><text x="380" y="164" text-anchor="middle" class="t-sm t-bold">A: CAS(6, 7) succeeds</text><text x="380" y="182" text-anchor="middle" class="t-xs">both increments counted</text></g>
+    <g data-steps="6"><text x="380" y="262" text-anchor="middle" class="t-sm t-bold tc-green">Final value 7. No lock was taken and no update was lost.</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>A reads.</strong> The shared value is 5. Thread A keeps a private copy, <code>old = 5</code>, and plans to write 6.</li>
+    <li><strong>B reads too.</strong> This is the dangerous interleaving from chapter 11: both threads now hold 5. With a plain store, the second one to write would overwrite the first.</li>
+    <li><strong>B's CAS succeeds.</strong> CAS(5, 6) means "if the value is still 5, make it 6". It is, so the CPU swaps it in, as one indivisible step. The value is now 6.</li>
+    <li><strong>A's CAS fails.</strong> A tries CAS(5, 6), but the value is 6, not 5, so the CPU refuses and writes nothing. A's stale copy was caught, and B's update survives.</li>
+    <li><strong>A retries.</strong> A loops back, re-reads the current value (6) and recomputes. Cheap, and no one was ever put to sleep.</li>
+    <li><strong>A succeeds.</strong> CAS(6, 7) succeeds. Both increments are counted. The failed attempt cost a little wasted work, but it never corrupted anything.</li>
+  </ol>
+</div>
+
+<p>Python doesn't expose CAS directly for ordinary variables, but we can <em>simulate</em> it to see the loop in action. In the script below a small internal lock stands in for the CPU's guarantee that the compare and the swap happen as one step. The <code>time.sleep(0)</code> between the read and the CAS is there only to invite other threads in, so that CAS failures actually happen:</p>
+
+<pre class="terminal" data-title="cas.py"><code>import threading, time
+
+class AtomicInt:
+    """A simulated atomic integer. Real CPUs do compare_and_swap in ONE instruction;
+    here a tiny lock stands in for that hardware guarantee."""
+    def __init__(self, value=0):
+        self._value = value
+        self._guard = threading.Lock()      # plays the role of the CPU's atomicity
+
+    def load(self):
+        return self._value
+
+    def compare_and_swap(self, expected, new):
+        with self._guard:
+            if self._value == expected:
+                self._value = new
+                return True
+            return False
+
+counter = AtomicInt()
+retries = 0                                  # only for the demo (itself racy, approximate)
+
+def work(n):
+    global retries
+    for _ in range(n):
+        while True:
+            old = counter.load()
+            time.sleep(0)                    # demo only: invite another thread in, so CAS can fail
+            if counter.compare_and_swap(old, old + 1):
+                break                        # nobody changed it between load and CAS
+            retries += 1                     # someone beat us to it: reload and try again
+
+ts = [threading.Thread(target=work, args=(10_000,)) for _ in range(4)]
+for t in ts: t.start()
+for t in ts: t.join()
+print("expected 40000, got", counter.load())
+print("CAS retries (approximate):", retries)</code></pre>
+
+<pre class="terminal" data-title="terminal (the retry count varies from run to run)"><code><span class="prompt">$ </span><span class="cmd">python3 cas.py</span>
+expected 40000, got 40000
+CAS retries (approximate): 3489</code></pre>
+
+<p>The answer is exact even though thousands of attempts failed and were retried. The takeaway is the loop shape: <strong>read, compute, CAS, and on failure start again</strong>. You'll see it in the standard library of other languages (Java's <code>AtomicInteger</code>, C++'s <code>std::atomic</code>, Go's <code>sync/atomic</code>), and, as chapter 11 hinted, in databases as "optimistic concurrency": <code>UPDATE ... WHERE version = 3</code> is a CAS on a row.</p>
+
+<h3>Spinlocks versus blocking locks</h3>
+
+<p>CAS makes a different kind of lock possible. A <span class="term">spinlock</span> is a lock whose waiters don't sleep: they loop, retrying the CAS ("is it free yet? is it free yet?") until they win. A <span class="term">blocking lock</span> (the kind Python gives you) puts the waiter to sleep in the kernel and wakes it later.</p>
+
+<table>
+  <thead><tr><th></th><th>Spinlock</th><th>Blocking lock</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Waiting</strong></td><td>Burns CPU in a loop</td><td>Sleeps; the core runs something else</td></tr>
+    <tr><td><strong>Wake-up speed</strong></td><td>Nanoseconds</td><td>Microseconds (a context switch)</td></tr>
+    <tr><td><strong>Good when</strong></td><td>The critical section is a few instructions, waiters are few, and each thread has its own core. Operating-system kernels use them heavily</td><td>The critical section may be long, or may block. This is the default for applications</td></tr>
+    <tr><td><strong>Danger</strong></td><td>If the holder is paused (descheduled) while others spin, they waste whole time slices</td><td>Sleep and wake-up costs when the lock is held only briefly</td></tr>
+  </tbody>
+</table>
+
+<p>Practical locks are often hybrids: spin briefly in case the holder is about to finish, then sleep. For application code, use the blocking kind unless you have measured a reason not to.</p>
+
+<details class="deeper">
+  <summary>Go deeper: lock-free programming and the ABA problem <span class="hint">optional</span></summary>
+  <p>A data structure is <span class="term">lock-free</span> if, whenever threads are running, <em>some</em> thread is always making progress, even if others are paused. It's built from CAS retry loops instead of locks, so a thread stalled in the middle can't block the rest. This matters for latency-sensitive code and for kernels and runtimes, and queues such as the ones inside some message brokers are built this way.</p>
+  <p>It's also notoriously hard to get right. One famous trap is the <strong>ABA problem</strong>: a thread reads value A, gets paused, and meanwhile other threads change the value to B and then back to A. The paused thread's CAS("is it still A?") succeeds, though the world changed underneath, which can corrupt structures such as stacks that hold <em>pointers</em> (if A was a node that has been freed and reused, say). The usual cure is to pair the value with a version counter so that "A at version 7" differs from "A at version 9". Unless you are writing a runtime or a database engine, use the library's ready-made structures.</p>
+</details>
+
+<h2>Condition variables: waiting for something to happen</h2>
+
+<p>Locks stop threads colliding. But sometimes a thread needs to <em>wait until something becomes true</em>: a consumer must wait for an item to arrive, a producer must wait for room. The crude approach, a loop that keeps checking, wastes a CPU and holds the lock or sleeps a guessed time. A <span class="term">condition variable</span> is the proper tool. It is always paired with a lock and offers two operations:</p>
+
+<ul>
+  <li><code>wait()</code>: <em>atomically</em> release the lock and go to sleep until someone notifies; when woken, re-acquire the lock before returning.</li>
+  <li><code>notify()</code> (or <code>notify_all()</code>): wake one (or all) of the threads sleeping on this condition.</li>
+</ul>
+
+<p>The "atomically" matters: if the thread released the lock and <em>then</em> went to sleep as two steps, a notification arriving in between would be missed and the thread would sleep for ever (a <em>lost wakeup</em>, itself a race).</p>
+
+<p>The textbook example is the <span class="term">bounded buffer</span>: producers add items to a queue of limited size, consumers remove them. Producers must wait when it's full; consumers must wait when it's empty.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 252" role="img" aria-label="A producer puts items into a bounded buffer of three slots guarded by one lock, and a consumer takes them out. Producers wait on a not_full condition when the buffer is full, and consumers wait on a not_empty condition when it is empty.">
+    <defs><marker id="ahS12c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="62" width="150" height="56" rx="10" class="fs-blue s-blue sw-2"/><text x="95" y="95" text-anchor="middle" class="t-bold">Producer</text>
+    <rect x="590" y="62" width="150" height="56" rx="10" class="fs-green s-green sw-2"/><text x="665" y="95" text-anchor="middle" class="t-bold">Consumer</text>
+    <text x="380" y="40" text-anchor="middle" class="t-sm t-bold">bounded buffer (capacity 3)</text>
+    <rect x="250" y="52" width="260" height="76" rx="10" class="box2"/>
+    <rect x="266" y="68" width="70" height="44" rx="6" class="f-yellow"/><text x="301" y="95" text-anchor="middle" class="t-sm t-bold t-dark">item</text>
+    <rect x="345" y="68" width="70" height="44" rx="6" class="f-yellow"/><text x="380" y="95" text-anchor="middle" class="t-sm t-bold t-dark">item</text>
+    <rect x="424" y="68" width="70" height="44" rx="6" class="box"/><text x="459" y="95" text-anchor="middle" class="t-xs t-faint">empty</text>
+    <line x1="172" y1="90" x2="248" y2="90" class="line" marker-end="url(#ahS12c)"/><text x="210" y="80" text-anchor="middle" class="t-xs t-muted">put</text>
+    <line x1="512" y1="90" x2="588" y2="90" class="line" marker-end="url(#ahS12c)"/><text x="550" y="80" text-anchor="middle" class="t-xs t-muted">get</text>
+    <rect x="250" y="140" width="260" height="26" rx="6" class="fs-orange s-orange sw-2"/><text x="380" y="158" text-anchor="middle" class="t-xs">one lock guards the buffer</text>
+
+    <rect x="20" y="186" width="350" height="50" rx="8" class="fs-blue s-blue sw-1"/>
+    <text x="195" y="208" text-anchor="middle" class="t-sm t-bold">not_full</text>
+    <text x="195" y="225" text-anchor="middle" class="t-xs t-muted">producers sleep here while the buffer is full</text>
+    <rect x="390" y="186" width="350" height="50" rx="8" class="fs-green s-green sw-1"/>
+    <text x="565" y="208" text-anchor="middle" class="t-sm t-bold">not_empty</text>
+    <text x="565" y="225" text-anchor="middle" class="t-xs t-muted">consumers sleep here while the buffer is empty</text>
+  </svg>
+  <figcaption>Each side wakes the other: a consumer's <code>get</code> notifies <code>not_full</code>; a producer's <code>put</code> notifies <code>not_empty</code>.</figcaption>
+</figure>
+
+<pre class="terminal" data-title="bounded.py"><code>import threading, collections, time
+
+class BoundedBuffer:
+    def __init__(self, capacity):
+        self.items = collections.deque()
+        self.capacity = capacity
+        self.lock = threading.Lock()
+        self.not_full = threading.Condition(self.lock)
+        self.not_empty = threading.Condition(self.lock)
+
+    def put(self, item):
+        with self.lock:
+            while len(self.items) &gt;= self.capacity:     # WHILE, not if
+                self.not_full.wait()
+            self.items.append(item)
+            self.not_empty.notify()
+
+    def get(self):
+        with self.lock:
+            while not self.items:                        # WHILE, not if
+                self.not_empty.wait()
+            item = self.items.popleft()
+            self.not_full.notify()
+            return item
+
+buf = BoundedBuffer(capacity=3)
+
+def producer():
+    for i in range(8):
+        buf.put(i)
+        print(f"produced {i}")
+    buf.put(None)                                        # sentinel: "no more items"
+
+def consumer():
+    while True:
+        item = buf.get()
+        if item is None:
+            break
+        time.sleep(0.05)                                 # consuming is slower than producing
+        print(f"    consumed {item}")
+
+p = threading.Thread(target=producer); c = threading.Thread(target=consumer)
+p.start(); c.start(); p.join(); c.join()</code></pre>
+
+<pre class="terminal" data-title="terminal (the interleaving of lines varies)"><code><span class="prompt">$ </span><span class="cmd">python3 bounded.py</span>
+produced 0
+produced 1
+produced 2
+produced 3
+    consumed 0
+produced 4
+    consumed 1
+produced 5
+    consumed 2
+produced 6
+    consumed 3
+produced 7
+    consumed 4
+    consumed 5
+    consumed 6
+    consumed 7</code></pre>
+
+<p>Watch the rhythm. The producer races ahead until the buffer is full, then sleeps in <code>not_full.wait()</code>. Each time the slow consumer takes an item out, it wakes the producer for exactly one more. (The consumer removes an item and <em>then</em> spends 0.05 s processing it before printing "consumed", so the printed lines trail the buffer by a little.) The producer is never more than a few items ahead: the slow side sets the pace, which is <span class="term">backpressure</span>, and it falls out of the bounded size for free. We build on it in <a href="14-queues-backpressure.html">chapter 14</a>.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Always wait in a while loop</p>
+  <p>Look at <code>while len(self.items) &gt;= self.capacity: self.not_full.wait()</code>. It is a <code>while</code>, never an <code>if</code>, for three reasons. (1) <strong>Spurious wakeups</strong>: operating systems and runtimes are allowed to wake a waiting thread for no reason at all. (2) <strong>Someone else got there first</strong>: between the notify and your thread re-acquiring the lock, another thread may have taken the only item, so the condition is false again. (3) <code>notify_all</code> wakes many threads for a condition only one can use. Re-checking the condition after every wake-up makes all three harmless. The pattern is: <em>lock, while not condition: wait, act, notify, unlock</em>.</p>
+</div>
+
+<p>Python's <code>queue.Queue</code> already implements exactly this (a lock plus <code>not_empty</code> and <code>not_full</code> conditions), so in real code you would use it. Writing it once by hand shows what's inside, and you'll rebuild a blocking queue in <a href="../labs/lab-03-races-locks.html">Lab 3</a>.</p>
+
+<h2>Semaphores: limiting concurrency to N</h2>
+
+<p>A <span class="term">semaphore</span> is a counter with two operations: <em>acquire</em> (wait until the count is above zero, then decrement it) and <em>release</em> (increment it). A lock is a semaphore that starts at 1. Starting it at <em>N</em> lets up to N threads in at once, which is the right tool for "no more than N of these at a time": 10 concurrent downloads, 20 database connections, 4 heavy jobs.</p>
+
+<pre class="terminal" data-title="sem.py"><code>import threading, time
+
+limit = threading.Semaphore(3)            # at most 3 downloads at once
+active = 0
+peak = 0
+stats = threading.Lock()
+
+def download(n):
+    global active, peak
+    with limit:                           # wait here if 3 are already running
+        with stats:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.2)                   # pretend network transfer
+        with stats:
+            active -= 1
+
+threads = [threading.Thread(target=download, args=(i,)) for i in range(10)]
+start = time.perf_counter()
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"10 downloads, peak concurrency {peak}, took {time.perf_counter() - start:.1f} s")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 sem.py</span>
+10 downloads, peak concurrency 3, took 0.8 s</code></pre>
+
+<p>Ten downloads of 0.2 s each, three at a time: four rounds (3 + 3 + 3 + 1), so 0.8 s, and the measured peak is exactly 3. One difference from a lock: a semaphore has no <em>owner</em>, so any thread can release it. That's flexible (one thread can signal another) but gives up some safety. Use <code>BoundedSemaphore</code> if you want an error when someone releases more times than they acquired.</p>
+
+<h2>Reader–writer locks and reentrant locks</h2>
+
+<h3>Readers–writer locks</h3>
+
+<p>Reading shared data never corrupts it, so why make readers queue behind each other? A <span class="term">readers–writer lock</span> allows <em>many readers at the same time</em> or <em>one writer alone</em>, never both. It's a good fit for data that is read constantly and changed rarely, such as a configuration table or a routing table. The cost is complexity: a stream of readers can starve a waiting writer unless the lock is designed to prevent that (starvation is in chapter 13), and the extra bookkeeping makes it slower than a plain mutex when critical sections are tiny. Python's standard library doesn't include one; other languages (Java's <code>ReentrantReadWriteLock</code>, Rust's <code>RwLock</code>, C++'s <code>std::shared_mutex</code>) do. A common Python alternative is to avoid it: replace the whole data structure with a new copy and swap one reference (a single assignment is atomic), so readers never need a lock.</p>
+
+<h3>Reentrant locks</h3>
+
+<p>What happens if a thread tries to acquire a lock it already holds? With a plain <code>Lock</code>, it waits for itself, for ever. This happens naturally: <code>deposit()</code> locks, then calls <code>log_balance()</code>, which also locks. A <span class="term">reentrant lock</span> (<code>threading.RLock</code>) remembers its owner and a count, so the same thread can acquire it repeatedly and must release it as many times.</p>
+
+<pre class="terminal" data-title="rlock.py"><code>import threading
+
+rlock = threading.RLock()
+
+def outer():
+    with rlock:
+        inner()
+
+def inner():
+    with rlock:                # same thread takes it again: fine for an RLock
+        print("inner ran")
+
+outer()
+
+plain = threading.Lock()
+with plain:
+    got_it = plain.acquire(timeout=0.5)     # same thread asks again
+    print("plain Lock, second acquire by the same thread:", got_it)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 rlock.py</span>
+inner ran
+plain Lock, second acquire by the same thread: False</code></pre>
+
+<p>(The plain-lock check used <code>timeout=0.5</code>; without it, that second acquire would simply hang.) Reentrant locks are convenient, but treat them with some suspicion: if you need one, it can mean your locking structure is tangled, and code that re-enters can see the shared data in a half-updated state that its caller left behind. Prefer designing so that "public methods lock, private helpers assume the lock is held".</p>
+
+<details class="deeper">
+  <summary>Go deeper: memory visibility and ordering <span class="hint">optional</span></summary>
+  <p>There's a second problem, separate from interleaving, that locks also solve. Each core has its own caches and write buffers (<a href="02-memory-hierarchy.html">chapter 2</a>), and both the <em>compiler</em> and the <em>CPU</em> are allowed to reorder instructions, so long as a single thread can't tell. A single thread can't, but another thread can. Suppose thread A does <code>data = 42; ready = True</code> and thread B waits for <code>ready</code> and then reads <code>data</code>. On a weakly ordered CPU (ARM is one; x86 is stricter) B could see <code>ready == True</code> yet still read the old <code>data</code>, because A's two writes became visible in the opposite order.</p>
+  <p>Languages with a memory model define the exact rules. Acquiring and releasing a lock acts as a <span class="term">memory barrier</span> (a fence): everything the previous holder wrote before releasing is guaranteed visible to the next thread after acquiring, and the compiler and CPU may not move operations across the boundary in a way that breaks that. Atomic operations come with an ordering choice (C++ offers <em>relaxed</em>, <em>acquire/release</em> and <em>sequentially consistent</em>), where stronger ordering costs more. The practical rule: <strong>if shared data is touched by several threads, every access must go through a lock or an atomic</strong>, not just the ones that "need" it. CPython hides most of this from you, since the GIL's hand-over acts as a barrier, but it is the reason a Java or C++ program that "works" without locks may fail on other hardware.</p>
+</details>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: measure what locks cost</p>
+  <p>All of these use only the standard library. Your timings will differ from mine.</p>
+</div>
+
+<ol>
+  <li>Run <code>counter_lock.py</code>. Then change <code>range(4)</code> threads to 1 thread with <code>args=(1_000_000,)</code>. Is the locked loop faster with one thread or four? (Fewer threads means less contention.)</li>
+  <li>Run <code>ioheld.py</code>, then change the thread count to 20. How does each total scale?</li>
+  <li>Run <code>sem.py</code> with <code>Semaphore(1)</code> (should take ~2.0 s) and <code>Semaphore(10)</code> (should take ~0.2 s).</li>
+  <li>Thought experiment on <code>bounded.py</code>: suppose you replaced the <code>while</code> in <code>get</code> with <code>if</code> and ran two consumers with <code>notify_all</code>. Both wake up, one takes the only item, and the other calls <code>popleft()</code> on an empty deque. Why does the <code>while</code> loop prevent that?</li>
+</ol>
+
+<h2>Locks across machines: leases and fencing tokens</h2>
+
+<p>Sometimes a lock must cover several machines: "only one worker may run this nightly job", "only one node is the leader". A <span class="term">distributed lock</span> is held in a shared service (a database row, a ZooKeeper or etcd entry) that every machine can reach. It looks like a mutex, but several things that were guaranteed inside one machine are no longer true:</p>
+
+<ul>
+  <li><strong>The holder can crash.</strong> A thread that dies takes its process with it; a machine that dies can leave the lock held for ever. So distributed locks come with a <span class="term">lease</span>: the lock is granted for a limited time (say 10 seconds) and expires on its own unless the holder renews it.</li>
+  <li><strong>You can't tell dead from slow</strong> (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>). If the holder doesn't renew, the service must assume it's gone and hand the lock to someone else.</li>
+  <li><strong>Processes pause.</strong> A garbage collection, a virtual machine freeze, or a slow disk can stall the holder at any instant, for far longer than the lease. When it wakes up, it has no way to know that time has passed.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 244" role="img" aria-label="Client A holds a lease until t=10 but is paused from t=3 to t=14. The lock service gives the lease to client B at t=11, and B writes to storage with token 34. When A wakes it writes with token 33, and storage rejects it because it has already seen the higher token 34.">
+    <text x="170" y="16" text-anchor="middle" class="t-xs t-faint">t=0</text>
+    <text x="520" y="16" text-anchor="middle" class="t-xs t-faint">t=10</text>
+    <text x="555" y="30" text-anchor="middle" class="t-xs t-faint">t=11</text>
+    <text x="660" y="16" text-anchor="middle" class="t-xs t-faint">t=14</text>
+    <text x="20" y="57" class="t-bold tc-blue">Client A</text>
+    <text x="20" y="93" class="t-bold tc-orange">Lock service</text>
+    <text x="20" y="129" class="t-bold tc-green">Client B</text>
+    <text x="20" y="165" class="t-bold">Storage</text>
+
+    <rect x="170" y="40" width="105" height="26" class="f-blue"/><text x="222" y="57" text-anchor="middle" class="t-xs t-bold t-dark">A runs</text>
+    <rect x="275" y="40" width="385" height="26" class="fs-red s-red sw-1"/><text x="467" y="57" text-anchor="middle" class="t-xs">A is paused (GC, VM freeze, slow disk)</text>
+    <rect x="660" y="40" width="70" height="26" class="f-blue"/><text x="695" y="57" text-anchor="middle" class="t-xs t-bold t-dark">A wakes</text>
+
+    <rect x="170" y="76" width="350" height="26" class="fs-orange s-orange sw-1"/><text x="345" y="93" text-anchor="middle" class="t-xs">lease for A (token 33), expires at t=10</text>
+    <rect x="555" y="76" width="175" height="26" class="fs-orange s-orange sw-1"/><text x="642" y="93" text-anchor="middle" class="t-xs">lease for B (token 34)</text>
+
+    <rect x="555" y="112" width="175" height="26" class="fs-green s-green sw-1"/><text x="642" y="129" text-anchor="middle" class="t-xs">B writes with token 34</text>
+
+    <circle cx="590" cy="161" r="8" class="f-green"/>
+    <text x="578" y="165" text-anchor="end" class="t-xs">accepts token 34</text>
+    <circle cx="695" cy="161" r="8" class="f-red"/>
+    <text x="730" y="196" text-anchor="end" class="t-xs tc-red t-bold">rejects A's stale write (token 33)</text>
+
+    <text x="380" y="226" text-anchor="middle" class="t-sm">Fencing: storage remembers the highest token it has seen and refuses anything older.</text>
+  </svg>
+  <figcaption>The lease expired while A was frozen, so A wrongly believes it still holds the lock. Only the storage layer can stop its write.</figcaption>
+</figure>
+
+<p>This is the nasty case: when A wakes, it does <code>if I hold the lock: write</code>, and its check says <em>yes</em>, because its clock-based reasoning was made before the pause. This is check-then-act again (chapter 11), now with the gap caused by a pause rather than a thread switch, and the lock service cannot interrupt a frozen process. The standard defence is a <span class="term">fencing token</span>: every time the lock service grants a lease it also returns a number that increases with each grant (33, then 34). The client sends its token with every write to the protected resource, and the resource remembers the highest token it has seen and rejects lower ones. A's stale write carries 33, storage has already seen 34, so it is refused. The point is that the check has moved to the one place that can't be paused out from under it.</p>
+
+<p>Chapter 20 of the networking course shows how lock services stay consistent despite crashes and partitions (consensus, <a href="../../networking/chapters/20-consensus.html">networking chapter 20</a>), and chapter 17 explains why you shouldn't trust clocks to decide when a lease has expired (<a href="../../networking/chapters/17-time.html">networking chapter 17</a>).</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Nearly everything here has a networked twin. A mutex becomes a distributed lock with a lease; a CAS loop becomes optimistic concurrency with version numbers or conditional writes in a database or object store; a semaphore becomes a rate limiter or a connection limit; a condition variable becomes a message queue where consumers wait for work. The twins are harder because they can't assume a shared memory, a reliable "release", or a process that stays awake, and so they need leases, fencing tokens and idempotent operations on top. A useful design habit: <em>prefer a single atomic operation owned by the data's home (a conditional write, an atomic increment) over a lock held across a network.</em></p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A mutex makes a critical section run by one thread at a time. Use <code>with lock:</code>; protect the whole <em>invariant</em>, check and act together, and make every access use the same lock.</li>
+    <li>Choose lock granularity deliberately: coarse is simple, fine scales. Keep critical sections short and never hold a lock across slow I/O.</li>
+    <li>Atomic instructions (fetch-and-add, compare-and-swap) make a single read-modify-write indivisible. The CAS retry loop (read, compute, CAS, retry on failure) is the base of lock-free code and of optimistic concurrency in databases.</li>
+    <li>Spinlocks burn CPU to wait briefly; blocking locks sleep. Applications should normally use blocking locks.</li>
+    <li>A condition variable lets a thread sleep until a condition holds. Always <code>wait()</code> inside a <code>while</code> loop that re-checks the condition, because of spurious wakeups and competing threads.</li>
+    <li>A semaphore limits concurrency to N. Readers–writer locks allow many readers or one writer. A reentrant lock lets the same thread acquire again.</li>
+    <li>Locks also order memory: without them or atomics, one thread may see another's writes late or out of order.</li>
+    <li>Distributed locks need leases (holders crash) and fencing tokens (holders pause); the protected resource must do the final check.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A bank-transfer function locks <code>balance</code> while reading it, unlocks, computes, then locks again to write. What is wrong?</p>
+    <ol class="q-options">
+      <li>Nothing; every access is locked</li>
+      <li>Locks cannot protect integers</li>
+      <li>The check and the update aren't in one critical section, so another thread can change the balance in between</li>
+      <li>It will always deadlock</li>
+    </ol>
+    <div class="q-explain">A lock protects an invariant, not a variable. The read and the dependent write must happen in one critical section; otherwise it is the chapter-11 check-then-act race, just with locks sprinkled around it.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why is calling a slow network API while holding a lock usually a bad idea?</p>
+    <ol class="q-options">
+      <li>Every other thread that needs the lock is stuck for the whole length of the call, so throughput collapses</li>
+      <li>Locks cannot be held for more than a millisecond</li>
+      <li>The network API will refuse to answer</li>
+      <li>It makes the GIL permanent</li>
+    </ol>
+    <div class="q-explain">Everyone waiting for the lock waits for its holder. If the holder spends milliseconds on I/O, the critical section becomes long and the threads serialise behind it, as the 1.02 s versus 0.20 s experiment showed.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">In a compare-and-swap retry loop, what does a failed CAS tell you?</p>
+    <ol class="q-options">
+      <li>The CPU is broken</li>
+      <li>Your thread must give up for good</li>
+      <li>Your update was applied twice</li>
+      <li>Someone changed the value since you read it, so re-read and try again</li>
+    </ol>
+    <div class="q-explain">CAS only writes if the location still holds the value you expected. A failure means another thread got in first and nothing was written, so you recompute from the new value. No update is lost and nobody blocked.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why must <code>cond.wait()</code> be called inside a <code>while</code> loop that re-checks the condition rather than an <code>if</code>?</p>
+    <ol class="q-options">
+      <li>Because <code>if</code> is slower</li>
+      <li>Because a thread can wake spuriously, or another thread can take the item first, so the condition may be false again when you run</li>
+      <li>Because <code>wait()</code> returns immediately otherwise</li>
+      <li>Because Python forbids <code>if</code> there</li>
+    </ol>
+    <div class="q-explain">Wake-ups are only a hint that the condition might be true. Between the notification and the waiter re-acquiring the lock, the state can change, and runtimes may wake waiters without any notify. Re-checking in a loop makes the code correct in every case.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">You need at most 10 downloads running at once, whatever the number of threads. Which tool fits best?</p>
+    <ol class="q-options">
+      <li>A mutex</li>
+      <li>A reentrant lock</li>
+      <li>A semaphore initialised to 10</li>
+      <li>A spinlock</li>
+    </ol>
+    <div class="q-explain">A semaphore counts permits: the first 10 threads pass, the rest wait until one releases. A mutex would allow only one download at a time.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A process holds a distributed lock with a 10 s lease, then freezes for 15 s during garbage collection. What protects the shared resource from its late write?</p>
+    <ol class="q-options">
+      <li>The process checking its own clock before writing</li>
+      <li>A fencing token: the resource rejects writes carrying a token older than one it has already seen</li>
+      <li>A longer lease</li>
+      <li>Nothing can; distributed locks are always safe</li>
+    </ol>
+    <div class="q-explain">The frozen process cannot know time has passed, so any check it performs itself can be stale. A longer lease only makes the window rarer. A monotonically increasing token, checked by the resource, is the check that can't be paused.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

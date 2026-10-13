@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Protection &amp; Privacy · Security Engineering</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/data-layers.css">
+</head>
+<body data-root="../.." data-course="sec" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Data Protection &amp; Privacy</h1>
+  <p class="lede">Most of this course protected <em>systems</em>. This chapter protects the <em>data</em> those systems hold, for as long as it exists and in every copy of it. You will learn what each layer of encryption does and does not defend against, how tokenization shrinks the part of your estate that is in scope for audits, why a hashed identifier is not anonymous, and how to honour a deletion request when the data lives in a cache, a search index, a backup and an append-only log.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Encryption is the first thing people reach for and the thing they most often misjudge. "The database is encrypted" can be true while every SQL injection, every over-privileged administrator and every compromised application server still reads the plaintext. And privacy duties, such as deleting a person's data on request, collide head-on with the designs this site taught you to love: caches, replicas, event logs and backups all exist to <em>keep</em> data. Seeing both problems clearly is what lets you design systems that hold less, expose less and can forget on purpose.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Not legal advice</p>
+  <p>This chapter describes privacy law in general terms, using the EU's GDPR as the running example, so that engineers can talk sensibly with lawyers and privacy officers. It is not legal advice. Which rules apply to you depends on where your users live, what data you hold and what you do with it. Treat the engineering patterns as ways to make compliance <em>possible</em>, and let qualified counsel decide what compliance requires.</p>
+</div>
+
+<h2>Start with classification</h2>
+
+<p>You cannot protect "the data" because it is not one thing. A <span class="term">data classification</span> scheme sorts data into a few tiers by the harm its exposure would cause, and attaches handling rules to each tier. Companies use different names; the shape is consistent.</p>
+
+<table>
+  <thead><tr><th>Tier</th><th>Examples</th><th>Typical handling</th></tr></thead>
+  <tbody>
+    <tr><td>Public</td><td>Marketing pages, published docs</td><td>Integrity matters (nobody should be able to change it); no confidentiality controls</td></tr>
+    <tr><td>Internal</td><td>Org charts, internal wikis, aggregate metrics</td><td>Employees only; no special encryption beyond the defaults</td></tr>
+    <tr><td>Confidential</td><td>Customer records, contracts, source code, personal data (<span class="term">PII</span>, personally identifiable information)</td><td>Access on need-to-know, encryption at rest, audit logging, retention limits</td></tr>
+    <tr><td>Restricted</td><td>Payment card numbers, government IDs, health records, credentials, signing keys</td><td>Tokenize or encrypt at the field level, narrow access with approval, strong audit, shortest possible retention</td></tr>
+  </tbody>
+</table>
+
+<p>Two practical points. First, classification is useful only if it is attached to <em>fields and stores</em> that engineers touch: a column comment, a schema tag, a label on a bucket. A policy document nobody can query changes nothing. Second, the highest tier should be small. Every field you classify as restricted is a field that needs a key, an access path and an audit trail, so the cheapest control for restricted data is often not to have it.</p>
+
+<p>Personal data deserves a few more definitions, using GDPR vocabulary. <span class="term">Personal data</span> is any information relating to an identified or identifiable person. A <span class="term">data subject</span> is that person. A <span class="term">controller</span> decides why and how personal data is processed; a <span class="term">processor</span> processes it on the controller's behalf (a cloud provider hosting your database is typically your processor). Notice that "identifiable" is broad: an IP address, a device id or a cookie id can qualify, because someone with additional information could link it to a person.</p>
+
+<h2>Encryption in transit</h2>
+
+<p>Data in motion between your clients and your services, and between your services, should travel over TLS. <a href="../../networking/chapters/11-tls.html">Networking chapter 11</a> covers the handshake and certificates, and <a href="04-keys-secrets-pki.html">chapter 4</a> of this course covers mutual TLS for service identity. Two things are worth restating because they matter for data protection.</p>
+
+<ul>
+  <li><strong>"Internal" links need it too.</strong> The zero-trust argument of <a href="13-zero-trust.html">chapter 13</a> applies to data: an attacker who lands on one host can sniff or tamper with traffic on a flat internal network. Encrypt service-to-service and service-to-database links, and verify certificates (a client that accepts any certificate gives you encryption without authentication, which a man-in-the-middle defeats).</li>
+  <li><strong>TLS ends at an endpoint.</strong> A TLS-terminating load balancer decrypts the traffic and forwards it. Wherever termination happens is a place where plaintext exists, so draw it on your data-flow diagram as a trust boundary, and decide deliberately whether the hop behind it is re-encrypted.</li>
+</ul>
+
+<h2>Encryption at rest: four layers, four different answers</h2>
+
+<p><span class="term">Encryption at rest</span> means data stored on durable media is encrypted. The phrase hides an important question: <em>encrypted by whom, with whose key, and decrypted for whom?</em> That determines which attacker it stops. There are four common layers.</p>
+
+<ol>
+  <li><strong>Full-disk or volume encryption</strong> (BitLocker, LUKS, FileVault, or the encrypted-volume option of a cloud block store). The block device is encrypted below the filesystem. Once the machine boots and the volume is unlocked, every process reads plaintext as usual.</li>
+  <li><strong>Database transparent data encryption</strong> (<span class="term">TDE</span>). The database engine encrypts its data files, logs and usually its backups, and decrypts pages as it loads them into memory. Every authorised SQL session sees plaintext. Availability varies by product and edition; managed cloud databases usually offer storage encryption as a setting.</li>
+  <li><strong>Application-level (field-level) encryption.</strong> The application encrypts chosen values, such as a national id or a note, <em>before</em> sending them to the database, using keys it obtains through a key service. The database stores ciphertext and never holds the keys. This is envelope encryption as described in <a href="04-keys-secrets-pki.html">chapter 4</a>: a data key per record, user or tenant, wrapped by a key-encryption key in a KMS.</li>
+  <li><strong>Client-side or end-to-end encryption.</strong> The user's device holds the keys and the service stores only ciphertext it cannot read. It gives the strongest guarantee against the service operator and the most functional cost: the server cannot search, deduplicate, preview or recover your data.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-label="Where each encryption layer sits. A client on the left connects over TLS into a dashed yellow trust boundary containing an application server, a database engine and a disk. Application-level field encryption happens in the application server, TDE inside the database engine, and volume encryption at the disk. Below the boundary, a separate dashed yellow boundary holds the key management service, which the application calls to wrap and unwrap data keys.">
+<defs>
+<marker id="ahS17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+<marker id="ahS17r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker>
+<marker id="ahS17o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker>
+<marker id="ahS17g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker>
+<marker id="ahS17b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker>
+</defs>
+<rect x="196" y="12" width="556" height="198" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="208" y="32" class="t-xs t-bold">Your data centre or cloud account (trust boundary)</text>
+<rect x="14" y="94" width="116" height="72" rx="10" class="fs-green s-green sw-2"/>
+<text x="72" y="124" text-anchor="middle" class="t-sm t-bold">Client</text><text x="72" y="144" text-anchor="middle" class="t-xs">browser or app</text>
+<line x1="130" y1="130" x2="208" y2="130" class="line s-green" marker-end="url(#ahS17g)"/>
+<text x="169" y="120" text-anchor="middle" class="t-xs">TLS</text>
+<rect x="212" y="62" width="144" height="136" rx="10" class="fs-blue s-blue sw-2"/>
+<text x="284" y="86" text-anchor="middle" class="t-sm t-bold">App server</text>
+<text x="284" y="108" text-anchor="middle" class="t-xs">plaintext in memory</text>
+<text x="284" y="136" text-anchor="middle" class="t-xs t-bold">Layer 3:</text><text x="284" y="152" text-anchor="middle" class="t-xs">field encryption</text><text x="284" y="168" text-anchor="middle" class="t-xs">with per-tenant keys</text>
+<line x1="356" y1="130" x2="440" y2="130" class="line s-blue" marker-end="url(#ahS17b)"/>
+<text x="398" y="120" text-anchor="middle" class="t-xs">TLS</text>
+<rect x="444" y="62" width="144" height="136" rx="10" class="fs-blue s-blue sw-2"/>
+<text x="516" y="86" text-anchor="middle" class="t-sm t-bold">Database engine</text>
+<text x="516" y="108" text-anchor="middle" class="t-xs">plaintext in buffers</text>
+<text x="516" y="136" text-anchor="middle" class="t-xs t-bold">Layer 2:</text><text x="516" y="152" text-anchor="middle" class="t-xs">TDE on data files</text><text x="516" y="168" text-anchor="middle" class="t-xs">and backups</text>
+<line x1="588" y1="130" x2="626" y2="130" class="line" marker-end="url(#ahS17a)"/>
+<rect x="630" y="62" width="112" height="136" rx="10" class="box"/>
+<text x="686" y="86" text-anchor="middle" class="t-sm t-bold">Disk</text>
+<text x="686" y="108" text-anchor="middle" class="t-xs">blocks at rest</text>
+<text x="686" y="136" text-anchor="middle" class="t-xs t-bold">Layer 1:</text><text x="686" y="152" text-anchor="middle" class="t-xs">volume</text><text x="686" y="168" text-anchor="middle" class="t-xs">encryption</text>
+<rect x="400" y="226" width="344" height="64" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="412" y="244" class="t-xs t-bold">KMS boundary: key-encryption keys never leave</text>
+<rect x="418" y="252" width="150" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="493" y="272" text-anchor="middle" class="t-xs">KEK, policy, audit</text>
+<path d="M284,198 L284,268 L414,268" class="line s-orange" style="fill:none" marker-end="url(#ahS17o)"/>
+<text x="296" y="250" class="t-xs">wrap / unwrap</text>
+</svg>
+<figcaption>Three layers of at-rest encryption sit at three different places. The deeper the layer, the more software still sees plaintext above it. Only the application layer keeps plaintext out of the database engine, at the price of the application managing keys.</figcaption>
+</figure>
+
+<h3>What each layer actually protects against</h3>
+
+<p>The rule of thumb is simple to state: <strong>encryption protects against whoever cannot ask the decrypting component to decrypt</strong>. A stolen disk cannot ask; a compromised application server can, because decrypting is its job.</p>
+
+<ul>
+  <li><strong>A stolen or decommissioned drive, or a copied snapshot of raw storage.</strong> All four layers help. This is the threat full-disk encryption exists for, and it is the most common reason compliance frameworks ask for "encryption at rest".</li>
+  <li><strong>A stolen database backup file.</strong> TDE typically helps, since engines encrypt backups; volume encryption helps only while the backup stays on the encrypted volume; field encryption helps regardless of tool.</li>
+  <li><strong>A database administrator, or a cloud operator's console, running SQL.</strong> Volume encryption and TDE do nothing, because the engine decrypts transparently for any authorised session. Only application-level encryption helps, and only if the administrator cannot also call the key service.</li>
+  <li><strong>SQL injection.</strong> The injected query runs inside your application's own database session, so storage encryption is invisible to it. Field encryption can leave the attacker holding ciphertext, but the real fix is the parameterisation of <a href="09-injection.html">chapter 9</a>.</li>
+  <li><strong>A compromised application server.</strong> No at-rest layer stops code execution on a machine that holds the keys or can ask for them. Per-tenant keys, narrow KMS policies, rate limits and audit logs bound the damage and make it visible, they do not prevent it.</li>
+</ul>
+
+<p>Try the combinations yourself. Notice how many cells are red for the two cheapest, most common layers.</p>
+
+<div class="widget" id="data-layers"></div>
+
+<div class="callout warn">
+  <p class="callout-title">"Encrypted at rest" is a compliance checkbox, not a threat model</p>
+  <p>Volume encryption and TDE are valuable, cheap and should be on by default. But they answer "what if someone walks off with the hardware?", a threat that is rare in a cloud data centre. Most real breaches in this course (see <a href="../cases/case-02-equifax.html">Equifax</a>) went through the running application, where these layers are transparent. Say what you mean in design docs: "volume encryption defends against lost media" is a true sentence; "our data is encrypted" is not a security claim.</p>
+</div>
+
+<h3>Envelope encryption, recapped, and why granularity matters</h3>
+
+<p>In <a href="04-keys-secrets-pki.html">chapter 4</a> you saw envelope encryption: a data key encrypts the data locally, and a key-encryption key in the KMS wraps the data key. The choice that matters for privacy is the <em>granularity</em> of the data key. One key for the whole database means any key compromise exposes everything and nothing can be selectively destroyed. One key per tenant bounds the blast radius to that tenant (<a href="15-multi-tenancy.html">chapter 15</a>). One key per <em>user</em> lets you delete one person's data by destroying one key, which is the trick later in this chapter. The cost is operational: more keys to store, rotate, back up and authorise.</p>
+
+<h2>Tokenization and PCI scope</h2>
+
+<p><span class="term">Tokenization</span> replaces a sensitive value with a meaningless substitute, a <span class="term">token</span>, and keeps the real value in a separate hardened service, the <span class="term">vault</span>. It differs from encryption in one important way. An encrypted value can be turned back into the original by anyone with the key, using mathematics. A token has <em>no mathematical relationship</em> to the original: the only way back is to ask the vault, which checks who is asking. (Some products use <em>format-preserving encryption</em> to produce tokens that keep the shape of the input; that is encryption wearing a token's clothes, and its security rests on the key.)</p>
+
+<p>The classic use is payment cards. The Payment Card Industry Data Security Standard (<span class="term">PCI DSS</span>) imposes a long list of controls on every system that stores, processes or transmits cardholder data, and on systems connected to those. Tokenization works by shrinking that set. The customer's browser sends the card number straight to a payment provider (typically through a form field or frame the provider hosts), and your servers only ever see a token such as <code>tok_8f3a…</code>. You can charge, refund and show "card ending in 4242" using tokens, while the card number itself never enters your network.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 270" role="img" aria-label="Tokenization shrinking PCI scope. The customer's browser sends the card number directly to the payment provider's vault, inside a dashed yellow boundary on the right marked in PCI scope. The merchant's application and database, inside a dashed yellow boundary on the left marked tokens only, receive a token from the provider and later send the token back to charge the card.">
+
+<rect x="186" y="14" width="218" height="178" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="198" y="34" class="t-xs t-bold">Merchant systems: tokens only</text>
+<rect x="508" y="14" width="238" height="178" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="520" y="34" class="t-xs t-bold">Provider: in PCI scope</text>
+<rect x="14" y="76" width="110" height="64" rx="10" class="fs-green s-green sw-2"/>
+<text x="69" y="104" text-anchor="middle" class="t-sm t-bold">Customer</text><text x="69" y="122" text-anchor="middle" class="t-xs">types card number</text>
+<rect x="204" y="56" width="180" height="116" rx="10" class="fs-blue s-blue sw-2"/>
+<text x="294" y="84" text-anchor="middle" class="t-sm t-bold">Your app and DB</text>
+<text x="294" y="108" text-anchor="middle" class="t-xs">stores tok_8f3a…</text><text x="294" y="126" text-anchor="middle" class="t-xs">and "ends in 4242"</text><text x="294" y="148" text-anchor="middle" class="t-xs t-muted">never sees the number</text>
+<rect x="528" y="56" width="198" height="116" rx="10" class="fs-orange s-orange sw-2"/>
+<text x="627" y="84" text-anchor="middle" class="t-sm t-bold">Token vault</text>
+<text x="627" y="108" text-anchor="middle" class="t-xs">token ↔ card number</text><text x="627" y="126" text-anchor="middle" class="t-xs">encrypted, access-controlled</text><text x="627" y="148" text-anchor="middle" class="t-xs">talks to the card network</text>
+<path d="M69,140 L69,232 L627,232 L627,174" class="line s-green" style="fill:none" marker-end="url(#ahS17g)"/>
+<text x="84" y="224" class="t-xs">1. card number goes straight to the provider</text>
+<line x1="526" y1="96" x2="388" y2="96" class="line s-orange" marker-end="url(#ahS17o)"/>
+<text x="457" y="88" text-anchor="middle" class="t-xs">2. token back</text>
+<line x1="388" y1="136" x2="524" y2="136" class="line s-blue" marker-end="url(#ahS17b)"/>
+<text x="457" y="156" text-anchor="middle" class="t-xs">3. charge(token)</text>
+</svg>
+<figcaption>Tokenization moves the card number out of your systems. The vault is a very high-value target, which is why it lives with a specialist provider whose whole job is to defend it.</figcaption>
+</figure>
+
+<p>Two caveats keep this honest. First, tokenization reduces <em>scope</em>, not <em>obligation</em>: you still have duties around the page that collects the card details (a script injected into your checkout page can skim the number before it reaches the provider; see the XSS and content security policy discussion in <a href="10-web-security.html">chapter 10</a>), and the standard defines which forms of integration cut scope how far. Confirm with a qualified assessor. Second, the standard forbids storing certain authentication data, such as the card verification code, after authorisation, so the right design is again <em>not to keep it</em>.</p>
+
+<p>The same pattern applies beyond cards: replace national ids, bank accounts or health ids with tokens in every system that does not need the real value, and let a tiny vault service hold the mapping.</p>
+
+<h2>Hashing an identifier is not anonymisation</h2>
+
+<p>A tempting shortcut: before sharing a dataset or sending events to an analytics vendor, replace each email address or phone number with its SHA-256 hash. The values look random, so surely nobody can recover them? They can, whenever the set of possible inputs is small enough to enumerate. A hash is deterministic and fast; an attacker takes every plausible phone number, hashes each, and looks for matches. Email addresses fall to a list of known addresses and a dictionary of names; the work is trivial by comparison with password cracking. <a href="03-applied-crypto.html">Chapter 3</a> made the same point about fast hashes, and <a href="05-authentication.html">chapter 5</a> about why passwords need slow ones. Identifiers are worse than passwords: they have even less entropy and are often public.</p>
+
+<p>The fix is a <em>keyed</em> pseudonym: <code>HMAC(secret_key, identifier)</code>, with the key held only by the data owner. Without the key, the attacker cannot test guesses. The script runs both, using made-up numbers, in one process.</p>
+
+<pre class="terminal" data-title="pseudo.py"><code>"""Why hashing an identifier is not anonymisation, and what a keyed pseudonym changes.
+Runs entirely on made-up numbers in documentation-style ranges, in one process."""
+import hashlib, hmac, secrets
+
+block = 1_000_000                                           # subscriber numbers in one made-up exchange
+customers = [f"+1555{n:07d}" for n in (482913, 77031, 905562)]
+sha = lambda s: hashlib.sha256(s.encode()).hexdigest()[:16]
+shared = [sha(p) for p in customers]                         # "anonymised" ids in a shared dataset
+print("shared dataset ids:", shared)
+
+# The attacker enumerates the (small) identifier space and hashes every candidate.
+table = {}
+for n in range(block):
+    cand = f"+1555{n:07d}"
+    d = sha(cand)
+    if d in shared: table[d] = cand
+print("hashes computed:", block, " recovered:", [table[d] for d in shared])
+
+key = secrets.token_bytes(32)                                # held by the data owner only
+pseudo = lambda p: hmac.new(key, p.encode(), hashlib.sha256).hexdigest()[:16]
+print("keyed pseudonym:", pseudo(customers[0]), "| same input, same pseudonym:", pseudo(customers[0]) == pseudo(customers[0]))
+print("plain-hash guess matches the keyed pseudonym?", sha(customers[0]) == pseudo(customers[0]))
+
+# k-anonymity check: how many rows share each quasi-identifier combination?
+rows = [("3012", "30-39"), ("3012", "30-39"), ("3012", "30-39"), ("3013", "40-49"), ("3013", "40-49"), ("3099", "20-29")]
+from collections import Counter
+c = Counter(rows)
+print("group sizes:", dict(c), "-&gt; k =", min(c.values()))</code></pre>
+<pre class="terminal" data-title="terminal"><code>shared dataset ids: ['5e9db149cbc04a37', '97ea2927707b8c3c', '33728a4018b640d5']
+hashes computed: 1000000  recovered: ['+15550482913', '+15550077031', '+15550905562']
+keyed pseudonym: f753989bac5ad3e7 | same input, same pseudonym: True
+plain-hash guess matches the keyed pseudonym? False
+group sizes: {('3012', '30-39'): 3, ('3013', '40-49'): 2, ('3099', '20-29'): 1} -&gt; k = 1</code></pre>
+
+<p>(The keyed pseudonym is random on each run because the key is freshly generated; everything else will match.) The last two lines illustrate <span class="term">k-anonymity</span>, introduced by Latanya Sweeney: a dataset is k-anonymous if every combination of <span class="term">quasi-identifiers</span> (attributes like postcode, age band and sex that are not names but can be joined with other data to find a person) is shared by at least <em>k</em> rows, so each person hides in a crowd of at least k. Here k is 1, and the one person in postcode 3099 stands out. Generalising (coarser postcodes, wider age bands) or suppressing rows raises k. It is a useful check, but it has known limits: if everyone in a group shares the same sensitive value, group membership still reveals it, and a determined adversary with extra data can still narrow things down.</p>
+
+<h3>Pseudonymisation, anonymisation, and differential privacy</h3>
+
+<ul>
+  <li><span class="term">Pseudonymisation</span> replaces direct identifiers with a code, while the means of re-identification (the key or the lookup table) exist somewhere. GDPR treats pseudonymised data as <em>still personal data</em>, because the holder of the key can reverse it. It is a valuable safeguard, not an exit from the rules.</li>
+  <li><span class="term">Anonymisation</span> means the data can no longer be linked to a person by any means reasonably likely to be used. It is hard to achieve for rich records, and it has repeatedly failed in public: datasets released with names removed have been re-identified by joining them with other public data. If you rely on it, test it against a plausible adversary with side information.</li>
+  <li><span class="term">Differential privacy</span> (Dwork, McSherry, Nissim and Smith, 2006) protects <em>query results</em> rather than rows. A mechanism adds carefully calibrated random noise so that the output is almost equally likely whether or not any one person's data was included, with a tunable parameter (usually written epsilon) trading accuracy against privacy. It suits aggregate statistics; it is not a way to publish individual records, and getting the engineering right takes care.</li>
+</ul>
+
+<h2>Minimisation and retention</h2>
+
+<p>The safest personal data is the data you never collected, and the next safest is data you have already deleted. <span class="term">Data minimisation</span> asks, for every field: what purpose needs it? Collect only that, keep it only as long as that purpose lasts, and let fewer systems see it. <span class="term">Retention</span> is the practical half. Each class of data gets a stated lifetime, and a job enforces it: time-to-live on cache entries, partition-drop on log tables, lifecycle rules on object storage, and expiry on backups.</p>
+
+<p>Retention is where security, privacy and engineering interests meet awkwardly. Security wants long audit logs for investigations; privacy wants personal data gone quickly; legal may require some records for years and a "legal hold" may freeze deletion for others. The way through is to decide <em>per data class</em>, write the decision down (<a href="../../architecture/chapters/19-documenting-decisions.html">architecture chapter 19</a> shows how), and design stores so deletion is a routine operation, not an archaeology project. Partition by time, partition by tenant, tag data with its class, and keep personal fields separate from the facts you need forever.</p>
+
+<h2>The right to erasure</h2>
+
+<p>GDPR Article 17 (the "right to erasure", often called the right to be forgotten) lets a data subject ask a controller to erase their personal data, and obliges the controller to do so without undue delay where one of the listed grounds applies, for example the data is no longer needed for its purpose, consent was withdrawn, or the processing was unlawful. It has exceptions, such as legal obligations to retain data and the establishment or defence of legal claims. The law does not say <em>how</em>; the how is your architecture, and the architecture of modern systems makes "delete this person" a distributed-systems problem.</p>
+
+<p>Walk the places one user's data lives:</p>
+
+<table>
+  <thead><tr><th>Store</th><th>Why it is hard</th><th>Usual answer</th></tr></thead>
+  <tbody>
+    <tr><td>Primary database</td><td>Foreign keys, soft-deletes that never really delete, copies in denormalised tables</td><td>Hard-delete or anonymise in place; track every table that holds the user id</td></tr>
+    <tr><td>Caches</td><td>Entries are copies with their own TTLs</td><td>Invalidate by key on erasure; bound TTLs so stragglers expire</td></tr>
+    <tr><td>Search index, data warehouse, ML features</td><td>Derived stores built asynchronously, often by pipelines that forgot about deletes</td><td>Propagate delete events; rebuild or purge on a schedule; document the lag</td></tr>
+    <tr><td>Logs and traces</td><td>Free text, immense, sprayed across systems</td><td>Do not put personal data in them (next section); short retention</td></tr>
+    <tr><td>Backups and snapshots</td><td>Immutable by design; restoring one resurrects deleted rows</td><td>Retention windows plus replay of the deletion ledger after any restore; or crypto-shredding</td></tr>
+    <tr><td>Event-sourced logs</td><td>The log is the source of truth and is append-only by definition</td><td>Keep personal data out of events, or encrypt it per user and destroy the key</td></tr>
+    <tr><td>Third parties</td><td>Processors and vendors have copies too</td><td>Contractual deletion duties and a tracked API call or ticket per processor</td></tr>
+  </tbody>
+</table>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: recalling a photocopied letter</p>
+  <p>A letter was copied for the file room, the archive across town, a colleague's desk and the microfilm vault. Shredding the original does nothing about the rest. You need a list of every place copies went, a procedure for each, and, for the microfilm you cannot cut into, a way to make the film unreadable without touching it.</p>
+  <p><em>Where it breaks down:</em> paper copies sit still; digital copies keep being re-made by pipelines, replicas and restores, so a deletion done once can be quietly undone next week.</p>
+</div>
+
+<p>The pattern that makes this tractable is a <span class="term">deletion ledger</span>: a small, durable record that "user 8841 was erased at time T", containing no personal data beyond the id. Every pipeline that can re-create data (a restore from backup, a replay of a log, a re-index) consults the ledger and re-applies the deletion. Step through the whole workflow below.</p>
+
+<div class="widget stepper" data-autoplay-ms="5000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One erasure request, two kinds of store</h4></div>
+  <svg viewBox="0 0 760 296" role="img" aria-label="An erasure request on the left. In the middle, in a dashed yellow boundary, four mutable stores: primary database, cache, search index and warehouse. On the right, in a second dashed yellow boundary, immutable stores: event log, backups and log archive, plus a per-user key box. Step two marks the mutable stores deleted. Step three destroys the key so the immutable copies become unreadable. Step four records a deletion ledger entry containing no personal data.">
+
+<rect x="152" y="8" width="256" height="248" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="164" y="26" class="t-xs t-bold">Mutable stores: edit them</text>
+<rect x="424" y="8" width="322" height="266" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="436" y="26" class="t-xs t-bold">Immutable stores: shred the key</text>
+<rect x="14" y="112" width="104" height="64" rx="10" class="fs-green s-green sw-2"/>
+<text x="66" y="140" text-anchor="middle" class="t-sm t-bold">Erasure</text><text x="66" y="158" text-anchor="middle" class="t-sm t-bold">request</text>
+<rect x="164" y="38" width="124" height="40" rx="6" class="fs-blue s-blue sw-2"/><text x="226" y="63" text-anchor="middle" class="t-xs">Primary DB</text>
+<rect x="164" y="92" width="124" height="40" rx="6" class="fs-blue s-blue sw-2"/><text x="226" y="117" text-anchor="middle" class="t-xs">Cache</text>
+<rect x="164" y="146" width="124" height="40" rx="6" class="fs-blue s-blue sw-2"/><text x="226" y="171" text-anchor="middle" class="t-xs">Search index</text>
+<rect x="164" y="200" width="124" height="40" rx="6" class="fs-blue s-blue sw-2"/><text x="226" y="225" text-anchor="middle" class="t-xs">Warehouse</text>
+<rect x="436" y="38" width="124" height="40" rx="6" class="box"/><text x="498" y="63" text-anchor="middle" class="t-xs">Event log</text>
+<rect x="436" y="92" width="124" height="40" rx="6" class="box"/><text x="498" y="117" text-anchor="middle" class="t-xs">Backups</text>
+<rect x="436" y="146" width="124" height="40" rx="6" class="box"/><text x="498" y="171" text-anchor="middle" class="t-xs">Log archive</text>
+<rect x="436" y="204" width="296" height="54" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="584" y="228" text-anchor="middle" class="t-sm t-bold">Per-user data key</text><text x="584" y="246" text-anchor="middle" class="t-xs">wrapped by the KMS key</text>
+<g data-steps="2-4"><line x1="118" y1="144" x2="150" y2="144" class="line" marker-end="url(#ahS17a)"/>
+<text x="296" y="63" class="t-xs tc-green t-bold">deleted</text><text x="296" y="117" class="t-xs tc-green t-bold">invalidated</text><text x="296" y="171" class="t-xs tc-green t-bold">purged</text><text x="296" y="225" class="t-xs tc-green t-bold">purged</text></g>
+<g data-steps="3-4"><text x="572" y="63" class="t-xs tc-red t-bold">unreadable</text><text x="572" y="117" class="t-xs tc-red t-bold">unreadable</text><text x="572" y="171" class="t-xs tc-red t-bold">unreadable</text>
+<rect x="436" y="204" width="296" height="54" rx="8" class="line-dash s-red" style="fill:none"/>
+<text x="584" y="268" text-anchor="middle" class="t-xs tc-red t-bold">key destroyed</text></g>
+<g data-steps="4"><rect x="14" y="196" width="122" height="64" rx="8" class="fs-cyan s-cyan sw-2"/><text x="75" y="222" text-anchor="middle" class="t-xs t-bold">Deletion ledger</text><text x="75" y="240" text-anchor="middle" class="t-xs">id + time, no PII</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li>A verified request arrives. The first job is to find every store that holds this person's data; that inventory is the hard, unglamorous part.</li>
+    <li>Mutable stores are edited: delete or anonymise the rows, invalidate cache entries, purge search and warehouse copies. Each is a normal write, but each pipeline must be told.</li>
+    <li>Immutable stores cannot be edited, so destroy the per-user key instead. Every copy of the encrypted fields, in the log and in every backup, is now unreadable without being touched.</li>
+    <li>Record a ledger entry (id and time only). Any restore or replay consults it and re-applies the deletion, so nothing resurrects the person later.</li>
+  </ol>
+</div>
+
+<h3>Crypto-shredding, running</h3>
+
+<p>Crypto-shredding is "deletion by destroying the key". Chapter 4 showed it for tenants; here it is for a single user in an event-sourced log, the structure of <a href="../../architecture/chapters/16-cqrs-event-sourcing.html">architecture chapter 16</a>, whose events are immutable by principle. Personal fields inside each event are encrypted under that user's key; non-personal facts stay readable so the history, counts and invariants survive. The read model is rebuilt by replay.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Educational only, never use in production</p>
+  <p>The cipher below is a toy (SHAKE-256 keystream plus HMAC, encrypt-then-MAC) so the program runs on the standard library alone, which has no AES. Never use it for real data. Production code uses AES-GCM or ChaCha20-Poly1305 from a vetted library, and keeps per-user keys wrapped in a KMS rather than in a Python dictionary.</p>
+</div>
+
+<pre class="terminal" data-title="shred.py"><code>"""Crypto-shredding an event-sourced log with per-user keys.
+TOY CIPHER - EDUCATIONAL ONLY, never use in production. Real systems use AES-GCM or
+ChaCha20-Poly1305 from a vetted library, with the per-user keys wrapped by a KMS."""
+import hashlib, hmac, json, secrets
+
+def _split(key):
+    return hashlib.sha256(b"enc" + key).digest(), hashlib.sha256(b"mac" + key).digest()
+
+def seal(key, plaintext, aad=b""):
+    ek, mk = _split(key)
+    nonce = secrets.token_bytes(16)
+    ks = hashlib.shake_256(ek + nonce).digest(len(plaintext))
+    ct = bytes(p ^ k for p, k in zip(plaintext, ks))
+    return nonce + ct + hmac.new(mk, aad + nonce + ct, hashlib.sha256).digest()
+
+def unseal(key, blob, aad=b""):
+    ek, mk = _split(key)
+    nonce, ct, tag = blob[:16], blob[16:-32], blob[-32:]
+    if not hmac.compare_digest(tag, hmac.new(mk, aad + nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("authentication failed")
+    ks = hashlib.shake_256(ek + nonce).digest(len(ct))
+    return bytes(c ^ k for c, k in zip(ct, ks))
+
+class KeyStore:
+    """One data key per user. Stands in for a KMS-backed table of wrapped keys."""
+    def __init__(self): self._keys = {}
+    def key_for(self, user):
+        return self._keys.setdefault(user, secrets.token_bytes(32))
+    def get(self, user): return self._keys.get(user)
+    def shred(self, user): self._keys.pop(user, None)
+
+class EventLog:
+    """Append-only. Personal fields are encrypted under the user's key; the rest stays in clear."""
+    def __init__(self, keys): self.keys, self.events = keys, []
+    def append(self, kind, user, pii):
+        seq = len(self.events)
+        blob = seal(self.keys.key_for(user), json.dumps(pii).encode(), f"{user}|{seq}".encode())
+        self.events.append({"seq": seq, "kind": kind, "user": user, "pii": blob.hex()})
+    def replay(self):
+        """Rebuild a read model. Events whose key is gone are kept but show as [erased]."""
+        view = {}
+        for e in self.events:
+            key = self.keys.get(e["user"])
+            try:
+                pii = json.loads(unseal(key, bytes.fromhex(e["pii"]), f"{e['user']}|{e['seq']}".encode())) if key else None
+            except ValueError:
+                pii = None
+            row = view.setdefault(e["user"], {"name": "[erased]", "email": "[erased]", "orders": 0})
+            if pii and e["kind"] == "SignedUp": row.update(pii)
+            if e["kind"] == "OrderPlaced": row["orders"] += 1      # non-personal fact survives
+        return view
+
+keys = KeyStore(); log = EventLog(keys)
+log.append("SignedUp", "u1", {"name": "Ada Example", "email": "ada@example.com"})
+log.append("SignedUp", "u2", {"name": "Grace Sample", "email": "grace@example.org"})
+log.append("OrderPlaced", "u1", {"ship_to": "1 Example Street"})
+log.append("OrderPlaced", "u2", {"ship_to": "2 Sample Road"})
+
+backup = json.dumps(log.events)                  # a backup that will never be edited
+print("before erasure:")
+for u, r in log.replay().items(): print("  ", u, r)
+
+keys.shred("u1")                                 # the erasure request: one key delete
+print("after shredding u1's key (log and backup untouched):")
+for u, r in log.replay().items(): print("  ", u, r)
+
+restored = EventLog(keys); restored.events = json.loads(backup)
+print("restore from the old backup, same key store:")
+for u, r in restored.replay().items(): print("  ", u, r)
+print("ciphertext still present:", len(log.events[0]["pii"]) // 2, "bytes; key present:", keys.get("u1") is not None)
+print("events still in the log:", len(log.events), "(none deleted, none rewritten)")</code></pre>
+<pre class="terminal" data-title="terminal"><code>before erasure:
+   u1 {'name': 'Ada Example', 'email': 'ada@example.com', 'orders': 1}
+   u2 {'name': 'Grace Sample', 'email': 'grace@example.org', 'orders': 1}
+after shredding u1's key (log and backup untouched):
+   u1 {'name': '[erased]', 'email': '[erased]', 'orders': 1}
+   u2 {'name': 'Grace Sample', 'email': 'grace@example.org', 'orders': 1}
+restore from the old backup, same key store:
+   u1 {'name': '[erased]', 'email': '[erased]', 'orders': 1}
+   u2 {'name': 'Grace Sample', 'email': 'grace@example.org', 'orders': 1}
+ciphertext still present: 99 bytes; key present: False
+events still in the log: 4 (none deleted, none rewritten)</code></pre>
+
+<p>Read the output against the figure. Erasing user <code>u1</code> was one key deletion; no event was removed or rewritten, the order count (a non-personal fact) survives, and restoring the <em>old backup</em> does not bring the name back because the backup only ever held ciphertext. The last line is the honest caveat: the ciphertext is still there. It is safe only as long as the cipher holds and the key is truly gone, and a regulator or an auditor may ask you to justify that.</p>
+
+<div class="callout warn">
+  <p class="callout-title">What crypto-shredding does not do</p>
+  <ul>
+    <li><strong>It only covers what was encrypted under that key.</strong> A name that also leaked into a log line, an analytics event or a support ticket is outside it. Design so personal data lives in exactly one encrypted place, and everything else holds the user id.</li>
+    <li><strong>The key must really be gone.</strong> Backups of the key store, caches of unwrapped keys in memory, and replicated key tables all count. Cover the key store in your deletion design, not just the data.</li>
+    <li><strong>It trades recoverability for forgetting.</strong> If you destroy a key by mistake, the data is lost in every copy, including your backups, by design. Guard key destruction with the same care as database drops: soft-delete the key with a delay, require approval, and log it.</li>
+    <li><strong>Whether it satisfies a given legal duty is a legal question.</strong> Many practitioners treat it as effective erasure; the details of "beyond use" for backups vary, so ask counsel.</li>
+  </ul>
+</div>
+
+<h2>Personal data in logs</h2>
+
+<p>Logs are where good data-protection designs go to die. <a href="../../reliability/chapters/05-logs-events.html">Reliability chapter 5</a> argued that logs should be structured, and warned against logging personal data. The security reasons: logs are copied to many systems, retained long, readable by many engineers, shipped to third-party vendors, and rarely subject to the access controls of the database. A password logged in a failed-login message or a bearer token in a request dump becomes a credential theft waiting for someone with log access (see the Log4Shell discussion in <a href="09-injection.html">chapter 9</a> for the opposite problem, logs as an attack surface).</p>
+
+<p>Defences, in order of strength:</p>
+<ol>
+  <li><strong>Do not log it.</strong> Log user ids, not names and emails; log request ids, not bodies. Use allowlist-style structured logging so only declared fields are emitted.</li>
+  <li><strong>Type the sensitive values.</strong> Wrap secrets and personal fields in a class whose <code>repr</code> prints <code>&lt;redacted&gt;</code>, so a stray <code>print</code> or exception message cannot leak them.</li>
+  <li><strong>Redact at the edge as a safety net.</strong> A filter in the logging pipeline scrubs patterns before records leave the process. It is a net, not a wall: it catches the known shapes and misses the rest.</li>
+</ol>
+
+<pre class="terminal" data-title="redact.py"><code>"""A logging filter that redacts common PII and secrets before records reach any handler."""
+import logging, re, sys
+
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+BEARER = re.compile(r"(?i)\b(bearer|token|api[_-]?key|password|secret)(\s*[=:]\s*|\s+)([^\s,;&amp;\"']+)")
+CARD = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
+SENSITIVE_KEYS = {"password", "ssn", "token", "authorization", "card_number", "email"}
+
+def luhn_ok(digits):
+    total, alt = 0, False
+    for ch in reversed(digits):
+        d = int(ch)
+        if alt:
+            d *= 2
+            if d &gt; 9: d -= 9
+        total += d; alt = not alt
+    return total % 10 == 0
+
+def scrub(text):
+    text = EMAIL.sub("&lt;email&gt;", text)
+    text = BEARER.sub(lambda m: f"{m.group(1)}{m.group(2)}&lt;redacted&gt;", text)
+    def card(m):
+        digits = re.sub(r"\D", "", m.group(0))
+        return "&lt;card&gt;" if 13 &lt;= len(digits) &lt;= 19 and luhn_ok(digits) else m.group(0)
+    return CARD.sub(card, text)
+
+def scrub_value(v):
+    if isinstance(v, dict):
+        return {k: ("&lt;redacted&gt;" if k.lower() in SENSITIVE_KEYS else scrub_value(x)) for k, x in v.items()}
+    if isinstance(v, (list, tuple)): return type(v)(scrub_value(x) for x in v)
+    return scrub(v) if isinstance(v, str) else v
+
+class RedactFilter(logging.Filter):
+    def filter(self, record):
+        record.msg = scrub(record.getMessage())      # format first, then scrub the final text
+        record.args = ()
+        return True
+
+log = logging.getLogger("app")
+h = logging.StreamHandler(sys.stdout)
+h.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+h.addFilter(RedactFilter())          # on the handler so records from child loggers are covered too
+log.addHandler(h); log.setLevel(logging.INFO)
+
+log.info("signup ok for ada@example.com from 203.0.113.9")
+log.info("calling billing with Authorization: Bearer abc123.def456")
+log.info("charge card 4111 1111 1111 1111 amount=%s", 42)
+log.info("order number 1234 5678 9012 3456 is not a card (fails Luhn)")
+log.info("payload=%s", scrub_value({"user": "u1", "password": "hunter2", "note": "mail me at bob@example.net"}))
+print("known gap -&gt; a name in free text is not caught:")
+log.info("support note: customer Ada Example called about her order")</code></pre>
+<pre class="terminal" data-title="terminal"><code>INFO signup ok for &lt;email&gt; from 203.0.113.9
+INFO calling billing with Authorization: Bearer &lt;redacted&gt;
+INFO charge card &lt;card&gt; amount=42
+INFO order number 1234 5678 9012 3456 is not a card (fails Luhn)
+INFO payload={'user': 'u1', 'password': '&lt;redacted&gt;', 'note': 'mail me at &lt;email&gt;'}
+known gap -&gt; a name in free text is not caught:
+INFO support note: customer Ada Example called about her order</code></pre>
+
+<p>Look at what the filter catches (email, bearer token, card number that passes the Luhn checksum, sensitive dictionary keys) and what it does not: the real card-shaped order number stays because it fails the checksum, which is the reason to validate rather than blindly mask, and the customer's name in free text sails through. Pattern redaction cannot find a name. That is why the first two layers matter more.</p>
+
+<h2>Data residency and sovereignty</h2>
+
+<p><span class="term">Data residency</span> is a requirement that certain data be stored (and sometimes processed) in a particular country or region. It comes from laws on cross-border transfers of personal data, from sector rules, from public-sector contracts and from customer demands. In general terms, GDPR restricts transfers of personal data outside the European Economic Area unless an approved mechanism or an adequacy decision covers them; the details change as courts and governments revise the arrangements, which is a good reason to ask counsel instead of encoding today's rules into code.</p>
+
+<p>For engineers it becomes a placement constraint on every store. <a href="../../distributed/chapters/18-multi-region.html">Distributed systems chapter 18</a> described multi-region designs that replicate everything everywhere for availability; residency pulls the other way. A workable design <em>homes</em> each user or tenant to a region, keeps their personal data and keys in that region, replicates only non-personal or pseudonymised data globally, and makes sure that backups, logs, search indexes, support tooling and analytics exports respect the same boundary. The leaks are rarely the primary database; they are the log shipper that sends everything to one region, or the debugging tool that copies production rows to a laptop. Regional KMS keys help: if the key for a region's data never leaves the region, copies of ciphertext elsewhere are of limited use.</p>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Run the four scripts above (Python 3.9 or later; save each block to the file named in its title bar and run <code>python3 file.py</code>). Then exercise the ideas on your own lab data:</p>
+  <ul>
+    <li>In <code>shred.py</code>, add a second personal field to the <code>OrderPlaced</code> event and confirm it vanishes with the key too. Then add a log line that prints the email, and notice that the shredding cannot reach it.</li>
+    <li>In <code>pseudo.py</code>, change the block size to ten million and time the enumeration; then try the same with a keyed pseudonym.</li>
+    <li>Search your own application's logs for patterns such as <code>@</code>, <code>Bearer </code> and 16-digit numbers. Do this only on systems you own or are authorised to inspect.</li>
+  </ul>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Erasure is a consistency problem: a delete must reach every replica, cache, index and derived store, and must beat the pipelines that would re-create the data, which is the same ordering and idempotence discipline as <a href="../../architecture/chapters/16-cqrs-event-sourcing.html">event sourcing</a> and <a href="../../distributed/chapters/18-multi-region.html">multi-region replication</a>. Immutable logs and backups, the tools of reliability, are exactly what privacy law finds awkward; per-subject keys reconcile them. And your <a href="../../reliability/chapters/05-logs-events.html">observability pipeline</a> is a data store with the widest read access in the company.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Classify data by the harm of exposure, attach the label to fields and stores, and keep the top tier small. Not collecting a field beats protecting it.</li>
+    <li>Encryption protects against whoever cannot ask the decrypting component to decrypt. Volume encryption and TDE stop stolen media; only application-level encryption with separate keys helps against administrators, and nothing at rest stops a fully compromised application.</li>
+    <li>Tokenization removes a sensitive value from your systems, so those systems fall out of audit scope; the vault is a concentrated target held by someone specialised.</li>
+    <li>A hashed low-entropy identifier is recoverable by enumeration. Use keyed pseudonyms, remember that pseudonymised data is still personal data, and treat claims of anonymisation sceptically.</li>
+    <li>Minimise, set retention per data class, and make deletion a routine operation by partitioning and tagging.</li>
+    <li>Erasure spans primary stores, caches, indexes, logs, backups and event logs. Keep a deletion ledger, edit what is mutable, and crypto-shred what is not with per-user keys.</li>
+    <li>Do not log personal data; typed values and allowlists beat regex redaction, which is only a safety net.</li>
+    <li>Residency is a placement constraint on every store, including backups, logs and tooling. This chapter is not legal advice; involve counsel.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A cloud database has "encryption at rest" enabled. An attacker exploits a SQL injection flaw in your web application. What does the at-rest encryption do?</p>
+    <ol class="q-options">
+      <li>It prevents the attack because the data on disk is ciphertext</li>
+      <li>Nothing useful here: the injected query runs inside an authorised session and the engine decrypts transparently for it</li>
+      <li>It encrypts the query results so the attacker cannot read them</li>
+      <li>It blocks the injected query from running</li>
+    </ol>
+    <div class="q-explain">TDE and volume encryption defend the media, not the running service. The fix for injection is parameterisation; field-level encryption with separate keys can add depth, but only if the injected path does not flow through your decrypt code.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">An analytics vendor receives <code>SHA-256(email)</code> as a "pseudonymous" user id. Why is this weak?</p>
+    <ol class="q-options">
+      <li>SHA-256 is broken</li>
+      <li>Hashes are reversible with a key</li>
+      <li>Hashes are always too long to store</li>
+      <li>The hash is deterministic and fast, so anyone with candidate emails can hash them and match; a keyed HMAC with a secret held by you prevents that</li>
+    </ol>
+    <div class="q-explain">SHA-256 is fine as a hash; the problem is the small, guessable input space. Even with HMAC the result is pseudonymised, not anonymised, because the key holder can re-link records.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">How does tokenization reduce PCI scope?</p>
+    <ol class="q-options">
+      <li>Card numbers go to a specialist provider, and your systems store only meaningless tokens, so fewer of your systems store, process or transmit cardholder data</li>
+      <li>Tokens are an encrypted form of the card number that auditors do not need to look at</li>
+      <li>It removes every PCI obligation from the merchant</li>
+      <li>It makes the card number impossible to steal from the provider</li>
+    </ol>
+    <div class="q-explain">The reduction is in <em>which of your systems</em> touch the real data. You keep duties around the collecting page and the provider relationship, and the vault remains a high-value target for the provider to defend.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">An event-sourced system must erase one user, but events are immutable and appear in months of backups. What is the most practical approach?</p>
+    <ol class="q-options">
+      <li>Rewrite every event and every backup</li>
+      <li>Refuse the request because the log is append-only</li>
+      <li>Encrypt personal fields in events under a per-user key and destroy that key, plus a deletion ledger re-applied after restores</li>
+      <li>Hash the user id in the log going forward</li>
+    </ol>
+    <div class="q-explain">Per-user keys turn deletion into one small mutable operation. Hashing future events does nothing for existing ones, and rewriting backups defeats their purpose.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">You add a regex filter that masks emails and card numbers in logs. A teammate says logging is now safe. What is the best response?</p>
+    <ol class="q-options">
+      <li>Agreed; regex redaction is complete</li>
+      <li>It is a useful safety net, but it cannot detect names or free-text identifiers; the primary controls are not logging personal data and using typed or allowlisted fields</li>
+      <li>Disable logging in production</li>
+      <li>Encrypt the log files instead</li>
+    </ol>
+    <div class="q-explain">Pattern matching finds known shapes only. Encrypting log files helps with stolen media but not with the many engineers and vendors who read logs through the normal tools.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why do data-residency rules tend to conflict with a naive multi-region replication design?</p>
+    <ol class="q-options">
+      <li>Replication is illegal in every country</li>
+      <li>Residency only concerns encryption algorithms</li>
+      <li>Replicating everything everywhere places personal data, and its backups, logs and indexes, outside the required region; the design must home users and keep their data and keys there</li>
+      <li>Multi-region systems cannot use TLS</li>
+    </ol>
+    <div class="q-explain">Availability designs copy data widely; residency constrains where copies may exist. The leaks are usually secondary systems such as log shippers and analytics exports.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/data-layers.js"></script>
+</body>
+</html>

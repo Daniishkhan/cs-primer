@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Tracing · Reliability &amp; Operations</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/trace-view.css">
+</head>
+<body data-root="../.." data-course="ops" data-chapter="06">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Distributed Tracing</h1>
+  <p class="lede">A single click on "Buy" can touch dozens of services, and a log line from one of them says nothing about the other forty. Distributed tracing reconstructs the journey of one request across every process it visited, with timing, so you can see where the time went and which call is to blame. This chapter covers the Dapper model of traces and spans, the W3C header that carries context between services, how context crosses queues, what sampling does to rare failures, how to find the critical path, how traces connect to metrics, and where OpenTelemetry fits.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The most common production question in a service-oriented system is "this request was slow; <em>where</em>?". Metrics say that the p99 of /checkout is high. Logs hold the story of each service in isolation. Neither shows that the time was spent waiting on a pricing service which was itself waiting on a cache that missed. Tracing is the tool for that question, and the mental model it teaches, a request as a tree of timed calls with a critical path, is the model you use for reasoning about latency whether or not you have a tracing system installed.</p>
+</div>
+
+<h2>Dapper: the model that everyone copied</h2>
+
+<p>In 2010 Benjamin Sigelman and colleagues at Google published a technical report, "Dapper, a Large-Scale Distributed Systems Tracing Infrastructure", describing the system Google had been running in production for years. Nearly every tracing system since (Zipkin, Jaeger, OpenTracing, OpenTelemetry) descends from its vocabulary, and the design goals it states are worth remembering because they still decide what is practical: <strong>low overhead</strong> (a tracer that slows the service is turned off), <strong>application-level transparency</strong> (developers should not have to instrument everything by hand, so the tracing hooks live in shared libraries: the RPC framework, the thread pool), and <strong>scalability</strong>.</p>
+
+<p>The model has three pieces.</p>
+<ul>
+  <li>A <span class="term">span</span> is one named, timed unit of work: "handle POST /checkout", "call pricing service", "SELECT from orders". It has a start time, a duration, and key-value <span class="term">attributes</span> (annotations in Dapper's terms) such as the route, the status or the database statement.</li>
+  <li>Spans form a tree through <span class="term">parent/child</span> links: when service A calls service B, the span for B's work is a child of the span for A's outgoing call.</li>
+  <li>A <span class="term">trace</span> is the whole tree for one request, identified by a <span class="term">trace ID</span> shared by every span in it. Each span also has its own <span class="term">span ID</span> and records its parent's span ID.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 240" role="img" aria-label="A trace as a tree. The root span POST /checkout has id a1. It has three children: call inventory (b2), call pricing (c3) and db write (d4). Call inventory has a child GET /stock (e5), call pricing has a child GET /price (f6). Every span records its parent's id.">
+    <rect x="265" y="14" width="230" height="48" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="34" text-anchor="middle" class="t-sm t-bold">POST /checkout</text>
+    <text x="380" y="52" text-anchor="middle" class="t-xs mono t-muted">id=a1  parent=none</text>
+    <rect x="40" y="96" width="190" height="48" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="135" y="116" text-anchor="middle" class="t-sm t-bold">call inventory</text>
+    <text x="135" y="134" text-anchor="middle" class="t-xs mono t-muted">id=b2  parent=a1</text>
+    <rect x="285" y="96" width="190" height="48" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="116" text-anchor="middle" class="t-sm t-bold">call pricing</text>
+    <text x="380" y="134" text-anchor="middle" class="t-xs mono t-muted">id=c3  parent=a1</text>
+    <rect x="530" y="96" width="190" height="48" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="625" y="116" text-anchor="middle" class="t-sm t-bold">db write</text>
+    <text x="625" y="134" text-anchor="middle" class="t-xs mono t-muted">id=d4  parent=a1</text>
+    <rect x="40" y="178" width="190" height="48" rx="8" class="fs-green s-green sw-2"/>
+    <text x="135" y="198" text-anchor="middle" class="t-sm t-bold">GET /stock</text>
+    <text x="135" y="216" text-anchor="middle" class="t-xs mono t-muted">id=e5  parent=b2</text>
+    <rect x="285" y="178" width="190" height="48" rx="8" class="fs-green s-green sw-2"/>
+    <text x="380" y="198" text-anchor="middle" class="t-sm t-bold">GET /price</text>
+    <text x="380" y="216" text-anchor="middle" class="t-xs mono t-muted">id=f6  parent=c3</text>
+    <line x1="380" y1="62" x2="135" y2="96" class="line"/>
+    <line x1="380" y1="62" x2="380" y2="96" class="line"/>
+    <line x1="380" y1="62" x2="625" y2="96" class="line"/>
+    <line x1="135" y1="144" x2="135" y2="178" class="line"/>
+    <line x1="380" y1="144" x2="380" y2="178" class="line"/>
+    <text x="625" y="190" text-anchor="middle" class="t-xs t-muted">blue: spans in the checkout service</text>
+    <text x="625" y="206" text-anchor="middle" class="t-xs t-muted">green: spans in other services</text>
+    <text x="625" y="222" text-anchor="middle" class="t-xs t-muted">all share one trace ID</text>
+  </svg>
+  <figcaption>A trace is a tree of spans. Only the IDs are needed to rebuild it: collect the spans in any order, group by trace ID, then link each span to its parent.</figcaption>
+</figure>
+
+<p>The elegance is that the tree can be rebuilt after the fact from independent pieces. Each service reports its own spans to a collector asynchronously; nobody needs to know the whole shape in advance, and nothing in the request path waits for the tracing backend. Dapper also reported that it traced only a small fraction of requests (a low uniform sampling rate, with the paper discussing rates around one in a thousand), and that this was enough for the common questions, because at Google's volume even a small sample contains many examples of every common behaviour. We return to what sampling costs below.</p>
+
+<p>In the hospital analogy, a trace is the <em>patient journey record</em>: triage at 14:02, X-ray 14:20, bloods 14:25, consultant 15:10. The individual departments (services) each have their own notes (logs); only the journey record shows that the patient waited 50 minutes for a consultant while the lab had finished long before.</p>
+
+<h2>Context propagation: carrying the identity of a request</h2>
+
+<p>For spans to join into a tree, each service must learn two things from its caller: the trace ID and the ID of the caller's span (to record as its parent). The bundle is the <span class="term">span context</span> (also "trace context"), and moving it from one process to the next is <span class="term">context propagation</span>. It has two halves.</p>
+
+<ol>
+  <li><strong>Within a process</strong>: the context must follow the request across function calls, threads and async tasks without every function taking it as a parameter. As in chapter 5, this uses ambient context (thread-locals, Go's <code>context.Context</code>, Python's <code>contextvars</code>). A very common cause of broken traces is a place where the context is <em>lost</em>: a thread pool or callback that was not instrumented, so the next span starts a fresh, orphaned trace.</li>
+  <li><strong>Between processes</strong>: the context is serialized into a header (HTTP) or metadata (gRPC, message headers) on the outgoing call, and parsed on the way in.</li>
+</ol>
+
+<h3>The W3C Trace Context header</h3>
+
+<p>For years each tracing system invented its own header (<code>X-B3-TraceId</code> in Zipkin, <code>uber-trace-id</code> in Jaeger, vendor ones elsewhere), which broke traces whenever a request crossed a system using a different scheme. The W3C Trace Context recommendation standardised one: the <code>traceparent</code> header (plus an optional <code>tracestate</code> for vendor-specific data). Its version 00 format is four dash-separated, lowercase-hex fields:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 170" role="img" aria-label="The traceparent header split into four fields: version 00 (2 hex characters), trace-id 4bf92f3577b34da6a3ce929d0e0e4736 (32 hex characters, 16 bytes), parent-id 00f067aa0ba902b7 (16 hex characters, 8 bytes, the caller's span id) and trace-flags 01 (2 hex characters, bit 0 is the sampled flag).">
+    <text x="10" y="22" class="t-sm t-bold mono">traceparent:</text>
+    <rect x="10" y="36" width="70" height="44" rx="6" class="fs-purple s-purple sw-2"/>
+    <text x="45" y="64" text-anchor="middle" class="mono t-sm t-bold">00</text>
+    <text x="95" y="64" text-anchor="middle" class="mono t-sm t-bold">-</text>
+    <rect x="110" y="36" width="330" height="44" rx="6" class="fs-cyan s-cyan sw-2"/>
+    <text x="275" y="64" text-anchor="middle" class="mono t-sm t-bold">4bf92f3577b34da6a3ce929d0e0e4736</text>
+    <text x="455" y="64" text-anchor="middle" class="mono t-sm t-bold">-</text>
+    <rect x="470" y="36" width="180" height="44" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="560" y="64" text-anchor="middle" class="mono t-sm t-bold">00f067aa0ba902b7</text>
+    <text x="665" y="64" text-anchor="middle" class="mono t-sm t-bold">-</text>
+    <rect x="680" y="36" width="70" height="44" rx="6" class="fs-orange s-orange sw-2"/>
+    <text x="715" y="64" text-anchor="middle" class="mono t-sm t-bold">01</text>
+    <text x="45" y="104" text-anchor="middle" class="t-xs t-bold">version</text>
+    <text x="45" y="119" text-anchor="middle" class="t-xs t-muted">2 hex</text>
+    <text x="275" y="104" text-anchor="middle" class="t-xs t-bold">trace-id</text>
+    <text x="275" y="119" text-anchor="middle" class="t-xs t-muted">32 hex = 16 bytes, shared by the whole trace</text>
+    <text x="275" y="134" text-anchor="middle" class="t-xs t-muted">all zeros is invalid</text>
+    <text x="560" y="104" text-anchor="middle" class="t-xs t-bold">parent-id</text>
+    <text x="560" y="119" text-anchor="middle" class="t-xs t-muted">16 hex = 8 bytes</text>
+    <text x="560" y="134" text-anchor="middle" class="t-xs t-muted">the caller's span ID</text>
+    <text x="715" y="104" text-anchor="middle" class="t-xs t-bold">flags</text>
+    <text x="715" y="119" text-anchor="middle" class="t-xs t-muted">2 hex</text>
+    <text x="715" y="134" text-anchor="middle" class="t-xs t-muted">bit 0 = sampled</text>
+    <text x="380" y="160" text-anchor="middle" class="t-xs t-muted">total length 55 characters: 2 + 1 + 32 + 1 + 16 + 1 + 2</text>
+  </svg>
+  <figcaption>The example value from the W3C specification. The receiver makes a new span ID, records <code>parent-id</code> as its parent, and sends its own span ID as the parent-id of any call it makes.</figcaption>
+</figure>
+
+<pre class="terminal" data-title="an outgoing request (illustrative)"><code>GET /price?sku=A17 HTTP/1.1
+Host: pricing.internal.example.com
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+tracestate: vendor1=opaque-value,vendor2=other</code></pre>
+
+<p>The <strong>sampled</strong> bit is the lowest bit of the flags byte: when set (<code>01</code>) the caller (or an upstream decision) indicates that this trace may be recorded; clear (<code>00</code>) means it probably is not. It is tested with a bit mask, not by reading the hex as a number, because other bits are reserved. The decision rides along with the request, so every service in the call chain makes the same choice and you get complete traces rather than a confetti of fragments. <code>tracestate</code> is a comma-separated list of up to 32 vendor key-value pairs, for information that one tracing vendor wants to pass along without breaking another's.</p>
+
+<p>Context is therefore tiny (55 bytes) and rides in headers that every proxy already passes. It does need to be forwarded by <em>every hop</em>: a gateway, service mesh sidecar or message broker that drops unknown headers severs the trace there.</p>
+
+<h3>Across queues: links, not just parents</h3>
+
+<p>A synchronous call has a clean shape: the caller waits, the callee's work nests inside the caller's span, parent-child is natural. <a href="../../architecture/chapters/13-sync-async.html">Architecture chapter 13</a> contrasted synchronous calls with asynchronous messaging. Tracing makes the difference visible: after a message is published, the producer's span <em>ends</em> and the consumer's work happens later, perhaps seconds or hours, perhaps in a batch, perhaps retried several times. The consumer is not "inside" the producer's operation in time.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Space-time diagram with three lanes: producer, broker, consumer. The producer's publish span ends. The message, carrying a traceparent header, waits in the broker for a queue wait period. The consumer's process span starts later and has a link back to the producer's span.">
+    <defs><marker id="ahR06a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="10" y="64" class="t-sm t-bold">Producer</text>
+    <text x="10" y="124" class="t-sm t-bold">Broker</text>
+    <text x="10" y="194" class="t-sm t-bold">Consumer</text>
+    <line x1="100" y1="70" x2="740" y2="70" class="line-thin"/>
+    <line x1="100" y1="130" x2="740" y2="130" class="line-thin"/>
+    <line x1="100" y1="200" x2="740" y2="200" class="line-thin"/>
+    <rect x="120" y="48" width="110" height="34" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="175" y="69" text-anchor="middle" class="t-xs t-bold">publish order</text>
+    <line x1="230" y1="76" x2="300" y2="122" class="line s-blue" marker-end="url(#ahR06a)"/>
+    <text x="268" y="88" class="t-xs t-muted">traceparent</text>
+    <text x="268" y="101" class="t-xs t-muted">in message</text>
+    <text x="268" y="114" class="t-xs t-muted">headers</text>
+    <rect x="304" y="114" width="250" height="32" rx="6" class="fs-orange s-orange sw-2" style="fill-opacity:.55"/>
+    <text x="429" y="134" text-anchor="middle" class="t-xs t-bold">message waits in the queue</text>
+    <line x1="554" y1="138" x2="590" y2="186" class="line s-blue" marker-end="url(#ahR06a)"/>
+    <rect x="594" y="178" width="130" height="34" rx="6" class="fs-green s-green sw-2"/>
+    <text x="659" y="199" text-anchor="middle" class="t-xs t-bold">process order</text>
+    <path d="M594,190 C 420,190 200,150 175,86" class="line-dash s-purple" fill="none" marker-end="url(#ahR06a)"/>
+    <text x="400" y="238" text-anchor="middle" class="t-xs tc-purple t-bold">link: "this work was caused by that span" (a reference, not parent-child)</text>
+  </svg>
+  <figcaption>Through a queue the consumer's span starts long after the producer's ends. The message carries the context; the consumer either continues the same trace as a child or starts a new trace with a link back.</figcaption>
+</figure>
+
+<p>Two representations are in use, and neither is wrong:</p>
+<ul>
+  <li><strong>Child of the producer.</strong> Same trace ID, parent is the publish span. The waterfall shows a long gap (the queue wait) before the consumer span, which is itself informative. Works well for one-message-one-consumer flows.</li>
+  <li><strong>New trace plus a link.</strong> A <span class="term">span link</span> is a reference from one span to another span's context that is <em>not</em> a parent. It fits where a parent-child tree would be wrong: a consumer that processes a <em>batch</em> of 100 messages from 100 different traces (one span with 100 links), a retry hours later, or fan-in from several sources. Links keep each trace's duration meaningful (a trace that includes a six-hour retry delay would swamp its own timeline).</li>
+</ul>
+
+<h2>Reading a trace: waterfalls, fan-out and the critical path</h2>
+
+<p>The standard view is the <span class="term">waterfall</span> (or Gantt) chart: one row per span, a bar from start to end, indented by depth. It reveals structure at a glance: which calls are sequential (a staircase), which are parallel (bars aligned at the same start), where there are gaps (time in no child, so the parent's own computation, queueing, or untraced work), and which span is longest.</p>
+
+<p>Longest is not the same as <em>important</em>. Consider the checkout request above: it calls inventory and pricing in parallel, and the inventory call is quick while pricing is slow. Making inventory twice as fast changes nothing, because the request waits for pricing anyway. The <span class="term">critical path</span> is the chain of spans that determines the total duration: the sequence that, if any one link got faster, would make the whole request faster. Formally, walk backwards from the end of the root: at each point take the child that finished last, then continue from <em>its</em> start, recursing into it. Everything off that path has <strong>slack</strong>: it can slow down by some amount without affecting the user. Optimisation effort belongs on the critical path; on a parallel fan-out, only the slowest branch matters (and only until it becomes faster than the next slowest).</p>
+
+<div class="widget" id="trace-view"></div>
+
+<p>Try the widget before reading on: in parallel mode, speeding up inventory or catalog changes nothing; speeding up pricing helps, but only until it ties with catalog (18 ms in total, including its database call); and the fixed sequence of auth, group, payment is a chain in which every link counts. In sequential mode, <em>every</em> call in the group is on the critical path, and switching to parallel is by far the largest improvement available. That is the reason waterfalls so often lead to the fix "these calls are independent, issue them concurrently".</p>
+
+<h3>Fan-out and the tail</h3>
+
+<p>A request that fans out to N services in parallel and waits for all of them is as slow as its slowest branch. If each backend returns within its own p99 99% of the time, the chance that <em>at least one</em> of 100 parallel calls is slower than its p99 is 1 - 0.99<sup>100</sup>, about 63%. The p99 of a backend becomes the typical experience of a wide fan-out, which is the "tail at scale" effect of chapter 9. Traces are how you observe it concretely: the critical path through a fan-out changes from request to request, hopping to whichever branch happened to be slow this time.</p>
+
+<h3>Building the intuition: a tiny tracer</h3>
+
+<p>A tracer is small enough to write in a few dozen lines. This runnable program simulates three services in one process (no sockets): context propagation in-process through <code>contextvars</code> and between "services" through a W3C-style <code>traceparent</code> string, a parallel fan-out, then rebuilds the tree, prints a text waterfall and computes the critical path with self-times.</p>
+
+<pre class="terminal" data-title="trace.py (runnable, standard library only)"><code>import contextvars, itertools, random
+from dataclasses import dataclass, field
+
+rng = random.Random(5)
+ids = itertools.count(1)
+SPANS: list["Span"] = []
+current: contextvars.ContextVar = contextvars.ContextVar("current", default=None)
+
+@dataclass
+class Span:
+    trace_id: str
+    span_id: str
+    parent_id: "str | None"
+    service: str
+    name: str
+    start: float
+    end: float = 0.0
+
+def traceparent(s: Span) -&gt; str:
+    return f"00-{s.trace_id}-{s.span_id}-01"       # version-traceid-parentid-flags
+
+def start_span(service, name, t, header=None) -&gt; Span:
+    """Parent comes from an incoming header (remote) or the current context (local)."""
+    if header:
+        _, tid, pid, _ = header.split("-")
+    elif current.get():
+        tid, pid = current.get().trace_id, current.get().span_id
+    else:
+        tid, pid = f"{rng.getrandbits(128):032x}", None
+    s = Span(tid, f"{next(ids):016x}", pid, service, name, t)
+    SPANS.append(s)
+    return s
+
+# Each "service" takes (start time, header) and returns its end time.
+def inventory(t, header):
+    s = start_span("inventory", "GET /stock", t, header)
+    s.end = t + 8
+    return s.end
+
+def pricing(t, header):
+    s = start_span("pricing", "GET /price", t, header)
+    tok = current.set(s)                         # local children find their parent here
+    c = start_span("pricing", "cache lookup", t + 1)
+    c.end = t + 3
+    current.reset(tok)
+    s.end = t + 25
+    return s.end
+
+def checkout(t0):
+    root = start_span("checkout", "POST /checkout", t0)
+    tok = current.set(root)
+    t = t0 + 3                                   # parse + auth
+    ends = []
+    for name, svc in (("call inventory", inventory), ("call pricing", pricing)):
+        c = start_span("checkout", name, t)      # client span; parent = root via context
+        end = svc(t + 1, traceparent(c))         # 1 ms network, header crosses the wire
+        c.end = end + 1
+        ends.append(c.end)
+    t = max(ends)                                # parallel fan-out: wait for the slowest
+    db = start_span("checkout", "db write", t + 5)
+    db.end = db.start + 12
+    root.end = db.end + 1
+    current.reset(tok)
+
+checkout(0.0)
+
+kids: dict = {}
+for sp in SPANS: kids.setdefault(sp.parent_id, []).append(sp)
+
+def critical_path(s):
+    """Walk backwards from s.end: at each point follow the child that finished last."""
+    path, t = [s], s.end
+    ch = sorted(kids.get(s.span_id, []), key=lambda c: c.end, reverse=True)
+    for c in ch:
+        if c.end &lt;= t + 1e-9:
+            path += critical_path(c)
+            t = c.start
+    return path
+
+root = kids[None][0]
+total = root.end
+W = 36
+def show(s, d=0):
+    a = int(s.start / total * W); b = max(a + 1, round(s.end / total * W))
+    print(f"{'  ' * d + s.name:22s}{s.service:10s}|{' ' * a}{'#' * (b - a)}{' ' * (W - b)}|{s.end - s.start:4.0f} ms")
+    for c in sorted(kids.get(s.span_id, []), key=lambda c: c.start):
+        show(c, d + 1)
+print(f"trace {root.trace_id[:8]}...  total {total:.0f} ms")
+show(root)
+cp = critical_path(root)
+onpath = {x.span_id for x in cp}
+print("critical path (time that only this chain can shorten):")
+tot = 0
+for x in cp:
+    self_t = (x.end - x.start) - sum(c.end - c.start for c in kids.get(x.span_id, []) if c.span_id in onpath)
+    tot += self_t
+    print(f"  {x.service}:{x.name:16s} self {self_t:4.0f} ms")
+print(f"  sum of self times = {tot:.0f} ms (= trace duration)")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>trace 5bc8fbbc...  total 48 ms
+POST /checkout        checkout  |####################################|  48 ms
+  call inventory      checkout  |  ########                          |  10 ms
+    GET /stock        inventory |   ######                           |   8 ms
+  call pricing        checkout  |  ####################              |  27 ms
+    GET /price        pricing   |   ###################              |  25 ms
+      cache lookup    pricing   |   ##                               |   2 ms
+  db write            checkout  |                          ######### |  12 ms
+critical path (time that only this chain can shorten):
+  checkout:POST /checkout   self    9 ms
+  checkout:db write         self   12 ms
+  checkout:call pricing     self    2 ms
+  pricing:GET /price       self   23 ms
+  pricing:cache lookup     self    2 ms
+  sum of self times = 48 ms (= trace duration)</code></pre>
+
+<p>Several things are visible in the output. The two calls start at the same instant (parallel), so the staircase is absent; the total is 48 ms rather than the sum of the parts. The critical path runs through pricing (the slower branch), not inventory. The "self time" listing shows where time is actually spent: 23 ms is inside <code>GET /price</code> itself, which is more than the whole inventory branch. And the self-times sum exactly to the trace duration, a handy check that the algorithm is right. The "network" here is a string, but the mechanics (generate IDs at the root, send <code>traceparent</code>, create a child span from the header on the far side) are the same as in a real tracer, which is what the <a href="../labs/lab-03-tracing.html">tracing lab</a> builds out in full.</p>
+
+<h2>Span attributes, events and status</h2>
+
+<p>A bare span says "this took 25 ms". The detail that makes a trace diagnostic goes in:</p>
+<ul>
+  <li><strong>Attributes</strong>: key-value facts about the whole span. <code>http.route</code>, <code>db.system</code>, <code>customer.tier</code>, <code>cache.hit=false</code>, <code>retry.count=2</code>. Spans (like logs, unlike metrics) tolerate high cardinality, so putting <code>user.id</code> or <code>order.id</code> here is fine and is what lets you find the trace for a particular complaint.</li>
+  <li><strong>Events</strong> (log records attached to a span): timestamped points within a span, such as "retry attempt 2", "cache miss", "exception thrown" with a stack trace. They put the equivalent of a log line in the right place on the timeline.</li>
+  <li><strong>Status</strong>: unset, OK or error, plus the span <strong>kind</strong> (client, server, producer, consumer, internal) that tells the UI which side of a call it is looking at.</li>
+</ul>
+
+<p>The point of attaching the same fields you would put in a wide event (chapter 5) is that a span is almost a wide event with timing and a parent. Many modern tools treat them as the same record: instrument once, derive logs-like queries and trace views from it.</p>
+
+<h2>Sampling: what you keep and what you lose</h2>
+
+<p>Tracing every request is usually too expensive. A trace with 30 spans of 500 bytes each is 15 KB; at 5,000 requests per second that is 75 MB/s. Dapper's low rate was a design decision, and today most deployments sample too. The decision can be made at two points, with very different outcomes.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Top row, head-based sampling: at request arrival a coin flip with 1 percent chance decides to keep, the sampled flag is put in the traceparent and services A, B and C obey it. Bottom row, tail-based sampling: services A, B and C all send spans to a collector which buffers the whole trace; when the trace is complete, rules keep errors and slow traces and 5 percent of the rest.">
+    <defs><marker id="ahR06b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="10" y="20" class="t-sm t-bold tc-orange">Head-based: decide at the start</text>
+    <rect x="10" y="32" width="160" height="62" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="90" y="56" text-anchor="middle" class="t-sm t-bold">Edge: coin flip</text>
+    <text x="90" y="74" text-anchor="middle" class="t-xs t-muted">keep 1%, set flag</text>
+    <text x="90" y="87" text-anchor="middle" class="t-xs t-muted">before any work</text>
+    <line x1="170" y1="63" x2="204" y2="63" class="line s-blue" marker-end="url(#ahR06b)"/>
+    <rect x="206" y="40" width="100" height="46" rx="8" class="fs-blue s-blue sw-2"/><text x="256" y="68" text-anchor="middle" class="t-sm t-bold">Service A</text>
+    <line x1="306" y1="63" x2="340" y2="63" class="line s-blue" marker-end="url(#ahR06b)"/>
+    <rect x="342" y="40" width="100" height="46" rx="8" class="fs-blue s-blue sw-2"/><text x="392" y="68" text-anchor="middle" class="t-sm t-bold">Service B</text>
+    <line x1="442" y1="63" x2="476" y2="63" class="line s-blue" marker-end="url(#ahR06b)"/>
+    <rect x="478" y="40" width="100" height="46" rx="8" class="fs-blue s-blue sw-2"/><text x="528" y="68" text-anchor="middle" class="t-sm t-bold">Service C</text>
+    <text x="596" y="58" class="t-xs t-muted">cheap; no buffering.</text>
+    <text x="596" y="73" class="t-xs tc-red">drops 99% of errors too.</text>
+
+    <text x="10" y="132" class="t-sm t-bold tc-purple">Tail-based: decide after the fact</text>
+    <rect x="10" y="146" width="100" height="40" rx="8" class="fs-blue s-blue sw-2"/><text x="60" y="171" text-anchor="middle" class="t-xs t-bold">Service A</text>
+    <rect x="10" y="192" width="100" height="40" rx="8" class="fs-blue s-blue sw-2"/><text x="60" y="217" text-anchor="middle" class="t-xs t-bold">Service B</text>
+    <rect x="10" y="238" width="100" height="26" rx="8" class="fs-blue s-blue sw-2"/><text x="60" y="256" text-anchor="middle" class="t-xs t-bold">Service C</text>
+    <line x1="110" y1="166" x2="212" y2="200" class="line s-cyan" marker-end="url(#ahR06b)"/>
+    <line x1="110" y1="212" x2="212" y2="212" class="line s-cyan" marker-end="url(#ahR06b)"/>
+    <line x1="110" y1="251" x2="212" y2="226" class="line s-cyan" marker-end="url(#ahR06b)"/>
+    <text x="150" y="156" class="t-xs t-muted">all spans</text>
+    <rect x="214" y="170" width="190" height="82" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="309" y="194" text-anchor="middle" class="t-sm t-bold">Collector</text>
+    <text x="309" y="212" text-anchor="middle" class="t-xs t-muted">buffer every span of a</text>
+    <text x="309" y="226" text-anchor="middle" class="t-xs t-muted">trace until it is complete</text>
+    <text x="309" y="242" text-anchor="middle" class="t-xs tc-orange">(wait window, memory)</text>
+    <line x1="404" y1="211" x2="440" y2="211" class="line s-purple" marker-end="url(#ahR06b)"/>
+    <rect x="442" y="170" width="170" height="82" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="527" y="194" text-anchor="middle" class="t-sm t-bold">Rules</text>
+    <text x="527" y="212" text-anchor="middle" class="t-xs t-muted">error? keep.  slow? keep.</text>
+    <text x="527" y="228" text-anchor="middle" class="t-xs t-muted">else keep 5%</text>
+    <text x="527" y="244" text-anchor="middle" class="t-xs t-muted">(the rest are dropped)</text>
+    <line x1="612" y1="211" x2="644" y2="211" class="line s-green" marker-end="url(#ahR06b)"/>
+    <rect x="646" y="186" width="104" height="50" rx="8" class="fs-green s-green sw-2"/>
+    <text x="698" y="208" text-anchor="middle" class="t-xs t-bold">trace store</text>
+    <text x="698" y="224" text-anchor="middle" class="t-xs t-muted">keeps what you</text>
+    <text x="698" y="236" text-anchor="middle" class="t-xs t-muted">will look at</text>
+  </svg>
+  <figcaption>Head-based sampling is cheap but blind; tail-based sampling sees the outcome and keeps the interesting traces, at the cost of a stateful collector tier.</figcaption>
+</figure>
+
+<p><strong>Head-based sampling</strong> decides when the request enters the system (a random draw, or a hash of the trace ID against a threshold) and propagates the decision in the sampled flag. It is simple, cheap, stateless, and has no extra delay. Its weakness is built in: <em>the decision is made before anyone knows whether the request will be interesting.</em> Suppose 0.1% of requests fail, you have a million requests a day, and you keep 1%. You get about 10,000 sampled traces, of which about 10 are errors, out of 1,000 errors. The chance that a particular rare failure, the one a customer is writing to complain about, has a trace is 1%. Rare events are precisely where tracing is wanted, and uniform head sampling treats them as common ones.</p>
+
+<p><strong>Tail-based sampling</strong> sends every span to a collector, buffers all the spans of each trace until it looks complete (usually a fixed wait of some seconds after the last span arrives), and then applies rules: keep all traces with an error, keep all traces slower than the SLO threshold, keep a small random share of the rest as a baseline. Now rare failures are kept at 100%. The price is real:</p>
+<ul>
+  <li><strong>Memory and a wait window.</strong> At 5,000 requests per second with a 10-second wait, 50,000 traces are in flight; at 10 spans of 500 bytes each that is about 250 MB buffered (an assumption-laden estimate, but the right order of magnitude), and every span must still travel from the services to the collector, so network and ingest costs are paid before the drop decision.</li>
+  <li><strong>All spans of a trace must reach the same collector instance</strong>, so you route by trace ID (a load-balancing tier in front), and that tier becomes stateful infrastructure with its own failure modes.</li>
+  <li><strong>Late spans.</strong> A span arriving after the decision is lost or orphaned; a long-running trace may be judged before it finishes.</li>
+</ul>
+
+<p>Real systems combine them: modest head sampling to cap the volume entering the pipeline, then tail rules on what arrives, and dynamic rates per route so that a quiet endpoint is traced more often than a hot one. Whatever you choose, two honest caveats stay: <strong>sampled traces cannot give you counts or rates</strong> (use metrics), and a tail sampler biased toward slow and failing requests gives a biased picture of "typical" behaviour (use the baseline share for that).</p>
+
+<h2>Exemplars: from a metric to a trace</h2>
+
+<p>The three signals are most powerful when you can jump between them. A metrics dashboard shows a latency spike at 14:03. You want an actual slow request from that moment. An <span class="term">exemplar</span> is a sample of one real observation attached to a metric data point, carrying the trace ID of the request that produced it. In the OpenMetrics text format it is appended to a histogram bucket line after a <code>#</code>:</p>
+
+<pre class="terminal" data-title="a histogram bucket with an exemplar (illustrative)"><code>http_request_duration_seconds_bucket{route="/checkout",le="1"} 133988 # {trace_id="4bf92f3577b34da6a3ce929d0e0e4736"} 0.83</code></pre>
+
+<p>Dashboards that understand exemplars draw them as dots over a latency heatmap; clicking a dot in the slow bucket opens that exact trace. It is a small feature with a big effect on investigation time: instead of guessing which of 10,000 traces is representative, the metric hands you one that landed in the bucket you are staring at. Note how this respects each signal's strengths: the metric stays cheap and low-cardinality (the trace ID is not a label), while the high-cardinality detail lives in the trace store.</p>
+
+<h2>OpenTelemetry in outline</h2>
+
+<p><span class="term">OpenTelemetry</span> (OTel) is a Cloud Native Computing Foundation project formed by merging two earlier efforts, OpenTracing (an API standard) and OpenCensus (a Google-originated library with metrics and traces). Its aim is a single vendor-neutral way to produce traces, metrics and logs, so that you instrument your code once and choose the backend later. The concepts you need:</p>
+
+<ul>
+  <li><strong>API</strong>: the interfaces application and library code call (<code>tracer.start_span</code>, <code>span.set_attribute</code>). With no SDK installed they do nothing, which lets libraries ship instrumentation at zero cost.</li>
+  <li><strong>SDK</strong>: the implementation, configured by the application owner: which sampler, which processors and exporters, which resource attributes (<code>service.name</code>, version, host).</li>
+  <li><strong>Instrumentation</strong>: automatic (agents or wrappers that patch popular frameworks and HTTP and database clients) or manual (your own spans around business operations). Auto-instrumentation gets you a skeleton fast; manual spans and attributes add the meaning.</li>
+  <li><strong>OTLP</strong>: the OpenTelemetry Protocol, the wire format (over gRPC or HTTP) for sending telemetry from SDKs to a collector or backend.</li>
+  <li><strong>Collector</strong>: a standalone process (a sidecar, an agent per host, or a gateway tier) with pluggable <em>receivers</em>, <em>processors</em> (batching, attribute editing, tail sampling) and <em>exporters</em>. It is where redaction, sampling and fan-out to multiple backends belong, so that applications stay simple.</li>
+</ul>
+
+<pre class="terminal" data-title="illustrative Python: manual instrumentation with the OpenTelemetry API"><code>from opentelemetry import trace
+
+tracer = trace.get_tracer("checkout")
+
+def charge(order_id: str, amount: int) -> None:
+    with tracer.start_as_current_span("charge") as span:
+        span.set_attribute("order.id", order_id)
+        span.set_attribute("payment.amount", amount)
+        for attempt in (1, 2):
+            try:
+                call_bank(amount)
+                break
+            except TimeoutError as exc:
+                span.add_event("retry", {"attempt": attempt})
+                span.record_exception(exc)</code></pre>
+
+<pre class="terminal" data-title="illustrative: an OpenTelemetry Collector config with tail sampling"><code>receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: keep-slow
+        type: latency
+        latency: { threshold_ms: 500 }
+      - name: baseline
+        type: probabilistic
+        probabilistic: { sampling_percentage: 5 }
+  batch: {}
+
+exporters:
+  otlp:
+    endpoint: traces.example.com:4317
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [otlp]</code></pre>
+
+<p>Both snippets are illustrative: they follow the shape of the OpenTelemetry Python API and of the collector's tail-sampling processor, but I have not run them against a live collector here, and option names change between versions. The architecture is the durable part: the application emits to a local collector over OTLP, the collector does the heavy and policy-laden work, and the backend stores and indexes.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "tracing replaces logs and metrics"</p>
+  <p>Traces answer "where did the time go in this request?", and they are sampled, so they cannot tell you error rates or throughput. Metrics give complete, cheap counts and alert fast; logs and wide events carry arbitrary detail. Tracing also needs 100% propagation coverage to be useful: a single un-instrumented hop breaks the tree below it. Treat the three as partners (exemplars and shared trace IDs in logs are the glue).</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Tracing is a practical application of the logical-time ideas you met in the distributed-systems course. The parent-child tree is a <em>happens-before</em> relation recorded explicitly through IDs, so it stays valid even when machine clocks disagree, though the timeline <em>bars</em> across hosts still inherit clock error (a child can appear to start before its parent if the two clocks differ by more than the network delay). Trace IDs flowing through headers are the same trick as correlation IDs, and the problems of tracing through queues are those of reasoning about asynchronous causality that appeared in the architecture chapter on <a href="../../architecture/chapters/13-sync-async.html">sync versus async</a> communication. Chapter 9 uses traces to see tail amplification, and chapter 12's canary analysis compares trace-derived latencies between versions.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>You need Python 3; the optional last item needs Docker (or a downloaded binary of Jaeger) and <code>pip</code>, so skip it if you prefer not to install anything.</p>
+</div>
+
+<ol>
+  <li>Run <code>trace.py</code>. Change the pricing call from 25 ms to 5 ms. Which branch is now on the critical path? What is the new total?</li>
+  <li>Make the calls sequential by starting the pricing call at the end of the inventory call. Does the critical path change? By how much does the total grow?</li>
+  <li>Decode <code>00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00</code> by hand. Is the trace sampled? What would a downstream service do with the parent-id?</li>
+  <li>Add a "queue" service to <code>trace.py</code> that returns immediately after enqueueing and a consumer that runs 40 ms later. Model it first as a child, then as a new trace with a link, and compare the waterfalls.</li>
+  <li><em>Optional.</em> Run Jaeger's all-in-one image and a small Flask or FastAPI app instrumented with <code>opentelemetry-instrument</code>, and look at one real trace in the UI.</li>
+</ol>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A trace is a tree of spans sharing a trace ID; each span records its parent's ID, a name, timing and attributes (Dapper, Sigelman et al., 2010).</li>
+    <li>Context propagation is the hard part: ambient context in-process, and the W3C <code>traceparent</code> header (<code>version-traceid-parentid-flags</code>, 55 characters, bit 0 = sampled) between processes. One hop that drops the header severs the tree.</li>
+    <li>Through queues, use a parent-child link when the flow is one-to-one, and a span link when work is batched, delayed or fanned in.</li>
+    <li>The critical path is the chain that sets total latency; only speeding up spans on it helps. Fan-out makes the slowest branch decide, and the slowest branch moves from request to request.</li>
+    <li>Head sampling is cheap but discards rare errors at the sampling rate; tail sampling keeps errors and slow traces at the cost of buffering and routing by trace ID. Sampled traces cannot give you rates.</li>
+    <li>Exemplars attach a trace ID to a metric data point, linking the cheap aggregate to the expensive detail.</li>
+    <li>OpenTelemetry separates API, SDK, collector and the OTLP protocol, so instrumentation is vendor neutral; put redaction and sampling policy in the collector.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">What does the third field of <code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</code> identify?</p>
+    <ol class="q-options">
+      <li>The trace, shared by all spans</li>
+      <li>The sampling decision</li>
+      <li>The span ID of the caller, which becomes the parent of the receiver's new span</li>
+      <li>The version of the protocol</li>
+    </ol>
+    <div class="q-explain">Fields in order: version (00), trace-id (32 hex), parent-id (16 hex, the caller's span), trace-flags (01, sampled bit set). Each hop creates a new span ID of its own and passes that as the parent-id on its outgoing calls.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A request calls service X (80 ms) and service Y (50 ms) in parallel, then writes to a database for 20 ms. Parent self-time is negligible. Which change reduces total latency most?</p>
+    <ol class="q-options">
+      <li>Halving Y to 25 ms</li>
+      <li>Halving X to 40 ms</li>
+      <li>Halving the database call</li>
+      <li>They are all equal because everything is on the critical path</li>
+    </ol>
+    <div class="q-explain">The total is max(80, 50) + 20 = 100 ms. Y is off the critical path, so speeding it up changes nothing. Halving X gives max(40, 50) + 20 = 70 ms, saving 30 ms. Halving the database saves 10 ms. After X drops below Y, the critical path moves to Y: the path is a moving target.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Errors occur in 0.1% of requests. You use head-based sampling at 1%. Roughly what fraction of error requests have a stored trace?</p>
+    <ol class="q-options">
+      <li>About 1%, the same as all other requests, since the decision is made before the outcome is known</li>
+      <li>About 100%, because errors are always kept</li>
+      <li>About 0.1%, the error rate</li>
+      <li>About 50%</li>
+    </ol>
+    <div class="q-explain">Head sampling is blind to the outcome, so errors are kept at the same 1% as everything else. Keeping errors specifically needs tail-based (or hybrid) sampling.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A worker consumes a batch of 50 messages in one go, each message from a different trace. How should the worker's span relate to the producers?</p>
+    <ol class="q-options">
+      <li>It should be a child of all 50 producer spans</li>
+      <li>It should copy the first message's trace ID and ignore the rest</li>
+      <li>It should have no relationship, because queues break tracing</li>
+      <li>It should have 50 span links, one to each producer's span context, since a span can have only one parent</li>
+    </ol>
+    <div class="q-explain">A tree allows exactly one parent, so batch and fan-in relationships use links, a many-to-one reference that keeps each producer trace intact without distorting its duration.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">What is the main operational cost of tail-based sampling?</p>
+    <ol class="q-options">
+      <li>It cannot keep error traces</li>
+      <li>The collectors must buffer all spans of in-flight traces and receive every span of a trace on the same instance, so you run a stateful, memory-hungry routing tier</li>
+      <li>It requires changing the traceparent format</li>
+      <li>It removes the need for context propagation</li>
+    </ol>
+    <div class="q-explain">The benefit is keeping errors and slow traces; the cost is buffering and routing by trace ID. Context propagation is still needed to produce the spans' links in the first place.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/trace-view.js"></script>
+</body>
+</html>

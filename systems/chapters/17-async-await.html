@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Async/Await &amp; Coroutines · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="sys" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Async/Await &amp; Coroutines</h1>
+  <p class="lede">Event loops are efficient, but writing code as a chain of callbacks is miserable. Async/await lets you write straight-line code that the event loop quietly slices into pieces. This chapter shows what is really going on underneath the keywords, how to use them in Python, and the one golden rule that still applies: never block the loop.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Most new network code in Python, JavaScript, Rust, C#, Kotlin and Swift is written with async/await. It is how people write a service that makes five calls to other services and handles ten thousand clients at once, without a thread for each. It is also the source of a very common bug: one innocent-looking blocking call inside an <code>async def</code> that freezes the whole server. If you understand that <code>await</code> is just "pause here and let the event loop run something else", both the power and the pitfalls become obvious.</p>
+</div>
+
+<h2>The problem: callbacks hurt</h2>
+
+<p>In <a href="16-event-loops.html">chapter 16</a> every piece of work was a callback: "when socket 7 is readable, call this function". That is fine for an echo server. Now imagine a request handler that must read a request, look something up in a database, render a page and send it. Each step takes time, so each becomes "do this, and when it's done call that". The code nests deeper with each step. This is the infamous <span class="term">callback hell</span>:</p>
+
+<pre class="terminal" data-title="a sketch (not runnable): callback style"><code>def handle(conn):
+    read_request(conn, lambda req:
+        db_lookup(req.user, lambda user:
+            render(user, lambda page:
+                send(conn, page, lambda _:
+                    log_done(conn)))))</code></pre>
+
+<p>Error handling is worse: where does a failure in <code>db_lookup</code> go? Each callback needs its own error path, loops (retry three times) turn into recursion, and the order of operations is no longer the order of lines. The async/await version of the same logic reads like the blocking code we started with:</p>
+
+<pre class="terminal" data-title="a sketch (not runnable): async/await style"><code>async def handle(conn):
+    req = await read_request(conn)
+    user = await db_lookup(req.user)
+    page = await render(user)
+    await send(conn, page)
+    log_done(conn)</code></pre>
+
+<p>Each <code>await</code> says: "this step might take a while: pause me here, let the loop do other things, and resume me with the result when it's ready". The code reads top to bottom, <code>try/except</code> and <code>for</code> loops work as normal, and yet nothing blocks. How is that possible? The answer is a very old idea.</p>
+
+<h2>Generators: functions that can pause</h2>
+
+<p>A normal function runs from start to finish and then it is gone. A <span class="term">generator</span> is a function that can <em>pause in the middle</em> with <code>yield</code>, hand a value to its caller, and later be resumed exactly where it stopped, with all its local variables intact. Its stack frame is kept alive on the heap instead of being thrown away (<a href="03-stack-heap.html">chapter 3</a>).</p>
+
+<pre class="terminal" data-title="generator.py"><code>def countdown(n):
+    while n &gt; 0:
+        yield n          # pause here, hand n to the caller
+        n -= 1
+    return "liftoff"
+
+g = countdown(3)
+print(next(g))   # 3
+print(next(g))   # 2
+print(next(g))   # 1
+try:
+    next(g)
+except StopIteration as e:
+    print("finished:", e.value)</code></pre>
+
+<pre class="terminal" data-title="output"><code>3
+2
+1
+finished: liftoff</code></pre>
+
+<p>A <span class="term">coroutine</span> is the general name for a function that can be suspended and resumed, and a generator is the simplest example. Notice who is in control: the caller decides when to resume it. Now swap the roles. What if the thing yielding is a job that says, "I'm waiting for 1 second, wake me then", and the thing calling <code>next()</code> is an event loop with a heap of timers? Here is a complete, runnable toy built from exactly that:</p>
+
+<pre class="terminal" data-title="toy_async.py"><code>import heapq
+import itertools
+import time
+
+
+def sleep(seconds):
+    yield seconds                   # "wake me in this many seconds"
+
+
+def job(name, delay):
+    print(f"{time.perf_counter() - T0:.1f}s  {name} starts")
+    yield from sleep(delay)         # pause here; the loop runs someone else
+    print(f"{time.perf_counter() - T0:.1f}s  {name} finishes")
+
+
+def run(*coros):
+    ready = list(coros)             # coroutines that can run right now
+    timers = []                     # heap of (wake_time, tie_breaker, coroutine)
+    tie = itertools.count()
+    while ready or timers:
+        while ready:
+            co = ready.pop(0)
+            try:
+                delay = next(co)    # run until the next yield
+            except StopIteration:
+                continue            # this coroutine is finished
+            heapq.heappush(timers, (time.monotonic() + delay, next(tie), co))
+        if timers:
+            wake, _, co = heapq.heappop(timers)
+            time.sleep(max(0, wake - time.monotonic()))   # the "wait" step
+            ready.append(co)
+
+
+T0 = time.perf_counter()
+run(job("A", 2), job("B", 1))</code></pre>
+
+<pre class="terminal" data-title="output"><code>0.0s  A starts
+0.0s  B starts
+1.0s  B finishes
+2.0s  A finishes</code></pre>
+
+<p>Two jobs, taking 2 s and 1 s, finish after 2 s in total, not 3. They overlapped, on one thread, because each one handed control back at its pause point. (The toy loop calls <code>time.sleep</code> for its own wait. A real loop waits in <code>epoll</code>/<code>kqueue</code> so that sockets can wake it too, as in chapter 16.) Python's <code>async def</code> and <code>await</code> are this same idea given proper syntax, with <code>await</code> in the role of <code>yield from</code>, so that coroutines are a distinct type that cannot be confused with ordinary generators.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 170" role="img" aria-label="A coroutine's body split into three parts by two await points. At each await the coroutine is parked and the event loop runs other tasks.">
+    <rect x="40" y="46" width="150" height="44" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="115" y="73" text-anchor="middle" class="t-sm">part 1 runs</text>
+    <circle cx="205" cy="68" r="9" class="f-yellow"/>
+    <rect x="220" y="46" width="150" height="44" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="295" y="73" text-anchor="middle" class="t-sm">part 2 runs</text>
+    <circle cx="385" cy="68" r="9" class="f-yellow"/>
+    <rect x="400" y="46" width="150" height="44" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="475" y="73" text-anchor="middle" class="t-sm">part 3 runs</text>
+    <text x="565" y="73" class="t-sm">return</text>
+    <text x="205" y="30" text-anchor="middle" class="t-xs t-bold">await recv()</text>
+    <text x="385" y="30" text-anchor="middle" class="t-xs t-bold">await sleep(1)</text>
+    <text x="205" y="116" text-anchor="middle" class="t-xs t-muted">parked: the loop</text>
+    <text x="205" y="131" text-anchor="middle" class="t-xs t-muted">runs other tasks</text>
+    <text x="385" y="116" text-anchor="middle" class="t-xs t-muted">parked: the loop</text>
+    <text x="385" y="131" text-anchor="middle" class="t-xs t-muted">runs other tasks</text>
+    <text x="40" y="158" class="t-xs t-faint">Local variables survive each pause; between the yellow dots the code behaves like any ordinary function.</text>
+  </svg>
+  <figcaption><strong>A coroutine is a function cut into pieces at its await points.</strong> The event loop runs one piece at a time and decides who goes next, which is how a single thread keeps thousands of such functions in progress.</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: one cook, several dishes</p>
+  <p>In the restaurant kitchen, a single cook can make three dishes at once. Put the pasta on to boil (an <code>await</code>: nothing for the cook to do until it's ready), chop vegetables for the second dish, check the oven for the third, then return to the pasta when the timer rings. The cook's hands are always busy even though most steps involve waiting. The dish being cooked is a coroutine; the cook's habit of "start it, set a timer, move on" is the event loop.</p>
+  <p><em>Where it breaks down:</em> a coroutine can only pause at an <code>await</code>; a human cook can switch at any moment. Our cook never abandons a chopping task in mid-slice. If one task takes ten minutes of non-stop chopping, no pot gets watched in the meantime.</p>
+</div>
+
+<h2>async def and await in Python</h2>
+
+<p>In Python, <code>async def</code> defines a coroutine function. <em>Calling</em> it does not run the body: it returns a <span class="term">coroutine object</span>, a parked function waiting to be started. Something must schedule it. The usual entry point is <code>asyncio.run(main())</code>, which creates an <span class="term">event loop</span> (the very thing from chapter 16: a selector plus a heap of timers), runs <code>main()</code> to completion, and shuts the loop down. Inside coroutines, <code>await x</code> pauses the current coroutine until <code>x</code> is done.</p>
+
+<p>To run several coroutines at the same time, wrap each in a <span class="term">task</span> (<code>asyncio.create_task(coro)</code>), which tells the loop "start running this on your own schedule". <code>asyncio.gather(*coros)</code> does that for a group and waits for all of them, returning their results in order. Here is the claim from the start of this chapter, made concrete: a thousand tasks, each waiting one second.</p>
+
+<pre class="terminal" data-title="thousand_sleeps.py"><code>import asyncio
+import time
+
+
+async def worker(i):
+    await asyncio.sleep(1)          # pretend this is a network call
+    return i
+
+
+async def main():
+    start = time.perf_counter()
+    results = await asyncio.gather(*(worker(i) for i in range(1000)))
+    elapsed = time.perf_counter() - start
+    print(f"{len(results)} tasks finished in {elapsed:.2f} s")
+
+
+asyncio.run(main())</code></pre>
+
+<pre class="terminal" data-title="output"><code>1000 tasks finished in 1.01 s</code></pre>
+
+<p>A thousand one-second waits took one second, with one thread. Each <code>asyncio.sleep(1)</code> registered a timer in the loop's heap and parked its task, costing a few hundred bytes to a few kilobytes of heap memory and no thread stack. If these were network calls instead of sleeps, 1,000 requests could be in flight at once, which is why async clients are good at "fan out to many backends" work.</p>
+
+<h3>Stepping through two coroutines</h3>
+
+<p>Here is the same thing in slow motion: two coroutines, <code>A</code> awaiting a 2-second sleep and <code>B</code> awaiting a 1-second sleep, started together with <code>gather</code>. The runs themselves take microseconds, so they're drawn wider than true scale.</p>
+
+<div class="widget stepper" data-autoplay-ms="3200">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">Two coroutines interleaving at await points</h4></div>
+  <svg viewBox="0 0 760 266" role="img" aria-label="A timeline showing an event loop, coroutine A and coroutine B. Both start at time zero and pause at their awaits. The loop waits, wakes B at one second and A at two seconds, so the total is two seconds, not three.">
+    <text x="16" y="64" class="t-sm t-bold">event loop</text>
+    <text x="16" y="124" class="t-sm t-bold tc-blue">coroutine A</text>
+    <text x="16" y="184" class="t-sm t-bold tc-green">coroutine B</text>
+    <line x1="150" y1="222" x2="740" y2="222" class="line-thin"/>
+    <line x1="150" y1="216" x2="150" y2="228" class="line-thin"/><line x1="410" y1="216" x2="410" y2="228" class="line-thin"/><line x1="670" y1="216" x2="670" y2="228" class="line-thin"/>
+    <text x="150" y="243" text-anchor="middle" class="t-xs t-muted">0 s</text>
+    <text x="410" y="243" text-anchor="middle" class="t-xs t-muted">1 s</text>
+    <text x="670" y="243" text-anchor="middle" class="t-xs t-muted">2 s</text>
+    <text x="740" y="260" text-anchor="end" class="t-xs t-faint">time (the short runs are drawn wider than true scale)</text>
+
+    <!-- loop lane -->
+    <g data-steps="1-3" data-active="1"><rect x="150" y="42" width="86" height="36" rx="6" class="fs-purple s-purple sw-2"/><text x="193" y="64" text-anchor="middle" class="t-xs">ready: A, B</text></g>
+    <g data-steps="4-" data-active="4,6"><rect x="240" y="42" width="168" height="36" rx="6" class="box2" stroke-dasharray="6 5"/><text x="324" y="64" text-anchor="middle" class="t-xs">WAIT (timeout 1 s)</text></g>
+    <g data-steps="5-" data-active="5"><rect x="410" y="42" width="62" height="36" rx="6" class="fs-yellow s-yellow sw-2"/><text x="441" y="64" text-anchor="middle" class="t-xs">wake B</text></g>
+    <g data-steps="6-" data-active="6"><rect x="476" y="42" width="192" height="36" rx="6" class="box2" stroke-dasharray="6 5"/><text x="572" y="64" text-anchor="middle" class="t-xs">WAIT (timeout 1 s)</text></g>
+    <g data-steps="7" data-active="7"><rect x="670" y="42" width="62" height="36" rx="6" class="fs-yellow s-yellow sw-2"/><text x="701" y="64" text-anchor="middle" class="t-xs">wake A</text></g>
+
+    <!-- A lane -->
+    <g data-steps="2-" data-active="2"><rect x="150" y="102" width="40" height="36" rx="6" class="fs-blue s-blue sw-2"/><text x="170" y="124" text-anchor="middle" class="t-xs">A runs</text></g>
+    <g data-steps="2-6"><rect x="192" y="102" width="476" height="36" rx="6" class="box2" stroke-dasharray="6 5"/><text x="430" y="124" text-anchor="middle" class="t-xs">suspended at await asyncio.sleep(2)</text></g>
+    <g data-steps="7" data-active="7"><rect x="670" y="102" width="62" height="36" rx="6" class="fs-blue s-blue sw-2"/><text x="701" y="124" text-anchor="middle" class="t-xs">A done</text></g>
+
+    <!-- B lane -->
+    <g data-steps="3-" data-active="3"><rect x="194" y="162" width="40" height="36" rx="6" class="fs-green s-green sw-2"/><text x="214" y="184" text-anchor="middle" class="t-xs">B runs</text></g>
+    <g data-steps="3-4"><rect x="236" y="162" width="172" height="36" rx="6" class="box2" stroke-dasharray="6 5"/><text x="322" y="184" text-anchor="middle" class="t-xs">suspended: sleep(1)</text></g>
+    <g data-steps="5-" data-active="5"><rect x="410" y="162" width="62" height="36" rx="6" class="fs-green s-green sw-2"/><text x="441" y="184" text-anchor="middle" class="t-xs">B done</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>gather() creates two tasks.</strong> Both coroutines are now in the loop's ready queue. Nothing has run yet.</li>
+    <li><strong>The loop runs A</strong> until it reaches <code>await asyncio.sleep(2)</code>. That call registers a timer 2 s ahead and parks A. A's local variables are kept; the thread is free.</li>
+    <li><strong>The loop runs B</strong> the same way, until <code>await asyncio.sleep(1)</code>: a timer 1 s ahead, and B is parked.</li>
+    <li><strong>Nothing is ready, so the loop waits.</strong> It asks the selector to sleep, with a timeout of 1 s, the time until the earliest timer. The thread uses no CPU.</li>
+    <li><strong>One second passes.</strong> B's timer is due; the loop resumes B right after its <code>await</code>. B finishes. (Its result is stored for gather.)</li>
+    <li><strong>Waiting again,</strong> for another second: the only remaining timer is A's.</li>
+    <li><strong>Two seconds.</strong> A is resumed and finishes. gather() has all its results and returns. Total time: 2 s, the slowest task, not 1 + 2 = 3 s.</li>
+  </ol>
+</div>
+
+<h2>Futures and promises: a value that will exist later</h2>
+
+<p>What does <code>await x</code> actually wait for? For something that represents a result that isn't available yet. That something is called a <span class="term">future</span> (JavaScript and other languages call it a <span class="term">promise</span>): an object that starts empty and is later filled in with either a result or an error. Anyone holding it can ask "are you done yet?", attach a callback, or <code>await</code> it. It is the bridge between the callback world of chapter 16 and the straight-line world of this chapter.</p>
+
+<pre class="terminal" data-title="future.py"><code>import asyncio
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()                  # an empty promise: no value yet
+    loop.call_later(0.5, fut.set_result, "the answer")   # someone fills it in later
+    print("waiting for the future...")
+    print("got:", await fut)                    # pause here until set_result is called
+
+
+asyncio.run(main())</code></pre>
+
+<pre class="terminal" data-title="output"><code>waiting for the future...
+got: the answer</code></pre>
+
+<p>A <span class="term">task</span> is a future with a job: it runs a coroutine and, when the coroutine finishes, stores its return value (or exception) in itself. <code>asyncio.sleep</code>, a socket read, and "this other task is finished" can all be awaited because each one is, or wraps, a future that something will complete later: a timer, the selector reporting a readable socket, or another task. Compare this with chapter 14, where a thread-pool <em>future</em> played the same role: a placeholder for a result that a worker produces. It's the same concept; only the thing that fills it in differs.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Calling an <code>async def</code> function runs it." It doesn't. It returns a coroutine object that does nothing until awaited or scheduled as a task. Writing <code>greet()</code> without <code>await</code> doesn't run <code>greet</code>; Python only warns you afterwards: <code>RuntimeWarning: coroutine 'greet' was never awaited</code>. Also, <code>await</code> doesn't make anything faster by itself. <code>await fetch(a)</code> followed by <code>await fetch(b)</code> runs them one after the other. To overlap them, start both as tasks or use <code>gather</code>.</p>
+</div>
+
+<h2>Function colouring</h2>
+
+<p>There is a catch to this design, often called <span class="term">function colouring</span> (from Bob Nystrom's essay "What Color is Your Function?"). An <code>async def</code> function can only be awaited from inside another <code>async def</code>. A plain function cannot use <code>await</code>. So the two kinds don't mix freely:</p>
+
+<ul>
+  <li>If one function deep in your call chain becomes async, every caller above it must become async too (or must explicitly bridge, e.g. with <code>asyncio.run()</code>, which can be done once, at the very top, and never from inside a running loop).</li>
+  <li>If an async function calls an ordinary function that blocks (a normal HTTP library, a synchronous database driver), it compiles and runs, but it silently freezes the loop. The language does not warn you. That is the central danger of the next section.</li>
+</ul>
+
+<p>The practical consequence: async is a decision for a whole program or a whole layer, not something you sprinkle on. The alternatives, such as goroutines in Go, avoid the split by letting any function block cheaply (<a href="18-concurrency-models.html">chapter 18</a>), at the price of a heavier runtime.</p>
+
+<h2>Blocking the loop by mistake</h2>
+
+<p>The cardinal rule from chapter 16 still holds: while any coroutine runs between two awaits, <em>nothing else in that loop runs</em>. Compare <code>await asyncio.sleep(1)</code>, which parks the task and lets others run, with <code>time.sleep(1)</code>, which holds the thread for a second. This program has a "heartbeat" coroutine that should tick every 0.2 s, running next to a coroutine that waits one second in two different ways:</p>
+
+<pre class="terminal" data-title="block_the_loop.py"><code>import asyncio
+import time
+
+
+async def heartbeat():
+    """Should print every 0.2 s."""
+    t0 = time.perf_counter()
+    for _ in range(8):
+        await asyncio.sleep(0.2)
+        print(f"  heartbeat at {time.perf_counter() - t0:.1f} s")
+
+
+async def bad():
+    await asyncio.sleep(0.3)
+    print("  bad(): calling time.sleep(1.0), the loop is now frozen")
+    time.sleep(1.0)                 # BLOCKS the whole event loop
+    print("  bad(): done")
+
+
+async def good():
+    await asyncio.sleep(0.3)
+    print("  good(): awaiting asyncio.to_thread(time.sleep, 1.0)")
+    await asyncio.to_thread(time.sleep, 1.0)   # runs in a worker thread
+    print("  good(): done")
+
+
+async def run(label, coro):
+    print(label)
+    await asyncio.gather(heartbeat(), coro)
+
+
+async def main():
+    await run("with time.sleep:", bad())
+    await run("with to_thread:", good())
+
+asyncio.run(main())</code></pre>
+
+<pre class="terminal" data-title="output"><code>with time.sleep:
+  heartbeat at 0.2 s
+  bad(): calling time.sleep(1.0), the loop is now frozen
+  bad(): done
+  heartbeat at 1.3 s
+  heartbeat at 1.5 s
+  heartbeat at 1.7 s
+  heartbeat at 1.9 s
+  heartbeat at 2.1 s
+  heartbeat at 2.3 s
+  heartbeat at 2.5 s
+with to_thread:
+  heartbeat at 0.2 s
+  good(): awaiting asyncio.to_thread(time.sleep, 1.0)
+  heartbeat at 0.4 s
+  heartbeat at 0.6 s
+  heartbeat at 0.8 s
+  heartbeat at 1.0 s
+  heartbeat at 1.2 s
+  good(): done
+  heartbeat at 1.4 s
+  heartbeat at 1.6 s</code></pre>
+
+<p>In the first run the heartbeat is silent between 0.2 s and 1.3 s: the beats that should have come at 0.4, 0.6, 0.8, 1.0 and 1.2 s never happened, because the loop had no chance to run them. In the second run, the blocking sleep happens in a different thread, so the loop keeps ticking. In a real server, "heartbeat" could be every other client.</p>
+
+<p>The tool for this is <code>asyncio.to_thread(fn, *args)</code> (Python 3.9+), or on older versions <code>loop.run_in_executor(None, fn, *args)</code>: run an ordinary blocking function in a thread pool and <code>await</code> the result. It is the "kitchen" from chapter 16, and the same pool ideas from <a href="14-queues-backpressure.html">chapter 14</a> apply: the pool is bounded, so too much blocking work will queue up. Two limits are worth knowing:</p>
+
+<ul>
+  <li>Threads help with <em>waiting</em> (blocking I/O, most disk and database drivers, C extensions that release the GIL). They do not help with pure-Python CPU work, because the GIL lets only one thread run Python bytecode at a time (<a href="10-threads.html">chapter 10</a>). For heavy computation use a process pool: <code>loop.run_in_executor(concurrent.futures.ProcessPoolExecutor(), fn, ...)</code>.</li>
+  <li>The best fix is often to use a library that is truly async (written in terms of <code>await</code>), so no thread is needed at all.</li>
+</ul>
+
+<h2>Cancellation and timeouts</h2>
+
+<p>Because waiting is a first-class operation, so is giving up. A task can be <span class="term">cancelled</span>: <code>task.cancel()</code> asks the loop to raise <code>asyncio.CancelledError</code> inside the coroutine at the point where it is currently paused. The coroutine can use <code>try/finally</code> to clean up, and must re-raise the error afterwards (swallowing it breaks cancellation for everyone above). Cancellation only takes effect at an <code>await</code>; a coroutine in a busy loop can't be cancelled, another consequence of the cooperative design.</p>
+
+<p>Every call that waits on something outside your control should have a time limit. Python offers two ways:</p>
+
+<pre class="terminal" data-title="timeouts.py"><code>import asyncio
+
+
+async def slow():
+    await asyncio.sleep(10)
+
+
+async def main():
+    try:
+        async with asyncio.timeout(0.5):              # Python 3.11+
+            await slow()
+    except TimeoutError:
+        print("timed out after 0.5 s; slow() was cancelled")
+    try:
+        await asyncio.wait_for(slow(), timeout=0.5)   # works on 3.8+
+    except asyncio.TimeoutError:
+        print("wait_for timed out too")
+
+
+asyncio.run(main())</code></pre>
+
+<pre class="terminal" data-title="output"><code>timed out after 0.5 s; slow() was cancelled
+wait_for timed out too</code></pre>
+
+<p>Under the hood a timeout is just a timer in the loop's heap that, when it fires, cancels the task. (On Python 3.11 and newer, <code>asyncio.TimeoutError</code> is the same thing as the built-in <code>TimeoutError</code>.)</p>
+
+<h2>Structured concurrency</h2>
+
+<p>Plain <code>create_task</code> has a hazard: you can start a task and forget about it. It may fail with nobody watching, or outlive the code that started it. <span class="term">Structured concurrency</span> is the idea that concurrent tasks should live inside a scope, like a block of code, and the scope doesn't end until all its tasks have. In Python 3.11+ that is <code>asyncio.TaskGroup</code>:</p>
+
+<pre class="terminal" data-title="taskgroup.py"><code>import asyncio
+
+
+async def ok(name):
+    try:
+        await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        print(f"{name}: cancelled, cleaning up")
+        raise                                    # always re-raise CancelledError
+
+
+async def boom():
+    await asyncio.sleep(0.1)
+    raise ValueError("something broke")
+
+
+async def main():
+    try:
+        async with asyncio.TaskGroup() as tg:    # Python 3.11+
+            tg.create_task(ok("task 1"))
+            tg.create_task(ok("task 2"))
+            tg.create_task(boom())
+    except* ValueError as eg:
+        print("group failed:", eg.exceptions)
+
+
+asyncio.run(main())</code></pre>
+
+<pre class="terminal" data-title="output"><code>task 2: cancelled, cleaning up
+task 1: cancelled, cleaning up
+group failed: (ValueError('something broke'),)</code></pre>
+
+<p>When one task in the group fails, the others are cancelled, and the <code>async with</code> block raises (as an <code>ExceptionGroup</code>, caught with <code>except*</code>). Nothing is left running in the background by accident. The order of the two "cancelled" lines may vary between runs. On Python 3.8 to 3.10 you do not have <code>TaskGroup</code>, so use <code>gather</code> and handle errors and cancellation yourself.</p>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: catch a blocked loop</p>
+  <p>Save the snippets above as files (<code>thousand_sleeps.py</code> and <code>block_the_loop.py</code> need Python 3.9+; <code>taskgroup.py</code> and the <code>asyncio.timeout</code> half of <code>timeouts.py</code> need 3.11+). Run them, then switch on asyncio's debug mode, which reports any callback that holds the loop for longer than 100 ms. These are safe, read-only experiments; your timings will differ slightly.</p>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 thousand_sleeps.py</span>
+1000 tasks finished in 1.01 s
+<span class="prompt">$ </span><span class="cmd">PYTHONASYNCIODEBUG=1 python3 block_the_loop.py 2&gt;&amp;1 | grep -i executing</span>
+Executing &lt;Task finished name='Task-3' coro=&lt;bad() done, defined at block_the_loop.py:13&gt; result=None ...&gt; took 1.005 seconds</code></pre>
+
+<p>The warning names the culprit coroutine and how long it held the loop. In a real service you would see it in the logs as soon as someone adds a blocking call. Then change <code>range(1000)</code> to <code>range(100000)</code> in the first program and see how far one thread and one second get you. On our test machine 100,000 tasks finished in about 1.4 s. The limit you'd hit first is the cost of creating tasks and, with real sockets, the file-descriptor limit from <code>ulimit -n</code>, not the waiting.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Futures and promises are how programs talk about <em>remote calls</em>: when you call another service, you get back "a result that will exist later, or an error, or never". That "never" is why timeouts and cancellation are not optional extras but part of the basic shape of the API. Structured concurrency gives the same safety to fan-out calls: if one of five parallel backend requests fails, the other four are cancelled instead of leaked. Cheap concurrency also means a bug can send a lot of requests very quickly; a retry loop with thousands of tasks can flatten a struggling backend (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>), so you still need limits and backpressure (<a href="14-queues-backpressure.html">chapter 14</a>), for instance <code>asyncio.Semaphore</code> to cap how many requests are in flight.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Callback chains are hard to read and handle errors badly. Async/await lets you write straight-line code that the event loop runs in pieces.</li>
+    <li>A coroutine is a function that can pause at <code>await</code> points and resume with its local state intact. Generators (<code>yield</code>) are the underlying idea.</li>
+    <li>Calling an <code>async def</code> function only creates a coroutine object. Run it with <code>await</code>, <code>asyncio.run</code> or as a task. Use <code>gather</code> or tasks to overlap work: 1,000 one-second waits finish in about a second.</li>
+    <li>A future/promise is a placeholder for a value that will exist later; a task is a future that runs a coroutine.</li>
+    <li>Async functions can only be awaited from async code ("function colouring"). A blocking call such as <code>time.sleep</code> inside a coroutine freezes the whole loop; use <code>await asyncio.sleep</code>, a truly async library, or <code>asyncio.to_thread</code>/<code>run_in_executor</code>.</li>
+    <li>Cancellation arrives as <code>CancelledError</code> at an <code>await</code>. Always put timeouts on waits (<code>asyncio.timeout</code> on 3.11+, <code>wait_for</code> otherwise), and prefer <code>TaskGroup</code> (3.11+) so no task is left running by accident.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">What does <code>await</code> do inside a coroutine?</p>
+    <ol class="q-options">
+      <li>It blocks the whole thread until the result is ready</li>
+      <li>It starts a new operating-system thread for the call</li>
+      <li>It pauses this coroutine, lets the event loop run other work, and resumes this coroutine when the awaited result is ready</li>
+      <li>It makes the called function run faster</li>
+    </ol>
+    <div class="q-explain">The thread is not blocked: control returns to the event loop, which runs other tasks and timers. The awaiting coroutine is resumed later, with its local variables intact.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A coroutine calls <code>time.sleep(2)</code> in an asyncio server. What happens?</p>
+    <ol class="q-options">
+      <li>The entire event loop is frozen for 2 seconds: no other task or timer runs</li>
+      <li>Only that coroutine pauses; other tasks continue normally</li>
+      <li>Python automatically converts it into <code>asyncio.sleep</code></li>
+      <li>It raises an error because blocking calls are forbidden in async functions</li>
+    </ol>
+    <div class="q-explain">Nothing stops you from calling a blocking function in an <code>async def</code>; it just holds the one thread that runs the loop. Use <code>await asyncio.sleep(2)</code> or push the blocking work to <code>asyncio.to_thread</code>.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You write <code>a = await fetch(1)</code> then <code>b = await fetch(2)</code>, each taking 1 s. How long does it take, and how could it be faster?</p>
+    <ol class="q-options">
+      <li>1 s, because await runs them concurrently</li>
+      <li>2 s, and it can't be made faster</li>
+      <li>0 s, because they run in the background</li>
+      <li>2 s; start both as tasks or use <code>asyncio.gather(fetch(1), fetch(2))</code> to overlap them for about 1 s</li>
+    </ol>
+    <div class="q-explain">Each <code>await</code> waits for its operation to finish before the next line runs. Concurrency comes from having several tasks in the loop, not from the keyword itself.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why does <code>asyncio.to_thread</code> not speed up a pure-Python function that crunches numbers for 3 seconds?</p>
+    <ol class="q-options">
+      <li>Threads cannot run Python code at all</li>
+      <li>It keeps the loop responsive, but the GIL prevents threads from running Python bytecode in parallel; for CPU-bound work use a process pool</li>
+      <li>to_thread is only for network sockets</li>
+      <li>It does speed it up on every machine</li>
+    </ol>
+    <div class="q-explain">Moving the work to a thread frees the event loop (other tasks keep running), but the computation itself doesn't get faster or parallel under the GIL. Separate processes can use several cores.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A task is cancelled while paused at an <code>await</code>. What happens inside the coroutine?</p>
+    <ol class="q-options">
+      <li>Nothing; cancel() only works on tasks that are not running</li>
+      <li>The coroutine finishes normally and returns None</li>
+      <li><code>asyncio.CancelledError</code> is raised at that await, so <code>finally</code> blocks run, and the coroutine should re-raise it</li>
+      <li>The process exits</li>
+    </ol>
+    <div class="q-explain">Cancellation is delivered as an exception at the current await. That lets you clean up, but swallowing it hides the cancellation from the code that asked for it. It also means a coroutine in a tight loop with no await can't be cancelled.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

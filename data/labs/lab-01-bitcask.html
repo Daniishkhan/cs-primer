@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Log-Structured Key-Value Store · Data Systems</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="data" data-lab="L1">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 1: A Log-Structured Key-Value Store</h1>
+  <p class="lede">In this lab you build a small Bitcask: a key-value store made of nothing but append-only files and a hash table in memory. You will start with a file you have to scan from the top, make lookups instant with an index, turn deletes into records, survive torn and corrupted files, and finally squeeze the garbage out with a compaction that is safe even if the power fails halfway through. About 150 lines of your own code give you the core of a real storage engine.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p><a href="../chapters/04-log-hash-index.html">Chapter 4</a> described this design in prose and showed it in a widget. Here you build it, and the pieces that looked simple on paper turn out to hold the interesting problems: what exactly is in a record, what to do with half a record, how a delete can be a <em>write</em>, and how to replace files you are still reading from. The same four ideas (append-only log, in-memory index, tombstones, compaction) return in LSM trees, Kafka, write-ahead logs and replication. If you can build this, you can read the storage layer of most modern systems.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Requirements</p>
+  <p>Python 3.8 or newer, standard library only, on macOS, Linux or Windows. Everything happens in temporary directories that <code>check.py</code> creates and deletes, so it will not touch your files. (On Windows the directory <code>fsync</code> of milestone 5 is skipped, because Windows cannot open a directory that way; the rest is identical.)</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">What the crash tests can and cannot prove</p>
+  <p>Milestone 4 damages files <em>directly</em>: it cuts a log at many byte offsets, flips bits, and appends garbage, then checks that recovery returns exactly the data that was whole. That tests your record format and your recovery logic thoroughly. It cannot test whether your <code>fsync</code> calls really reach the disk, because the operating system's page cache would hide a missing one in any test that does not cut the power. The <a href="../../systems/labs/lab-02-crash-safe-log.html">Crash-Safe Storage lab in the Systems course</a> explains that limit in detail, and <a href="../../systems/chapters/09-durability.html">systems chapter 9</a> explains why. What this lab does check is the <em>order</em> of the steps in compaction: the new file must be synced before it is renamed into place.</p>
+</div>
+
+<h2>What you'll build</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="A directory of segment files on disk: two sealed segments and one active segment. In RAM, an index maps each key to a segment, an offset and a size. A put appends to the active segment and updates the index. A get looks up the index, then reads one record with a single seek.">
+    <defs>
+      <marker id="ahDL1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="20" width="280" height="136" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="160" y="44" text-anchor="middle" class="t-bold">index: a dict in RAM</text>
+    <rect x="32" y="54" width="256" height="26" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="42" y="72" class="t-xs mono">user:1 → seg 2, offset 0, 38 B</text>
+    <text x="42" y="100" class="t-xs mono">user:2 → seg 1, offset 57, 30 B</text>
+    <text x="42" y="120" class="t-xs mono">user:3 → seg 3, offset 0, 41 B</text>
+    <text x="160" y="146" text-anchor="middle" class="t-xs t-muted">one entry per live key</text>
+
+    <rect x="400" y="20" width="340" height="38" rx="10" class="box"/>
+    <text x="570" y="44" text-anchor="middle" class="t-sm">seg-000001.log <tspan class="t-muted">(sealed)</tspan></text>
+    <rect x="400" y="68" width="340" height="38" rx="10" class="box"/>
+    <rect x="410" y="75" width="150" height="24" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="485" y="92" text-anchor="middle" class="t-xs">record: user:1 → Ada</text>
+    <text x="650" y="92" text-anchor="middle" class="t-sm">seg-000002.log <tspan class="t-muted">(sealed)</tspan></text>
+    <rect x="400" y="116" width="340" height="40" rx="10" class="fs-orange s-orange sw-2"/>
+    <text x="570" y="141" text-anchor="middle" class="t-sm">seg-000003.log <tspan class="t-muted">(active: appends go here)</tspan></text>
+    <line x1="288" y1="67" x2="406" y2="85" class="line s-yellow sw-2" marker-end="url(#ahDL1a)"/>
+
+    <rect x="20" y="180" width="350" height="72" rx="10" class="box"/>
+    <text x="195" y="202" text-anchor="middle" class="t-bold">put(key, value)</text>
+    <text x="195" y="222" text-anchor="middle" class="t-sm">1. append a record to the active segment</text>
+    <text x="195" y="240" text-anchor="middle" class="t-sm">2. index[key] = (segment, offset, size)</text>
+    <rect x="390" y="180" width="350" height="72" rx="10" class="box"/>
+    <text x="565" y="202" text-anchor="middle" class="t-bold">get(key)</text>
+    <text x="565" y="222" text-anchor="middle" class="t-sm">1. look the key up in the index</text>
+    <text x="565" y="240" text-anchor="middle" class="t-sm">2. one seek, read <tspan class="mono">size</tspan> bytes, check the CRC</text>
+  </svg>
+  <figcaption><strong>The whole design in one picture.</strong> Disk holds the truth (orange is the log being appended to); RAM holds a cache of where everything is (purple). The yellow arrow is one <code>get</code>: no scanning.</figcaption>
+</figure>
+
+<p>Six milestones, each building on the last (the sixth is optional):</p>
+<ol class="steps">
+  <li><strong>The record and the slow store:</strong> a record format with a CRC, and a <code>put</code>/<code>get</code> that scans the file from the start.</li>
+  <li><strong>The index:</strong> a dict from key to <code>(segment, offset, size)</code>, so a <code>get</code> is one seek. You will measure the difference.</li>
+  <li><strong>Deletes and segments:</strong> a delete appends a tombstone; a full segment is sealed and a new one begins.</li>
+  <li><strong>Crash recovery:</strong> on open, rebuild the index by replaying every segment, and cut off a torn or corrupt tail.</li>
+  <li><strong>Compaction:</strong> merge the segments, keep only the latest live value per key, and swap the files in without ever risking the data.</li>
+  <li><strong>(optional) Hint files:</strong> remember each sealed segment's keys, so startup does not have to read every value.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code> (on Windows, <code>py --version</code>). The lab's files are in this guide's folder, in <code>data/labs/code/lab01/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab01/starter.py"><code>starter.py</code></a></td><td>Your file. Signatures, docstrings with hints, and a <code>TODO</code> for each milestone. The boring plumbing (finding segment files, opening them, syncing directories) is already written.</td></tr>
+    <tr><td><a href="code/lab01/check.py"><code>check.py</code></a></td><td>The self-check. It builds stores in temporary directories, truncates and corrupts their files at seeded random places, and simulates crashes in the middle of compaction. Deterministic, and it finishes in a few seconds.</td></tr>
+    <tr><td><a href="code/lab01/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Every milestone should report "not implemented yet", without crashing:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd data/labs/code/lab01</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 1 checks against starter.py
+
+  … Milestone 1: records, and the slow scanning store: not implemented yet (TODO milestone 1: encode_record)
+  … Milestone 2: in-memory hash index (O(1) gets): not implemented yet (TODO milestone 2: Store.put)
+  … Milestone 3: tombstone deletes and segment rollover: not implemented yet (TODO milestone 2: Store.put)
+  … Milestone 4: crash recovery (torn and corrupt tails): not implemented yet (TODO milestone 2: Store.put)
+  … Milestone 5: compaction with a safe file swap: not implemented yet (TODO milestone 2: Store.put)
+  … Milestone 6 (optional): hint files for fast startup: not implemented yet (TODO milestone 2: Store.put)
+
+0/5 required milestones passing, optional milestone 6: not done</span></code></pre>
+
+<p>Keys and values are <code>bytes</code> throughout (<code>b"user:1"</code>, not <code>"user:1"</code>). A store is a directory; its files are <code>seg-000001.log</code>, <code>seg-000002.log</code>, and so on.</p>
+
+<h2>Milestone 1: a record you can trust, and the slow store</h2>
+
+<p>A log is a long run of bytes, so every record must say how long it is and prove it is intact. This is the layout from <a href="../chapters/04-log-hash-index.html">chapter 4</a> (Bitcask's own records also carry a timestamp, which we skip):</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 240" role="img" aria-label="A live record is a 4-byte CRC32, a 4-byte key length, a 4-byte value length, the key bytes and the value bytes. A tombstone has the same header with a value length of minus one and no value bytes. The CRC covers every byte after itself.">
+    <text x="20" y="18" class="t-xs t-faint t-bold">A LIVE RECORD</text>
+    <rect x="20" y="28" width="100" height="46" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="70" y="48" text-anchor="middle" class="t-sm t-bold">crc32</text>
+    <text x="70" y="64" text-anchor="middle" class="t-xs t-muted">4 bytes</text>
+    <rect x="120" y="28" width="100" height="46" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="170" y="48" text-anchor="middle" class="t-sm t-bold">key len</text>
+    <text x="170" y="64" text-anchor="middle" class="t-xs t-muted">4 bytes</text>
+    <rect x="220" y="28" width="100" height="46" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="270" y="48" text-anchor="middle" class="t-sm t-bold">val len</text>
+    <text x="270" y="64" text-anchor="middle" class="t-xs t-muted">4 B, signed</text>
+    <rect x="320" y="28" width="140" height="46" rx="8" class="box"/>
+    <text x="390" y="48" text-anchor="middle" class="t-sm t-bold">key</text>
+    <text x="390" y="64" text-anchor="middle" class="t-xs t-muted">key len bytes</text>
+    <rect x="460" y="28" width="280" height="46" rx="8" class="box"/>
+    <text x="600" y="48" text-anchor="middle" class="t-sm t-bold">value</text>
+    <text x="600" y="64" text-anchor="middle" class="t-xs t-muted">val len bytes</text>
+
+    <text x="20" y="116" class="t-xs t-faint t-bold">A TOMBSTONE (A DELETE)</text>
+    <rect x="20" y="126" width="100" height="46" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="70" y="154" text-anchor="middle" class="t-sm t-bold">crc32</text>
+    <rect x="120" y="126" width="100" height="46" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="170" y="154" text-anchor="middle" class="t-sm t-bold">key len</text>
+    <rect x="220" y="126" width="100" height="46" rx="8" class="fs-red s-red sw-2"/>
+    <text x="270" y="146" text-anchor="middle" class="t-sm t-bold">val len</text>
+    <text x="270" y="163" text-anchor="middle" class="t-xs t-muted">-1</text>
+    <rect x="320" y="126" width="140" height="46" rx="8" class="box"/>
+    <text x="390" y="154" text-anchor="middle" class="t-sm t-bold">key</text>
+    <text x="475" y="154" class="t-xs t-faint">(no value bytes follow)</text>
+
+    <line x1="120" y1="196" x2="740" y2="196" class="line s-yellow sw-2"/>
+    <line x1="120" y1="190" x2="120" y2="202" class="line s-yellow sw-2"/>
+    <line x1="740" y1="190" x2="740" y2="202" class="line s-yellow sw-2"/>
+    <text x="430" y="224" text-anchor="middle" class="t-xs t-bold">the CRC is computed over everything after it: key len, val len, key and value</text>
+  </svg>
+  <figcaption><strong>One record.</strong> The 12-byte header (yellow) says how many bytes follow; the checksum catches a record that was cut short or damaged. A <span class="term">tombstone</span> is a record whose value length is -1: it means "this key is deleted".</figcaption>
+</figure>
+
+<ul>
+  <li><strong>key len, val len</strong> let a reader know exactly where the record ends. Integers are <strong>big-endian</strong>: <code>struct.pack("&gt;I", n)</code> (<code>I</code> is an unsigned 4-byte integer, <code>i</code> a signed one). The value length is <em>signed</em> so that -1 can mean "tombstone", which is not the same thing as an empty value (length 0).</li>
+  <li><strong>crc32</strong> (<code>zlib.crc32</code>) is the checksum idea from <a href="../../systems/chapters/09-durability.html">systems chapter 9</a>. It covers the two lengths as well as the data. Otherwise a damaged length field would make the reader jump to a random place and still believe it had found a record.</li>
+  <li><code>decode_record</code> must never trust a length before checking it. A garbage length such as <code>0x7FFFFFF0</code> must make it return <code>None</code>, not try to read two gigabytes. Torn writes and flipped bits are exactly how such lengths appear.</li>
+</ul>
+
+<p>You will write <code>encode_record</code> and <code>decode_record</code>, and then the <span class="term">slow store</span>, <code>ScanStore</code>: a single file where <code>put</code> appends a record and <code>get</code> reads the whole file, walking it record by record and keeping the <em>last</em> value it sees for the key. It is the Python version of chapter 4's two-line shell database, and it is the baseline you will beat in milestone 2.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>encode_record(key, value)</code> (<code>value=None</code> means tombstone), <code>decode_record(buf, pos=0)</code> (returns <code>(key, value, next_pos)</code>, or <code>None</code> for an incomplete or damaged record) and <code>ScanStore.put</code> / <code>ScanStore.get</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 1 as ✔. The check compares your bytes with an independent encoder, cuts a record at <em>every</em> possible length, flips a bit in <em>every</em> byte position, and feeds in absurd lengths. Once it passes, look at the bytes you produced:
+  <code>python3 -c "from starter import *; print(encode_record(b'name', b'ada').hex(' '))"</code> should print <code>5d 10 3e 8b 00 00 00 04 00 00 00 03 6e 61 6d 65 61 64 61</code>: the CRC, then 4, then 3, then <code>name</code>, then <code>ada</code>.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Build the part after the checksum first: <code>body = struct.pack("&gt;Ii", len(key), vlen) + key + (value or b"")</code>. Then <code>struct.pack("&gt;I", zlib.crc32(body)) + body</code>. Careful: <code>value or b""</code> is right for both <code>None</code> and <code>b""</code>, but <code>vlen</code> must be -1 only for <code>None</code>.</li>
+      <li><code>HEADER.unpack_from(buf, pos)</code> returns <code>(crc, klen, vlen)</code> without copying. Check, in this order: enough bytes for a header; <code>klen</code> and <code>vlen</code> in range; the whole record fits in the buffer; the CRC matches <code>buf[pos + 4:end]</code>.</li>
+      <li>The value length of a tombstone is -1, so the end of the record is <code>key_end + max(vlen, 0)</code>.</li>
+      <li><code>ScanStore.get</code> loops <code>rec = decode_record(data, pos)</code> until it returns <code>None</code>, remembering the value whenever the key matches. A later record for the same key overrides an earlier one, and a tombstone's value <code>None</code> naturally means "not found".</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> encode_record(key, value):
+    <span class="str">"""Bytes for one record. value=None encodes a tombstone (value length -1)."""</span>
+    vlen = -<span class="num">1</span> <span class="kw">if</span> value <span class="kw">is</span> <span class="kw">None</span> <span class="kw">else</span> len(value)
+    body = struct.pack(<span class="str">"&gt;Ii"</span>, len(key), vlen) + key + (value <span class="kw">or</span> <span class="str">b""</span>)
+    <span class="kw">return</span> struct.pack(<span class="str">"&gt;I"</span>, zlib.crc32(body)) + body</code></pre>
+<pre><code><span class="kw">def</span> decode_record(buf, pos=<span class="num">0</span>):
+    <span class="str">"""Parse one record at buf[pos:].
+
+    Returns (key, value, next_pos), where value is None for a tombstone, or
+    None if the record is incomplete or fails its checksum. Never raises on
+    garbage and never trusts a length before checking it.
+    """</span>
+    <span class="kw">if</span> pos + HEADER.size &gt; len(buf):
+        <span class="kw">return</span> <span class="kw">None</span>                                    <span class="cmt"># not even a whole header</span>
+    crc, klen, vlen = HEADER.unpack_from(buf, pos)
+    <span class="kw">if</span> klen &gt; MAX_KEY <span class="kw">or</span> vlen &lt; -<span class="num">1</span> <span class="kw">or</span> vlen &gt; MAX_VALUE:
+        <span class="kw">return</span> <span class="kw">None</span>                                    <span class="cmt"># absurd lengths: garbage</span>
+    key_start = pos + HEADER.size
+    val_start = key_start + klen
+    end = val_start + max(vlen, <span class="num">0</span>)
+    <span class="kw">if</span> end &gt; len(buf):
+        <span class="kw">return</span> <span class="kw">None</span>                                    <span class="cmt"># the record is cut short</span>
+    <span class="kw">if</span> zlib.crc32(buf[pos + <span class="num">4</span>:end]) != crc:
+        <span class="kw">return</span> <span class="kw">None</span>                                    <span class="cmt"># damaged, or a half-written write</span>
+    key = bytes(buf[key_start:val_start])
+    value = <span class="kw">None</span> <span class="kw">if</span> vlen == -<span class="num">1</span> <span class="kw">else</span> bytes(buf[val_start:end])
+    <span class="kw">return</span> key, value, end</code></pre>
+<pre><code><span class="kw">class</span> ScanStore:
+    <span class="str">"""The slow version: one file, and every get() scans it from the start."""</span>
+
+    <span class="kw">def</span> __init__(self, path):
+        self.path = path
+        open(path, <span class="str">"ab"</span>).close()                       <span class="cmt"># make sure the file exists</span>
+
+    <span class="kw">def</span> put(self, key, value):
+        <span class="kw">with</span> open(self.path, <span class="str">"ab"</span>) <span class="kw">as</span> f:
+            f.write(encode_record(key, value))
+
+    <span class="kw">def</span> get(self, key):
+        <span class="kw">with</span> open(self.path, <span class="str">"rb"</span>) <span class="kw">as</span> f:
+            data = f.read()
+        found, pos = <span class="kw">None</span>, <span class="num">0</span>
+        <span class="kw">while</span> <span class="kw">True</span>:
+            rec = decode_record(data, pos)
+            <span class="kw">if</span> rec <span class="kw">is</span> <span class="kw">None</span>:
+                <span class="kw">break</span>
+            k, v, pos = rec
+            <span class="kw">if</span> k == key:
+                found = v                              <span class="cmt"># a later record overrides an earlier one</span>
+        <span class="kw">return</span> found</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: an index makes reads O(1)</h2>
+
+<p>Your <code>ScanStore.get</code> reads the whole file, so its cost grows with the amount of data, which is what <span class="term">O(n)</span> means. The cure is the one from <a href="../chapters/04-log-hash-index.html">chapter 4</a>: a hash table in RAM that remembers where each key's newest record lives. For every key it stores a tuple <code>(segment id, offset, size)</code>, and the <code>size</code> is the length of the <em>whole</em> record, so a <code>get</code> can read it with one <code>seek</code> and one <code>read</code> and never needs to scan.</p>
+
+<p>Now you work in the real <code>Store</code> class. It manages a directory of segment files; the plumbing is given. For this milestone everything fits in the first segment, <code>seg-000001.log</code>. Two things to know about the given helpers:</p>
+<ul>
+  <li><code>self._fd</code> is a raw file descriptor opened for appending (<code>os.O_APPEND</code>), and you write with <code>write_all(self._fd, record)</code>. A raw descriptor has no Python-level buffer, so when <code>write_all</code> returns, the bytes are in the operating system. <code>self._active_size</code> is the current size of the active segment, which is also the offset where the next record will start.</li>
+  <li><code>self._reader(seg_id)</code> returns a cached read handle opened with <code>buffering=0</code>. Without that, Python's buffered reader could hand back stale bytes for a file that is still being appended to.</li>
+</ul>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Store._append</code> (write one record, update <code>_active_size</code>, return <code>(segment id, offset, size)</code>), <code>Store.put</code> and <code>Store.get</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 2 as ✔ and a small table. Here is one laptop's result (yours will differ, and nothing about speed is graded):</p>
+<pre class="terminal" data-title="terminal"><code><span class="out">  ✔ Milestone 2: in-memory hash index (O(1) gets)
+      4000 keys, 277,960 bytes in the log (timings depend on your machine; not graded):
+        ScanStore.get      2.189 ms per lookup
+        Store.get            1.6 us per lookup   (about 1,346x faster)</span></code></pre>
+  <p>The check also verifies the exact bytes in <code>seg-000001.log</code>, every index entry, and that <code>get</code> decodes only one or two records per call (it counts calls to your <code>decode_record</code>), so a hidden scan cannot sneak through.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>put</code> is: <code>self.index[key] = self._append(key, value)</code>. Reject <code>value is None</code> (that is what <code>delete</code> is for).</li>
+      <li><code>get</code>: <code>f = self._reader(seg_id); f.seek(offset); data = f.read(size)</code>, then <code>decode_record(data, 0)</code>. If it returns <code>None</code>, the record you wrote earlier no longer verifies, so raise <code>CorruptionError</code>.</li>
+      <li>If <code>self.sync</code> is true, call <code>os.fsync(self._fd)</code> after the write. It is off by default; <a href="../../systems/labs/lab-02-crash-safe-log.html">Systems Lab 2</a> studies that dial.</li>
+      <li>An overwritten key keeps its old record in the file. Only the index forgets it. That garbage is what compaction will remove in milestone 5.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code>    <span class="kw">def</span> _append(self, key, value):
+        <span class="str">"""Append one record to the active segment. Returns (segment id, offset, size)."""</span>
+        rec = encode_record(key, value)
+        <span class="cmt"># Milestone 3: roll over to a new segment when this record would not fit.</span>
+        <span class="kw">if</span> self._active_size &gt; <span class="num">0</span> <span class="kw">and</span> self._active_size + len(rec) &gt; self.max_segment_bytes:
+            self._roll()
+        offset = self._active_size
+        write_all(self._fd, rec)
+        <span class="kw">if</span> self.sync:
+            os.fsync(self._fd)
+        self._active_size += len(rec)
+        <span class="kw">return</span> self.active_id, offset, len(rec)</code></pre>
+<pre><code>    <span class="kw">def</span> put(self, key, value):
+        <span class="kw">if</span> value <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">raise</span> ValueError(<span class="str">"value must be bytes; use delete() to remove a key"</span>)
+        self.index[key] = self._append(key, value)
+
+    <span class="kw">def</span> get(self, key):
+        loc = self.index.get(key)
+        <span class="kw">if</span> loc <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">return</span> <span class="kw">None</span>
+        seg_id, offset, size = loc
+        f = self._reader(seg_id)
+        f.seek(offset)
+        rec = decode_record(f.read(size), <span class="num">0</span>)            <span class="cmt"># one seek, one read</span>
+        <span class="kw">if</span> rec <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">raise</span> CorruptionError(<span class="str">"record at segment %d offset %d failed its checksum"</span> % (seg_id, offset))
+        <span class="kw">return</span> rec[<span class="num">1</span>]</code></pre>
+  </details>
+</div>
+
+<p>Notice what the index does and does not hold: it has one entry per <em>live key</em>, never the values. RAM use therefore grows with the number of keys, not with the amount of data (<a href="../chapters/04-log-hash-index.html">chapter 4</a>, <em>Why every key must fit in RAM</em>). Try it in the "under the hood" section below: double the number of keys and watch the two stores diverge.</p>
+
+<h2>Milestone 3: deletes and segments</h2>
+
+<p>You cannot remove a record from a file you only append to. So <code>delete(key)</code> <em>appends a tombstone</em> (a record with value length -1) and removes the key from the index. Why write anything at all, when the index already forgot the key? Because the index lives in RAM. After a restart the index is rebuilt by replaying the log, and replaying the old <code>put</code> without the tombstone after it would bring the key back from the dead (milestone 4 will show it happening).</p>
+
+<p>The second job of this milestone is <strong>segments</strong>. A single file that grows forever can never be cleaned. So the store appends to one <span class="term">active</span> segment, and when the next record would push it past <code>max_segment_bytes</code>, it <span class="term">seals</span> that segment (fsync it, close it, never write to it again) and starts <code>seg-N+1.log</code>. Sealed segments are immutable, which makes everything that follows simpler: they can be read without locks, compacted in the background and backed up as plain files.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="Three segment files side by side. The first two are sealed and hold records a1 b1 c1 and a2 d1 b2. The third is active and holds a tombstone for c, then e1 and a3. An arrow shows the roll-over from the second to the third segment when the limit is reached.">
+    <defs>
+      <marker id="ahDL1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="20" class="t-xs t-faint t-bold">SEG-000001 (SEALED)</text>
+    <rect x="20" y="28" width="220" height="56" rx="10" class="box"/>
+    <rect x="30" y="42" width="62" height="28" rx="6" class="box"/><text x="61" y="61" text-anchor="middle" class="t-xs">a1</text>
+    <rect x="100" y="42" width="62" height="28" rx="6" class="box"/><text x="131" y="61" text-anchor="middle" class="t-xs">b1</text>
+    <rect x="170" y="42" width="62" height="28" rx="6" class="box"/><text x="201" y="61" text-anchor="middle" class="t-xs">c1</text>
+
+    <text x="270" y="20" class="t-xs t-faint t-bold">SEG-000002 (SEALED)</text>
+    <rect x="270" y="28" width="220" height="56" rx="10" class="box"/>
+    <rect x="280" y="42" width="62" height="28" rx="6" class="box"/><text x="311" y="61" text-anchor="middle" class="t-xs">a2</text>
+    <rect x="350" y="42" width="62" height="28" rx="6" class="box"/><text x="381" y="61" text-anchor="middle" class="t-xs">d1</text>
+    <rect x="420" y="42" width="62" height="28" rx="6" class="box"/><text x="451" y="61" text-anchor="middle" class="t-xs">b2</text>
+
+    <text x="520" y="20" class="t-xs t-faint t-bold">SEG-000003 (ACTIVE)</text>
+    <rect x="520" y="28" width="220" height="56" rx="10" class="fs-orange s-orange sw-2"/>
+    <rect x="530" y="42" width="62" height="28" rx="6" class="fs-red s-red sw-2"/><text x="561" y="61" text-anchor="middle" class="t-xs">c ✕</text>
+    <rect x="600" y="42" width="62" height="28" rx="6" class="box"/><text x="631" y="61" text-anchor="middle" class="t-xs">e1</text>
+    <rect x="670" y="42" width="62" height="28" rx="6" class="box"/><text x="701" y="61" text-anchor="middle" class="t-xs">a3</text>
+
+    <line x1="492" y1="56" x2="518" y2="56" class="line s-yellow sw-2" marker-end="url(#ahDL1b)"/>
+
+    <text x="130" y="108" text-anchor="middle" class="t-xs t-muted">never modified again</text>
+    <text x="380" y="108" text-anchor="middle" class="t-xs t-muted">never modified again</text>
+    <text x="630" y="108" text-anchor="middle" class="t-xs t-muted">appends only</text>
+
+    <rect x="20" y="130" width="720" height="62" rx="10" class="box"/>
+    <text x="380" y="155" text-anchor="middle" class="t-sm"><tspan class="t-bold">Roll-over:</tspan> if the next record would not fit, fsync and close the file, start the next one.</text>
+    <text x="380" y="176" text-anchor="middle" class="t-sm"><tspan class="t-bold">Tombstone:</tspan> c ✕ hides c1 in an older segment (newer records win).</text>
+  </svg>
+  <figcaption><strong>Segments and tombstones.</strong> Records are labelled key and version. The current value of <code>a</code> is a3, the third version. The key <code>c</code> is deleted: its tombstone (red) sits in a newer segment than the value it hides.</figcaption>
+</figure>
+
+<p>A few details the check will insist on:</p>
+<ul>
+  <li><code>delete</code> returns <code>True</code> if the key existed, and <code>False</code> if not. Deleting a missing key writes <em>nothing</em>: it would only grow the log.</li>
+  <li>A segment never exceeds the limit, <em>except</em> that a single record bigger than the limit must still be storable. It gets a segment to itself. (So roll over only when the active segment already holds something.)</li>
+  <li>Sealed segments really are never touched again: the check keeps a copy of segment 1's bytes early and compares them after hundreds more writes.</li>
+</ul>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Store.delete</code> and <code>Store._roll</code>, then add the rollover test to <code>_append</code>: before writing, if the active segment is not empty and the record would not fit, call <code>self._roll()</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 3 as ✔. The last part of the test runs 1,500 seeded random puts and deletes across about a hundred tiny segments and compares every answer with a plain Python dict.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>delete</code>: if the key is not in the index return <code>False</code>. Otherwise <code>self._append(key, None)</code>, <code>del self.index[key]</code>, return <code>True</code>.</li>
+      <li><code>_roll</code> is two calls: the given <code>self._seal()</code> (it fsyncs and closes the active file) and then <code>self._start_segment(self.active_id + 1)</code>.</li>
+      <li>"Would not fit" is <code>self._active_size + len(rec) &gt; self.max_segment_bytes</code>. Compute <code>rec = encode_record(key, value)</code> first, and read <code>offset</code> <em>after</em> any roll-over.</li>
+      <li>The index tuple must carry the segment id the record actually landed in, which is <code>self.active_id</code> after the roll.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code>    <span class="kw">def</span> _append(self, key, value):
+        <span class="str">"""Append one record to the active segment. Returns (segment id, offset, size)."""</span>
+        rec = encode_record(key, value)
+        <span class="cmt"># Milestone 3: roll over to a new segment when this record would not fit.</span>
+        <span class="kw">if</span> self._active_size &gt; <span class="num">0</span> <span class="kw">and</span> self._active_size + len(rec) &gt; self.max_segment_bytes:
+            self._roll()
+        offset = self._active_size
+        write_all(self._fd, rec)
+        <span class="kw">if</span> self.sync:
+            os.fsync(self._fd)
+        self._active_size += len(rec)
+        <span class="kw">return</span> self.active_id, offset, len(rec)
+
+    <span class="kw">def</span> delete(self, key):
+        <span class="str">"""Delete a key by appending a tombstone. Returns True if the key existed."""</span>
+        <span class="kw">if</span> key <span class="kw">not</span> <span class="kw">in</span> self.index:
+            <span class="kw">return</span> <span class="kw">False</span>                    <span class="cmt"># nothing to delete: do not grow the log</span>
+        self._append(key, <span class="kw">None</span>)
+        <span class="kw">del</span> self.index[key]
+        <span class="kw">return</span> <span class="kw">True</span>
+
+    <span class="kw">def</span> _roll(self):
+        <span class="str">"""Seal the active segment and start the next one."""</span>
+        self._seal()
+        self._start_segment(self.active_id + <span class="num">1</span>)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: crash recovery</h2>
+
+<p>The index is a cache of the log, and a cache in RAM disappears with the process. So <code>Store.__init__</code> calls <code>_rebuild_index</code> whenever segment files already exist. The log is the truth: scan every segment from oldest to newest and replay it. For each record, set <code>index[key]</code> to its location, or remove the key if it is a tombstone. Newer records overwrite older ones, so at the end the index is exactly right.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="On startup, three segments are replayed oldest to newest into an in-memory index. The last segment ends with a torn record, shown in red; recovery stops at the end of the last good record and truncates the file there.">
+    <defs>
+      <marker id="ahDL1c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="24" width="150" height="50" rx="10" class="box"/>
+    <text x="95" y="54" text-anchor="middle" class="t-sm">seg-000001 ✓</text>
+    <rect x="190" y="24" width="150" height="50" rx="10" class="box"/>
+    <text x="265" y="54" text-anchor="middle" class="t-sm">seg-000002 ✓</text>
+    <rect x="360" y="24" width="380" height="50" rx="10" class="fs-orange s-orange sw-2"/>
+    <rect x="370" y="34" width="70" height="30" rx="6" class="box"/><text x="405" y="54" text-anchor="middle" class="t-xs">r1 ✓</text>
+    <rect x="446" y="34" width="70" height="30" rx="6" class="box"/><text x="481" y="54" text-anchor="middle" class="t-xs">r2 ✓</text>
+    <rect x="522" y="34" width="70" height="30" rx="6" class="box"/><text x="557" y="54" text-anchor="middle" class="t-xs">r3 ✓</text>
+    <rect x="598" y="34" width="132" height="30" rx="6" class="fs-red s-red sw-2"/><text x="664" y="54" text-anchor="middle" class="t-xs">r4: cut short</text>
+    <line x1="595" y1="20" x2="595" y2="84" class="line-dash"/>
+    <text x="595" y="100" text-anchor="middle" class="t-xs t-bold">good_end: truncate here</text>
+
+    <line x1="95" y1="76" x2="250" y2="146" class="line s-purple sw-2" marker-end="url(#ahDL1c)"/>
+    <line x1="265" y1="76" x2="320" y2="146" class="line s-purple sw-2" marker-end="url(#ahDL1c)"/>
+    <line x1="480" y1="106" x2="430" y2="146" class="line s-purple sw-2" marker-end="url(#ahDL1c)"/>
+
+    <rect x="190" y="150" width="380" height="54" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="380" y="174" text-anchor="middle" class="t-bold">index, rebuilt in RAM</text>
+    <text x="380" y="193" text-anchor="middle" class="t-xs t-muted">oldest to newest: newer overwrites, tombstones remove</text>
+    <text x="380" y="232" text-anchor="middle" class="t-xs t-muted">Damage in a sealed segment is not a crash artifact: refuse to open (CorruptionError).</text>
+  </svg>
+  <figcaption><strong>Recovery.</strong> Replay oldest to newest. In the <em>last</em> segment, the first bad record marks the end of the valid prefix, and everything after it is cut off.</figcaption>
+</figure>
+
+<p>Things can be wrong in two different ways, and they get two different answers:</p>
+<ul>
+  <li><strong>A torn tail in the last segment.</strong> The machine died in the middle of an append, so the file ends with half a record, or with a record whose bytes never all arrived. That is expected after a crash. Recovery stops at the first record <code>decode_record</code> rejects, <strong>truncates the file</strong> there (<code>f.truncate(good_end)</code>, then <code>fsync</code> so the repair itself is durable), and carries on. Truncating matters: if you left the garbage in place, the next record you appended would land <em>behind</em> it, and the following restart would stop at the garbage and lose that record.</li>
+  <li><strong>Damage in a sealed segment.</strong> A sealed segment was completed and fsynced before the store moved on. A bad record in the middle of one is not a torn write: it means the disk returned wrong bytes. Silently truncating would throw away good data, so recovery raises <code>CorruptionError</code> and lets a human (or a replica) decide, as <a href="../chapters/04-log-hash-index.html">chapter 4</a> advises.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">A simplification</p>
+  <p>Treating "the first bad record in the last segment" as the torn tail is the rule the <a href="../../systems/labs/lab-02-crash-safe-log.html">Systems crash-safe log</a> uses too. A real engine can do better: if valid records <em>follow</em> the bad one, the damage is in the middle, not at the tail, and it can report that loudly. The rule is safe only because the store acknowledges a write after the whole record has been written (and, with <code>sync=True</code>, fsynced), so a torn tail can only be a write nobody was told about.</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>scan_segment(data)</code> (returns <code>(entries, good_end)</code> where each entry is <code>(key, offset, size, is_tombstone)</code>) and <code>Store._rebuild_index(ids)</code>. Remember that <code>__init__</code> then starts the last segment as the active one, so a recovered store simply continues appending.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 4 as ✔. The check builds a store, then re-opens damaged copies of its file: 72 truncation points (every boundary of the last few records, plus seeded random ones), 25 single bit flips, five kinds of trailing garbage (random bytes, an absurd key length, an absurd value length, a record cut short, zeros), and several segments with the tail torn or a sealed segment damaged. In each case the reopened store must equal the state after the last whole record, the file must have been truncated to that point, and a record written <em>after</em> recovery must survive another restart. It prints a summary line:</p>
+<pre class="terminal" data-title="terminal"><code><span class="out">  ✔ Milestone 4: crash recovery (torn and corrupt tails)
+      72 truncation points all recovered to the last whole record
+      25 random bit flips recovered to a clean prefix</span></code></pre>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>scan_segment</code> is a loop: <code>rec = decode_record(data, pos)</code>; stop when it is <code>None</code>; otherwise record <code>(key, pos, next_pos - pos, value is None)</code> and move <code>pos</code> forward. Return <code>(entries, pos)</code>. It must not raise on any input.</li>
+      <li>In <code>_rebuild_index</code>, read each file with <code>open(path, "rb")</code>. If <code>good_end &lt; len(data)</code>: for the last id, <code>open(path, "r+b")</code>, <code>truncate(good_end)</code>, <code>flush()</code> and <code>os.fsync(f.fileno())</code>; for any other id raise <code>CorruptionError</code>. A healthy file must not be modified at all (the check compares bytes).</li>
+      <li>A tombstone entry means <code>self.index.pop(key, None)</code>. Process segments in the order given: oldest first.</li>
+      <li>An empty last segment (the machine crashed right after a roll-over) is normal: zero entries, <code>good_end == 0</code>.</li>
+      <li>Want to see the bug? Comment out the truncation. The cut-file cases fail with "after recovery the file should be N bytes".</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> scan_segment(data):
+    <span class="str">"""Parse bytes as a run of records.
+
+    Returns (entries, good_end). entries is a list of
+    (key, offset, size, is_tombstone), oldest first. good_end is the byte
+    offset where the valid prefix ends (len(data) for a healthy segment).
+    """</span>
+    entries, pos = [], <span class="num">0</span>
+    <span class="kw">while</span> pos &lt; len(data):
+        rec = decode_record(data, pos)
+        <span class="kw">if</span> rec <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">break</span>
+        key, value, nxt = rec
+        entries.append((key, pos, nxt - pos, value <span class="kw">is</span> <span class="kw">None</span>))
+        pos = nxt
+    <span class="kw">return</span> entries, pos</code></pre>
+<pre><code>    <span class="kw">def</span> _rebuild_index(self, ids):
+        <span class="str">"""Rebuild self.index by replaying every segment, oldest first."""</span>
+        <span class="kw">for</span> n, seg_id <span class="kw">in</span> enumerate(ids):
+            is_last = n == len(ids) - <span class="num">1</span>
+            entries = self._read_hint(seg_id) <span class="kw">if</span> (self.hints <span class="kw">and</span> <span class="kw">not</span> is_last) <span class="kw">else</span> <span class="kw">None</span>   <span class="cmt"># Milestone 6</span>
+            <span class="kw">if</span> entries <span class="kw">is</span> <span class="kw">None</span>:
+                path = self._seg_path(seg_id)
+                <span class="kw">with</span> open(path, <span class="str">"rb"</span>) <span class="kw">as</span> f:
+                    data = f.read()
+                entries, good_end = scan_segment(data)
+                <span class="kw">if</span> good_end &lt; len(data):
+                    <span class="kw">if</span> <span class="kw">not</span> is_last:
+                        <span class="kw">raise</span> CorruptionError(<span class="str">"sealed segment %d is damaged at byte %d"</span> % (seg_id, good_end))
+                    <span class="kw">with</span> open(path, <span class="str">"r+b"</span>) <span class="kw">as</span> f:          <span class="cmt"># torn tail of the active segment:</span>
+                        f.truncate(good_end)              <span class="cmt"># cut it off, then make that durable</span>
+                        f.flush()
+                        os.fsync(f.fileno())
+            <span class="kw">for</span> key, offset, size, is_tombstone <span class="kw">in</span> entries:
+                <span class="kw">if</span> is_tombstone:
+                    self.index.pop(key, <span class="kw">None</span>)             <span class="cmt"># a newer tombstone hides older values</span>
+                <span class="kw">else</span>:
+                    self.index[key] = (seg_id, offset, size)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: compaction</h2>
+
+<p>An overwrite-heavy workload leaves a log full of garbage. In the experiment below, 3,000 writes to just 100 keys produce 175 kB of log holding about 6 kB of live data. <span class="term">Compaction</span> copies only the live records into a new segment and throws the old files away. A record is <strong>live exactly when the index points at it</strong>: for each record in the old segments, it is live if <code>self.index.get(key) == (segment, offset, size)</code>. Overwritten values, deleted keys, and the tombstones themselves are all dead, so none of them is copied. Because tombstones are dropped, this version compacts <em>all</em> segments at once; if you left some older segment out, a dropped tombstone could let its key's old value come back.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Before compaction, three sealed segments hold records a1 b1 c1, a2 c-tombstone d1, and b2 a3 e1; only d1, b2, a3 and e1 are live. Compaction copies the live records into a new merged segment and a fresh empty active segment is started. Below, the four steps of the safe swap: write a temp file, fsync it, rename it into place, delete the old segments oldest first.">
+    <defs>
+      <marker id="ahDL1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="16" class="t-xs t-faint t-bold">BEFORE: THREE SEGMENTS, MOSTLY GARBAGE</text>
+    <rect x="20" y="24" width="220" height="50" rx="10" class="box"/>
+    <rect x="30" y="34" width="62" height="30" rx="6" class="box"/><text x="61" y="54" text-anchor="middle" class="t-xs t-faint">a1</text>
+    <rect x="100" y="34" width="62" height="30" rx="6" class="box"/><text x="131" y="54" text-anchor="middle" class="t-xs t-faint">b1</text>
+    <rect x="170" y="34" width="62" height="30" rx="6" class="box"/><text x="201" y="54" text-anchor="middle" class="t-xs t-faint">c1</text>
+    <rect x="270" y="24" width="220" height="50" rx="10" class="box"/>
+    <rect x="280" y="34" width="62" height="30" rx="6" class="box"/><text x="311" y="54" text-anchor="middle" class="t-xs t-faint">a2</text>
+    <rect x="350" y="34" width="62" height="30" rx="6" class="fs-red s-red sw-2"/><text x="381" y="54" text-anchor="middle" class="t-xs">c ✕</text>
+    <rect x="420" y="34" width="62" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="451" y="54" text-anchor="middle" class="t-xs">d1</text>
+    <rect x="520" y="24" width="220" height="50" rx="10" class="box"/>
+    <rect x="530" y="34" width="62" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="561" y="54" text-anchor="middle" class="t-xs">b2</text>
+    <rect x="600" y="34" width="62" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="631" y="54" text-anchor="middle" class="t-xs">a3</text>
+    <rect x="670" y="34" width="62" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="701" y="54" text-anchor="middle" class="t-xs">e1</text>
+    <text x="130" y="94" text-anchor="middle" class="t-xs t-muted">seg 1: all dead</text>
+    <text x="380" y="94" text-anchor="middle" class="t-xs t-muted">seg 2: d1 live, the rest dead</text>
+    <text x="630" y="94" text-anchor="middle" class="t-xs t-muted">seg 3: all live</text>
+
+    <line x1="380" y1="104" x2="380" y2="136" class="line s-yellow sw-2" marker-end="url(#ahDL1d)"/>
+    <text x="394" y="125" class="t-xs t-bold">copy only the live records</text>
+
+    <text x="20" y="152" class="t-xs t-faint t-bold">AFTER</text>
+    <rect x="260" y="140" width="260" height="50" rx="10" class="box"/>
+    <rect x="270" y="150" width="56" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="298" y="170" text-anchor="middle" class="t-xs">d1</text>
+    <rect x="332" y="150" width="56" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="360" y="170" text-anchor="middle" class="t-xs">b2</text>
+    <rect x="394" y="150" width="56" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="422" y="170" text-anchor="middle" class="t-xs">a3</text>
+    <rect x="456" y="150" width="56" height="30" rx="6" class="fs-orange s-orange sw-2"/><text x="484" y="170" text-anchor="middle" class="t-xs">e1</text>
+    <text x="390" y="206" text-anchor="middle" class="t-xs t-muted">merged segment (an id above every input)</text>
+    <rect x="560" y="140" width="180" height="50" rx="10" class="fs-orange s-orange sw-2"/>
+    <text x="650" y="170" text-anchor="middle" class="t-xs">new, empty active segment</text>
+
+    <text x="20" y="236" class="t-xs t-faint t-bold">THE SAFE SWAP</text>
+    <rect x="20" y="244" width="160" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="100" y="268" text-anchor="middle" class="t-sm t-bold">1. write .tmp</text>
+    <text x="100" y="286" text-anchor="middle" class="t-xs t-muted">live records only</text>
+    <rect x="205" y="244" width="160" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="285" y="268" text-anchor="middle" class="t-sm t-bold">2. fsync it</text>
+    <text x="285" y="286" text-anchor="middle" class="t-xs t-muted">bytes are on disk</text>
+    <rect x="390" y="244" width="160" height="56" rx="10" class="fs-yellow s-yellow sw-2"/>
+    <text x="470" y="268" text-anchor="middle" class="t-sm t-bold">3. os.replace</text>
+    <text x="470" y="286" text-anchor="middle" class="t-xs t-muted">the atomic switch</text>
+    <rect x="575" y="244" width="165" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="657" y="268" text-anchor="middle" class="t-sm t-bold">4. delete old</text>
+    <text x="657" y="286" text-anchor="middle" class="t-xs t-muted">oldest first</text>
+    <line x1="180" y1="272" x2="203" y2="272" class="line" marker-end="url(#ahDL1d)"/>
+    <line x1="365" y1="272" x2="388" y2="272" class="line" marker-end="url(#ahDL1d)"/>
+    <line x1="550" y1="272" x2="573" y2="272" class="line" marker-end="url(#ahDL1d)"/>
+    <text x="380" y="320" text-anchor="middle" class="t-xs t-muted">crash before 3: old files intact. Crash after 3: merged file and old files coexist, and the merged file wins.</text>
+  </svg>
+  <figcaption><strong>Compaction.</strong> Faint records are dead; orange are live; red is a tombstone. The active segment is sealed first, so it is compacted too.</figcaption>
+</figure>
+
+<h3>Getting the swap right</h3>
+
+<p>Compaction replaces files, and a crash can arrive at any line of it. This is the atomic-replace pattern of <a href="../../systems/chapters/09-durability.html">systems chapter 9</a> (the Systems lab builds it for a config file), applied to a set of segments:</p>
+<ol>
+  <li><strong>Seal the active segment, then pick two new ids.</strong> The merged file gets <code>out_id = active_id + 1</code>, and the new active segment gets <code>out_id + 1</code>. Segment ids are the replay order, so the merged file must sort <em>after</em> every input it replaces and <em>before</em> the new writes.</li>
+  <li><strong>Write the merged file under a temporary name</strong> (<code>seg-N.log.tmp</code>) and <code>fsync</code> it. Nothing visible has changed yet. A leftover <code>.tmp</code> is simply deleted when the store opens (that part is given).</li>
+  <li><strong><code>os.replace</code> it into its final name</strong>, then <code>fsync</code> the directory (<code>self._fsync_dir()</code>) so the rename is durable. Fsync the file <em>before</em> the rename: otherwise a power cut could persist the new name but not the new bytes.</li>
+  <li><strong>Point the index at the new locations</strong>, then <strong>delete the old segments, oldest first</strong>. Oldest first matters: if the crash comes after the oldest is gone but before the newest is, replay sees the merged file plus the newer originals, which agree. If you deleted the <em>newest</em> first, a tombstone could vanish while an older segment still held the value it hid, and the deleted key would be resurrected on the next start (the "zombie" from chapter 4).</li>
+</ol>
+
+<p>The test sets a trap for exactly this. Its workload writes a key early, deletes it several segments later, then calls <code>compact(hook)</code> and raises an exception from the hook after each stage: <code>tmp_synced</code>, <code>replaced</code>, <code>deleted_1</code> (after the first old segment is removed) and <code>done</code>. The exception unwinds out of your code like a power cut, and the test reopens the directory and demands the same answers as before.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Store.compact(hook=None)</code> following the steps in its docstring and calling <code>hook(stage)</code> at the points it lists. The given helpers do the fiddly parts: <code>_seal</code>, <code>_start_segment</code>, <code>_fsync_dir</code>, <code>_remove_segment</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 5 as ✔. It also prints what happened to the data. The check reads every key before and after and demands identical answers, requires that the total size of the segment files <em>drops</em>, that no tombstones and no duplicate keys remain on disk, and that the new file was fsynced before the <code>os.replace</code>. For example:</p>
+<pre class="terminal" data-title="terminal"><code><span class="out">  ✔ Milestone 5: compaction with a safe file swap
+      36 segments, 52,724 bytes  ->  2 segments, 3,211 bytes (94% smaller); all 52 keys read back identically
+      simulated crashes after tmp_synced / replaced / deleted_1 / done all recovered the same data</span></code></pre>
+  <p>The workload is seeded, so the sizes should be the same on your machine if your records have the same layout.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Read each input segment with <code>open(path, "rb").read()</code>, run <code>scan_segment</code> on it, and for each entry decide: dead if it is a tombstone or <code>self.index.get(key) != (seg_id, offset, size)</code>. For a live one, <code>write_all(fd, data[offset:offset + size])</code> copies the exact bytes (no need to re-encode), and <code>new_index[key] = (out_id, new_offset, size)</code>.</li>
+      <li>Do not touch <code>self.index</code> until after the rename. Then <code>self.index.update(new_index)</code>.</li>
+      <li>Remove the inputs with <code>self._remove_segment(seg_id)</code> in ascending id order, and call <code>hook("deleted_1")</code> after the first. The helper also closes any cached reader for that file.</li>
+      <li>An empty store has nothing to compact: return early.</li>
+      <li>If the zombie key comes back in the test, the message says so: check the deletion order.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code>    <span class="kw">def</span> compact(self, hook=<span class="kw">None</span>):
+        <span class="str">"""Merge every segment into one file holding only the live records.
+
+        Safe order: write new -&gt; fsync -&gt; rename -&gt; update index -&gt; delete old, oldest first.
+        hook(stage), if given, is called after each step so tests can "crash" there.
+        """</span>
+        <span class="kw">def</span> step(name):
+            <span class="kw">if</span> hook:
+                hook(name)
+
+        inputs = self.segment_ids()
+        <span class="kw">if</span> <span class="kw">not</span> inputs <span class="kw">or</span> self.total_bytes() == <span class="num">0</span>:
+            <span class="kw">return</span> {<span class="str">"bytes_before"</span>: <span class="num">0</span>, <span class="str">"bytes_after"</span>: <span class="num">0</span>}
+        before = self.total_bytes()
+        self._seal()                                     <span class="cmt"># the old active segment is now an input too</span>
+        out_id = self.active_id + <span class="num">1</span>                      <span class="cmt"># sorts after every input...</span>
+        self._start_segment(out_id + <span class="num">1</span>)                  <span class="cmt"># ...and before the fresh active segment</span>
+        final = self._seg_path(out_id)
+        tmp = final + <span class="str">".tmp"</span>
+
+        new_index = {}
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, <span class="str">"O_BINARY"</span>, <span class="num">0</span>), <span class="num">0o644</span>)
+        <span class="kw">try</span>:
+            offset = <span class="num">0</span>
+            <span class="kw">for</span> seg_id <span class="kw">in</span> inputs:
+                <span class="kw">with</span> open(self._seg_path(seg_id), <span class="str">"rb"</span>) <span class="kw">as</span> f:
+                    data = f.read()
+                entries, _ = scan_segment(data)
+                <span class="kw">for</span> key, off, size, is_tombstone <span class="kw">in</span> entries:
+                    <span class="kw">if</span> is_tombstone <span class="kw">or</span> self.index.get(key) != (seg_id, off, size):
+                        <span class="kw">continue</span>                         <span class="cmt"># dead: overwritten, deleted or a tombstone</span>
+                    write_all(fd, data[off:off + size])  <span class="cmt"># copy the live record byte for byte</span>
+                    new_index[key] = (out_id, offset, size)
+                    offset += size
+            os.fsync(fd)                                 <span class="cmt"># the new file is on disk BEFORE we publish it</span>
+        <span class="kw">finally</span>:
+            os.close(fd)
+        step(<span class="str">"tmp_synced"</span>)
+        os.replace(tmp, final)                           <span class="cmt"># the atomic switch</span>
+        self._fsync_dir()
+        step(<span class="str">"replaced"</span>)
+        self.index.update(new_index)                     <span class="cmt"># point the index at the new file</span>
+        <span class="kw">if</span> self.hints:
+            self._write_hint(out_id)                     <span class="cmt"># Milestone 6</span>
+        <span class="kw">for</span> n, seg_id <span class="kw">in</span> enumerate(inputs):              <span class="cmt"># oldest first: never orphan a tombstone</span>
+            self._remove_segment(seg_id)
+            <span class="kw">if</span> n == <span class="num">0</span>:
+                step(<span class="str">"deleted_1"</span>)
+        self._fsync_dir()
+        step(<span class="str">"done"</span>)
+        <span class="kw">return</span> {<span class="str">"bytes_before"</span>: before, <span class="str">"bytes_after"</span>: self.total_bytes()}</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 6 (optional): hint files</h2>
+
+<p>Opening a store replays every record of every segment, and that means reading every <em>value</em> too, even though the index never needs them. For a 100 GB store that is minutes of downtime. Bitcask's answer is the <span class="term">hint file</span>: next to each sealed segment, a small file listing just <code>(key, offset, size, tombstone?)</code> for each record. Replaying a hint touches a few bytes per key instead of the whole value, so startup reads a fraction of the data.</p>
+
+<p>A hint is only a <em>cache</em> of what scanning the segment would give, so it must never be trusted blindly:</p>
+<ul>
+  <li>It ends with a trailer holding the segment's size and a CRC of the hint's own entries. A hint with a bad CRC (bit rot, or a torn write when it was created) or whose recorded size no longer matches the segment is <strong>ignored</strong>, and the segment is scanned instead.</li>
+  <li>It is written when a segment is sealed (the given <code>_seal</code> calls <code>_write_hint</code> if <code>hints=True</code>) and after compaction. The <em>last</em> segment never uses one: it is about to be appended to, and it is where a torn tail lives.</li>
+  <li>Hints are written to a <code>.tmp</code> name, fsynced and renamed, like everything else.</li>
+</ul>
+
+<div class="milestone">
+  <p class="milestone-title">Your task (optional)</p>
+  <p>Implement <code>Store._write_hint(seg_id)</code> and <code>Store._read_hint(seg_id)</code>, then teach <code>_rebuild_index</code> to try the hint first for every segment except the last (<code>if self.hints</code>). In <code>compact</code>, write a hint for the merged segment before deleting the inputs.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 6 as ✔ and counts how many records reopening had to decode:</p>
+<pre class="terminal" data-title="terminal"><code><span class="out">  ✔ Milestone 6 (optional): hint files for fast startup
+      reopen decoded 10 of 661 records (hints covered the sealed segments)</span></code></pre>
+  <p>The check also damages a hint three ways (a flipped byte, a truncation, a stale size) and deletes another; every time the store must still open with the correct data, by scanning.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Entry format that works: <code>struct.pack("&gt;IQIB", len(key), offset, size, tombstone) + key</code>, repeated; then a trailer <code>struct.pack("&gt;QI", segment_size, zlib.crc32(all_entries))</code>.</li>
+      <li>Make <code>_read_hint</code> total: any <code>OSError</code>, short file, bad CRC or size mismatch returns <code>None</code>. The CRC check happens <em>before</em> parsing the entries, so parsing never sees garbage.</li>
+      <li>In <code>_rebuild_index</code>: <code>entries = self._read_hint(seg_id) if (self.hints and not is_last) else None</code>, and fall back to reading and scanning the segment when it is <code>None</code>.</li>
+      <li>Delete the hint when you delete its segment (the given <code>_remove_segment</code> does).</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code>    <span class="kw">def</span> _write_hint(self, seg_id):
+        <span class="str">"""seg-N.hint: (key, offset, size, tombstone?) for every record of a sealed segment."""</span>
+        <span class="kw">with</span> open(self._seg_path(seg_id), <span class="str">"rb"</span>) <span class="kw">as</span> f:
+            data = f.read()
+        entries, _ = scan_segment(data)
+        body = <span class="str">b""</span>.join(struct.pack(<span class="str">"&gt;IQIB"</span>, len(k), off, size, int(t)) + k <span class="kw">for</span> k, off, size, t <span class="kw">in</span> entries)
+        blob = body + struct.pack(<span class="str">"&gt;QI"</span>, len(data), zlib.crc32(body))   <span class="cmt"># trailer: segment size, checksum</span>
+        tmp = self._hint_path(seg_id) + <span class="str">".tmp"</span>
+        <span class="kw">with</span> open(tmp, <span class="str">"wb"</span>) <span class="kw">as</span> f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._hint_path(seg_id))
+
+    <span class="kw">def</span> _read_hint(self, seg_id):
+        <span class="str">"""Entries from the hint file, or None if it is missing, damaged or stale."""</span>
+        <span class="kw">try</span>:
+            <span class="kw">with</span> open(self._hint_path(seg_id), <span class="str">"rb"</span>) <span class="kw">as</span> f:
+                blob = f.read()
+            seg_size = os.path.getsize(self._seg_path(seg_id))
+        <span class="kw">except</span> OSError:
+            <span class="kw">return</span> <span class="kw">None</span>
+        trailer = struct.Struct(<span class="str">"&gt;QI"</span>)
+        <span class="kw">if</span> len(blob) &lt; trailer.size:
+            <span class="kw">return</span> <span class="kw">None</span>
+        body = blob[:-trailer.size]
+        size_then, crc = trailer.unpack(blob[-trailer.size:])
+        <span class="kw">if</span> crc != zlib.crc32(body) <span class="kw">or</span> size_then != seg_size:
+            <span class="kw">return</span> <span class="kw">None</span>                                  <span class="cmt"># corrupt, or the segment changed</span>
+        entries, pos, head = [], <span class="num">0</span>, struct.Struct(<span class="str">"&gt;IQIB"</span>)
+        <span class="kw">while</span> pos &lt; len(body):
+            klen, off, size, tomb = head.unpack_from(body, pos)
+            pos += head.size
+            entries.append((body[pos:pos + klen], off, size, bool(tomb)))
+            pos += klen
+        <span class="kw">return</span> entries</code></pre>
+<pre><code>    <span class="kw">def</span> _rebuild_index(self, ids):
+        <span class="str">"""Rebuild self.index by replaying every segment, oldest first."""</span>
+        <span class="kw">for</span> n, seg_id <span class="kw">in</span> enumerate(ids):
+            is_last = n == len(ids) - <span class="num">1</span>
+            entries = self._read_hint(seg_id) <span class="kw">if</span> (self.hints <span class="kw">and</span> <span class="kw">not</span> is_last) <span class="kw">else</span> <span class="kw">None</span>   <span class="cmt"># Milestone 6</span>
+            <span class="kw">if</span> entries <span class="kw">is</span> <span class="kw">None</span>:
+                path = self._seg_path(seg_id)
+                <span class="kw">with</span> open(path, <span class="str">"rb"</span>) <span class="kw">as</span> f:
+                    data = f.read()
+                entries, good_end = scan_segment(data)
+                <span class="kw">if</span> good_end &lt; len(data):
+                    <span class="kw">if</span> <span class="kw">not</span> is_last:
+                        <span class="kw">raise</span> CorruptionError(<span class="str">"sealed segment %d is damaged at byte %d"</span> % (seg_id, good_end))
+                    <span class="kw">with</span> open(path, <span class="str">"r+b"</span>) <span class="kw">as</span> f:          <span class="cmt"># torn tail of the active segment:</span>
+                        f.truncate(good_end)              <span class="cmt"># cut it off, then make that durable</span>
+                        f.flush()
+                        os.fsync(f.fileno())
+            <span class="kw">for</span> key, offset, size, is_tombstone <span class="kw">in</span> entries:
+                <span class="kw">if</span> is_tombstone:
+                    self.index.pop(key, <span class="kw">None</span>)             <span class="cmt"># a newer tombstone hides older values</span>
+                <span class="kw">else</span>:
+                    self.index[key] = (seg_id, offset, size)</code></pre>
+  </details>
+</div>
+
+<h2>Look under the hood</h2>
+
+<p>You should be able to read your own data file. This writes a tiny store, deletes a key, and dumps the first segment; it only touches a temporary directory:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">rm -rf /tmp/kv-demo</span>
+<span class="prompt">$ </span><span class="cmd">python3 -c "
+from solution import Store            # use starter once yours works
+with Store('/tmp/kv-demo') as s:
+    s.put(b'name', b'ada'); s.put(b'lang', b'python')
+    s.put(b'name', b'ada lovelace'); s.delete(b'lang')
+    print(s.index)
+"</span>
+<span class="out">{b'name': (1, 41, 28)}</span>
+<span class="prompt">$ </span><span class="cmd">hexdump -C /tmp/kv-demo/seg-000001.log</span>        <span class="cmt"># or: xxd</span>
+<span class="out">00000000  5d 10 3e 8b 00 00 00 04  00 00 00 03 6e 61 6d 65  |].&gt;.........name|
+00000010  61 64 61 1b 77 c8 8d 00  00 00 04 00 00 00 06 6c  |ada.w..........l|
+00000020  61 6e 67 70 79 74 68 6f  6e 3c 0d 26 e4 00 00 00  |angpython&lt;.&amp;....|
+00000030  04 00 00 00 0c 6e 61 6d  65 61 64 61 20 6c 6f 76  |.....nameada lov|
+00000040  65 6c 61 63 65 ac a9 ec  8b 00 00 00 04 ff ff ff  |elace...........|
+00000050  ff 6c 61 6e 67                                    |.lang|
+00000055</span></code></pre>
+
+<p>Read it like the store does. The first record starts at offset 0: <code>5d 10 3e 8b</code> is the CRC, <code>00 00 00 04</code> the key length, <code>00 00 00 03</code> the value length, then <code>6e 61 6d 65</code> ("name") and <code>61 64 61</code> ("ada"): 19 bytes. The second ("lang", "python") starts at offset 19 and takes 22 bytes, so the third starts at 41, which is exactly where the index says <code>name</code> lives: <code>(1, 41, 28)</code>. The old "ada" is still in the file, dead weight, with no index entry pointing at it. And at offset 0x45 you can see the tombstone for <code>lang</code>: its CRC <code>ac a9 ec 8b</code>, the key length 4, then <code>ff ff ff ff</code> (a signed -1) and just the key. Your CRC bytes will match these, because a CRC is a pure function of the bytes.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Watch the scan grow.</strong> This builds stores of increasing size and times both kinds of lookup (keys of 9 bytes, values of 50). Here is one machine's output; the shape matters, not the digits. The scan time grows roughly in step with the number of keys while the indexed lookup barely moves:
+<pre class="terminal" data-title="terminal"><code><span class="out">  1000 keys   scan    0.444 ms   index   1.32 us
+  2000 keys   scan    0.887 ms   index   1.45 us
+  4000 keys   scan    1.830 ms   index   1.58 us
+  8000 keys   scan    5.734 ms   index   1.98 us
+ 16000 keys   scan   16.162 ms   index   2.17 us</span></code></pre>
+    Write the script yourself: build a <code>ScanStore</code> and a <code>Store</code> with the same keys for each size, then time 30 random <code>get</code> calls on each. (The index timings grow a little because Python's dicts and caches slow down at larger sizes.)</li>
+    <li><strong>Measure the garbage.</strong> Overwrite 100 keys 3,000 times, then compact:
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">rm -rf /tmp/kv-gc</span>
+<span class="prompt">$ </span><span class="cmd">python3 -c "
+import random, os
+from solution import Store
+s = Store('/tmp/kv-gc', max_segment_bytes=4096); r = random.Random(1)
+for i in range(3000): s.put(b'user:%d' % r.randrange(100), b'x' * r.randrange(20, 60))
+print(len(s), 'keys,', len(s.segment_ids()), 'segments,', s.total_bytes(), 'bytes')
+print(s.compact())
+print(len(s.segment_ids()), 'segments,', s.total_bytes(), 'bytes', sorted(os.listdir('/tmp/kv-gc')))
+"</span>
+<span class="out">100 keys, 44 segments, 174942 bytes
+{'bytes_before': 174942, 'bytes_after': 6127}
+2 segments, 6127 bytes ['seg-000045.log', 'seg-000046.log']</span></code></pre>
+    Forty-four files became one merged file (<code>seg-000045</code>, with the id just above the inputs) plus an empty active segment, and about 96% of the bytes were garbage. This is "write amplification" in miniature: you paid to write 175 kB so you could keep 6 kB.</li>
+    <li><strong>Resurrect a zombie.</strong> In <code>compact</code>, delete the inputs <em>newest first</em> (<code>reversed(inputs)</code>). The data is still right after a normal compaction, but the <code>deleted_1</code> crash test fails: after the simulated crash and reopen, keys have changed (a deleted key can come back from an old segment whose tombstone is already gone). The bug is invisible in normal operation and only appears if the process dies at exactly the wrong moment, which is why the test crashes it on purpose.</li>
+    <li><strong>Remove the tombstone.</strong> Make <code>delete</code> only <code>del self.index[key]</code> without appending anything. Within one run everything still looks right, because the index forgot the key, but milestone 3 fails on its first assertion (no tombstone was appended), and if you reopen the store the deleted key returns.</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>Compact only some segments.</strong> Merge just the oldest few sealed segments. You now have to keep the tombstones that might still hide values in segments you did not include. Work out the precise rule for when a tombstone may be dropped. (This is how real Bitcask-style stores bound the work per compaction.)</li>
+  <li><strong>Compact in the background.</strong> Run <code>compact</code> in a thread while another thread keeps calling <code>put</code> and <code>get</code>. What needs a lock, and what is safe because sealed segments never change? Be careful about the moment you swap index entries.</li>
+  <li><strong>fsync policy.</strong> Add <code>sync="batch"</code> (group commit): one <code>fsync</code> for every N appends or on <code>flush()</code>. The <a href="../../systems/labs/lab-02-crash-safe-log.html">Systems crash-safe log lab</a> shows the trade-off; apply it here and decide when a <code>put</code> may be acknowledged.</li>
+  <li><strong>Verify on every read.</strong> <code>get</code> already checks the CRC. Add a <code>verify()</code> method that scans every segment and reports (without changing anything) which records are damaged. Run it after flipping a byte in a sealed segment.</li>
+  <li><strong>A snapshot of the index.</strong> Instead of hint files, periodically write the whole index to disk along with the (segment, offset) it is current up to, and replay only the log written since. Compare startup times.</li>
+  <li><strong>Timestamps and merge-by-time.</strong> Bitcask records carry a timestamp so that compaction can merge files in any order. Add one to the record format (what changes in the CRC? in recovery?).</li>
+  <li><strong>Range scans.</strong> Try to add <code>scan(lo, hi)</code>. Notice that a hash index cannot do it without sorting every key first. That is the wall <a href="../chapters/05-lsm-trees.html">chapter 5</a> climbs over, and <a href="lab-02-lsm.html">Lab 2</a> builds the next store.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>You have built, on one machine, three things that distributed systems rely on constantly. First, an <strong>append-only log as the source of truth</strong> with a derived, rebuildable index. Replicated databases ship their logs to followers, which replay them to rebuild identical state (<a href="../chapters/15-replication-practice.html">chapter 15</a>), and the idea of a cache that is "thrown away and recomputed from the log" is the same one behind change data capture and event streams (<a href="../chapters/19-streams-cdc.html">chapter 19</a>). Second, <strong>tombstones</strong>. A delete that must be recorded because someone, somewhere, may still hold the old value: with replicas, a tombstone has to outlive the slowest replica that has not heard about the delete yet, or the key comes back. Third, <strong>compaction by key</strong>: keeping only the latest record per key is exactly what Kafka calls log compaction, and it turns an event log into a snapshot of current state. The safe-swap discipline (write new, sync, rename, delete old in the right order) is also how any system replaces files that others may read at any moment.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>A record needs a length and a checksum: the length tells you where it ends, the CRC tells you it is whole. Never trust a length you have not checked against the bytes you actually have.</li>
+    <li>An append-only log plus an in-memory index of <code>(segment, offset, size)</code> gives one-seek reads and sequential writes. The cost is that every live key must fit in RAM.</li>
+    <li>A delete is a write: a tombstone record. The index is a cache; the log is the truth, so deletes must be in the log.</li>
+    <li>Segments make the log cleanable: sealed segments never change, so they can be read freely and replaced wholesale.</li>
+    <li>Recovery replays the log oldest to newest. A bad record at the end of the last segment is a torn write and is truncated away; damage in a sealed segment is real corruption and is reported.</li>
+    <li>Compaction keeps only records the index points at. Swap files safely: write temp, fsync, rename, fsync the directory, and delete old files oldest first so a tombstone never vanishes before the value it hides.</li>
+    <li>Hint files are a validated cache of a cache: use them if they check out, scan if they do not.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Your store deletes a key by removing it from the in-memory index only, without writing a tombstone. It works fine until the process restarts. What happens, and why?</p>
+    <ol class="q-options">
+      <li>Nothing: the index is rebuilt from the data files, which no longer contain the key</li>
+      <li>The key comes back, because rebuilding the index replays the old <code>put</code> record, which is still in the log</li>
+      <li>The store refuses to start, because the index and log disagree</li>
+      <li>All keys written before the delete are lost</li>
+    </ol>
+    <div class="q-explain">The log is the truth and the index is a cache derived from it. The old record is still in a segment, and nothing in the log says it was superseded, so replay restores it. A tombstone is the log's way of recording "this key is deleted from here on".</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">During compaction, the merged file has been renamed into place, and the process dies before any old segment is deleted. The next start finds both the merged file and all the old segments. Why does it still return correct data?</p>
+    <ol class="q-options">
+      <li>Because opening the store deletes every file older than the newest</li>
+      <li>Because the index is saved to disk before compaction</li>
+      <li>Because duplicate keys are rejected</li>
+      <li>Because the merged file has a higher segment id than every input it replaces, so in a replay oldest to newest its records are applied last and win; the old segments only repeat what it already says</li>
+    </ol>
+    <div class="q-explain">Segment ids define the replay order. The merged file sorts after all of its inputs and before the new active segment, so it overrides them. That is why the output id is chosen above the inputs, and why old files must be deleted oldest first: a tombstone must never disappear while an older value it hides remains.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">On startup the store finds a record with a bad checksum at the very end of the <em>last</em> segment, and a different one in the middle of a <em>sealed</em> segment. What should it do in each case?</p>
+    <ol class="q-options">
+      <li>Truncate the torn tail of the last segment (a crash artifact, never acknowledged); report corruption for the sealed segment (it was complete, so a bad record means damaged storage)</li>
+      <li>Truncate both at the bad record</li>
+      <li>Ignore both and keep going</li>
+      <li>Delete the whole store and start again</li>
+    </ol>
+    <div class="q-explain">An append that was interrupted can only leave damage at the end of the segment being written. A sealed segment was finished and synced, so damage inside it is not explained by a crash; silently truncating would throw away good data after it. A careful engine reports it and, if the data is replicated, repairs it from another copy.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why does this design (and Bitcask itself) suit "100 million video-view counters, each updated constantly" better than "10 billion different small keys, each written once"?</p>
+    <ol class="q-options">
+      <li>Because hash tables cannot store more than 100 million entries</li>
+      <li>Because sequential writes are slow for many distinct keys</li>
+      <li>The index needs RAM for every <em>live key</em>, however large the values, so the key count is the limit; and constant overwrites make compaction effective because most of the log is garbage</li>
+      <li>Because compaction cannot work on keys that were written once</li>
+    </ol>
+    <div class="q-explain">RAM use grows with the number of keys, not with the data size. A hundred million counters is a few GB of index, which fits; ten billion keys does not fit on one machine. And a workload that rewrites the same keys generates lots of dead records for compaction to reclaim.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

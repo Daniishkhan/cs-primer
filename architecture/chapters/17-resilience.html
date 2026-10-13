@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resilience Patterns · Software Architecture &amp; Design</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/breaker-sim.css">
+</head>
+<body data-root="../.." data-course="arch" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Resilience Patterns</h1>
+  <p class="lede">Every remote call can fail, hang or be slow, and in a system of many services something is always doing one of those. This chapter is a catalogue of the patterns that stop a local problem from becoming an outage: timeouts, retries, circuit breakers, bulkheads, rate limits, load shedding and graceful degradation. For each one you get the problem, the mechanism, a working sketch, its knobs and, most importantly, how it fails, plus a simulator where you can break a dependency yourself and watch the protections work and misfire.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Once you split a system across a network (<a href="11-monolith-microservices.html">chapter 11</a>), the question stops being "will something fail?" and becomes "when it does, how far does the damage spread?". The most expensive outages are rarely caused by the first failure. They are caused by the system's own reactions to it: clients that retry harder, threads that pile up behind a slow call, health checks that take healthy servers out of rotation. The patterns in this chapter are the vocabulary for reasoning about those reactions. Senior engineers are expected to know them by name, to know each one's parameters, and to say what happens when two of them are stacked wrongly.</p>
+</div>
+
+<h2>Three questions every remote call must answer</h2>
+
+<p>Networking chapter 16 (<a href="../../networking/chapters/16-failure.html">Failure, Timeouts &amp; Retries</a>) established the foundations: from the caller's side, a dead server, a slow server and a lost packet all look the same, which is "no answer yet"; the only tool you have is a timeout; retries help but can storm; and retrying is safe only for idempotent operations. This chapter does not re-derive any of that. It takes those facts as given and asks the <em>architectural</em> question: where in a system do you put these mechanisms, how do they combine, and what do you do when they are not enough?</p>
+
+<p>It helps to organise the catalogue around three questions the calling code is always implicitly answering:</p>
+
+<ul>
+  <li><strong>How long am I willing to wait?</strong> Timeouts and deadlines.</li>
+  <li><strong>Should I try again?</strong> Retries, backoff, budgets.</li>
+  <li><strong>Should I even try?</strong> Circuit breakers, bulkheads, rate limits, load shedding, and what to return instead (fallbacks, degradation).</li>
+</ul>
+
+<p>The first two protect <em>you</em> from a slow or flaky dependency. The third group also protects the <em>dependency</em> from you, which is what lets it recover. A system with only the first two is a polite client until the day it isn't.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the restaurant with ten waiters</p>
+  <p>Picture the restaurant chain from earlier chapters, with the front of house as your service and a dessert supplier as a dependency. There are ten waiters. If the supplier's delivery slows to a crawl and every waiter walks to the back door to wait for it, soon all ten are standing there and nobody can take an order for <em>mains</em>, which have nothing to do with the supplier. A <em>timeout</em> is the waiter giving up after a few minutes. A <em>retry</em> is going back to ask again (and ten waiters asking together does not help the supplier). A <em>circuit breaker</em> is the manager saying "the dessert supplier is down, stop going out there; tell guests desserts are off for now". A <em>bulkhead</em> is reserving two waiters for desserts so the other eight can always serve mains.</p>
+  <p><em>Where it breaks down:</em> the manager in a restaurant knows the supplier is down because someone phoned. Software has no phone call. It infers the failure from timeouts and errors, so it will sometimes decide wrongly in both directions.</p>
+</div>
+
+<h2>Timeouts: the foundation</h2>
+
+<p><strong>The problem.</strong> A call with no timeout can wait forever. While it waits it holds a thread, a connection and memory, and the user's request behind it. Many default client settings are either "no timeout" or a very long one, so the first rule of resilience is dull and important: <em>every remote call needs an explicit timeout</em>. That includes database queries, cache lookups, calls to "internal" services and DNS lookups.</p>
+
+<p><strong>The mechanism.</strong> The caller starts a clock when it sends the request, and if no complete response has arrived by then it abandons the wait and treats the call as failed. Real clients usually have several: a <span class="term">connect timeout</span> (how long to wait for the TCP connection), a <span class="term">read timeout</span> (how long to wait for data once connected), and sometimes a total timeout covering everything. Use them all.</p>
+
+<p><strong>Choosing the number.</strong> Not by feel, and not by copying the default. Measure the dependency's latency distribution and pick from its percentiles. A common starting point is somewhere above the p99 or p99.9 under normal load: high enough that healthy-but-slow calls (the tail, <a href="../../networking/chapters/13-performance.html">networking chapter 13</a>) rarely get cut off, and low enough that a hung call frees its thread quickly. Here is the idea with simulated latencies (a log-normal distribution, a common rough shape for service latencies):</p>
+
+<pre class="terminal" data-title="pick_timeout.py"><code>import random
+
+random.seed(7)
+# 10,000 observed latencies (ms): mostly fast, with a long tail
+lat = sorted(random.lognormvariate(3.9, 0.45) for _ in range(10_000))
+
+def pct(p):
+    return lat[int(p / 100 * len(lat)) - 1]
+
+for p in (50, 95, 99, 99.9):
+    print(f"p{p:&lt;5} {pct(p):7.1f} ms")
+print(f"timeout candidates: 2 x p99 = {2 * pct(99):.0f} ms, p99.9 = {pct(99.9):.0f} ms")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>p50       49.4 ms
+p95      103.4 ms
+p99      136.1 ms
+p99.9    189.6 ms
+timeout candidates: 2 x p99 = 272 ms, p99.9 = 190 ms</code></pre>
+
+<p>The median is 49 ms but the p99.9 is nearly four times that. A 100 ms timeout here would fail about one call in twenty even when everything is healthy; a 30-second default would let a hung call hold a thread for 600 times the typical duration. Somewhere between 200 and 300 ms is defensible, and the exact choice depends on what the caller can do with a failure (see retries below).</p>
+
+<p><strong>Deadlines propagate.</strong> A per-call timeout is not enough in a chain. If the user will give up after 2 seconds, and service A calls B which calls C, then C working for 5 seconds is wasted effort, as is B retrying C after A has stopped waiting. The fix is a <span class="term">deadline</span>: an absolute point in time by which the whole request must be answered, passed along with every call (in a header, or in gRPC's built-in deadline). Each hop computes how much time is left and uses that as its timeout. This is the synchronous-chain problem from <a href="13-sync-async.html">chapter 13</a>, solved in code:</p>
+
+<pre class="terminal" data-title="deadline.py"><code>import time
+
+def call_with_deadline(fn, deadline, per_call_cap=1.0):
+    remaining = deadline - time.monotonic()
+    if remaining &lt;= 0:
+        raise TimeoutError("deadline already passed, not calling")
+    return fn(timeout=min(remaining, per_call_cap))
+
+def downstream(timeout):
+    return f"downstream call allowed {timeout:.2f}s"
+
+deadline = time.monotonic() + 1.5          # the user's whole request gets 1.5 s
+print(call_with_deadline(downstream, deadline))
+time.sleep(0.9)                            # 0.9 s spent elsewhere
+print(call_with_deadline(downstream, deadline))
+time.sleep(0.8)                            # now the budget is gone
+try:
+    call_with_deadline(downstream, deadline)
+except TimeoutError as e:
+    print("TimeoutError:", e)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>downstream call allowed 1.00s
+downstream call allowed 0.60s
+TimeoutError: deadline already passed, not calling
+</code></pre>
+
+<p>The second figure may print as 0.59 on your machine, because <code>time.sleep</code> can overshoot slightly. Note the third call: the code refuses to call at all. Work that cannot finish in time is not started, which is the cheapest form of load shedding.</p>
+
+<div class="callout warn">
+  <p class="callout-title">A timeout abandons the wait, not the work</p>
+  <p>When the client times out, the server usually keeps going. The query keeps running, the downstream calls keep flying, and the dependency is still loaded by a request nobody is waiting for. This is why timeouts alone cannot protect a struggling dependency, and why a timed-out write may have <em>succeeded</em> (so retrying it needs idempotency, <a href="../../networking/chapters/16-failure.html">networking chapter 16</a> and <a href="09-api-design.html">chapter 9</a>). The simulator below counts these abandoned calls as "in flight at the dependency".</p>
+</div>
+
+<p><strong>Failure modes of timeouts.</strong> Too short: healthy calls fail, which triggers retries, which add load (a self-inflicted outage). Too long: threads and connections pile up behind a hung dependency. Inconsistent across layers: if the outer call has a 1 s timeout and the inner one 5 s, the inner work continues long after the outer caller left. A good rule is that timeouts shrink as you go deeper, which deadline propagation gives you for free.</p>
+
+<h2>Retries: help and harm</h2>
+
+<p><strong>The problem.</strong> Many failures are transient: a packet dropped, a server restarting, a brief overload. Trying again often works. But a retry is also <em>more load</em>, and it is sent at precisely the moment the dependency is least able to take it.</p>
+
+<p><strong>The rules.</strong> Networking chapter 16 covers the mechanics (exponential backoff, jitter, idempotency keys) and <a href="../../networking/cases/case-08-retry-storms.html">case study: retry storms and metastable failures</a> tells what happens when they are missing. As an architect, the decisions are about <em>policy</em>:</p>
+
+<ul>
+  <li><strong>Retry only retryable errors.</strong> A timeout, a connection reset, an HTTP 503 or 429 may clear on its own. A 400 (bad request), a 404 or a validation failure will fail identically a second time, so retrying wastes load. This is a contract question: your error model (<a href="03-abstractions.html">chapter 3</a>, <a href="09-api-design.html">chapter 9</a>) should let a caller tell "retry me" from "I will never work".</li>
+  <li><strong>Retry only idempotent operations</strong>, or non-idempotent ones carrying an idempotency key. Reads and "set to this value" writes are safe; "charge the card" is not without a key.</li>
+  <li><strong>Back off exponentially, with jitter</strong>, and cap both the delay and the number of attempts. Two or three attempts total is typical; ten is a bug.</li>
+  <li><strong>Retry in one place.</strong> This is the one the rest of the chapter keeps returning to.</li>
+</ul>
+
+<h3>Retrying at every layer multiplies traffic</h3>
+
+<p>Suppose a request passes through three layers: a gateway, an order service and a payment service, which talks to a database. Each layer, reasonably, retries a failed call up to 3 attempts in total. The database is struggling and fails every call. What does it see?</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 230" role="img" aria-label="Four boxes in a row: Gateway, Order service, Payment service and Database. Each of the three arrows between them is labelled 3 attempts. Below the boxes, the number of calls grows: 1 request enters the gateway, the order service receives 3 calls, the payment service receives 9, and the database receives 27.">
+<defs><marker id="ahA17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="20" y="50" width="120" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="80" y="76" text-anchor="middle" class="t-sm t-bold">Gateway</text>
+<text x="80" y="94" text-anchor="middle" class="t-xs t-muted">layer 1</text>
+<rect x="220" y="50" width="120" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="280" y="76" text-anchor="middle" class="t-sm t-bold">Order service</text>
+<text x="280" y="94" text-anchor="middle" class="t-xs t-muted">layer 2</text>
+<rect x="420" y="50" width="120" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="480" y="76" text-anchor="middle" class="t-sm t-bold">Payment service</text>
+<text x="480" y="94" text-anchor="middle" class="t-xs t-muted">layer 3</text>
+<rect x="620" y="50" width="120" height="60" rx="8" class="fs-red s-red sw-2"/>
+<text x="680" y="76" text-anchor="middle" class="t-sm t-bold">Database</text>
+<text x="680" y="94" text-anchor="middle" class="t-xs t-muted">failing</text>
+<line x1="140" y1="80" x2="220" y2="80" class="line" marker-end="url(#ahA17a)"/>
+<line x1="340" y1="80" x2="420" y2="80" class="line" marker-end="url(#ahA17a)"/>
+<line x1="540" y1="80" x2="620" y2="80" class="line" marker-end="url(#ahA17a)"/>
+<text x="180" y="40" text-anchor="middle" class="t-xs t-muted">up to 3</text>
+<text x="380" y="40" text-anchor="middle" class="t-xs t-muted">up to 3</text>
+<text x="580" y="40" text-anchor="middle" class="t-xs t-muted">up to 3</text>
+<text x="80" y="150" text-anchor="middle" class="t-sm t-bold tc-yellow">1 request</text>
+<text x="280" y="150" text-anchor="middle" class="t-sm t-bold">3 calls</text>
+<text x="480" y="150" text-anchor="middle" class="t-sm t-bold">9 calls</text>
+<text x="680" y="150" text-anchor="middle" class="t-sm t-bold tc-red">27 calls</text>
+<line x1="80" y1="164" x2="680" y2="164" class="line-thin"/>
+<text x="380" y="192" text-anchor="middle" class="t-sm">3 x 3 x 3 = 27 calls reach the database for one user request</text>
+<text x="380" y="212" text-anchor="middle" class="t-xs t-muted">each layer is sensible alone; together they multiply</text>
+</svg>
+  <figcaption>Each layer retries 3 times, so the work multiplies at every hop: 1, 3, 9, 27. Add a fourth layer and it is 81. The database gets hit hardest exactly when it is weakest.</figcaption>
+</figure>
+
+<p>It is easy to confirm in code. This fake database counts every call it receives; each of three layers wraps the next in a 3-attempt retry:</p>
+
+<pre class="terminal" data-title="amplify.py"><code>class Dependency:
+    """Always failing, counts every call it receives."""
+    calls = 0
+    def handle(self):
+        Dependency.calls += 1
+        raise TimeoutError("busy")
+
+def with_retries(fn, attempts=3):
+    for i in range(attempts):
+        try:
+            return fn()
+        except TimeoutError:
+            if i == attempts - 1:
+                raise
+
+dep = Dependency()
+def db_client():      return with_retries(dep.handle)       # layer 3 retries 3x
+def service_b():      return with_retries(db_client)        # layer 2 retries 3x
+def service_a():      return with_retries(service_b)        # layer 1 retries 3x
+
+try:
+    service_a()
+except TimeoutError:
+    pass
+print("calls that reached the dependency:", Dependency.calls)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>calls that reached the dependency: 27</code></pre>
+
+<p>The standard defences, in order of how often they are the right answer:</p>
+
+<ul>
+  <li><strong>Retry at one layer only</strong>, usually the one closest to the user (which has the most context on whether the whole operation is worth retrying) or the one closest to the dependency (which can see exact error types). The other layers fail fast and pass the error up. Pick deliberately and write it down.</li>
+  <li><strong>Pass a "do not retry" signal downstream.</strong> If layer 1 is going to retry, it can mark its calls so deeper layers do not.</li>
+  <li><strong>Use a retry budget.</strong> Instead of a per-request limit ("3 attempts"), limit retries as a fraction of traffic: retries may be at most, say, 10% of first attempts over a window. When a dependency is truly down, almost every request wants to retry, and the budget turns that into at most 1.1x load instead of 3x or 27x. When failures are rare, the budget is never the limit. The idea is described in public engineering writing about several large systems; the mechanism is small:</li>
+</ul>
+
+<pre class="terminal" data-title="retry_budget.py"><code>class RetryBudget:
+    """Allow retries only while they stay under `ratio` of first attempts."""
+    def __init__(self, ratio=0.1, min_tokens=3):
+        self.ratio, self.tokens, self.max = ratio, float(min_tokens), float(min_tokens)
+
+    def on_request(self):                 # every first attempt earns a fraction of a retry
+        self.tokens = min(self.max, self.tokens + self.ratio)
+
+    def try_retry(self):                  # a retry must spend a whole token
+        if self.tokens &gt;= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+budget = RetryBudget(ratio=0.1, min_tokens=3)
+sent = retries = 0
+for _ in range(1000):                     # dependency down: every request fails
+    budget.on_request(); sent += 1
+    while budget.try_retry():
+        retries += 1; sent += 1
+        break                             # at most one retry per request
+print(f"first attempts=1000, retries={retries}, total calls={sent} ({sent/1000:.2f}x)")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>first attempts=1000, retries=102, total calls=1102 (1.10x)</code></pre>
+
+<p>With every single request failing, load went up by 10%, not 200%. The budget (a token bucket, which reappears under rate limiting below) turns "retry whenever you can" into "retry only while the system is mostly healthy". Its parameters are the ratio (often around 10%) and a small minimum so that a quiet service can still retry occasionally.</p>
+
+<p><strong>Failure modes of retries.</strong> Retrying non-idempotent operations (duplicate charges); retrying deterministic failures (wasted load); synchronised retries without jitter (waves); multiplication across layers; and the subtle one, retries that keep a bad state going after the original trigger is gone, which is the subject of the metastable-failure case study.</p>
+
+<h2>Circuit breakers</h2>
+
+<p><strong>The problem.</strong> A dependency is failing or very slow. Every call to it costs you a thread for the full timeout and gives the dependency more work it cannot do. Retrying politely does not help; the better move is to stop calling for a while.</p>
+
+<p><strong>The mechanism.</strong> A <span class="term">circuit breaker</span>, popularised for software by Michael Nygard's book <em>Release It!</em> and named after the electrical device, wraps calls to a dependency in a small state machine:</p>
+
+<ul>
+  <li><strong>Closed</strong>: normal operation. Calls go through; the breaker counts recent failures.</li>
+  <li><strong>Open</strong>: too many recent failures. Calls are rejected immediately without touching the dependency. After a cool-down period the breaker moves on.</li>
+  <li><strong>Half-open</strong>: the cool-down is over. The breaker lets a small number of probe calls through. If they succeed, the breaker closes again; if one fails, it re-opens and the cool-down restarts.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="State machine with three states in a row: Closed, Open and Half-open. An arrow from Closed to Open is labelled failures over threshold. An arrow from Open to Half-open is labelled cool-down elapsed. A curved arrow from Half-open back to Closed is labelled probe succeeds. A shorter curved arrow from Half-open back to Open is labelled probe fails.">
+<defs><marker id="ahA17b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="20" y="50" width="150" height="60" rx="8" class="fs-green s-green sw-2"/>
+<text x="95" y="72" text-anchor="middle" class="t-sm t-bold">Closed</text>
+<text x="95" y="90" text-anchor="middle" class="t-xs t-muted">calls pass through</text>
+<text x="95" y="103" text-anchor="middle" class="t-xs t-muted">failures counted</text>
+<rect x="305" y="50" width="150" height="60" rx="8" class="fs-red s-red sw-2"/>
+<text x="380" y="72" text-anchor="middle" class="t-sm t-bold">Open</text>
+<text x="380" y="90" text-anchor="middle" class="t-xs t-muted">calls rejected</text>
+<text x="380" y="103" text-anchor="middle" class="t-xs t-muted">instantly</text>
+<rect x="590" y="50" width="150" height="60" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="665" y="72" text-anchor="middle" class="t-sm t-bold">Half-open</text>
+<text x="665" y="90" text-anchor="middle" class="t-xs t-muted">one probe call</text>
+<text x="665" y="103" text-anchor="middle" class="t-xs t-muted">allowed through</text>
+<line x1="170" y1="92" x2="305" y2="92" class="line" marker-end="url(#ahA17b)"/>
+<text x="237" y="70" text-anchor="middle" class="t-xs">failures over</text>
+<text x="237" y="83" text-anchor="middle" class="t-xs">threshold</text>
+<line x1="455" y1="92" x2="590" y2="92" class="line" marker-end="url(#ahA17b)"/>
+<text x="522" y="70" text-anchor="middle" class="t-xs">cool-down</text>
+<text x="522" y="83" text-anchor="middle" class="t-xs">elapsed</text>
+<path d="M665,110 C665,250 95,250 95,110" class="line" fill="none" marker-end="url(#ahA17b)"/>
+<text x="380" y="252" text-anchor="middle" class="t-xs">probe succeeds: close and forget old failures</text>
+<path d="M610,110 C590,160 480,160 440,110" class="line" fill="none" marker-end="url(#ahA17b)"/>
+<text x="525" y="178" text-anchor="middle" class="t-xs">probe fails: open again</text>
+</svg>
+  <figcaption>The circuit-breaker state machine. Closed is the normal state; Open protects both the caller and the dependency; Half-open tests for recovery with a trickle of traffic.</figcaption>
+</figure>
+
+<p>A compact version in Python. The clock is injectable, so the demo is deterministic, and a <span class="term">fallback</span> says what to return when the breaker will not make the call:</p>
+
+<pre class="terminal" data-title="breaker.py"><code>import time
+
+class CircuitOpen(Exception):
+    pass
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=3, reset_timeout=10.0, clock=time.monotonic):
+        self.threshold, self.reset_timeout, self.clock = failure_threshold, reset_timeout, clock
+        self.state, self.failures, self.opened_at = "closed", 0, 0.0
+
+    def call(self, fn, fallback=None):
+        if self.state == "open":
+            if self.clock() - self.opened_at &lt; self.reset_timeout:
+                return self._reject(fallback)          # fail fast, do not touch the dependency
+            self.state = "half-open"                   # cool-down over: allow one probe
+        try:
+            result = fn()
+        except Exception:
+            self._on_failure()
+            if fallback: return fallback()
+            raise
+        self._on_success()
+        return result
+
+    def _reject(self, fallback):
+        if fallback: return fallback()
+        raise CircuitOpen("circuit open")
+
+    def _on_failure(self):
+        self.failures += 1
+        if self.state == "half-open" or self.failures &gt;= self.threshold:
+            self.state, self.opened_at = "open", self.clock()
+
+    def _on_success(self):
+        self.state, self.failures = "closed", 0
+
+# --- demo with a fake clock and a dependency that breaks, then heals ---
+now = [0.0]
+healthy = [False]
+def dep():
+    if not healthy[0]: raise TimeoutError("timeout")
+    return "ok"
+
+cb = CircuitBreaker(failure_threshold=3, reset_timeout=10, clock=lambda: now[0])
+for t in (0, 1, 2, 3, 4, 12):
+    now[0] = t
+    if t == 12: healthy[0] = True
+    try:
+        r = cb.call(dep, fallback=lambda: "cached")
+    except Exception as e:
+        r = type(e).__name__
+    print(f"t={t:&gt;2}s  state={cb.state:&lt;9} result={r}")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>t= 0s  state=closed    result=cached
+t= 1s  state=closed    result=cached
+t= 2s  state=open      result=cached
+t= 3s  state=open      result=cached
+t= 4s  state=open      result=cached
+t=12s  state=closed    result=ok</code></pre>
+
+<p>Read the trace. The first three calls really hit the dependency and failed (each returned the cached fallback); the third tripped the breaker. At t=3 and t=4 the dependency was not called at all. At t=12 the 10-second cool-down had passed, so the breaker went half-open, let one probe through, saw it succeed and closed. (The printed state is the state <em>after</em> each call, so half-open is never visible: it lasts only for the probe.) This sketch is deliberately minimal. It is not thread-safe, it counts consecutive-ish failures rather than a rate, and in half-open it would let every concurrent caller through rather than one.</p>
+
+<p><strong>Parameters.</strong> What counts as a failure (errors, timeouts, slow calls? all three, usually; but not client mistakes like a 404). The trip condition: a consecutive-failure count, or better, a failure <em>rate</em> over a sliding window with a minimum number of calls so that two failures at 3 a.m. do not open it. The cool-down length. How many probes half-open allows. And the scope: one breaker per dependency, or per endpoint or host, so that one bad route does not block a healthy one.</p>
+
+<p><strong>What to return when open.</strong> This is a product decision as much as a technical one, and there are only three honest answers: a <em>fallback</em> (a sensible default, such as "no recommendations"), a <em>cached</em> value (stale but useful, such as yesterday's prices, clearly marked), or a fast <em>error</em> (when no substitute exists, as for a payment). A fast error is still better than a slow one: the caller learns immediately and can degrade.</p>
+
+<p><strong>Failure modes.</strong> Thresholds too sensitive, so the breaker flaps open and closed. Thresholds too loose, so it opens after the damage is done. Per-instance breakers that each learn of the outage separately (every instance takes its own 10 failing calls), versus shared state that is itself a dependency. A fallback that fails too (see below). And a half-open state that lets a flood of probes through, re-overloading a dependency that has only just begun to recover. The opposite worry also applies: a breaker is not free, since it adds state to reason about and test; use it where a dependency's failure can plausibly hurt you, not on every call. The story of how Netflix's Hystrix library made this pattern widely known, and what was learned, is in <a href="../cases/case-04-netflix-hystrix.html">the Hystrix case study</a>.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the fuse box</p>
+  <p>The electrical circuit breaker in a house trips when too much current flows, cutting the circuit so the wiring does not overheat. Software borrowed the name for the same reason: it fails fast and protects the rest of the system from a fault in one part.</p>
+  <p><em>Where it breaks down:</em> a household breaker stays off until a human flips it back. A software breaker must test for recovery itself, which is the whole purpose of the half-open state, and it must decide on partial, noisy evidence rather than a clear overload.</p>
+</div>
+
+<h2>Bulkheads</h2>
+
+<p><strong>The problem.</strong> One slow dependency should not be able to consume every thread, connection or unit of memory and take down features that do not need it. This is the restaurant story, and it is the most common way a small problem becomes a large one: a non-critical call (recommendations, an audit log) takes down a critical path (checkout) because they share a pool.</p>
+
+<p><strong>The mechanism.</strong> The name comes from the watertight compartments in a ship's hull: a breach floods one compartment, not the whole ship. In software, give each dependency (or each class of work) its own limited resource: a separate thread pool, a separate connection pool, or just a counter that caps the number of concurrent calls. When that dependency is slow and its allowance is used up, further calls to it are rejected immediately; everything else keeps its own capacity.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 230" role="img" aria-label="Two panels. Left: a shared pool of ten threads, all ten coloured red because they are all waiting on a slow Recommendations service, so a checkout request finds no free thread. Right: two separate pools. The Checkout pool has six threads, two busy and four free. The Recommendations pool has four threads, all red and stuck. Checkout still has threads.">
+<rect x="10" y="10" width="360" height="210" rx="10" class="box"/>
+<rect x="390" y="10" width="360" height="210" rx="10" class="box"/>
+<text x="190" y="36" text-anchor="middle" class="t-sm t-bold">One shared pool of 10 threads</text>
+<text x="570" y="36" text-anchor="middle" class="t-sm t-bold">A pool per dependency</text>
+<rect x="114" y="62" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="146" y="62" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="178" y="62" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="210" y="62" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="242" y="62" width="24" height="24" rx="4" class="fs-red s-red sw-2"/>
+<rect x="114" y="94" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="146" y="94" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="178" y="94" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="210" y="94" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="242" y="94" width="24" height="24" rx="4" class="fs-red s-red sw-2"/>
+<text x="190" y="148" text-anchor="middle" class="t-xs t-muted">all 10 waiting on slow Recommendations</text>
+<text x="190" y="176" text-anchor="middle" class="t-sm t-bold tc-red">A checkout request finds no thread</text>
+<text x="190" y="196" text-anchor="middle" class="t-xs t-muted">unrelated work is starved too</text>
+<text x="410" y="60" class="t-xs t-bold">Checkout pool: 6</text>
+<rect x="410" y="66" width="24" height="24" rx="4" class="fs-green s-green sw-2"/><rect x="440" y="66" width="24" height="24" rx="4" class="fs-green s-green sw-2"/><rect x="470" y="66" width="24" height="24" rx="4" class="box"/><rect x="500" y="66" width="24" height="24" rx="4" class="box"/><rect x="530" y="66" width="24" height="24" rx="4" class="box"/><rect x="560" y="66" width="24" height="24" rx="4" class="box"/>
+<text x="410" y="118" class="t-xs t-bold">Recommendations pool: 4</text>
+<rect x="410" y="124" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="440" y="124" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="470" y="124" width="24" height="24" rx="4" class="fs-red s-red sw-2"/><rect x="500" y="124" width="24" height="24" rx="4" class="fs-red s-red sw-2"/>
+<text x="410" y="182" class="t-xs">Only the 4 Recommendations threads wait.</text>
+<text x="410" y="200" class="t-xs">Checkout keeps its threads; extra Recs calls fail fast.</text>
+</svg>
+  <figcaption>Without a bulkhead, a slow low-value dependency can hold every thread. With one, the damage is limited to that dependency's own allowance.</figcaption>
+</figure>
+
+<pre class="terminal" data-title="bulkhead.py"><code>import threading, time
+from concurrent.futures import ThreadPoolExecutor
+
+class Bulkhead:
+    def __init__(self, max_concurrent):
+        self.sem = threading.BoundedSemaphore(max_concurrent)
+    def call(self, fn):
+        if not self.sem.acquire(blocking=False):      # full: reject, do not queue
+            raise RuntimeError("bulkhead full")
+        try:
+            return fn()
+        finally:
+            self.sem.release()
+
+recs = Bulkhead(2)                                     # recommendations: at most 2 at once
+def slow(): time.sleep(0.2); return "ok"
+def attempt(_):
+    try:    return recs.call(slow)
+    except RuntimeError as e: return str(e)
+
+with ThreadPoolExecutor(6) as pool:
+    results = list(pool.map(attempt, range(6)))
+print(sorted(results))</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>['bulkhead full', 'bulkhead full', 'bulkhead full', 'bulkhead full', 'ok', 'ok']</code></pre>
+
+<p>Six simultaneous callers, a limit of two: two get in and four are rejected at once instead of piling up. (Exactly which calls win depends on thread timing; the 2-and-4 split is the stable part.) A semaphore is the lightweight form; a dedicated thread pool is the heavier form that also isolates CPU and gives you a queue; with asynchronous I/O, a semaphore usually is the bulkhead.</p>
+
+<p><strong>Parameters and sizing.</strong> The limit is a capacity decision. <a href="../../systems/chapters/14-queues-backpressure.html">Little's law</a> gives a first estimate: concurrent calls in flight ≈ arrival rate × time per call. A dependency called 100 times a second with a 50 ms typical latency needs about 5 in flight; a limit of 10 to 20 leaves headroom for bursts without letting a 5-second hang absorb 500 threads. Failure modes: limits set too low cause rejections during normal bursts; limits set too high give no isolation; many tiny pools waste capacity that sits idle in one pool while another is starved (isolation always costs some efficiency); and a bulkhead without a timeout just gets full and stays full.</p>
+
+<h2>Rate limiting</h2>
+
+<p><strong>The problem.</strong> Some callers send more than the system should accept: a buggy client in a loop, a batch job, a noisy tenant, an abusive user. A <span class="term">rate limit</span> caps how fast a given caller can go, so that one party's demand cannot crowd out everyone else's. It is a <em>fairness and policy</em> tool, set per client, API key or tenant, which makes it different from load shedding (next section).</p>
+
+<p><strong>Token bucket.</strong> The most common algorithm. A bucket holds up to <code>capacity</code> tokens and refills at <code>rate</code> tokens per second. Each request removes a token; with an empty bucket the request is rejected. The effect is a long-run average of <code>rate</code> requests per second, while allowing bursts up to <code>capacity</code>. The same trick, bucket, refill, spend, is what the retry budget above is.</p>
+
+<pre class="terminal" data-title="token_bucket.py"><code>class TokenBucket:
+    def __init__(self, rate, capacity, clock):
+        self.rate, self.capacity, self.clock = rate, capacity, clock
+        self.tokens, self.stamp = float(capacity), clock()
+
+    def allow(self, cost=1):
+        now = self.clock()
+        self.tokens = min(self.capacity, self.tokens + (now - self.stamp) * self.rate)
+        self.stamp = now
+        if self.tokens &gt;= cost:
+            self.tokens -= cost
+            return True
+        return False
+
+now = [0.0]
+tb = TokenBucket(rate=5, capacity=10, clock=lambda: now[0])   # 5/s, bursts of 10
+burst = sum(tb.allow() for _ in range(15))
+print("burst of 15 at t=0:", burst, "allowed,", 15 - burst, "rejected")
+now[0] = 1.0                                                   # one second later
+print("1 s later, 15 more:", sum(tb.allow() for _ in range(15)), "allowed")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>burst of 15 at t=0: 10 allowed, 5 rejected
+1 s later, 15 more: 5 allowed</code></pre>
+
+<p><strong>Leaky bucket.</strong> The mirror image: requests pour into a bucket (a queue) that drains at a fixed rate. If it overflows, requests are dropped. Where the token bucket lets bursts through and limits the average, the leaky bucket <em>smooths</em> traffic into a constant outflow. Choose the token bucket when bursts are acceptable (most APIs); choose the leaky bucket (a queue with a fixed-rate worker) when the thing behind you needs a steady pace, such as an SMS gateway with a hard send rate. Window counters ("100 requests per minute") are simpler but admit a double burst at the boundary of two windows.</p>
+
+<p><strong>Where it lives.</strong> On the <em>server side</em> (or at a gateway) the limit protects the service and enforces the contract; when exceeded it should answer <strong>HTTP 429 Too Many Requests</strong>, ideally with a <code>Retry-After</code> header so well-behaved clients know when to come back. On the <em>client side</em> a limiter keeps you inside a third party's quota, or stops one of your jobs from hammering your own dependency. Both are useful: the server limit is the guarantee; the client limit is good manners and avoids wasted calls.</p>
+
+<p><strong>Failure modes.</strong> A limiter per instance multiplies the real limit by the instance count (ten instances at 100/s each is 1000/s); a shared limiter in a central store becomes a dependency and a hot spot, and many systems accept approximate counts for that reason. A limit set too low during a flash sale rejects paying customers. Clients that ignore 429 and retry immediately turn the limiter into an amplifier, which is why 429 is a <em>retryable-after-a-delay</em> error and the delay matters.</p>
+
+<h2>Load shedding and admission control</h2>
+
+<p><strong>The problem.</strong> Even with every client within its limit, total demand can exceed what the service can serve: a traffic spike, a slow dependency, a lost replica. A server that accepts everything it is sent queues the excess, latency climbs, every request slows (see the utilisation cliff and the unbounded-queue trap in <a href="../../systems/chapters/14-queues-backpressure.html">systems chapter 14</a>), and soon nearly all of them time out: it is working flat out and delivering almost nothing useful.</p>
+
+<p><strong>The mechanism.</strong> <span class="term">Load shedding</span> means deliberately refusing some work so the rest can succeed; <span class="term">admission control</span> is the policy that decides what gets in. The crudest policy is a cap on concurrent requests in flight, rejecting beyond it with 503. Better policies use <em>priority</em>: when load rises, shed the least important work first, such as background and batch traffic, then reads that can be retried, and keep checkout and health checks until the very end.</p>
+
+<pre class="terminal" data-title="admission.py"><code>from dataclasses import dataclass
+
+@dataclass
+class Request:
+    name: str
+    priority: int          # 0 = critical (checkout), 1 = normal, 2 = background
+
+class Admission:
+    """Shed lowest-priority work first as in-flight load approaches the limit."""
+    def __init__(self, limit):
+        self.limit, self.in_flight = limit, 0
+    def admit(self, req):
+        # priority 2 is refused above 50% of the limit, priority 1 above 80%, priority 0 only at 100%
+        cutoff = {2: 0.5, 1: 0.8, 0: 1.0}[req.priority] * self.limit
+        if self.in_flight &gt;= cutoff:
+            return False
+        self.in_flight += 1
+        return True
+
+adm = Admission(limit=10)
+stream = [Request(f"r{i}", p) for i, p in enumerate([2, 1, 0] * 6)]
+for r in stream:
+    ok = adm.admit(r)
+    print(f"{r.name:&lt;4} priority={r.priority} in_flight={adm.in_flight:&gt;2} -&gt; {'admit' if ok else 'SHED'}")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>r0   priority=2 in_flight= 1 -&gt; admit
+r1   priority=1 in_flight= 2 -&gt; admit
+r2   priority=0 in_flight= 3 -&gt; admit
+r3   priority=2 in_flight= 4 -&gt; admit
+r4   priority=1 in_flight= 5 -&gt; admit
+r5   priority=0 in_flight= 6 -&gt; admit
+r6   priority=2 in_flight= 6 -&gt; SHED
+r7   priority=1 in_flight= 7 -&gt; admit
+r8   priority=0 in_flight= 8 -&gt; admit
+r9   priority=2 in_flight= 8 -&gt; SHED
+r10  priority=1 in_flight= 8 -&gt; SHED
+r11  priority=0 in_flight= 9 -&gt; admit
+r12  priority=2 in_flight= 9 -&gt; SHED
+r13  priority=1 in_flight= 9 -&gt; SHED
+r14  priority=0 in_flight=10 -&gt; admit
+r15  priority=2 in_flight=10 -&gt; SHED
+r16  priority=1 in_flight=10 -&gt; SHED
+r17  priority=0 in_flight=10 -&gt; SHED</code></pre>
+
+<p>Nothing in this demo finishes, so the in-flight count only rises; in a real server requests complete and free slots. The point is the ordering of the refusals: background work (priority 2) is shed first, normal work next, and the last request, even a critical one, is shed only when the server is truly full. Notice how much cheaper a rejection must be than an acceptance. A rejection that costs as much CPU as doing the work sheds nothing, so decide <em>before</em> parsing the body or opening a database connection.</p>
+
+<p><strong>Parameters.</strong> The limit (best found by load testing; some systems adapt it automatically from observed latency, which is more robust than a static number but harder to reason about), the priority classes and their cut-offs, and which requests are classified as critical. Two further tricks: drop requests whose deadline has already passed (their callers have gone), and when a queue builds up, serve the <em>newest</em> requests first, since the oldest are the most likely to have been abandoned.</p>
+
+<p><strong>Rate limiting versus load shedding.</strong> A rate limit says "you are asking for too much" and is about one caller's behaviour; load shedding says "we are asking for too much in total" and is about the server's capacity. A well-behaved client under its quota can still be shed during an overload. Answering 429 for the first and 503 for the second helps clients react correctly, since a 503 suggests backing off for everyone while a 429 suggests slowing <em>yourself</em>.</p>
+
+<p><strong>Failure modes.</strong> Shedding the wrong traffic (a health check or login that everything else depends on); a static limit that is wrong after a deploy changes the cost of a request; shed requests that clients immediately retry, restoring the load; and no visibility, so nobody notices that 5% of traffic has been refused for a week. Always count and alert on shed requests.</p>
+
+<h2>Graceful degradation</h2>
+
+<p><strong>The problem.</strong> When a part of the system is unavailable, the choices are not just "fully working" and "error page". Most products have features of unequal value. A product page that cannot load recommendations, reviews or personalised pricing can still show the product and the Buy button.</p>
+
+<p><strong>The mechanism.</strong> <span class="term">Graceful degradation</span> means designing each page or API so that non-essential parts can be dropped, simplified or stale without failing the whole response: serve a <em>partial result</em> (the page without the reviews panel), a cached or default value, a cheaper algorithm (popular items instead of personalised ones), or a read-only mode when writes are failing. To make this practical you need <span class="term">feature switches</span> (operational flags, covered in <a href="18-evolving-safely.html">chapter 18</a>) that turn an expensive or failing feature off in seconds, without a deploy, ideally automatically when a breaker opens.</p>
+
+<p>The prerequisite is a decision made in advance, with product people in the room: which features are essential, and what does the user see when each non-essential one is missing? Teams that skip this have degradation by accident, which usually means a blank page or a raw stack trace. Be careful about <em>silently</em> degrading data that matters: showing a stale balance without saying so is a correctness problem, not a resilience win. Mark degraded responses so users and monitoring can tell.</p>
+
+<h2>Fallbacks and their dangers</h2>
+
+<p>A <span class="term">fallback</span> is the alternative path taken when the primary one fails: a cache, a default, a second provider, a simpler algorithm. They are the practical content of graceful degradation, and they carry a specific, well-known danger: <strong>fallback paths are the least-exercised code in the system</strong>. They run only during failures, which are rare, so they rot. A fallback that was correct a year ago may reference a cache that no longer exists, a config key that was renamed, or a second provider whose credentials expired. Worse, it runs at the worst moment, when the system is already under stress, and may itself fail, turning a degraded outage into a total one.</p>
+
+<div class="callout warn">
+  <p class="callout-title">An untested fallback is a hope, not a design</p>
+  <p>Treat a fallback as production code with the same standards: exercise it regularly (in tests, in a staging environment, in game days or by deliberately failing the primary in production at low risk), monitor how often it is used, and keep it <em>simple and independent</em> of the thing it replaces. A fallback that calls the same overloaded database as the primary is not a fallback. A fallback that is more expensive than the primary (a heavy "slow path") can also take the system down faster than the failure it was meant to cover.</p>
+</div>
+
+<h3>Health checks: liveness vs readiness</h3>
+
+<p>Orchestrators and load balancers need to know whether an instance is usable, and the standard answer is two different questions that are often confused:</p>
+
+<ul>
+  <li><span class="term">Liveness</span>: is the process alive and not stuck? If not, restart it. This should be a cheap check that does <em>not</em> depend on other services.</li>
+  <li><span class="term">Readiness</span>: is this instance able to take traffic right now (finished starting up, caches warm, not overloaded)? If not, stop sending it requests but do not kill it.</li>
+</ul>
+
+<p>These ideas are used in container platforms such as Kubernetes under those names, and the general distinction applies elsewhere. The classic mistake is putting a dependency check in the liveness probe: when the database has a hiccup, every instance fails liveness, the orchestrator restarts all of them at once, and a database blip becomes a full outage with a cold-start stampede on top. A subtler version puts the dependency in readiness: when a shared dependency is down, <em>every</em> instance becomes "unready", the load balancer has nobody to send to, and even endpoints that did not need that dependency go dark. Readiness should reflect whether <em>this instance</em> can do useful work, and degrade (return partial answers) rather than refuse everything when an optional dependency fails.</p>
+
+<h2>Static stability</h2>
+
+<p>The patterns so far react to failure at run time. A complementary idea is to arrange the system so that a dependency failure <em>does not require anyone or anything to change anything</em> in order to keep working. The AWS Builders' Library uses the term <span class="term">static stability</span> for this; the general idea is worth knowing under any name. A statically stable system keeps operating in its current state when a supporting component, especially a <em>control plane</em> (the part that makes changes, such as launching instances, updating routes, or issuing credentials), becomes unavailable.</p>
+
+<p>Examples of the style, described generally: a service that pre-provisions enough capacity in each zone to survive losing one, instead of relying on an auto-scaler launching replacements during the very failure that might also disable the launcher; a proxy that keeps running with the last known good configuration if the configuration service is unreachable, instead of failing closed; a client that caches the most recent routing table or feature flags on disk and uses them when the flag service is down. The trade-off is cost and staleness: pre-provisioned spare capacity is paid for while idle, and cached state can be wrong. The design question to ask of every dependency is therefore: <em>"If this vanished right now, what would my service do in the next hour, and would recovery require a human or an automated action that might itself depend on the thing that failed?"</em> If the answer involves the failed thing, you have found a hidden circular dependency.</p>
+
+<h2>Chaos engineering</h2>
+
+<p>All of these mechanisms have parameters that are guessed, and fallbacks that rarely run. <span class="term">Chaos engineering</span> is the practice of testing them by injecting realistic failures into a running system on purpose: killing instances, adding latency, failing a dependency, and watching whether the system's behaviour matches what the design promised. The idea is to find weaknesses under controlled conditions, with a hypothesis, a limited blast radius and a way to stop, rather than at 3 a.m. during a real incident. It is associated especially with Netflix, which built tooling for it alongside its resilience libraries; the <a href="../cases/case-04-netflix-hystrix.html">Netflix, Hystrix &amp; Chaos case study</a> covers that history. The principle holds on any scale. A smaller team can do the same with a "game day" where a dependency is blocked in a staging environment and everyone checks what happens, and with fault-injection tests like the ones in <a href="../labs/lab-06-resilience.html">Lab 6</a>.</p>
+
+<h2>Where each pattern sits</h2>
+
+<p>The patterns are layers at different points on the call path, not alternatives. Server-side controls protect the service from its callers; client-side controls protect the caller from its dependency; fallbacks and static stability decide what happens when protection is not enough.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Call path diagram. Top row, server side: Callers, then Rate limit, then Load shedding, then Handler with degradation and flags, plus a separate dashed box for Health checks. A line from the Handler goes down and left to the second row, client side: Deadline and timeout, Retry with budget and jitter, Circuit breaker, Bulkhead, then the Dependency. From the Circuit breaker an arrow goes down to a Fallback box. A dashed box at the bottom right notes static stability.">
+<defs><marker id="ahA17c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="18" class="t-xs t-muted">Server side: protecting yourself from callers</text>
+<rect x="10" y="30" width="100" height="60" rx="8" class="box2"/>
+<text x="60" y="64" text-anchor="middle" class="t-sm t-bold">Callers</text>
+<rect x="140" y="30" width="130" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="205" y="55" text-anchor="middle" class="t-sm t-bold">Rate limit</text>
+<text x="205" y="73" text-anchor="middle" class="t-xs t-muted">429 per client</text>
+<rect x="300" y="30" width="130" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="365" y="55" text-anchor="middle" class="t-sm t-bold">Load shedding</text>
+<text x="365" y="73" text-anchor="middle" class="t-xs t-muted">503 when full</text>
+<rect x="460" y="30" width="140" height="60" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="530" y="55" text-anchor="middle" class="t-sm t-bold">Handler</text>
+<text x="530" y="73" text-anchor="middle" class="t-xs t-muted">degrade, flags</text>
+<rect x="630" y="30" width="120" height="60" rx="8" class="box" stroke-dasharray="5 4"/>
+<text x="690" y="55" text-anchor="middle" class="t-sm t-bold">Health checks</text>
+<text x="690" y="73" text-anchor="middle" class="t-xs t-muted">live / ready</text>
+<line x1="110" y1="60" x2="140" y2="60" class="line" marker-end="url(#ahA17c)"/>
+<line x1="270" y1="60" x2="300" y2="60" class="line" marker-end="url(#ahA17c)"/>
+<line x1="430" y1="60" x2="460" y2="60" class="line" marker-end="url(#ahA17c)"/>
+<path d="M530,90 L530,120 L75,120 L75,150" class="line" fill="none" marker-end="url(#ahA17c)"/>
+<text x="750" y="142" text-anchor="end" class="t-xs t-muted">Client side: protecting yourself from the dependency</text>
+<rect x="10" y="150" width="130" height="60" rx="8" class="fs-green s-green sw-2"/>
+<text x="75" y="175" text-anchor="middle" class="t-sm t-bold">Deadline</text>
+<text x="75" y="193" text-anchor="middle" class="t-xs t-muted">+ timeout</text>
+<rect x="165" y="150" width="130" height="60" rx="8" class="fs-green s-green sw-2"/>
+<text x="230" y="175" text-anchor="middle" class="t-sm t-bold">Retry</text>
+<text x="230" y="193" text-anchor="middle" class="t-xs t-muted">budget, jitter</text>
+<rect x="320" y="150" width="130" height="60" rx="8" class="fs-green s-green sw-2"/>
+<text x="385" y="175" text-anchor="middle" class="t-sm t-bold">Circuit breaker</text>
+<text x="385" y="193" text-anchor="middle" class="t-xs t-muted">open / half-open</text>
+<rect x="475" y="150" width="130" height="60" rx="8" class="fs-green s-green sw-2"/>
+<text x="540" y="175" text-anchor="middle" class="t-sm t-bold">Bulkhead</text>
+<text x="540" y="193" text-anchor="middle" class="t-xs t-muted">pool per dependency</text>
+<rect x="640" y="150" width="110" height="60" rx="8" class="box2"/>
+<text x="695" y="175" text-anchor="middle" class="t-sm t-bold">Dependency</text>
+<text x="695" y="193" text-anchor="middle" class="t-xs t-muted">may fail</text>
+<line x1="140" y1="180" x2="165" y2="180" class="line" marker-end="url(#ahA17c)"/>
+<line x1="295" y1="180" x2="320" y2="180" class="line" marker-end="url(#ahA17c)"/>
+<line x1="450" y1="180" x2="475" y2="180" class="line" marker-end="url(#ahA17c)"/>
+<line x1="605" y1="180" x2="640" y2="180" class="line" marker-end="url(#ahA17c)"/>
+<line x1="385" y1="210" x2="385" y2="250" class="line" marker-end="url(#ahA17c)"/>
+<text x="395" y="234" class="t-xs">open or failed</text>
+<rect x="290" y="250" width="190" height="60" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="385" y="275" text-anchor="middle" class="t-sm t-bold">Fallback</text>
+<text x="385" y="293" text-anchor="middle" class="t-xs t-muted">cached, default or fast error</text>
+<rect x="520" y="250" width="230" height="60" rx="8" class="box" stroke-dasharray="5 4"/>
+<text x="635" y="275" text-anchor="middle" class="t-sm t-bold">Static stability</text>
+<text x="635" y="293" text-anchor="middle" class="t-xs t-muted">last known good, no control plane</text>
+</svg>
+  <figcaption>Where each pattern sits on a call path. The order of the client-side wrappers varies between libraries (some put the breaker outside the retry, some inside); what matters is that you can say why yours is in the order it is, and that only one layer in the whole system retries.</figcaption>
+</figure>
+
+<p>On the order of the wrappers: a common arrangement is retry outside the breaker, so that each attempt asks the breaker for permission and a tripped breaker stops further attempts quickly; with a timeout and bulkhead inside the breaker, nearest the actual call. Other arrangements exist and libraries differ; the principle that matters is that a rejection by the breaker or bulkhead should <em>not</em> itself be retried blindly. The simulator below follows the same logic.</p>
+
+<h2>Try it: break a dependency</h2>
+
+<p>The simulator models a client with a pool of 40 threads, serving 40 requests per second that each call one dependency, plus 10 per second of unrelated work. You control the dependency (healthy, slow, or failing with errors) and which protections are on. Everything runs from a seeded random generator, so the same settings and clicks produce the same result; the two <em>Replay</em> buttons run a scripted outage (healthy for 10 seconds, bad until 40 seconds, then healthy) so you can compare configurations fairly.</p>
+
+<p>Suggested experiments:</p>
+<ol>
+  <li><strong>Nothing on, then Slow.</strong> Watch threads climb to 40, success rate fall, and the unrelated endpoint (which needs no dependency) die with it. That is the shared-pool story from the bulkhead section.</li>
+  <li><strong>Timeout + retries, then Slow.</strong> Timeouts stop a thread waiting forever, but with retries each request still holds its thread for about two seconds, so the pool stays full, and the <em>in flight at dependency</em> tile soars: abandoned calls keep piling onto something already drowning. After switching back to Healthy, see how long it takes to recover.</li>
+  <li><strong>Retries only, then Failing.</strong> Calls reaching the dependency go well above 40 per second and above its comfortable capacity; the success rate gets <em>worse</em> than with no retries at all. This is amplification in action. In this model the dependency's error rate rises with load, which is exactly what makes retries counterproductive.</li>
+  <li><strong>Add the breaker.</strong> Watch it open, calls drop to a trickle, threads free up, and the dependency recover. Tick the cached fallback and see how the success tile changes (and how much of it is "cached").</li>
+  <li><strong>Turn on only the bulkhead</strong> and compare the unrelated-endpoint tile with experiment 1.</li>
+  <li><strong>Jitter on or off.</strong> Be honest about what you see: with steady, independent arrivals the difference is small in this model. Jitter earns its keep when many clients fail at the same instant (a restart, a shared outage); the <a href="../../networking/chapters/16-failure.html">backoff simulator in networking chapter 16</a> is built to show exactly that.</li>
+</ol>
+
+<div class="widget" id="breaker-sim"></div>
+
+<details class="deeper">
+  <summary>Go deeper: what the simulator simplifies <span class="hint">optional</span></summary>
+  <p>The dependency's latency is multiplied by a load factor computed from calls in flight and calls in the last second; real systems queue, shed, garbage-collect and fail in many other ways. Abandoned calls keep occupying the dependency until they would have finished, which is realistic for most servers. Time is discretised into 100 ms ticks, and a request holds one thread for its whole duration, including the sleeps between retries, which is how a blocking client behaves. The model is a teaching tool: trust the <em>direction</em> of each effect (retries add load, breakers free threads, bulkheads contain damage), not the exact numbers. A related phenomenon, where a system stays broken after the trigger is gone because its own retries and queues keep the load high, is the subject of the <a href="../../networking/cases/case-08-retry-storms.html">metastable-failure case study</a>.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>You need only Python 3 and, for the last item, <code>curl</code> (included with macOS and most Linux distributions; on Windows use WSL or PowerShell's <code>curl.exe</code>).</p>
+</div>
+
+<ol>
+  <li>Copy the breaker sketch into a file and change <code>failure_threshold</code> to 1, then to 10. Which setting would flap on an occasional blip? Which opens too late?</li>
+  <li>Extend <code>amplify.py</code> so that only the outermost layer retries. Confirm that the database now sees 3 calls instead of 27.</li>
+  <li>Run the retry budget with a dependency that fails 10% of the time instead of always. How many retries does it allow now? (Hint: the budget should barely matter. That is the point.)</li>
+  <li>Try a timeout from the command line: <code>curl --max-time 2 --connect-timeout 1 https://example.com</code>. Then see curl's own retry policy with <code>curl --retry 2 --retry-delay 1 --max-time 2 https://example.com/does-not-exist</code>. Which responses does it retry, and which does it not? (Look at what curl's manual says about transient errors.)</li>
+  <li>Build the real thing in <a href="../labs/lab-06-resilience.html">Lab 6: A Resilience Toolkit</a>: timeouts, retries with jitter, a circuit breaker and a bulkhead, tested against a flaky fake.</li>
+</ol>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Resilience patterns are the practical answer to the central fact of <a href="../../networking/chapters/15-why-distribute.html">networking chapter 15</a>: in a distributed system you cannot tell a slow node from a dead one, and failures are partial. Timeouts are failure detectors; breakers and bulkheads are policies for acting on uncertain evidence; retry budgets and load shedding keep feedback loops from turning small failures into metastable ones. Static stability is the same insight applied to design: avoid recovery paths that depend on the thing that broke. The Distributed Systems course goes deeper on failure detection, leases and consensus, which is where "who is the leader, and are they still alive?" gets a rigorous treatment.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Every remote call needs a timeout, chosen from measured latency percentiles, and shrinking as you go deeper. Propagate a deadline so downstream work stops when the user has gone.</li>
+    <li>Retry only retryable errors on idempotent operations, with backoff and jitter, and in <em>one</em> layer. Three layers of 3 attempts is 27 calls. A retry budget caps the total extra load.</li>
+    <li>A circuit breaker (closed, open, half-open) stops you from hammering a failing dependency and frees your threads. Decide in advance what it returns when open: a fallback, a cached value or a fast error.</li>
+    <li>Bulkheads give each dependency its own allowance so one slow call cannot consume every thread. Size them with Little's law.</li>
+    <li>Rate limits enforce fairness per caller (429); load shedding protects the server's own capacity (503), shedding low-priority work first. Rejecting must be far cheaper than serving.</li>
+    <li>Degrade gracefully with decisions made in advance. Test your fallbacks, or they will fail when you need them. Keep liveness checks free of dependencies; make readiness reflect this instance's ability to work.</li>
+    <li>Prefer designs that need no action to survive a dependency failure (static stability), and use chaos experiments to check that the protections behave as designed.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A gateway, an order service and a payment service each retry a failing call up to 3 attempts in total. The database behind the payment service is down. How many calls does the database receive for one user request?</p>
+    <ol class="q-options">
+      <li>9</li>
+      <li>3</li>
+      <li>27</li>
+      <li>1, because the later retries are blocked by timeouts</li>
+    </ol>
+    <div class="q-explain">The attempts multiply: 3 x 3 x 3 = 27. Each layer is sensible alone, but together they send 27 times the load to a dependency that is already failing. The fixes are to retry in one layer only, to signal downstream layers not to retry, and to use a retry budget.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A circuit breaker has been open for its full cool-down period. What should it do next?</p>
+    <ol class="q-options">
+      <li>Move to half-open and let a probe call through: close on success, re-open on failure</li>
+      <li>Close immediately and send all traffic, since time has passed</li>
+      <li>Stay open until an operator resets it</li>
+      <li>Delete its failure history and go back to closed without testing</li>
+    </ol>
+    <div class="q-explain">Half-open is the recovery test. Closing blindly would send full traffic at a dependency that may still be down (or just recovering), and waiting for a human defeats the purpose. Software breakers test for recovery themselves with a trickle of traffic.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A checkout service and a recommendations feature share one pool of 20 threads. Recommendations becomes very slow and checkout stalls too. Which pattern addresses this most directly?</p>
+    <ol class="q-options">
+      <li>A longer timeout on every call</li>
+      <li>More retries on the recommendations call</li>
+      <li>A token-bucket rate limit on checkout</li>
+      <li>A bulkhead: a separate, limited pool (or concurrency cap) per dependency</li>
+    </ol>
+    <div class="q-explain">The failure is resource sharing: slow recommendation calls hold every thread. A bulkhead limits how many threads each dependency can occupy, so the damage is contained. Longer timeouts hold threads even longer, and extra retries add load; a rate limit on checkout would reject customers for no reason.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Which statement about a client-side timeout is correct?</p>
+    <ol class="q-options">
+      <li>It cancels the work on the server, so the dependency is unloaded</li>
+      <li>It only stops the caller waiting; the server may continue, and a timed-out write may even have succeeded</li>
+      <li>It makes a retry always safe</li>
+      <li>It is unnecessary if the server has its own timeout</li>
+    </ol>
+    <div class="q-explain">A timeout ends the caller's wait and nothing more. The request is probably still being processed, which keeps loading the dependency and means a timed-out write may have taken effect. That is why retries of writes need idempotency keys. The caller still needs its own timeout, because it cannot rely on the server's.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">An instance's liveness probe calls the database. During a brief database blip, what is the most likely consequence?</p>
+    <ol class="q-options">
+      <li>Nothing, because liveness only restarts a single instance</li>
+      <li>The load balancer stops routing to the instance, which is the intended behaviour</li>
+      <li>Every instance fails liveness at once and is restarted together, turning a blip into a full outage</li>
+      <li>The database restarts and recovers faster</li>
+    </ol>
+    <div class="q-explain">All instances share the dependency, so they fail the probe together and get restarted together, adding a cold-start stampede on top of the original problem. Liveness should check only that the process itself is healthy; whether it can take traffic is the readiness question, and even that should degrade rather than refuse everything when an optional dependency fails.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Which pair correctly distinguishes rate limiting from load shedding?</p>
+    <ol class="q-options">
+      <li>Rate limiting protects the client; load shedding protects the database</li>
+      <li>Rate limiting caps what one caller may send (usually 429); load shedding refuses some work when total demand exceeds capacity (usually 503), preferably low-priority work first</li>
+      <li>They are two names for the same thing</li>
+      <li>Rate limiting happens only on the client; load shedding only on the server</li>
+    </ol>
+    <div class="q-explain">Rate limiting is per-caller policy and fairness; load shedding is whole-server survival under overload. Both can be on the server, and clients can also rate-limit themselves. The status codes help clients behave: 429 says "slow yourself down", 503 says "the service is overloaded".</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/breaker-sim.js"></script>
+</body>
+</html>

@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event Sourcing &amp; CQRS · Software Architecture &amp; Design</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="arch" data-lab="L5">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 5: Event Sourcing &amp; CQRS</h1>
+  <p class="lede">In <a href="../chapters/16-cqrs-event-sourcing.html">chapter 16</a> the database stopped being a table of current values and became a list of things that happened. The balance of an account is not stored anywhere; it is whatever you get by replaying the account's history. In this lab you will build that machine for bank accounts: an append-only event store that refuses stale writers, an aggregate that is rebuilt from its events and guards its own rules, a read side that is fed from the log and can be thrown away and rebuilt, snapshots so loading stays fast, a time machine for "what was the balance last Tuesday?", and, optionally, a way to read old events written in a shape you no longer use.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Event sourcing is easy to explain in a sentence and surprisingly easy to get wrong in code. The mistakes are never in the happy path. They are in the corners: two writers who both decided on the same old state, a read model that applies one event twice after a crash, a snapshot that quietly disagrees with the log, an event written two years ago that no longer matches the code. Building each piece yourself shows you where the real costs of the pattern are, so that when someone proposes it in a design review you can say <em>where</em> it earns its keep and where it is a tax. It is also the same machinery as the <a href="../../data/chapters/19-streams-cdc.html">logs and consumers</a> of the data course, seen from the application side.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Real databases, no servers, no flakiness</p>
+  <p>The event store is a real <code>sqlite3</code> database in a temporary file, so constraints, transactions and locking behave for real. Everything else is pure Python. The checks use a fake clock for <code>recorded_at</code>, seeded random numbers for histories, and a two-thread race whose outcome (exactly one winner) does not depend on which thread is faster. Nothing needs the network or a port. Python 3.8 or newer, standard library only, about a second to run. All money is whole <strong>cents</strong> held in integers, never floats.</p>
+</div>
+
+<h2>What you'll build</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Write side: a command goes to the Account aggregate, which loads itself from the event store, checks its rules and appends new events with an expected version. Read side: a projector reads the global event log from its saved position and updates the account_balances and large_transactions tables, which answer queries. Snapshots sit beside the store as a cache.">
+    <defs>
+      <marker id="ahAL5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="20" class="t-xs t-faint t-bold">WRITE SIDE: decide</text>
+    <text x="440" y="20" class="t-xs t-faint t-bold">READ SIDE: answer</text>
+    <rect x="20" y="34" width="110" height="46" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="75" y="55" text-anchor="middle" class="t-sm t-bold">command</text>
+    <text x="75" y="70" text-anchor="middle" class="t-xs t-muted">withdraw 80</text>
+    <rect x="170" y="34" width="150" height="46" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="245" y="55" text-anchor="middle" class="t-sm t-bold">Account</text>
+    <text x="245" y="70" text-anchor="middle" class="t-xs t-muted">rules + folded state</text>
+    <line x1="132" y1="57" x2="168" y2="57" class="line s-blue sw-2" marker-end="url(#ahAL5a)"/>
+    <rect x="20" y="130" width="300" height="130" rx="10" class="box"/>
+    <text x="170" y="150" text-anchor="middle" class="t-sm t-bold">EventStore (sqlite)</text>
+    <rect x="34" y="162" width="272" height="26" rx="5" class="fs-orange s-orange sw-2"/>
+    <text x="44" y="179" class="t-xs t-bold">1  acc-1  AccountOpened</text>
+    <rect x="34" y="192" width="272" height="26" rx="5" class="fs-orange s-orange sw-2"/>
+    <text x="44" y="209" class="t-xs t-bold">2  acc-1  Deposited 5000</text>
+    <rect x="34" y="222" width="272" height="26" rx="5" class="fs-orange s-orange sw-2"/>
+    <text x="44" y="239" class="t-xs t-bold">3  acc-1  Withdrawn 1200</text>
+    <line x1="215" y1="82" x2="215" y2="128" class="line s-purple sw-2" marker-end="url(#ahAL5a)"/>
+    <text x="224" y="108" class="t-xs t-muted">append(id, expected_version, events)</text>
+    <line x1="125" y1="128" x2="125" y2="84" class="line-dash"/>
+    <text x="40" y="108" class="t-xs t-muted">load = fold</text>
+    <rect x="20" y="276" width="300" height="38" rx="8" class="box2"/>
+    <text x="170" y="299" text-anchor="middle" class="t-xs t-muted">snapshots: a disposable cache of folded state</text>
+
+    <rect x="440" y="34" width="150" height="62" rx="8" class="fs-teal s-teal sw-2"/>
+    <text x="515" y="58" text-anchor="middle" class="t-sm t-bold">Projector</text>
+    <text x="515" y="75" text-anchor="middle" class="t-xs t-muted">remembers its position</text>
+    <text x="515" y="89" text-anchor="middle" class="t-xs t-muted">(last seq it handled)</text>
+    <line x1="322" y1="190" x2="436" y2="80" class="line-dash s-orange" marker-end="url(#ahAL5a)"/>
+    <text x="352" y="158" class="t-xs t-muted">read_all(after_seq)</text>
+    <rect x="440" y="150" width="300" height="46" rx="8" class="box"/>
+    <text x="590" y="170" text-anchor="middle" class="t-sm t-bold">account_balances</text>
+    <text x="590" y="186" text-anchor="middle" class="t-xs t-muted">account, owner, balance, last_seq</text>
+    <rect x="440" y="206" width="300" height="46" rx="8" class="box"/>
+    <text x="590" y="226" text-anchor="middle" class="t-sm t-bold">large_transactions</text>
+    <text x="590" y="242" text-anchor="middle" class="t-xs t-muted">seq, account, kind, amount (&gt;= $1,000)</text>
+    <line x1="515" y1="98" x2="515" y2="148" class="line s-teal sw-2" marker-end="url(#ahAL5a)"/>
+    <rect x="440" y="276" width="300" height="38" rx="8" class="box2"/>
+    <text x="590" y="299" text-anchor="middle" class="t-xs t-muted">queries read these tables, never the events</text>
+  </svg>
+  <figcaption><strong>Two models, one log.</strong> The write side loads an account by replaying its stream, checks the command against the result and appends new events. The read side is a separate set of tables that a projector keeps up to date by reading the same log. Nothing on the read side is the source of truth: delete it and it can be rebuilt.</figcaption>
+</figure>
+
+<p>Six milestones, each building on the last (the sixth is optional):</p>
+<ol class="steps">
+  <li><strong>The event store:</strong> a sqlite table of events, <code>append</code> with an <code>expected_version</code>, and a <code>ConcurrencyError</code> for stale writers. The check races two threads.</li>
+  <li><strong>Aggregates:</strong> <code>Account.load</code> folds events into state; commands (open, deposit, withdraw) enforce the invariants and return events.</li>
+  <li><strong>Projections:</strong> a projector that keeps <code>account_balances</code> and a large-transactions view, remembers its position, survives replays and can rebuild from zero.</li>
+  <li><strong>Snapshots:</strong> save folded state every N events and load from snapshot plus tail. Same answer, far fewer events read.</li>
+  <li><strong>Temporal queries:</strong> the balance as of a time or a version.</li>
+  <li><strong>Upcasting (optional):</strong> read an old <code>Deposited</code> event (a decimal string) as the current shape (integer cents) without rewriting history.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are inside this guide's folder, in <code>architecture/labs/code/lab05/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab05/starter.py"><code>starter.py</code></a></td><td>Your file. The data types, the error classes and the plumbing are given; every method that matters has a docstring with steps and a <code>TODO</code> for its milestone.</td></tr>
+    <tr><td><a href="code/lab05/check.py"><code>check.py</code></a></td><td>The self-check. It builds seeded histories, uses a fake clock and races two threads, so it is the same every run.</td></tr>
+    <tr><td><a href="code/lab05/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Everything starts red:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd architecture/labs/code/lab05</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 5 checks against starter.py
+
+  … Milestone 1: the event store and optimistic concurrency: not implemented yet (TODO milestone 1: EventStore._init_schema)
+  … Milestone 2: aggregates rebuilt from events: not implemented yet (TODO milestone 1: EventStore._init_schema)
+  … Milestone 3: projections and the read model: not implemented yet (TODO milestone 1: EventStore._init_schema)
+  … Milestone 4: snapshots: not implemented yet (TODO milestone 1: EventStore._init_schema)
+  … Milestone 5: temporal queries: not implemented yet (TODO milestone 1: EventStore._init_schema)
+  … Milestone 6 (optional): upcasting old events: not implemented yet (TODO milestone 1: EventStore._init_schema)
+
+0/6 milestones passing</span></code></pre>
+
+<p>Every milestone reports <em>not implemented yet</em> because milestone 1 is the foundation: the event store is where every other check starts. After you finish it, the others light up one by one.</p>
+
+<h2>Milestone 1: an event store that refuses stale writers</h2>
+
+<p>An <a href="../chapters/14-event-driven.html">event</a> is a fact in the past tense: <code>AccountOpened</code>, <code>Deposited</code>, <code>Withdrawn</code>. In an event-sourced system these facts are the database. They are only ever appended, never updated or deleted, and each one belongs to a <strong>stream</strong> (here: one stream per account) where it has a <strong>version</strong>, 1, 2, 3 and so on. The store also numbers every event in one <strong>global sequence</strong> (<code>seq</code>), which is the order the read side will consume them in.</p>
+
+<pre><code>seq | stream_id | version | type          | data                          | recorded_at
+----+-----------+---------+---------------+-------------------------------+------------
+  1 | acc-1     |       1 | AccountOpened | {"owner": "ada"}              | 100.0
+  2 | acc-1     |       2 | Deposited     | {"amount_cents": 5000, "v": 2}| 110.0
+  3 | acc-1     |       3 | Withdrawn     | {"amount_cents": 1200}        | 120.0</code></pre>
+
+<p>The interesting operation is <code>append(stream_id, expected_version, events)</code>. A client loaded the account at version 3, checked its rules against that state and now wants to add event 4. If somebody else added a version 4 in the meantime, the client's decision was made on stale facts, so the store must refuse. This is <strong>optimistic concurrency</strong>: nobody takes a lock while thinking; the check happens at the moment of writing, exactly like the compare-and-swap you met in <a href="../../data/chapters/11-isolation.html">the lost-update discussion</a>. The client reacts by reloading, deciding again and retrying.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the paper ledger</p>
+  <p>An accountant's ledger has numbered lines in ink. You never rub out a line; you add a correcting line below. If two clerks each look at "line 41 is the last one" and both try to write line 42, the second one finds the line already taken and has to look again. The UNIQUE constraint is the printed line number: two clerks cannot both own line 42.</p>
+  <p>Where it breaks down: a ledger line is on one desk. A real event store has to stop the two clerks even when they sit in different offices, which is why the final guard must live in the database, not in the clerk's own habits.</p>
+</div>
+
+<p>Two defences work together. First, the code checks the current version inside a write transaction and raises <code>ConcurrencyError</code> with a friendly message. Second, the table has <code>UNIQUE (stream_id, version)</code>, so even a bug in the check, or a second process you forgot about, cannot create two events with the same version: the database itself says no, and you translate its <code>IntegrityError</code> into the same <code>ConcurrencyError</code>. Appending several events at once is <em>all or nothing</em>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 232" role="img" aria-label="Two writers A and B both load stream s at version 3. A appends event 4 and succeeds. B then tries to append with expected version 3, but the stream is at 4, so B gets a ConcurrencyError, reloads, decides again and appends event 5.">
+    <defs>
+      <marker id="ahAL5b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <line x1="80" y1="86" x2="750" y2="86" class="line-thin"/>
+    <text x="20" y="62" class="t-bold tc-green">A</text>
+    <text x="20" y="128" class="t-bold tc-pink">B</text>
+    <rect x="90" y="36" width="120" height="44" rx="6" class="fs-green s-green sw-2"/>
+    <text x="150" y="62" text-anchor="middle" class="t-xs t-bold">load: version 3</text>
+    <rect x="90" y="96" width="120" height="44" rx="6" class="fs-pink s-pink sw-2"/>
+    <text x="150" y="122" text-anchor="middle" class="t-xs t-bold">load: version 3</text>
+    <rect x="226" y="36" width="150" height="44" rx="6" class="fs-green s-green sw-2"/>
+    <text x="301" y="55" text-anchor="middle" class="t-xs t-bold">append(expected 3)</text>
+    <text x="301" y="70" text-anchor="middle" class="t-xs t-muted">stored as version 4</text>
+    <rect x="390" y="96" width="170" height="44" rx="6" class="fs-red s-red sw-2"/>
+    <text x="475" y="115" text-anchor="middle" class="t-xs t-bold">append(expected 3)</text>
+    <text x="475" y="130" text-anchor="middle" class="t-xs t-muted">ConcurrencyError: now at 4</text>
+    <rect x="574" y="96" width="166" height="44" rx="6" class="fs-pink s-pink sw-2"/>
+    <text x="657" y="115" text-anchor="middle" class="t-xs t-bold">reload (v4), decide</text>
+    <text x="657" y="130" text-anchor="middle" class="t-xs t-muted">append(expected 4) = v5</text>
+    <line x1="90" y1="186" x2="722" y2="186" class="line" marker-end="url(#ahAL5b)"/>
+    <text x="730" y="190" class="t-xs t-muted">time</text>
+    <text x="380" y="218" text-anchor="middle" class="t-sm t-bold">Exactly one writer owns each version number</text>
+  </svg>
+  <figcaption><strong>Optimistic concurrency.</strong> B never waited and never held a lock. It simply found out at write time that its picture of the world was out of date, and started again from the new truth.</figcaption>
+</figure>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>EventStore._init_schema</code>, <code>append</code>, <code>read_stream</code> and <code>read_all</code>. The connection is given: it uses <code>isolation_level=None</code>, which means sqlite will not open transactions for you, so you issue <code>BEGIN IMMEDIATE</code>, <code>COMMIT</code> and <code>ROLLBACK</code> yourself. The columns are <code>seq</code> (an autoincrementing primary key), <code>stream_id</code>, <code>version</code>, <code>type</code>, <code>data</code> (JSON text) and <code>recorded_at</code>, plus the UNIQUE constraint. Time comes from <code>self.clock()</code>, never from <code>time.time()</code> directly, so tests can fake it.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 1 as ✔. It appends to several streams and reads them back, checks that stale and future <code>expected_version</code> values raise <code>ConcurrencyError</code> and write nothing, tries to insert a duplicate version with raw SQL (the database must refuse), and then runs <strong>25 rounds of two threads racing</strong> to append version 1 of the same stream, released together by a barrier. In every round exactly one wins and one gets <code>ConcurrencyError</code>.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>INTEGER PRIMARY KEY AUTOINCREMENT</code> gives you <code>seq</code> for free, and <code>cursor.lastrowid</code> after an <code>INSERT</code> tells you which one an event got.</li>
+      <li>Start the write with <code>BEGIN IMMEDIATE</code>. That takes sqlite's write lock <em>before</em> you read the current version, so a competing writer waits instead of reading the same version and failing halfway through. Without it, the race check may report <code>database is locked</code>.</li>
+      <li>"The stream's current version" is <code>SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?</code>. A new stream is at version 0, which is why creating one means <code>expected_version=0</code>.</li>
+      <li>Wrap the body so that <em>any</em> exception, including your own <code>ConcurrencyError</code>, runs <code>ROLLBACK</code> before propagating. Then an append of three events that fails leaves zero behind.</li>
+      <li>Catch <code>sqlite3.IntegrityError</code> separately and re-raise as <code>ConcurrencyError</code>: it is the UNIQUE constraint telling you that someone won a race your check could not see.</li>
+      <li>Store <code>json.dumps(data)</code> and return events with <code>data</code> as the original dict. <code>json.loads</code> happens in the given <code>_event</code> helper.</li>
+      <li><code>read_stream</code> must add the number of rows it returns to <code>self.events_read</code>. Milestone 4 uses that counter to prove snapshots help.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> _init_schema(self):
+    self.conn.execute(<span class="str">"""
+        CREATE TABLE IF NOT EXISTS events (
+            seq         INTEGER PRIMARY KEY AUTOINCREMENT,   -- global order of the whole log
+            stream_id   TEXT    NOT NULL,
+            version     INTEGER NOT NULL,                    -- 1, 2, 3 ... within one stream
+            type        TEXT    NOT NULL,
+            data        TEXT    NOT NULL,                    -- JSON
+            recorded_at REAL    NOT NULL,
+            UNIQUE (stream_id, version)                      -- the last line of defence
+        )"""</span>)
+
+<span class="kw">def</span> append(self, stream_id, expected_version, events):
+    <span class="str">"""Append [(type, data), ...] to a stream, but only if the stream is still at
+    `expected_version` (0 for a stream that does not exist yet).
+    Returns the stored Events. Raises ConcurrencyError if someone got there first;
+    in that case nothing at all is written."""</span>
+    now = self.clock()
+    <span class="kw">try</span>:
+        self.conn.execute(<span class="str">"BEGIN IMMEDIATE"</span>)        <span class="cmt"># take the write lock before looking</span>
+        <span class="kw">try</span>:
+            row = self.conn.execute(
+                <span class="str">"SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?"</span>, (stream_id,)).fetchone()
+            <span class="kw">if</span> row[<span class="num">0</span>] != expected_version:
+                <span class="kw">raise</span> ConcurrencyError(<span class="str">"stream %r is at version %d, you expected %d"</span>
+                                       % (stream_id, row[<span class="num">0</span>], expected_version))
+            stored = []
+            <span class="kw">for</span> i, (etype, data) <span class="kw">in</span> enumerate(events, start=<span class="num">1</span>):
+                version = expected_version + i
+                cur = self.conn.execute(
+                    <span class="str">"INSERT INTO events (stream_id, version, type, data, recorded_at) VALUES (?,?,?,?,?)"</span>,
+                    (stream_id, version, etype, json.dumps(data, sort_keys=<span class="kw">True</span>), now))
+                stored.append(Event(cur.lastrowid, stream_id, version, etype, data, now))
+            self.conn.execute(<span class="str">"COMMIT"</span>)
+            <span class="kw">return</span> stored
+        <span class="kw">except</span> BaseException:
+            self.conn.execute(<span class="str">"ROLLBACK"</span>)
+            <span class="kw">raise</span>
+    <span class="kw">except</span> sqlite3.IntegrityError <span class="kw">as</span> e:             <span class="cmt"># the UNIQUE constraint caught a race we did not see</span>
+        <span class="kw">raise</span> ConcurrencyError(<span class="str">"version already taken: %s"</span> % e)</code></pre>
+<p>The two readers are plain queries:</p>
+<pre><code><span class="kw">def</span> read_stream(self, stream_id, after_version=<span class="num">0</span>):
+    <span class="str">"""The events of one stream with version &gt; after_version, oldest first."""</span>
+    rows = self.conn.execute(
+        <span class="str">"SELECT seq, stream_id, version, type, data, recorded_at FROM events "</span>
+        <span class="str">"WHERE stream_id = ? AND version &gt; ? ORDER BY version"</span>, (stream_id, after_version)).fetchall()
+    self.events_read += len(rows)
+    <span class="kw">return</span> [self._event(r) <span class="kw">for</span> r <span class="kw">in</span> rows]
+
+<span class="kw">def</span> read_all(self, after_seq=<span class="num">0</span>, limit=<span class="kw">None</span>):
+    <span class="str">"""The global log: events with seq &gt; after_seq, in seq order, at most `limit` of them."""</span>
+    sql = (<span class="str">"SELECT seq, stream_id, version, type, data, recorded_at FROM events "</span>
+           <span class="str">"WHERE seq &gt; ? ORDER BY seq"</span>)
+    args = [after_seq]
+    <span class="kw">if</span> limit <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        sql += <span class="str">" LIMIT ?"</span>
+        args.append(limit)
+    <span class="kw">return</span> [self._event(r) <span class="kw">for</span> r <span class="kw">in</span> self.conn.execute(sql, args).fetchall()]</code></pre>
+  </details>
+</div>
+<h2>Milestone 2: the aggregate, rebuilt from events</h2>
+
+<p>The <a href="../chapters/06-ddd.html">aggregate</a> is the object that owns a consistency rule. Here it is <code>Account</code>, and its rules are: an account must be opened before anything else happens to it, you cannot open it twice, amounts are positive, and <strong>the balance may never go below zero</strong>. In an event-sourced system the aggregate has no table. Its state is a <strong>fold</strong> (a left-to-right reduce) over its events:</p>
+
+<pre><code>state = Account(id)                  # empty: version 0, not opened, balance 0
+for event in store.read_stream(id):
+    state.apply(event)               # AccountOpened -> opened; Deposited -> balance += n; ...</code></pre>
+
+<p>Two jobs, kept strictly apart:</p>
+<ul>
+  <li><strong><code>apply(event)</code> records what happened.</strong> It never validates and never raises for business reasons. Events are facts; if you replay a <code>Withdrawn</code> from last year, you do not ask whether it was allowed, it already happened. (This is also why <code>apply</code> must be deterministic and free of side effects: no clock, no database, no email. Replay it a million times and it must give the same answer.)</li>
+  <li><strong>Commands decide.</strong> <code>deposit(cents)</code> and <code>withdraw(cents)</code> check the rules against the <em>current folded state</em> and, if allowed, <em>return</em> a list of new events. They do not change the aggregate. The caller appends the events; the next load applies them.</li>
+</ul>
+
+<p>The glue is <code>execute(store, id, decide)</code>, which is given to you: load, decide, append with <code>expected_version = acct.version</code>, and if the append raises <code>ConcurrencyError</code>, reload and decide again. This loop is where the invariant survives concurrency. Two clients can both see a balance of 100 and both decide to withdraw 80. Only one append can win; the loser reloads, sees 20 and now <em>its</em> command is refused. Without the version check you would have an overdraft that no unit test of <code>withdraw</code> could ever find.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Commands can be refused. Events cannot.</p>
+  <p>A <code>Withdrawn</code> event means the money left. A refused withdrawal produces <em>no event at all</em> (or, if the business wants a record of the attempt, a different event such as <code>WithdrawalRejected</code>; that is a design choice you could make). Mixing the two up, validating inside <code>apply</code>, is the most common beginner bug: it makes old events unreplayable the day a rule changes.</p>
+</div>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Account.apply</code>, <code>Account.load</code>, the three commands <code>open</code>, <code>deposit</code>, <code>withdraw</code>, and <code>load_account</code> (for now it just calls <code>Account.load</code>). Raise <code>AlreadyOpen</code>, <code>AccountNotOpen</code>, <code>InvalidAmount</code> or <code>InsufficientFunds</code>; all are subclasses of <code>DomainError</code>. New <code>Deposited</code> events carry <code>{"v": 2, "amount_cents": n}</code>; the <code>"v"</code> will matter in milestone 6.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 2 as ✔. It runs commands through <code>execute</code>, rebuilds from a brand-new <code>EventStore</code> object on the same file (state must come from events alone), checks that every refused command appends nothing, and that commands do not mutate the aggregate. Then it replays the overdraft scenario: two clients load 100, both decide to withdraw 80, the second append gets <code>ConcurrencyError</code>, and the retry is refused with <code>InsufficientFunds</code>. Finally a rival writer sneaks in <em>between</em> <code>execute</code>'s load and append, and <code>decide</code> must run a second time on fresh state.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>apply</code> is a chain of <code>if ev.type == ...</code>. Unknown types should simply be ignored, but <code>self.version = ev.version</code> must still be set for every event.</li>
+      <li>Commands <em>read</em> <code>self.balance</code> and <code>self.opened</code> but never assign to them. If your command tests pass but the check complains that commands mutate state, look for a stray <code>self.balance -=</code>.</li>
+      <li>Validate in a sensible order: first "is it open?", then "is the amount valid?", then "is there enough money?". The check does not care much, but error messages read better.</li>
+      <li><code>isinstance(True, int)</code> is true in Python. If you care that <code>deposit(True)</code> is refused, test <code>type(cents) is int</code>. The check only tries 0 and negatives.</li>
+      <li>Withdrawing exactly the balance is allowed (<code>cents &gt; self.balance</code> is the overdraft test, not <code>&gt;=</code>).</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> apply(self, ev):
+    <span class="str">"""Fold one event into the state. Never validates: events are facts."""</span>
+    <span class="kw">if</span> ev.type == <span class="str">"AccountOpened"</span>:
+        self.opened = <span class="kw">True</span>
+        self.owner = ev.data[<span class="str">"owner"</span>]
+    <span class="kw">elif</span> ev.type == <span class="str">"Deposited"</span>:
+        self.balance += ev.data[<span class="str">"amount_cents"</span>]
+    <span class="kw">elif</span> ev.type == <span class="str">"Withdrawn"</span>:
+        self.balance -= ev.data[<span class="str">"amount_cents"</span>]
+    self.version = ev.version
+
+@classmethod
+<span class="kw">def</span> load(cls, store, account_id):
+    acct = cls(account_id)
+    <span class="kw">for</span> ev <span class="kw">in</span> store.read_stream(account_id):
+        acct.apply(ev)
+    <span class="kw">return</span> acct
+
+<span class="kw">def</span> open(self, owner):
+    <span class="kw">if</span> self.opened:
+        <span class="kw">raise</span> AlreadyOpen(<span class="str">"account %s is already open"</span> % self.id)
+    <span class="kw">return</span> [(<span class="str">"AccountOpened"</span>, {<span class="str">"owner"</span>: owner})]
+
+<span class="kw">def</span> deposit(self, cents):
+    self._need_open()
+    self._need_positive(cents)
+    <span class="kw">return</span> [(<span class="str">"Deposited"</span>, {<span class="str">"v"</span>: <span class="num">2</span>, <span class="str">"amount_cents"</span>: cents})]
+
+<span class="kw">def</span> withdraw(self, cents):
+    self._need_open()
+    self._need_positive(cents)
+    <span class="kw">if</span> cents &gt; self.balance:
+        <span class="kw">raise</span> InsufficientFunds(<span class="str">"balance %d, tried to withdraw %d"</span> % (self.balance, cents))
+    <span class="kw">return</span> [(<span class="str">"Withdrawn"</span>, {<span class="str">"amount_cents"</span>: cents})]
+
+<span class="kw">def</span> _need_open(self):
+    <span class="kw">if</span> <span class="kw">not</span> self.opened:
+        <span class="kw">raise</span> AccountNotOpen(<span class="str">"account %s is not open"</span> % self.id)
+
+@staticmethod
+<span class="kw">def</span> _need_positive(cents):
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(cents, int) <span class="kw">or</span> cents &lt;= <span class="num">0</span>:
+        <span class="kw">raise</span> InvalidAmount(<span class="str">"amount must be a positive whole number of cents, got %r"</span> % (cents,))</code></pre>
+<p>and the given <code>execute</code>, the loop that turns a conflict into a retry:</p>
+<pre><code><span class="kw">def</span> execute(store, account_id, decide, snapshots=<span class="kw">None</span>, snapshot_every=<span class="kw">None</span>, retries=<span class="num">3</span>):
+    <span class="str">"""Load the account, let `decide(account)` return new events, append them with
+    optimistic concurrency. On ConcurrencyError, reload and decide again. (Given.)"""</span>
+    <span class="kw">for</span> attempt <span class="kw">in</span> range(retries):
+        acct = load_account(store, account_id, snapshots)
+        before = acct.version
+        new = decide(acct)                       <span class="cmt"># may raise DomainError: nothing is written</span>
+        <span class="kw">try</span>:
+            stored = store.append(account_id, acct.version, new)
+        <span class="kw">except</span> ConcurrencyError:
+            <span class="kw">if</span> attempt == retries - <span class="num">1</span>:
+                <span class="kw">raise</span>
+            <span class="kw">continue</span>
+        <span class="kw">for</span> ev <span class="kw">in</span> stored:
+            acct.apply(ev)
+        <span class="kw">if</span> snapshots <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> snapshot_every <span class="kw">and</span> acct.version // snapshot_every &gt; before // snapshot_every:
+            snapshots.save(acct)
+        <span class="kw">return</span> stored</code></pre>
+  </details>
+</div>
+<h2>Milestone 3: projections, the read side</h2>
+
+<p>Replaying an account's events is perfect for deciding a command, and hopeless for questions like "which accounts have more than $10,000?" or "show every transaction over $1,000 this week". Those questions cross streams. The CQRS answer is a second model, built for reading: tables shaped like the queries, fed by a <strong>projector</strong> that follows the global log. (The <a href="../chapters/16-cqrs-event-sourcing.html">chapter</a> calls this the read model; the data course calls the same idea a <a href="../../data/chapters/19-streams-cdc.html">derived view</a>.)</p>
+
+<p>Your projector maintains two tables:</p>
+<ul>
+  <li><code>account_balances(account_id, owner, balance_cents, last_seq)</code></li>
+  <li><code>large_transactions(seq, account_id, kind, amount_cents)</code>, one row per deposit or withdrawal of <code>LARGE_CENTS</code> (100,000 cents, $1,000) or more.</li>
+</ul>
+<p>It also remembers its <strong>position</strong>, the seq of the last event it has handled, in a third table. That single number is what makes everything else work: restart the projector and it resumes; add events and it handles only the new ones; it can fall behind and catch up. It is the same idea as a Kafka consumer's offset.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="The global log as numbered event boxes 1 to 9. Events 1 to 6 are shaded as handled. A marker says position equals 6. Events 7 to 9 are not yet handled; catch_up will read them and move the position to 9. A note says that if the position update is lost, events 5 and 6 are delivered again and must change nothing.">
+    <defs>
+      <marker id="ahAL5c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="22" class="t-xs t-faint t-bold">THE GLOBAL LOG (seq)</text>
+    <g>
+      <rect x="20" y="36" width="68" height="40" rx="6" class="fs-teal s-teal sw-2"/><text x="54" y="61" text-anchor="middle" class="t-sm t-bold">1</text>
+      <rect x="96" y="36" width="68" height="40" rx="6" class="fs-teal s-teal sw-2"/><text x="130" y="61" text-anchor="middle" class="t-sm t-bold">2</text>
+      <rect x="172" y="36" width="68" height="40" rx="6" class="fs-teal s-teal sw-2"/><text x="206" y="61" text-anchor="middle" class="t-sm t-bold">3</text>
+      <rect x="248" y="36" width="68" height="40" rx="6" class="fs-teal s-teal sw-2"/><text x="282" y="61" text-anchor="middle" class="t-sm t-bold">4</text>
+      <rect x="324" y="36" width="68" height="40" rx="6" class="fs-teal s-teal sw-2"/><text x="358" y="61" text-anchor="middle" class="t-sm t-bold">5</text>
+      <rect x="400" y="36" width="68" height="40" rx="6" class="fs-teal s-teal sw-2"/><text x="434" y="61" text-anchor="middle" class="t-sm t-bold">6</text>
+      <rect x="494" y="36" width="68" height="40" rx="6" class="fs-orange s-orange sw-2"/><text x="528" y="61" text-anchor="middle" class="t-sm t-bold">7</text>
+      <rect x="570" y="36" width="68" height="40" rx="6" class="fs-orange s-orange sw-2"/><text x="604" y="61" text-anchor="middle" class="t-sm t-bold">8</text>
+      <rect x="646" y="36" width="68" height="40" rx="6" class="fs-orange s-orange sw-2"/><text x="680" y="61" text-anchor="middle" class="t-sm t-bold">9</text>
+    </g>
+    <line x1="481" y1="26" x2="481" y2="112" class="line-dash"/>
+    <text x="481" y="130" text-anchor="middle" class="t-xs t-bold">position = 6</text>
+    <text x="230" y="102" text-anchor="middle" class="t-xs tc-teal t-bold">already in the read model</text>
+    <text x="604" y="102" text-anchor="middle" class="t-xs tc-orange t-bold">catch_up() handles these next</text>
+    <rect x="20" y="148" width="720" height="44" rx="8" class="box2"/>
+    <text x="380" y="168" text-anchor="middle" class="t-xs t-bold">Crash after updating the tables but before saving the position?</text>
+    <text x="380" y="184" text-anchor="middle" class="t-xs t-muted">Then 5 and 6 are delivered again. Applying them a second time must change nothing.</text>
+  </svg>
+  <figcaption><strong>A projector is a cursor on the log.</strong> The read model is always "the log up to <em>position</em>", so reads can be stale, which is eventual consistency made visible. Staleness is the price; being able to build any number of different views from the same log is the reward.</figcaption>
+</figure>
+
+<h3>Idempotence: replays must be harmless</h3>
+
+<p>You can make the table updates and the position update commit together in one transaction, and you should. But systems still re-deliver events (a bug, a restore from backup, the projector was pointed at an older position by an operator). Networking taught you that <a href="../../networking/chapters/16-failure.html">at-least-once delivery</a> is the realistic guarantee, so the consumer must make duplicates harmless. Two techniques are used here:</p>
+<ul>
+  <li><code>large_transactions</code> uses the event's <code>seq</code> as its primary key, and inserts with <code>INSERT OR IGNORE</code>: the same event cannot appear twice.</li>
+  <li><code>account_balances</code> stores <code>last_seq</code>, the seq of the last event applied <em>to that row</em>, and updates only <code>WHERE last_seq &lt; event.seq</code>. An old event finds the row already past it and does nothing. (Adding a deposit twice is not idempotent by itself; guarding it with a sequence number is.)</li>
+</ul>
+
+<p>The same property gives you <strong>rebuild</strong> for free: delete the tables, set the position to 0 and replay. The result must be identical, which is the proof that the read model is only a cache of the log. That is also how you ship a new view next quarter, or fix a bug in a projection: change the code, rebuild.</p>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Projector._init_schema</code>, <code>position</code>, <code>catch_up</code>, <code>_apply</code>, <code>rebuild</code> and the three queries. <code>catch_up(limit=None, from_seq=None)</code> reads events after the saved position (or after <code>from_seq</code> if given, to force a re-delivery), applies them, saves the new position and returns how many events it handled. The position must never move backwards, even on a re-delivery. The projector has its own sqlite database (in memory by default), separate from the event store, because in a real system they would live in different places.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 3 as ✔. The check generates a seeded history of about 245 events over four accounts and verifies against balances it computes independently of your code. Then: before <code>catch_up</code> the read model is empty; after it, balances and the list of large transactions match; a new event is invisible until the next <code>catch_up</code>; <code>catch_up(from_seq=0)</code> (full re-delivery) and <code>from_seq=100</code> change nothing; catching up in batches of 7 reaches the same tables as one big call; and <code>rebuild()</code> gives exactly the same read model as the incremental one.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Do the batch in one transaction: <code>BEGIN</code>, apply every event, write the new position, <code>COMMIT</code>. If anything raises, <code>ROLLBACK</code>. Then a crash leaves either all of it or none of it.</li>
+      <li>For <code>AccountOpened</code>, <code>INSERT ... ON CONFLICT(account_id) DO UPDATE ... WHERE excluded.last_seq &gt; account_balances.last_seq</code> is an upsert that ignores older events. If your sqlite is too old for that, do a <code>SELECT</code> first.</li>
+      <li>For deposits and withdrawals, the whole idempotence trick is <code>UPDATE ... SET balance_cents = balance_cents + ?, last_seq = ? WHERE account_id = ? AND last_seq &lt; ?</code>.</li>
+      <li>The new position is <code>max(self.position(), events[-1].seq)</code>. If the check says your position went backwards after <code>from_seq=100</code>, that is the line.</li>
+      <li>Remember <code>LARGE_CENTS</code> is a module constant: use it by name, so the "change the threshold and rebuild" experiment works.</li>
+      <li><code>rebuild</code> should empty all three tables and then loop <code>catch_up(limit=500)</code> until it returns 0.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> catch_up(self, limit=<span class="kw">None</span>, from_seq=<span class="kw">None</span>):
+    <span class="str">"""Apply events the projector has not seen yet and move its position. Returns how many
+    events were handled. `from_seq` forces re-delivery from that position (to simulate a
+    crash between updating the tables and saving the position); the position never moves back."""</span>
+    start = self.position() <span class="kw">if</span> from_seq <span class="kw">is</span> <span class="kw">None</span> <span class="kw">else</span> from_seq
+    events = self.store.read_all(after_seq=start, limit=limit)
+    <span class="kw">if</span> <span class="kw">not</span> events:
+        <span class="kw">return</span> <span class="num">0</span>
+    self.db.execute(<span class="str">"BEGIN"</span>)                            <span class="cmt"># tables and position move together</span>
+    <span class="kw">try</span>:
+        <span class="kw">for</span> ev <span class="kw">in</span> events:
+            self._apply(ev)
+        new_pos = max(self.position(), events[-<span class="num">1</span>].seq)
+        self.db.execute(<span class="str">"INSERT OR REPLACE INTO projector_position (name, last_seq) VALUES (?,?)"</span>,
+                        (self.NAME, new_pos))
+        self.db.execute(<span class="str">"COMMIT"</span>)
+    <span class="kw">except</span> BaseException:
+        self.db.execute(<span class="str">"ROLLBACK"</span>)
+        <span class="kw">raise</span>
+    <span class="kw">return</span> len(events)
+
+<span class="kw">def</span> _apply(self, ev):
+    <span class="kw">if</span> ev.type == <span class="str">"AccountOpened"</span>:
+        <span class="cmt"># idempotent: a replay finds the row already at (or past) this seq and changes nothing</span>
+        self.db.execute(
+            <span class="str">"INSERT INTO account_balances (account_id, owner, balance_cents, last_seq) VALUES (?,?,0,?) "</span>
+            <span class="str">"ON CONFLICT(account_id) DO UPDATE SET owner = excluded.owner, last_seq = excluded.last_seq "</span>
+            <span class="str">"WHERE excluded.last_seq &gt; account_balances.last_seq"</span>,
+            (ev.stream_id, ev.data[<span class="str">"owner"</span>], ev.seq))
+    <span class="kw">elif</span> ev.type <span class="kw">in</span> (<span class="str">"Deposited"</span>, <span class="str">"Withdrawn"</span>):
+        cents = ev.data[<span class="str">"amount_cents"</span>]
+        delta = cents <span class="kw">if</span> ev.type == <span class="str">"Deposited"</span> <span class="kw">else</span> -cents
+        <span class="cmt"># the WHERE last_seq &lt; ? guard is what makes a re-delivered event harmless</span>
+        self.db.execute(
+            <span class="str">"UPDATE account_balances SET balance_cents = balance_cents + ?, last_seq = ? "</span>
+            <span class="str">"WHERE account_id = ? AND last_seq &lt; ?"</span>, (delta, ev.seq, ev.stream_id, ev.seq))
+        <span class="kw">if</span> cents &gt;= LARGE_CENTS:
+            self.db.execute(
+                <span class="str">"INSERT OR IGNORE INTO large_transactions (seq, account_id, kind, amount_cents) VALUES (?,?,?,?)"</span>,
+                (ev.seq, ev.stream_id, ev.type, cents))
+
+<span class="kw">def</span> rebuild(self):
+    <span class="str">"""Throw the read model away and recompute it from event number one."""</span>
+    self.db.execute(<span class="str">"BEGIN"</span>)
+    self.db.execute(<span class="str">"DELETE FROM account_balances"</span>)
+    self.db.execute(<span class="str">"DELETE FROM large_transactions"</span>)
+    self.db.execute(<span class="str">"DELETE FROM projector_position"</span>)
+    self.db.execute(<span class="str">"COMMIT"</span>)
+    total = <span class="num">0</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        n = self.catch_up(limit=<span class="num">500</span>)
+        <span class="kw">if</span> n == <span class="num">0</span>:
+            <span class="kw">return</span> total
+        total += n</code></pre>
+  </details>
+</div>
+<h2>Milestone 4: snapshots</h2>
+
+<p>Replaying 12 events to load an account is nothing. Replaying 12 million is a problem, and a busy account or a long-lived stream gets there. A <strong>snapshot</strong> is the folded state saved at some version. To load, take the newest snapshot, then apply only the events <em>after</em> it. The rule that keeps this honest:</p>
+
+<div class="callout key">
+  <p class="callout-title">A snapshot is a cache, never the truth</p>
+  <p>You must be able to delete every snapshot and get exactly the same state by replaying from event 1. If that is ever false, you have a bug (or you changed <code>apply</code> without invalidating the snapshots). Snapshots buy speed; they never decide correctness.</p>
+</div>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 170" role="img" aria-label="A stream of 237 events as a long bar. A snapshot marker at version 200. Without snapshots all 237 events are read. With the snapshot, only events 201 to 237, which is 37 events, are read.">
+    <text x="20" y="22" class="t-xs t-faint t-bold">STREAM acc-1: 237 EVENTS</text>
+    <rect x="20" y="34" width="560" height="34" rx="6" class="fs-orange s-orange sw-2"/>
+    <rect x="580" y="34" width="150" height="34" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <line x1="580" y1="28" x2="580" y2="110" class="line-dash"/>
+    <text x="580" y="126" text-anchor="middle" class="t-xs t-bold">snapshot at version 200</text>
+    <text x="300" y="56" text-anchor="middle" class="t-xs t-bold">events 1 .. 200</text>
+    <text x="655" y="56" text-anchor="middle" class="t-xs t-bold">201 .. 237</text>
+    <text x="300" y="96" text-anchor="middle" class="t-xs t-muted">full replay: read 237 events</text>
+    <text x="655" y="96" text-anchor="middle" class="t-xs tc-green t-bold">snapshot + tail: read 37</text>
+    <text x="380" y="154" text-anchor="middle" class="t-xs t-muted">Both give the same Account. Only the number of rows read differs.</text>
+  </svg>
+  <figcaption><strong>Snapshot plus tail.</strong> The tail is bounded by the snapshot interval, so load time stops growing with the length of the stream.</figcaption>
+</figure>
+
+<p>When to take one? A simple policy is "every N events": after appending, if the stream crossed a multiple of N, save a snapshot. The given <code>execute</code> does that. Snapshots need the aggregate's state as plain JSON (<code>to_state</code> and <code>from_state</code>), and a place to keep them (here: a <code>snapshots</code> table in the same sqlite file, one row per stream, the latest only). Real systems also store a <em>schema version</em> inside the snapshot, so that a code change throws old snapshots away instead of loading them wrongly.</p>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Account.to_state</code> / <code>from_state</code>, <code>SnapshotStore</code> (<code>__init__</code> creates the table, <code>save</code>, <code>latest</code>, <code>clear</code>) and extend <code>load_account</code> so that, given a <code>SnapshotStore</code>, it starts from the latest snapshot and reads only the tail with <code>store.read_stream(id, after_version=snapshot_version)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 4 as ✔. It builds a 237-event account with snapshots every 50 events and asserts: the latest snapshot is at version 200; the state loaded with snapshot + tail equals the state from a full replay; a full replay reads exactly 237 events (the counter you added in milestone 1) and snapshot + tail reads exactly 37; after <code>snaps.clear()</code> you still get the same state; a stream that is too short never gets a snapshot; and one command that appends 13 events across the boundary at 250 leaves a snapshot behind.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>to_state</code> returns a dict of plain JSON types: <code>version</code>, <code>opened</code>, <code>owner</code>, <code>balance</code>. <code>from_state</code> is its mirror. A test for yourself: <code>Account.from_state(id, a.to_state()).to_state() == a.to_state()</code>.</li>
+      <li><code>INSERT OR REPLACE INTO snapshots ...</code> with <code>stream_id</code> as the primary key keeps just the latest one per stream.</li>
+      <li>The snapshot's <code>version</code> is the version <em>of the account's last folded event</em>, not the count of events you happened to read this time.</li>
+      <li>In <code>load_account</code>: if there is no snapshot, fall back to a plain <code>Account.load</code>. The check deletes the snapshots and expects that to work.</li>
+      <li>If the "events read" number is right for the tail but the state differs, you probably started the tail one event too early or too late (<code>after_version=</code> is exclusive).</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> to_state(self):
+    <span class="kw">return</span> {<span class="str">"version"</span>: self.version, <span class="str">"opened"</span>: self.opened, <span class="str">"owner"</span>: self.owner, <span class="str">"balance"</span>: self.balance}
+
+@classmethod
+<span class="kw">def</span> from_state(cls, account_id, state):
+    acct = cls(account_id)
+    acct.version = state[<span class="str">"version"</span>]
+    acct.opened = state[<span class="str">"opened"</span>]
+    acct.owner = state[<span class="str">"owner"</span>]
+    acct.balance = state[<span class="str">"balance"</span>]
+    <span class="kw">return</span> acct
+
+<span class="kw">def</span> save(self, account):
+    self.store.conn.execute(
+        <span class="str">"INSERT OR REPLACE INTO snapshots (stream_id, version, state) VALUES (?,?,?)"</span>,
+        (account.id, account.version, json.dumps(account.to_state(), sort_keys=<span class="kw">True</span>)))
+
+<span class="kw">def</span> latest(self, stream_id):
+    <span class="str">"""(version, state_dict) of the newest snapshot, or None."""</span>
+    row = self.store.conn.execute(
+        <span class="str">"SELECT version, state FROM snapshots WHERE stream_id = ?"</span>, (stream_id,)).fetchone()
+    <span class="kw">return</span> (row[<span class="num">0</span>], json.loads(row[<span class="num">1</span>])) <span class="kw">if</span> row <span class="kw">else</span> <span class="kw">None</span>
+
+<span class="kw">def</span> load_account(store, account_id, snapshots=<span class="kw">None</span>):
+    <span class="str">"""Milestone 2: full replay. Milestone 4: start from the latest snapshot if there is one."""</span>
+    <span class="kw">if</span> snapshots <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        snap = snapshots.latest(account_id)
+        <span class="kw">if</span> snap <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+            version, state = snap
+            acct = Account.from_state(account_id, state)
+            <span class="kw">for</span> ev <span class="kw">in</span> store.read_stream(account_id, after_version=version):
+                acct.apply(ev)
+            <span class="kw">return</span> acct
+    <span class="kw">return</span> Account.load(store, account_id)</code></pre>
+  </details>
+</div>
+<h2>Milestone 5: temporal queries</h2>
+
+<p>An ordinary database answers "what is the balance?" and the past is gone unless somebody built an audit table. An event log <em>is</em> the audit table, and the past is just a shorter fold. "What was the balance at 14:00 yesterday?" is "fold the events recorded at or before 14:00". "What did the account look like after its 4th event?" is "fold the first 4". Auditors, regulators, debugging ("how did we get into this state?") and customer disputes all ask exactly these questions, and for most systems that keep only current state they are impossible to answer reliably.</p>
+
+<p>Be precise about <em>which</em> time you mean. <code>recorded_at</code> is when the system <strong>learned</strong> the fact, which is what the store knows. When the fact <em>happened</em> in the real world (a card swiped Monday, reported Wednesday) is a second timestamp, and asking "what did we believe on Tuesday about Monday?" needs both; that is called <em>bitemporal</em> modelling and is a stretch goal below.</p>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>account_as_of(store, account_id, version=None, at=None)</code>, returning an <code>Account</code> folded from only the qualifying events: those with <code>version &lt;=</code> the given version and <code>recorded_at &lt;=</code> the given time (inclusive). With neither argument it is the current state; with both, both limits apply. Also implement <code>balance_history</code>, which returns <code>(version, recorded_at, balance_after)</code> for every event in a single pass.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 5 as ✔. It records five events at t = 100, 110, 120, 130 and 140 (fake clock), then asks for the account at t=125, t=130 (inclusive), t=129.9, t=99 (before it existed: not opened, balance 0, version 0), at versions 0, 2 and 99, and with both limits at once. It also checks that every row of <code>balance_history</code> agrees with <code>account_as_of</code> at that version and at that time.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Events come back ordered by version, and <code>recorded_at</code> never decreases within a stream, so you can <code>break</code> at the first event beyond a limit instead of filtering the whole list.</li>
+      <li>Start from <code>Account(account_id)</code>, not from <code>Account.load</code>: the starting point is "nothing happened yet".</li>
+      <li>"Inclusive" means <code>ev.recorded_at &lt;= at</code> qualifies. Check both a time exactly on an event and a time just before it.</li>
+      <li><code>balance_history</code> is the same loop, appending a tuple after every <code>apply</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> account_as_of(store, account_id, version=<span class="kw">None</span>, at=<span class="kw">None</span>):
+    <span class="str">"""The account as it was after event `version` and/or at time `at` (inclusive).
+    With neither, the current state."""</span>
+    acct = Account(account_id)
+    <span class="kw">for</span> ev <span class="kw">in</span> store.read_stream(account_id):
+        <span class="kw">if</span> version <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> ev.version &gt; version:
+            <span class="kw">break</span>
+        <span class="kw">if</span> at <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> ev.recorded_at &gt; at:
+            <span class="kw">break</span>
+        acct.apply(ev)
+    <span class="kw">return</span> acct
+
+<span class="kw">def</span> balance_history(store, account_id):
+    <span class="str">"""[(version, recorded_at, balance_after)] for every event of the account, in one pass."""</span>
+    acct = Account(account_id)
+    out = []
+    <span class="kw">for</span> ev <span class="kw">in</span> store.read_stream(account_id):
+        acct.apply(ev)
+        out.append((ev.version, ev.recorded_at, acct.balance))
+    <span class="kw">return</span> out</code></pre>
+  </details>
+</div>
+<h2>Milestone 6 (optional): upcasting</h2>
+
+<p>Events are immutable, and they live forever. Code does not. A year after launch, the team decides money should be integer cents instead of a decimal string. The old <code>Deposited</code> events, written as <code>{"amount": "12.50"}</code>, are still in the log and can never be edited: they are history, and other systems may already have consumed them. This is the schema-evolution problem from <a href="../chapters/10-evolving-contracts.html">chapter 10</a>, with one extra twist: here the old data is <em>your own</em> database and every reader meets all the versions at once.</p>
+
+<p>The standard answer is an <strong>upcaster</strong>: a pure function applied at read time that turns an old event shape into the current one, in memory, before any code that cares sees it. <code>apply</code>, the projector and the temporal queries only ever deal with the newest shape. Your store already calls <code>upcast</code> on every event it reads. New events are tagged <code>"v": 2</code> from milestone 2 on; an old one has no <code>"v"</code>, which means version 1.</p>
+
+<pre><code>Deposited v1   {"amount": "12.50"}                  # decimal dollars as a string
+Deposited v2   {"v": 2, "amount_cents": 1250}       # integer cents</code></pre>
+
+<div class="callout warn">
+  <p class="callout-title">Why not just use float?</p>
+  <p>Because <code>float("19.99") * 100</code> is <code>1998.9999999999998</code> in Python, and <code>int()</code> of that is 1998: you lose a cent. Money converted through floating point is a classic source of off-by-one-cent bugs that appear only on some amounts. Use <code>decimal.Decimal</code> for the conversion, or at least <code>round()</code>. The check includes 19.99 and 0.29 to catch this.</p>
+</div>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>upcast(ev)</code>. It receives an <code>Event</code> and returns an <code>Event</code>: a <code>Deposited</code> with no <code>"v"</code> (or <code>"v": 1</code>) is converted to the v2 shape; everything else is returned unchanged. Do not modify the argument (<code>ev._replace(data=...)</code> builds a modified copy of a namedtuple), and do not write anything back to the database.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 6 as ✔. It upcasts several amounts including 19.99, checks that other events pass through untouched, then appends <em>raw v1 events</em> to a stream and verifies that <code>Account.load</code>, a fresh <code>Projector</code> and <code>account_as_of</code> all see the right cents, while the row in the database still holds the original v1 JSON.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>Decimal("19.99") * 100</code> is exactly <code>Decimal("1999.00")</code>; <code>int()</code> of it is 1999. Convert once, at the boundary.</li>
+      <li>Copy the dict (<code>dict(ev.data)</code>), remove <code>"amount"</code>, add <code>"v": 2</code> and <code>"amount_cents"</code>. Never mutate <code>ev.data</code>: the check compares it before and after.</li>
+      <li>If milestones 1 to 5 are green but this one reports a wrong balance, make sure nothing in your code reads <code>ev.data["amount"]</code> directly: only <code>upcast</code> should know the old shape.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> upcast(ev):
+    <span class="str">"""Upgrade old event shapes to the current one, in memory, when they are read.
+    Deposited v1: {"amount": "12.50"}  (a decimal string in dollars)
+    Deposited v2: {"v": 2, "amount_cents": 1250}
+    The stored row is never touched."""</span>
+    <span class="kw">if</span> ev.type == <span class="str">"Deposited"</span> <span class="kw">and</span> ev.data.get(<span class="str">"v"</span>, <span class="num">1</span>) == <span class="num">1</span>:
+        cents = int((Decimal(ev.data[<span class="str">"amount"</span>]) * <span class="num">100</span>).to_integral_value())    <span class="cmt"># Decimal: no 19.99 -&gt; 1998 surprise</span>
+        data = {k: v <span class="kw">for</span> k, v <span class="kw">in</span> ev.data.items() <span class="kw">if</span> k != <span class="str">"amount"</span>}
+        data.update({<span class="str">"v"</span>: <span class="num">2</span>, <span class="str">"amount_cents"</span>: cents})
+        <span class="kw">return</span> ev._replace(data=data)
+    <span class="kw">return</span> ev</code></pre>
+  </details>
+</div>
+<h2>Look under the hood</h2>
+
+<p>Nothing is hidden: the database is the log, and you can open it. This snippet makes the three-event account from the figure with a fake clock, prints the raw rows, rebuilds the state, shows the stale append being refused and asks for the balance at time 115, between the deposit and the withdrawal:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -c "
+from solution import *
+ticks = iter(range(100, 1000, 10))
+s = EventStore(clock=lambda: next(ticks))
+execute(s, 'acc-1', lambda a: a.open('ada'))
+execute(s, 'acc-1', lambda a: a.deposit(5000))
+execute(s, 'acc-1', lambda a: a.withdraw(1200))
+for r in s.conn.execute('SELECT * FROM events'): print(r)
+print(vars(Account.load(s, 'acc-1')))
+try: s.append('acc-1', 2, [('Deposited', {'v': 2, 'amount_cents': 1})])
+except ConcurrencyError as e: print('ConcurrencyError:', e)
+print(account_as_of(s, 'acc-1', at=115).balance)
+"</span>
+<span class="out">(1, 'acc-1', 1, 'AccountOpened', '{"owner": "ada"}', 100.0)
+(2, 'acc-1', 2, 'Deposited', '{"amount_cents": 5000, "v": 2}', 110.0)
+(3, 'acc-1', 3, 'Withdrawn', '{"amount_cents": 1200}', 120.0)
+{'id': 'acc-1', 'version': 3, 'opened': True, 'owner': 'ada', 'balance': 3800}
+ConcurrencyError: stream 'acc-1' is at version 3, you expected 2
+5000</span></code></pre>
+
+<p>There is no <code>balance</code> column anywhere in those rows. 3800 exists only because something folded three facts. Everything else in this lab is a way to do that fold less often (snapshots), somewhere else (projections), at a different moment (temporal queries) or across a change in meaning (upcasting).</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Remove the safety nets one at a time.</strong> Delete <code>UNIQUE (stream_id, version)</code> from the schema <em>and</em> your explicit version check, and run milestone 1: the race test now fails, with two writers both owning version 1. Now put the check back but also drop <code>BEGIN IMMEDIATE</code>, still without the constraint: the single-threaded tests pass, and only the threaded race has a chance to show the hole, because "read the version" and "insert" are then two separate steps that another writer can slip between. That is why the lab keeps both a check <em>and</em> a constraint.</li>
+    <li><strong>Change your mind about a view, then rebuild.</strong> A read model is disposable, so changing it is cheap. Lower <code>LARGE_CENTS</code> and rebuild a fresh projector over the same log:
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -c "
+import solution as m
+from solution import *
+s = EventStore()
+execute(s, 'a', lambda a: a.open('ada'))
+for c in (500, 20000, 150000, 99999, 100000): execute(s, 'a', lambda a, c=c: a.deposit(c))
+P = Projector(s); P.catch_up(); print(P.large_transactions())
+m.LARGE_CENTS = 10000
+Q = Projector(s); Q.rebuild(); print(Q.large_transactions())
+"</span>
+<span class="out">[(4, 'a', 'Deposited', 150000), (6, 'a', 'Deposited', 100000)]
+[(3, 'a', 'Deposited', 20000), (4, 'a', 'Deposited', 150000), (5, 'a', 'Deposited', 99999), (6, 'a', 'Deposited', 100000)]</span></code></pre>
+      The new view includes transactions from before the rule changed. A system that stored only current state could not have done that.</li>
+    <li><strong>Measure what snapshots save.</strong> Build a 537-event account with snapshots every 100 events and count the reads (this is the <code>events_read</code> counter from milestone 1):
+<pre class="terminal" data-title="terminal"><code><span class="out">no snapshots  balance 536  version 537  events read: 537
+snapshots     balance 536  version 537  events read: 37</span></code></pre>
+      Now set the interval to 1000. The snapshot never fires, and you pay for the full replay. Pick the interval from the length of the streams and the cost of one event, not from folklore.</li>
+    <li><strong>Break a snapshot on purpose.</strong> Save a snapshot, then change <code>apply</code> so that a deposit adds one extra cent, and load with and without the snapshot. The two answers now differ, and only the full replay is "right" under the new code. This is why snapshots carry a schema version in real systems, and why you must be able to delete them.</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>An <code>AccountClosed</code> event:</strong> closing requires a zero balance, and after it no command is accepted. Does <code>apply</code> need to change? Does the projector?</li>
+  <li><strong>Multi-event commands and idempotency keys:</strong> a <code>transfer</code> touches two accounts, which are two streams, so no single append can cover both. Sketch what you would do (a process manager, or the saga of <a href="../chapters/15-sagas.html">chapter 15</a>), and add a <code>command_id</code> so that retrying a command that already succeeded appends nothing.</li>
+  <li><strong>A subscription:</strong> make <code>catch_up</code> a loop that blocks (with a timeout) until new events arrive, using <code>threading.Condition</code>, so the read model follows the log live. Measure the lag in events.</li>
+  <li><strong>Snapshots in temporal queries:</strong> let <code>account_as_of</code> start from a snapshot when the snapshot's version is not beyond the requested version. When is that wrong?</li>
+  <li><strong>Bitemporal events:</strong> add an <code>occurred_at</code> to <code>Deposited</code> (when it happened) beside <code>recorded_at</code> (when we learned it), and answer "what did we believe about Monday on Tuesday?".</li>
+  <li><strong>Per-stream ordering vs global order:</strong> split the log into two files by account hash and have the projector merge them. Which guarantees from the global <code>seq</code> do you lose, and which queries break?</li>
+  <li><strong>Compensation instead of editing:</strong> a deposit was recorded on the wrong account. Add a correcting event (<code>DepositReversed</code>) instead of deleting anything, and see how the read model and the temporal query show the history honestly.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>You built a log, and a log is the oldest trick in distributed systems. <code>expected_version</code> is a compare-and-swap on a single register per stream, the same primitive that <a href="../../networking/chapters/18-replication.html">replicated systems</a> use to avoid two leaders accepting conflicting writes. Your projector's position is a consumer offset, and its idempotent handlers are the consumer half of <a href="../../networking/chapters/16-failure.html">at-least-once delivery</a>. The global <code>seq</code> is cheap here because one sqlite file orders everything; once the log is split over many machines, a single total order stops being free (<a href="../../networking/chapters/17-time.html">clocks and ordering</a>) and you get ordering <em>per stream</em> or <em>per partition</em> only, which is why event-sourced designs make the aggregate the unit of consistency. And the gap between the write and the moment the projector catches up is <a href="../chapters/14-event-driven.html">eventual consistency</a> showing up in your user interface: a customer deposits money and the balance page, read from the projection, may still show the old number for a moment.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>An event store is an append-only table with a per-stream version. <code>expected_version</code> turns "someone else wrote first" into an error you can handle by reloading, and a UNIQUE constraint is the last line of defence when the check is not enough.</li>
+    <li>An aggregate's state is a fold over its events. <code>apply</code> records facts and never validates; commands validate and return events. Business invariants such as "no overdraft" survive concurrency because of the version check, not because of locks.</li>
+    <li>CQRS splits deciding from answering. Read models are built by a projector that follows the log from a saved position, and their handlers must be idempotent because delivery is at least once.</li>
+    <li>A read model is a cache of the log: you can drop it and rebuild it, or build a new one that answers a question nobody asked when the events were written.</li>
+    <li>Snapshots make loading fast but are never the truth: snapshot plus tail must equal a full replay, and deleting all snapshots must be safe.</li>
+    <li>The log gives you time travel for free: any past state is a shorter fold, if you are clear about which timestamp you mean.</li>
+    <li>Old events are never rewritten. Upcasters translate old shapes at read time, so only the newest shape exists in your code. The costs of event sourcing (versioning, replay time, eventual consistency, harder ad-hoc queries) are real, and are the reason many experienced engineers reserve it for domains where history itself is the product.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">Two clients load an account at version 7 with a balance of 100. Each decides to withdraw 80 and calls <code>append("acc", 7, [Withdrawn 80])</code>. What happens, and what does the loser do?</p>
+    <ol class="q-options">
+      <li>Both succeed, and the balance becomes -60, which is why aggregates need locks</li>
+      <li>The second one is queued by the store until the first finishes, then also succeeds</li>
+      <li>The second raises <code>ConcurrencyError</code>; it reloads (balance 20, version 8), decides again, and this time its own command is refused with <code>InsufficientFunds</code></li>
+      <li>The second one silently overwrites event 8 with its own</li>
+    </ol>
+    <div class="q-explain">The store accepts a write only if the stream is still at the version the writer saw. The loser's decision was based on stale state, so it must start over from the new state, and the business rule is applied to the fresh facts. No lock was held while either client was thinking.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A projector crashes after updating <code>account_balances</code> but before saving its position, then restarts and re-reads the last 50 events. Why is the read model still correct?</p>
+    <ol class="q-options">
+      <li>Because the event store removes events once they have been delivered</li>
+      <li>Because each handler is idempotent: it only applies an event whose seq is newer than the row's <code>last_seq</code> (and large transactions are keyed by seq), so the re-delivered events change nothing</li>
+      <li>Because sqlite automatically undoes the changes after a crash</li>
+      <li>It is not correct: the balances are now doubled and must be rebuilt by hand</li>
+    </ol>
+    <div class="q-explain">At-least-once delivery is the realistic guarantee, so the consumer makes duplicates harmless. Putting the table updates and the position in one transaction narrows the window; idempotent handlers close it. Rebuild is the backstop.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You delete all snapshots in production. What should happen?</p>
+    <ol class="q-options">
+      <li>Accounts can no longer be loaded until the snapshots are restored from backup</li>
+      <li>Balances reset to zero and have to be re-entered</li>
+      <li>Nothing changes, because snapshots are only used by the read side</li>
+      <li>Nothing is lost: loads fall back to replaying the stream from event 1, just slower, and new snapshots appear over time</li>
+    </ol>
+    <div class="q-explain">A snapshot is a cache of the fold, used by the write side to shorten loads. The events are the source of truth, so deleting snapshots costs time, never data. If it could cost data, the design is wrong.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Three years ago a <code>Deposited</code> event was stored as <code>{"amount": "19.99"}</code>; today the code expects <code>{"amount_cents": 1999}</code>. What is the standard fix, and why not rewrite the old rows?</p>
+    <ol class="q-options">
+      <li>An upcaster that converts old shapes to the current one when events are read. Events are immutable history, other consumers may have seen them, and a rewrite is risky and cannot be undone</li>
+      <li>Run an UPDATE over the whole table at deploy time. The log can be edited whenever the schema changes</li>
+      <li>Keep both shapes in <code>apply</code> forever, with an <code>if</code> for every version in every consumer</li>
+      <li>Delete the old events and recompute balances from the read model</li>
+    </ol>
+    <div class="q-explain">Upcasting keeps one translation in one place, so every reader (aggregate, projector, temporal query) sees only the newest shape. Editing the log destroys the property that makes event sourcing valuable: that history is a trustworthy record of what was written.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

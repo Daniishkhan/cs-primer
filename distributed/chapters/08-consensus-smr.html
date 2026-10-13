@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consensus &amp; Replicated State Machines · Distributed Systems, Deep</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dist" data-chapter="08">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Consensus &amp; Replicated State Machines</h1>
+  <p class="lede">Part 3 of this course is about getting machines to agree despite crashes and delays. This chapter lays the foundation before the algorithms (Paxos and Raft, in the next two chapters): what exactly "agree" means, why overlapping majorities make agreement safe, how a stream of agreed decisions turns into a log, and why a log is all you need to run almost any service on several machines. Along the way you will meet the family of broadcast primitives, see why total-order broadcast and consensus are the same problem in two costumes, and learn what makes a program safe to replicate.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Almost every strongly consistent system you will operate (etcd, ZooKeeper, Consul, the metadata layer of most databases, the lock service in the cloud you use) is a replicated state machine on top of a consensus protocol. When one of them misbehaves, the useful questions are about this chapter's vocabulary: what did the group agree on, in what order, and what must every replica do identically? And when you design a system, the central senior-level question is what <em>needs</em> consensus and what does not, because consensus is the one tool in the toolbox that always costs at least a majority round trip.</p>
+</div>
+
+<h2>Where networking chapter 20 stopped</h2>
+
+<p><a href="../../networking/chapters/20-consensus.html">Networking chapter 20</a> introduced the problem, the impossibility result, majorities, the replicated log, and walked through Raft's leader election and log replication at the level of "how it works". It showed the table of cluster sizes and failures tolerated, and the diagram of two majorities sharing a member. We do not repeat any of that. This chapter asks the next set of questions: What are the precise requirements a consensus protocol must meet? Why is the overlapping-majority trick <em>sufficient</em> for safety and not just plausible? What sits between a consensus protocol and a service? And what has to be true of a service for the "same log, same state" promise to hold?</p>
+
+<h2>The consensus problem, precisely</h2>
+
+<p>A set of <em>n</em> processes each start with a proposed value. They run a protocol, communicating by messages that can be delayed, reordered or lost, and up to <em>f</em> of them may crash. Each must eventually <span class="term">decide</span> on a value. A correct solution satisfies:</p>
+
+<table>
+  <thead><tr><th>Property</th><th>Statement</th><th>Kind</th></tr></thead>
+  <tbody>
+    <tr><td><span class="term">Agreement</span></td><td>No two processes decide different values.</td><td>safety</td></tr>
+    <tr><td><span class="term">Validity</span></td><td>The decided value was proposed by some process.</td><td>safety</td></tr>
+    <tr><td><span class="term">Integrity</span></td><td>Each process decides at most once.</td><td>safety</td></tr>
+    <tr><td><span class="term">Termination</span></td><td>Every process that does not crash eventually decides.</td><td>liveness</td></tr>
+  </tbody>
+</table>
+
+<p>Recall the split from <a href="01-system-models.html">chapter 1</a>: a <span class="term">safety</span> property says "nothing bad ever happens" (it can be violated by a single finite bad prefix of an execution), and a <span class="term">liveness</span> property says "something good eventually happens". Each of the four properties has a job.</p>
+
+<ul>
+  <li><strong>Agreement</strong> is the point. A stronger version, <em>uniform</em> agreement, also forbids a process that later crashes from having decided differently before it died. This matters: a client may have been told the decision by a replica that then crashed, and the decision must still stand.</li>
+  <li><strong>Validity</strong> rules out the lazy solution "everyone always decides 0". Without it, agreement and termination are trivial. Variants exist (the decision must be one of the <em>correct</em> processes' proposals, or must be the unanimous value if all propose the same), but the idea is that the answer is connected to the question.</li>
+  <li><strong>Integrity</strong> stops a protocol from deciding A and then changing its mind.</li>
+  <li><strong>Termination</strong> is the property that cannot always be guaranteed. The result of Fischer, Lynch and Paterson (1985) says that in a fully asynchronous system, no <em>deterministic</em> protocol can guarantee it if even one process might crash (<a href="02-impossibility.html">chapter 2</a>). The engineering response, in Paxos, Raft and their relatives, is a deliberate asymmetry: <strong>safety must hold always, whatever the network does; liveness is promised only while the network behaves well enough for long enough</strong>. A protocol built this way never produces a wrong answer; at worst it makes no progress for a while, until timeouts and elections settle it.</li>
+</ul>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a committee choosing a meeting date by post</p>
+  <p>Five committee members must pick one date for the annual meeting. They only communicate by letters that may be lost, delayed or arrive out of order, and any member may fall asleep for an unknown time. <em>Agreement</em> means they must not end up with two different dates in the minutes. <em>Validity</em> means the date must be one that someone actually suggested. <em>Termination</em> means that if the post eventually behaves and enough members stay awake, they do pick a date. Notice what a wise committee does when letters are going astray: it keeps the minutes safe and waits. It does not pick a date it cannot prove everyone will accept.</p>
+  <p><em>Where it breaks down:</em> real committee members can tell if a colleague is rude and ignoring them. Processes cannot distinguish a slow member from a dead one, which is exactly why termination cannot be guaranteed unconditionally.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Consensus is not a vote</p>
+  <p>It is tempting to think consensus is "everyone sends a vote, majority wins". One round of votes fails in two ways. With five processes proposing A, A, B, B, C nobody has a majority and nothing is decided (termination fails). And if processes may <em>change</em> their votes to break the tie, two different processes can observe two different majorities at different moments (agreement fails). The protocols of the next chapters exist because of these two failures: they add rounds with numbers, so that a process which has already made a commitment can tell a later round about it. The rest of this section is the idea that makes that work.</p>
+</div>
+
+<h2>Quorum intersection: the core trick</h2>
+
+<p>A <span class="term">quorum system</span> is a collection of subsets of the processes, called quorums, in which <strong>any two quorums have at least one process in common</strong>. The simplest example is "any majority", which has this property because two sets of more than half of <em>n</em> processes must overlap (otherwise they would contain more than <em>n</em> processes in total). You have seen this overlap as a picture; here is why it is enough to build a safe protocol, using the sketch of a "write-once register": a box that every process can propose to, which must end up holding a single value.</p>
+
+<ol>
+  <li><strong>Deciding.</strong> A proposer asks processes to <em>accept</em> its value <code>v</code>. If a quorum <code>Q1</code> accepts, <code>v</code> is <span class="term">chosen</span>. Chosen means: from now on the protocol must never choose anything else, even if the proposer crashes, and even if nobody learns about it for a while.</li>
+  <li><strong>Later proposers.</strong> Some other proposer wants to try, perhaps with a different value, perhaps because it does not know what happened. Before proposing, it must <em>ask</em> a quorum <code>Q2</code> what they have accepted.</li>
+  <li><strong>The overlap.</strong> <code>Q1</code> and <code>Q2</code> share a process. That process accepted <code>v</code> and remembers (it is on stable storage), so it tells the new proposer. The new proposer then proposes <code>v</code>, not its own value. A chosen value therefore survives any number of later proposers.</li>
+</ol>
+
+<p>That is the entire safety argument of Paxos in one paragraph; the details (round numbers, promises not to accept older rounds, and how Raft's terms do the same job) are for chapters 9 and 10. The pictured version:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 320" role="img" aria-label="Space-time diagram with a proposer P at the top, five acceptors N1 to N5 in the middle, and a second proposer Q at the bottom. In round one, P sends accept v to N1, N2 and N3, which each accept and acknowledge; v is chosen, and then P crashes. In round two, Q asks N3, N4 and N5 what they have accepted. N3 answers that it accepted v; N4 and N5 answer nothing. A yellow band highlights N3 as the process in both quorums, so Q learns it must propose v.">
+<defs><marker id="ahX08a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="76" y="148" width="670" height="24" rx="6" class="fs-yellow"/>
+<text x="12" y="34" class="t-sm t-bold tc-purple">proposer P</text>
+<text x="12" y="84" class="t-sm t-bold tc-blue">N1</text><text x="12" y="124" class="t-sm t-bold tc-blue">N2</text><text x="12" y="164" class="t-sm t-bold tc-blue">N3</text><text x="12" y="204" class="t-sm t-bold tc-blue">N4</text><text x="12" y="244" class="t-sm t-bold tc-blue">N5</text>
+<text x="12" y="294" class="t-sm t-bold tc-purple">proposer Q</text>
+<line x1="90" y1="30" x2="745" y2="30" class="line-thin"/>
+<line x1="90" y1="80" x2="745" y2="80" class="line-thin"/><line x1="90" y1="120" x2="745" y2="120" class="line-thin"/><line x1="90" y1="160" x2="745" y2="160" class="line-thin"/><line x1="90" y1="200" x2="745" y2="200" class="line-thin"/><line x1="90" y1="240" x2="745" y2="240" class="line-thin"/>
+<line x1="90" y1="290" x2="745" y2="290" class="line-thin"/>
+<!-- round 1 -->
+<line x1="120" y1="30" x2="170" y2="80" class="line s-blue" marker-end="url(#ahX08a)"/>
+<line x1="120" y1="30" x2="170" y2="120" class="line s-blue" marker-end="url(#ahX08a)"/>
+<line x1="120" y1="30" x2="170" y2="160" class="line s-blue" marker-end="url(#ahX08a)"/>
+<line x1="170" y1="80" x2="250" y2="30" class="line s-green" marker-end="url(#ahX08a)"/>
+<line x1="170" y1="120" x2="250" y2="30" class="line s-green" marker-end="url(#ahX08a)"/>
+<line x1="170" y1="160" x2="250" y2="30" class="line s-green" marker-end="url(#ahX08a)"/>
+<circle cx="170" cy="80" r="5" class="f-yellow s-yellow"/><circle cx="170" cy="120" r="5" class="f-yellow s-yellow"/><circle cx="170" cy="160" r="5" class="f-yellow s-yellow"/>
+<text x="104" y="16" class="t-xs t-bold">round 1: "accept v"</text>
+<text x="270" y="96" class="t-xs">N1, N2, N3 accept v</text>
+<text x="270" y="108" class="t-xs t-bold">v is chosen</text>
+<text x="270" y="34" class="t-sm t-bold tc-red">✕ P crashes</text>
+<!-- round 2 -->
+<line x1="420" y1="290" x2="470" y2="160" class="line s-blue" marker-end="url(#ahX08a)"/>
+<line x1="420" y1="290" x2="470" y2="200" class="line s-blue" marker-end="url(#ahX08a)"/>
+<line x1="420" y1="290" x2="470" y2="240" class="line s-blue" marker-end="url(#ahX08a)"/>
+<line x1="470" y1="160" x2="560" y2="290" class="line s-green" marker-end="url(#ahX08a)"/>
+<line x1="470" y1="200" x2="560" y2="290" class="line s-green" marker-end="url(#ahX08a)"/>
+<line x1="470" y1="240" x2="560" y2="290" class="line s-green" marker-end="url(#ahX08a)"/>
+<circle cx="470" cy="160" r="5" class="f-yellow s-yellow"/><circle cx="470" cy="200" r="5" class="f-blue"/><circle cx="470" cy="240" r="5" class="f-blue"/>
+<text x="360" y="310" class="t-xs t-bold">round 2: "what have you accepted?"</text>
+<text x="510" y="188" class="t-xs t-bold">N3: "I accepted v"</text>
+<text x="512" y="224" class="t-xs">N4, N5: "nothing"</text>
+<text x="600" y="272" class="t-xs t-bold">Q must propose v</text>
+<text x="600" y="286" class="t-xs">(not its own value)</text>
+<text x="745" y="148" text-anchor="end" class="t-xs t-muted">N3 is in both quorums: {N1,N2,N3} and {N3,N4,N5}</text>
+</svg>
+  <figcaption>Quorum intersection carrying a decision across time. The two quorums share exactly one process; that process is the memory. Remove it, by picking quorums that do not overlap, and the second proposer learns nothing and may choose a different value.</figcaption>
+</figure>
+
+<h3>A counterexample for every simplification</h3>
+
+<ul>
+  <li><strong>"Quorums of just under half."</strong> With four processes, quorums of size 2 are not required to intersect: {N1,N2} and {N3,N4} are disjoint, so a value chosen by the first pair can be invisible to a proposer who consults the second. The script below checks this by brute force.</li>
+  <li><strong>"Ask only the leader."</strong> One process is a quorum of size 1 for everything. Fast, until it crashes with the only copy of the decision; then no one remembers.</li>
+  <li><strong>"Ask everyone."</strong> The quorum "all <em>n</em>" intersects trivially but a single crash blocks progress, since a quorum can no longer be assembled. Termination fails with one fault.</li>
+  <li><strong>"Remember in volatile memory."</strong> The overlap process must keep its acceptance on <em>stable storage</em> before acknowledging. If it restarts with a blank memory, the overlap is gone. This is the "fsync before ack" rule of <a href="../../systems/chapters/09-durability.html">systems chapter 9</a>, applied to protocol state.</li>
+</ul>
+
+<pre class="terminal" data-title="quorum.py"><code>from itertools import combinations
+
+def quorums(n: int, size: int):
+    return [frozenset(q) for q in combinations(range(n), size)]
+
+def always_intersect(qs) -&gt; bool:
+    return all(a &amp; b for a, b in combinations(qs, 2))
+
+print(f"{'N':&gt;2} {'quorum size':&gt;11} {'any two intersect?':&gt;19} {'crashes survivable':&gt;19}")
+for n in range(3, 8):
+    for size in (n // 2, n // 2 + 1):                 # one too small, and the majority
+        qs = quorums(n, size)
+        print(f"{n:&gt;2} {size:&gt;11} {str(always_intersect(qs)):&gt;19} {n - size:&gt;19}")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code> N quorum size  any two intersect?  crashes survivable
+ 3           1               False                   2
+ 3           2                True                   1
+ 4           2               False                   2
+ 4           3                True                   1
+ 5           2               False                   3
+ 5           3                True                   2
+ 6           3               False                   3
+ 6           4                True                   2
+ 7           3               False                   4
+ 7           4                True                   3</code></pre>
+
+<p>Every row with "False" is unsafe regardless of the "crashes survivable" figure next to it: being able to carry on after more crashes is no use if two sides of a split can each form a quorum and decide differently. The "True" rows are exactly the majorities (⌊n/2⌋ + 1), and they tolerate ⌊(n−1)/2⌋ crashes, which is the 2f + 1 rule you saw in networking chapter 20. Notice also that 4 processes survive no more crashes than 3.</p>
+
+<details class="deeper">
+  <summary>Go deeper: majorities are not the only quorum systems <span class="hint">optional</span></summary>
+  <p>All the safety argument needs is that the quorums used for <em>choosing</em> intersect the quorums used for <em>asking</em>. Quorums of the same kind need not intersect each other. The 2016 paper "Flexible Paxos" by Heidi Howard, Dahlia Malkhi and Alexander Spiegelman makes this precise: the group can use a large quorum for the rare phase (leader election) and a small one for the common phase (replicating each command), as long as every election quorum intersects every replication quorum. With 6 processes, for example, you could replicate to 3 and elect with 4. The sizes <em>R + W &gt; N</em> from <a href="../../networking/chapters/18-replication.html">networking chapter 18</a> are the same idea for reads and writes. There are also grid and weighted quorum systems. Majorities remain the default because they maximise tolerance to the number of crashes for a symmetric system.</p>
+</details>
+
+<h2>The replicated state machine approach</h2>
+
+<p>Agreeing on one value is a building block. A service needs to agree on a never-ending sequence of them. The approach is older than Paxos: Lamport described it in his 1978 paper on clocks, and Fred Schneider's 1990 tutorial "Implementing Fault-Tolerant Services Using the State Machine Approach" made it the standard recipe. In outline:</p>
+
+<ol>
+  <li>Write the service as a <span class="term">state machine</span>: a state, and a function <code>apply(state, command) → (new state, response)</code>. Every command is processed atomically, one at a time.</li>
+  <li>Require it to be <span class="term">deterministic</span>: the new state and the response depend <em>only</em> on the old state and the command, nothing else.</li>
+  <li>Run a copy on each of <em>n</em> machines, all starting in the same state.</li>
+  <li>Feed every copy <em>the same commands in the same order</em>.</li>
+</ol>
+
+<p>Then, by induction, all copies hold the same state after each command and produce the same responses. Schneider's two requirements for step 4 are <em>agreement</em> (every correct replica receives every command) and <em>order</em> (all replicas process them in the same order). Everything difficult about replication is concentrated in delivering a command sequence reliably and identically, which is the job of a consensus-based <em>log</em>. Order matters in the most mundane way, as the next snippet shows: two replicas given the same three commands, one with the last two swapped.</p>
+
+<pre class="terminal" data-title="smr_order.py"><code>def apply(state: dict, cmd: tuple) -&gt; dict:
+    op, key, n = cmd
+    state = dict(state)                       # pure function: (state, command) -&gt; new state
+    if op == "set": state[key] = n
+    elif op == "add": state[key] = state.get(key, 0) + n
+    elif op == "mul": state[key] = state.get(key, 0) * n
+    return state
+
+def run(log):
+    s = {}
+    for cmd in log: s = apply(s, cmd)
+    return s
+
+log = [("set", "x", 1), ("add", "x", 5), ("mul", "x", 2)]
+print("replica 1 and 2, same log:     ", run(log), run(log))
+print("replica 3, last two swapped:   ", run([log[0], log[2], log[1]]))</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>replica 1 and 2, same log:      {'x': 12} {'x': 12}
+replica 3, last two swapped:    {'x': 7}</code></pre>
+
+<p>Same commands, different order, different state: (1 + 5) × 2 = 12 against 1 × 2 + 5 = 7. The log's job is to rule that out. Here is one command's life in a leader-based system, which is what most real implementations look like (Raft makes this explicit; Multi-Paxos in practice does the same). The chapters that follow fill in each box.</p>
+
+<div class="widget stepper" data-autoplay-ms="3600">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One command through a replicated log</h4></div>
+  <svg viewBox="0 0 760 300" role="img" aria-label="Space-time diagram with a client, a leader and two followers. The client sends put x=5 to the leader. The leader appends it as log entry 7 and sends it to both followers. The first follower appends and acknowledges. With itself and one follower the leader has a majority of three, so it commits entry 7, applies it, and replies to the client. The second follower's acknowledgement arrives later. Followers learn the commit index from the next message from the leader and apply the entry.">
+    <defs><marker id="ahX08b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="10" y="44" class="t-sm t-bold tc-green">client</text>
+    <text x="10" y="114" class="t-sm t-bold tc-purple">leader</text>
+    <text x="10" y="184" class="t-sm t-bold tc-blue">follower 1</text>
+    <text x="10" y="254" class="t-sm t-bold tc-blue">follower 2</text>
+    <line x1="90" y1="40" x2="745" y2="40" class="line-thin"/><line x1="90" y1="110" x2="745" y2="110" class="line-thin"/><line x1="90" y1="180" x2="745" y2="180" class="line-thin"/><line x1="90" y1="250" x2="745" y2="250" class="line-thin"/>
+
+    <g data-steps="1-" data-active="1">
+      <line x1="130" y1="40" x2="190" y2="110" class="line s-blue" marker-end="url(#ahX08b)"/>
+      <text x="150" y="86" text-anchor="end" class="t-xs">put x=5</text>
+    </g>
+    <g data-steps="2-" data-active="2">
+      <rect x="196" y="84" width="118" height="20" rx="4" class="fs-orange s-orange sw-2"/>
+      <text x="255" y="98" text-anchor="middle" class="t-xs t-bold mono">log[7] = put x=5</text>
+    </g>
+    <g data-steps="3-" data-active="3">
+      <line x1="230" y1="110" x2="300" y2="180" class="line s-blue" marker-end="url(#ahX08b)"/>
+      <line x1="230" y1="110" x2="320" y2="250" class="line s-blue" marker-end="url(#ahX08b)"/>
+      <text x="300" y="138" class="t-xs">AppendEntries(7)</text>
+    </g>
+    <g data-steps="4-" data-active="4">
+      <rect x="306" y="190" width="70" height="20" rx="4" class="fs-orange s-orange sw-2"/><text x="341" y="204" text-anchor="middle" class="t-xs t-bold mono">log[7]</text>
+      <line x1="340" y1="180" x2="410" y2="110" class="line s-green" marker-end="url(#ahX08b)"/>
+      <rect x="326" y="260" width="70" height="20" rx="4" class="fs-orange s-orange sw-2"/><text x="361" y="274" text-anchor="middle" class="t-xs t-bold mono">log[7]</text>
+      <text x="388" y="152" class="t-xs">ack</text>
+    </g>
+    <g data-steps="5-" data-active="5">
+      <circle cx="410" cy="110" r="7" class="f-yellow s-yellow"/>
+      <text x="410" y="68" text-anchor="middle" class="t-xs t-bold">2 of 3 have it:</text>
+      <text x="410" y="80" text-anchor="middle" class="t-xs t-bold">commit 7, apply</text>
+      <line x1="430" y1="110" x2="500" y2="40" class="line s-green" marker-end="url(#ahX08b)"/>
+      <text x="520" y="36" class="t-xs t-bold">x=5 ok</text>
+      <line x1="400" y1="250" x2="550" y2="110" class="line-dash s-green" marker-end="url(#ahX08b)"/>
+      <text x="520" y="206" class="t-xs t-muted">late ack from 2</text>
+    </g>
+    <g data-steps="6" data-active="6">
+      <line x1="600" y1="110" x2="650" y2="180" class="line s-blue" marker-end="url(#ahX08b)"/>
+      <line x1="600" y1="110" x2="670" y2="250" class="line s-blue" marker-end="url(#ahX08b)"/>
+      <text x="610" y="96" class="t-xs">commit index = 7</text>
+      <circle cx="650" cy="180" r="6" class="f-yellow s-yellow"/><text x="650" y="200" text-anchor="middle" class="t-xs">apply</text>
+      <circle cx="670" cy="250" r="6" class="f-yellow s-yellow"/><text x="670" y="270" text-anchor="middle" class="t-xs">apply</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>A client sends a command to the leader.</strong> In a leader-based protocol all commands go through one process at a time. A client that reaches a follower is redirected. Nothing has changed yet.</li>
+    <li><strong>The leader appends it to its log</strong> as a new entry, here slot 7. The entry is not committed. It is a proposal that only the leader knows about, and the leader could still lose leadership before anyone else sees it.</li>
+    <li><strong>The leader sends the entry to the followers.</strong> This is the "accept" phase in the language of the last section: asking a quorum to remember the entry.</li>
+    <li><strong>Followers persist the entry, then acknowledge.</strong> "Persist" means the log is on stable storage before the ack goes out; that is the rule from the quorum argument. The faster follower's ack arrives first.</li>
+    <li><strong>A majority now has it, so the entry is committed.</strong> The leader plus one follower is two out of three. The leader applies the command to its state machine and answers the client. Follower 2's acknowledgement arrives later and changes nothing: the leader never waited for it.</li>
+    <li><strong>Followers learn that 7 is committed</strong> from the next message the leader sends (the commit index rides along on ordinary traffic) and apply it to their own state machines. Every replica applies entries 1 to 7 in the same order, so every replica holds the same state.</li>
+  </ol>
+</div>
+
+<p>Two properties make this usable. A command is <strong>committed</strong> only after a quorum has persisted it, so any future leader, elected by a quorum that must overlap, will have it (the quorum-intersection argument again, this time for logs). And commands are <strong>applied</strong> only after being committed, so a replica never executes an entry that might later be thrown away.</p>
+
+<h2>The broadcast hierarchy</h2>
+
+<p>"Send the same commands to every replica in the same order" is an instance of a broader family of problems. These are the <span class="term">broadcast</span> (or <em>multicast</em>) abstractions, and they form a ladder, each adding one guarantee on top of the previous, that tells you precisely what the log provides.</p>
+
+<table>
+  <thead><tr><th>Abstraction</th><th>Guarantee (for messages broadcast by processes, among correct processes)</th><th>Implementation idea</th></tr></thead>
+  <tbody>
+    <tr><td><span class="term">Best-effort broadcast</span></td><td>If the sender is correct, every correct process delivers the message. If the sender crashes midway, some may deliver it and others not.</td><td>Send to each process one by one.</td></tr>
+    <tr><td><span class="term">Reliable broadcast</span></td><td>As above, plus: if <em>any</em> correct process delivers a message, <em>all</em> correct processes do, even if the sender crashed midway.</td><td>On first receiving a message, relay it to everyone, then deliver (at the cost of roughly <em>n</em><sup>2</sup> messages).</td></tr>
+    <tr><td><span class="term">FIFO broadcast</span></td><td>Reliable, and messages from the same sender are delivered in the order that sender sent them.</td><td>Per-sender sequence numbers; hold back out-of-order arrivals.</td></tr>
+    <tr><td><span class="term">Causal broadcast</span></td><td>Reliable, and if broadcast of <code>m1</code> happened before broadcast of <code>m2</code> (<a href="../../networking/chapters/17-time.html">happens-before</a>), every process delivers <code>m1</code> before <code>m2</code>.</td><td>Attach vector clocks or dependency lists; hold back until dependencies are delivered (as in <a href="06-causal-session.html">chapter 6</a>).</td></tr>
+    <tr><td><span class="term">Total-order broadcast</span> (atomic broadcast)</td><td>Reliable, and all correct processes deliver all messages in <em>the same order</em>.</td><td>Needs agreement on the order: a consensus instance per position, or a leader that sequences and a protocol to replace it safely.</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 350" role="img" aria-label="Ladder of broadcast abstractions. On the left, in blue, best-effort broadcast leads up to reliable broadcast, then FIFO broadcast, then causal broadcast. On the right, in purple, reliable broadcast also leads to total-order broadcast, and causal broadcast together with total-order broadcast gives causal total-order broadcast. A bracket under the left column says solvable in an asynchronous system with crash faults. A bracket under the right says equivalent to consensus, so the impossibility result applies.">
+<defs><marker id="ahX08c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="40" y="260" width="220" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="150" y="287" text-anchor="middle" class="t-sm t-bold">Best-effort</text>
+<rect x="40" y="180" width="220" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="150" y="207" text-anchor="middle" class="t-sm t-bold">Reliable</text>
+<rect x="40" y="100" width="220" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="150" y="127" text-anchor="middle" class="t-sm t-bold">FIFO</text>
+<rect x="40" y="20" width="220" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="150" y="47" text-anchor="middle" class="t-sm t-bold">Causal</text>
+<rect x="480" y="100" width="220" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="590" y="127" text-anchor="middle" class="t-sm t-bold">Total order (atomic)</text>
+<rect x="480" y="20" width="220" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="590" y="47" text-anchor="middle" class="t-sm t-bold">Causal + total order</text>
+<line x1="150" y1="260" x2="150" y2="226" class="line" marker-end="url(#ahX08c)"/>
+<line x1="150" y1="180" x2="150" y2="146" class="line" marker-end="url(#ahX08c)"/>
+<line x1="150" y1="100" x2="150" y2="66" class="line" marker-end="url(#ahX08c)"/>
+<line x1="260" y1="200" x2="480" y2="132" class="line" marker-end="url(#ahX08c)"/>
+<line x1="590" y1="100" x2="590" y2="66" class="line" marker-end="url(#ahX08c)"/>
+<line x1="260" y1="42" x2="478" y2="42" class="line" marker-end="url(#ahX08c)"/>
+<text x="165" y="246" class="t-xs">+ everyone or no one</text>
+<text x="165" y="166" class="t-xs">+ per-sender order</text>
+<text x="165" y="86" class="t-xs">+ cause before effect</text>
+<text x="330" y="198" class="t-xs">+ same order everywhere</text>
+<text x="598" y="86" class="t-xs">+ cause before effect</text>
+<line x1="40" y1="322" x2="260" y2="322" class="line s-blue sw-2"/>
+<text x="150" y="340" text-anchor="middle" class="t-xs">solvable asynchronously with crashes</text>
+<line x1="480" y1="322" x2="700" y2="322" class="line s-purple sw-2"/>
+<text x="590" y="340" text-anchor="middle" class="t-xs">equivalent to consensus: FLP applies</text>
+<text x="330" y="287" class="t-xs t-muted">each box adds one guarantee</text>
+</svg>
+  <figcaption>The broadcast ladder. Everything on the left can be built from plain message passing in an asynchronous system with crashes. Putting messages in a single agreed order is a different kind of guarantee, because it requires agreement, and agreement is consensus.</figcaption>
+</figure>
+
+<h3>Total-order broadcast is consensus</h3>
+
+<p>The step up to the right-hand column is the heart of the matter, and it is a precise equivalence: <strong>total-order broadcast and consensus are equivalent</strong> in the sense that either can be implemented using the other (a result usually credited to Chandra and Toueg's 1996 paper on failure detectors). The two directions are short:</p>
+
+<ul>
+  <li><strong>Consensus from total-order broadcast.</strong> Each process broadcasts its proposal and decides on the first message delivered. All processes deliver in the same order, so all see the same first message, hence agree. It was proposed by someone, hence validity.</li>
+  <li><strong>Total-order broadcast from consensus.</strong> Run a sequence of consensus instances, one per slot 0, 1, 2, ... of the log. To broadcast <code>m</code>, propose it for the next undecided slot; if another message wins the slot, try again at the next. Deliver slots in order. All processes decide the same message in each slot, so they deliver the same sequence.</li>
+</ul>
+
+<p>Both directions are a few lines of Python. The "consensus" below is a stand-in that simply takes the first proposal made, so this runs in one process and demonstrates the construction, not the distribution:</p>
+
+<pre class="terminal" data-title="tob.py"><code>from typing import Any, Callable
+
+class Consensus:
+    """One-shot consensus: the first proposal wins and everyone decides it (stand-in for Paxos/Raft)."""
+    def __init__(self): self.decided: Any = None; self.has = False
+    def propose(self, v):
+        if not self.has: self.decided, self.has = v, True
+        return self.decided
+
+class TotalOrderBroadcast:
+    """Total-order broadcast built from consensus: one consensus instance per log slot."""
+    def __init__(self): self.slots: list[Consensus] = []
+    def broadcast(self, msg) -&gt; int:
+        slot = 0
+        while True:
+            if slot == len(self.slots): self.slots.append(Consensus())
+            if self.slots[slot].propose(msg) == msg:          # my message won this slot
+                return slot
+            slot += 1                                          # someone else's did: try the next slot
+    def deliver_all(self): return [s.decided for s in self.slots]
+
+def consensus_from_tob(tob: TotalOrderBroadcast, my_value):
+    """The other direction: broadcast your value, decide whatever is delivered first."""
+    tob.broadcast(my_value)
+    return tob.deliver_all()[0]
+
+tob = TotalOrderBroadcast()
+for who, msg in [("p1", "set x=1"), ("p2", "set x=2"), ("p3", "set y=7"), ("p2", "del x")]:
+    print(f"{who} broadcast {msg!r:&lt;10} -&gt; slot {tob.broadcast(msg)}")
+print("every process delivers:", tob.deliver_all())
+t2 = TotalOrderBroadcast()
+print("consensus from TOB:", [consensus_from_tob(t2, v) for v in ("blue", "green", "red")])</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>p1 broadcast 'set x=1'  -&gt; slot 0
+p2 broadcast 'set x=2'  -&gt; slot 1
+p3 broadcast 'set y=7'  -&gt; slot 2
+p2 broadcast 'del x'    -&gt; slot 3
+every process delivers: ['set x=1', 'set x=2', 'set y=7', 'del x']
+consensus from TOB: ['blue', 'blue', 'blue']</code></pre>
+
+<p>Two consequences to remember. First, since consensus cannot be solved deterministically in a purely asynchronous system with crashes (FLP), neither can total-order broadcast; yet reliable broadcast and FIFO broadcast can be. That is why the ladder has two columns. Everything that needs a single agreed order (replicated databases, lock services, unique-id allocation, leader election, atomic commit) is an instance of consensus, and no cleverness with timestamps or gossip removes that cost. Second, the same fact is an escape hatch: a design that needs only the left column (causal order, per-sender order, convergent merges) can avoid consensus entirely, which is the theme of Part 4 of this course.</p>
+
+<h2>Why one log can run any deterministic service</h2>
+
+<p>The replicated state machine is a universal construction. Anything you can write as <code>apply(state, command) → (state, response)</code> can be made fault-tolerant by this recipe, without the service author knowing anything about distribution:</p>
+
+<ul>
+  <li>A <strong>key-value store</strong>: commands are <code>put</code>, <code>delete</code>, <code>compare-and-swap</code>.</li>
+  <li>A <strong>lock service</strong> or <strong>lease manager</strong>: commands are <code>acquire(name, client)</code>, <code>release</code>, <code>renew</code>. This is what Chubby, ZooKeeper and etcd are (<a href="11-coordination-services.html">chapter 11</a>).</li>
+  <li>A <strong>queue</strong>, a <strong>counter</strong>, a <strong>sequence generator</strong>, a <strong>schema registry</strong>.</li>
+  <li>The <strong>metadata</strong> of a bigger system: which node leads which shard, which files exist, where each partition lives. Many databases keep this small, critical state in a consensus group and the bulk data elsewhere.</li>
+  <li>A whole <strong>SQL database</strong>, if its execution engine is deterministic given the log (some distributed databases are organised this way).</li>
+</ul>
+
+<p>This is why consensus gets its own chapters even though it looks like a narrow problem. It is the "make this state machine survive failures" function. It also tells you what you give up: every command goes through a leader and a majority round trip, so throughput of one group is limited by a single leader and latency is bounded below by the speed of the quorum's slowest needed member. Systems that need more scale partition their data across many groups (each with its own log, <a href="../../networking/chapters/19-partitioning.html">networking chapter 19</a>) and use a transaction protocol across them (chapter 13).</p>
+
+<h3>Making the replicated service behave</h3>
+
+<p><strong>Client retries.</strong> A client that times out does not know whether its command was committed (the classic problem of <a href="../../networking/chapters/16-failure.html">chapter 16</a>). If it simply resends, the command may be applied twice, so the state machine itself must make commands idempotent: clients attach a unique id and a sequence number, and the state machine remembers the latest response per client and returns it instead of re-executing. (Ongaro's Raft thesis describes this client-session design.) Without it, "exactly-once" is not available however good the consensus is.</p>
+
+<p><strong>Reads.</strong> A read does not change state. You can either send it through the log like any command (always linearizable, but costs a replication round per read), or serve it from the leader with extra checks to prove it is still the leader (<a href="10-raft-deep.html">chapter 10</a>), or serve it from a follower and accept staleness (the session guarantees of <a href="06-causal-session.html">chapter 6</a>). Which one you pick determines which consistency model, in the sense of <a href="05-consistency-models.html">chapter 5</a>, the service gives.</p>
+
+<p><strong>Log growth.</strong> The log grows forever, and a replica that was down for a week would have to replay it all. Real systems periodically take a <em>snapshot</em> of the state machine at some log index and discard the entries before it. Snapshots and how a lagging replica catches up are in chapter 10.</p>
+
+<h3>The determinism pitfalls</h3>
+
+<p>The whole construction rests on the word "deterministic", which is easier to write than to achieve. Any difference between replicas in how they execute the same command silently breaks the "same state" guarantee, and the divergence may not be noticed for weeks. The usual sources:</p>
+
+<ul>
+  <li><strong>Time.</strong> A command that reads the local clock (<code>now()</code>, "expires in 30 s") gets a different value on each replica. Expiry decisions are the most common offender.</li>
+  <li><strong>Randomness.</strong> Random ids, jitter, or randomised algorithms in the application.</li>
+  <li><strong>Iteration order.</strong> Hash maps and sets: in many languages the order of iteration differs between processes, deliberately (Python randomises string hashes per process; Go randomises map iteration order).</li>
+  <li><strong>Concurrency.</strong> Multi-threaded execution inside the state machine, where the interleaving decides the outcome.</li>
+  <li><strong>The environment.</strong> Reading a file, calling an external service, looking up DNS, using the machine's locale, or relying on the CPU's floating-point behaviour or the memory layout.</li>
+  <li><strong>Software versions.</strong> During a rolling upgrade, replicas run different code. A new version that handles a command differently from the old one forks the state.</li>
+</ul>
+
+<p>The fix for each is the same principle: <strong>the leader decides, and writes the decision into the log</strong>; the state machine only replays. A timestamp, a random id or an expiry time is chosen once, by the leader at proposal time, and travels inside the command. Iteration is over sorted keys. Execution is single-threaded in log order. Side effects (sending an email) are triggered only after commit and made idempotent, ideally by one designated replica. And a behaviour change is rolled out by committing a log entry that says "switch to version N at this index", so that every replica switches at the same point in the sequence.</p>
+
+<p>Here the three classic traps are visible. Four replicas of a tiny order service apply the same log; the "naive" version asks its own clock and random number generator for the order's timestamp and ticket, and lists users by iterating a set. The "careful" version uses the values the leader put in the log and iterates in sorted order. Each run is a separate process, with a different hash seed, as three real replicas would be:</p>
+
+<pre class="terminal" data-title="smr_nondet.py"><code>import sys, time, random
+
+# The agreed log. The LEADER chose the timestamp and the ticket number once, before appending,
+# so they are part of the command that every replica sees.
+LOG = [("alice", "tea",  1700000001, 417),
+       ("bob",   "cake", 1700000002, 902),
+       ("carol", "soup", 1700000004, 133),
+       ("dave",  "rice", 1700000009, 658)]
+
+def apply_log(log, careful: bool):
+    users, last = set(), None
+    for user, item, ts, ticket in log:
+        if not careful:
+            ts = time.perf_counter_ns() % 1000        # trap 1: this replica's own clock
+            ticket = random.randrange(1000)           # trap 2: this replica's own randomness
+        users.add(user)
+        last = (user, item, ts, ticket)
+    listing = sorted(users) if careful else list(users)   # trap 3: set iteration order
+    return listing, last
+
+print(apply_log(LOG, careful=(sys.argv[1] == "careful")))</code></pre>
+
+<pre class="terminal" data-title="terminal: for mode in naive careful; for seed in 1 2 3; PYTHONHASHSEED=$seed python3 smr_nondet.py $mode"><code>naive replica 1: (['dave', 'alice', 'carol', 'bob'], ('dave', 'rice', 83, 435))
+naive replica 2: (['dave', 'carol', 'alice', 'bob'], ('dave', 'rice', 583, 32))
+naive replica 3: (['dave', 'alice', 'bob', 'carol'], ('dave', 'rice', 625, 821))
+careful replica 1: (['alice', 'bob', 'carol', 'dave'], ('dave', 'rice', 1700000009, 658))
+careful replica 2: (['alice', 'bob', 'carol', 'dave'], ('dave', 'rice', 1700000009, 658))
+careful replica 3: (['alice', 'bob', 'carol', 'dave'], ('dave', 'rice', 1700000009, 658))</code></pre>
+
+<p>The naive replicas disagree on everything: the user listing, the timestamp and the ticket, though the log was identical. (The exact numbers in the naive rows change every time you run it; the point is that they differ. The careful rows are the same every time.) Real bugs of this kind are hard to find because the state differs silently; a few systems protect themselves with periodic checksums of the state machine across replicas, so that a fork is detected within minutes rather than at the next failover.</p>
+
+<div class="callout warn">
+  <p class="callout-title">"Replicated" does not mean "identical" unless you made it so</p>
+  <p>Consensus guarantees that every replica receives the same <em>commands</em>. It cannot, by itself, guarantee they compute the same <em>results</em>. The bridge between the two is the discipline of determinism, and it is the application developer's, or the framework's, responsibility. If your state machine is deterministic only "most of the time", you have built a replicated system that diverges rarely, which is worse than one that diverges often, because you will not catch it in testing.</p>
+</div>
+
+<h2>Viewstamped Replication in a paragraph</h2>
+
+<p>Viewstamped Replication (VR) was published by Brian Oki and Barbara Liskov in 1988, and is the earliest complete protocol of this kind; Liskov and James Cowling's "Viewstamped Replication Revisited" (2012) is a clear modern description. A group of 2<em>f</em> + 1 replicas runs in numbered <span class="term">views</span>; in each view one replica, determined by the view number, is the <strong>primary</strong> and the rest are <strong>backups</strong>. The primary gives every client request the next <em>op-number</em>, appends it to its log, and sends <code>Prepare</code> to the backups; each backup appends and answers <code>PrepareOK</code>. When the primary has replies from <em>f</em> backups (so <em>f</em> + 1 replicas including itself, a majority) the operation is committed: the primary executes it and replies to the client, and the commit number reaches the backups on later messages. If backups stop hearing from the primary they start a <strong>view change</strong> to the next view: a majority sends the new primary their logs, it adopts the most up-to-date one, and it announces the new view. Quorum intersection guarantees that every committed operation is in at least one log in any majority, so none is lost.</p>
+
+<p>If this reads like a description of Raft, that is the point. The same three-part structure appears under different names in every practical protocol:</p>
+
+<table>
+  <thead><tr><th>Idea</th><th>Viewstamped Replication</th><th>Raft</th><th>Multi-Paxos</th></tr></thead>
+  <tbody>
+    <tr><td>An epoch with one designated leader</td><td>view</td><td>term</td><td>ballot (proposal number)</td></tr>
+    <tr><td>The leader</td><td>primary</td><td>leader</td><td>distinguished proposer</td></tr>
+    <tr><td>Replicate an entry to a quorum</td><td>Prepare / PrepareOK</td><td>AppendEntries / success</td><td>Accept / Accepted</td></tr>
+    <tr><td>Replace a failed leader safely</td><td>view change (a majority sends logs)</td><td>election, with the vote restriction on up-to-date logs</td><td>Prepare phase for a higher ballot</td></tr>
+  </tbody>
+</table>
+
+<p>The details differ in important ways (what a new leader must collect, how gaps are handled, whether the log may have holes), and chapters 9 and 10 take them one at a time. But if you hold on to the picture of a numbered epoch, a quorum-acknowledged log and a recovery step that consults a quorum, each protocol becomes a variation on one idea.</p>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>All the scripts use only the Python 3.9+ standard library. Save the listings as <code>quorum.py</code>, <code>smr_order.py</code>, <code>smr_nondet.py</code> and <code>tob.py</code>. For the determinism demo, run it as three separate processes as shown, so that each gets its own hash seed: <code>PYTHONHASHSEED=1 python3 smr_nondet.py naive</code>, and with seeds 2 and 3, then the same with <code>careful</code>.</p>
+</div>
+
+<ol>
+  <li>In <code>quorum.py</code>, add a "weighted" quorum system: processes have weights (say 3, 1, 1, 1, 1) and a quorum is any set with more than half of the total weight. Does it still always intersect? How many crashes can it survive in the best and worst case?</li>
+  <li>Extend <code>quorum.py</code> to check the Flexible Paxos condition: with <em>n</em> = 6, choose a replication quorum size of 3 and find the smallest election quorum size so that every election quorum intersects every replication quorum.</li>
+  <li>In <code>smr_order.py</code>, give the state machine a <code>"cas"</code> command (compare-and-swap) and an at-most-once table keyed by (client id, sequence number). Resend a command and check it is not applied twice.</li>
+  <li>In <code>tob.py</code>, make <code>Consensus.propose</code> return different winners depending on a seed and run three simulated "processes" that each keep their own local copy of the decided values, to convince yourself that agreement per slot gives the same delivery order everywhere.</li>
+  <li>Find a source of nondeterminism not on the list above in a program you know (for example, one that reads environment variables, uses <code>id()</code> or pointer values, or sorts with an unstable comparison that has ties).</li>
+</ol>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>This chapter is the hinge of the course. Behind it: the models of failure and time (chapters 1 to 4) tell you what can go wrong, and the consistency map (chapter 5) names what you want. Ahead of it: <a href="09-paxos.html">Paxos</a> shows how one value is chosen; <a href="10-raft-deep.html">Raft in depth</a> turns that into a full log with membership changes, snapshots and linearizable reads; <a href="11-coordination-services.html">coordination services</a> package a replicated state machine as a product; <a href="13-atomic-commit.html">atomic commit</a> uses a consensus group to make a commit coordinator fault-tolerant. And in <a href="../labs/lab-04-paxos.html">Lab 4</a> you will build a replicated key-value store on top of a lossy network.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Consensus requires agreement, validity, integrity (safety) and termination (liveness). In an asynchronous system termination cannot be guaranteed for deterministic protocols (FLP), so practical protocols guarantee safety always and liveness only when the network is behaving.</li>
+    <li>Quorum intersection is the core trick: anything a quorum has chosen is remembered by at least one member of every later quorum, which makes a chosen value survive leader changes. Quorums must overlap, so a quorum of less than half is unsafe, a quorum of "all" blocks on one crash, and the overlap process must write to stable storage before acknowledging.</li>
+    <li>A replicated state machine (Schneider, 1990) is a deterministic state machine fed identical commands in identical order. The agreed log provides the ordering; the state machine provides the service. Any deterministic service can be built this way.</li>
+    <li>The broadcast ladder: best-effort, reliable, FIFO, causal, total order. The first four are solvable asynchronously with crashes; total-order broadcast is equivalent to consensus (Chandra and Toueg, 1996), each implementable from the other.</li>
+    <li>Determinism is the application's responsibility: no local clocks, randomness, hash-order iteration, thread races, environment reads or version differences inside the state machine. The leader decides nondeterministic values and logs them.</li>
+    <li>Clients need idempotent commands (session id and sequence number), and reads must be routed deliberately: through the log, from a verified leader, or from a follower with staleness. Snapshots keep the log bounded.</li>
+    <li>Viewstamped Replication, Multi-Paxos and Raft are one idea under different names: numbered epochs with a leader, quorum-acknowledged log entries, and leader replacement that consults a quorum.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A protocol in which every process always decides the value 0 satisfies agreement, integrity and termination. Which property rules it out as a consensus protocol?</p>
+    <ol class="q-options">
+      <li>Integrity</li>
+      <li>Termination</li>
+      <li>Validity: the decided value must have been proposed by some process</li>
+      <li>Uniform agreement</li>
+    </ol>
+    <div class="q-explain">Without validity the problem is trivial. Validity ties the decision to the inputs: if every process proposed 1, deciding 0 is not allowed. Variants differ in exactly how strongly they tie them.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why is a quorum of 2 out of 4 processes unsafe for a consensus protocol, when 3 out of 4 is safe?</p>
+    <ol class="q-options">
+      <li>Two disjoint pairs exist, so a value chosen by one pair can be invisible to a proposer that consults the other pair; any two groups of 3 out of 4 overlap</li>
+      <li>Two processes are too slow to tolerate crashes</li>
+      <li>Four is an even number, and even numbers cannot be used for consensus</li>
+      <li>Because 2 is less than the majority of 4 plus one</li>
+    </ol>
+    <div class="q-explain">The safety argument needs every pair of quorums to intersect. {N1,N2} and {N3,N4} do not, so a value chosen by the first can be forgotten by the second. Groups of 3 out of 4 always overlap. Even sizes are not forbidden; they are just wasteful, as 4 tolerates no more crashes than 3.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Which of these breaks a replicated state machine, even though consensus delivers an identical log to all replicas?</p>
+    <ol class="q-options">
+      <li>A command that updates two keys</li>
+      <li>A command whose effect depends on the previous state</li>
+      <li>A state machine with a large amount of state</li>
+      <li>A command that stamps the entry with the local wall-clock time when it is applied</li>
+    </ol>
+    <div class="q-explain">Dependence on previous state is exactly what a state machine is. Applying a local clock reading means each replica computes a different result from the same input, so their states diverge. The leader should choose the timestamp once and put it in the log entry.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">What does reliable broadcast guarantee that best-effort broadcast does not?</p>
+    <ol class="q-options">
+      <li>All messages are delivered in the same order everywhere</li>
+      <li>If any correct process delivers a message, all correct processes do, even if the sender crashed partway through sending</li>
+      <li>Messages from one sender arrive in order</li>
+      <li>No messages are ever lost by the network</li>
+    </ol>
+    <div class="q-explain">Best-effort broadcast only helps if the sender survives. Reliable broadcast is achieved by relaying so a crash mid-send cannot leave only some processes with the message. Ordering guarantees (FIFO, causal, total) are further layers on top, and the network may still lose individual messages.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">How can consensus be built from total-order broadcast?</p>
+    <ol class="q-options">
+      <li>Every process broadcasts its proposal and decides the first message delivered; all see the same first message</li>
+      <li>Every process broadcasts a vote and decides when it has seen a majority of votes</li>
+      <li>It cannot, because total-order broadcast is strictly weaker than consensus</li>
+      <li>Every process picks the proposal with the highest process id</li>
+    </ol>
+    <div class="q-explain">Because everyone delivers in the same order, the first delivered message is the same everywhere, giving agreement, and it was somebody's proposal, giving validity. The equivalence (Chandra and Toueg) holds in both directions, so total-order broadcast is not weaker. A highest-id rule would need everyone to know all proposals.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In Viewstamped Replication, Raft and Multi-Paxos, which concepts correspond to each other?</p>
+    <ol class="q-options">
+      <li>View, term and quorum</li>
+      <li>Primary, follower and acceptor</li>
+      <li>View, term and ballot: the numbered epoch in which one designated process leads</li>
+      <li>Op-number, election timeout and learner</li>
+    </ol>
+    <div class="q-explain">All three protocols organise time into numbered epochs with one leader each. A quorum is a different concept (the set that must acknowledge), a primary corresponds to a leader rather than a follower, and an election timeout is a mechanism, not an epoch.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

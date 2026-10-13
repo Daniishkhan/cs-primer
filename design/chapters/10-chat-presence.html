@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Chat &amp; Presence · System Design Studio</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="design" data-chapter="10">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design Chat &amp; Presence</h1>
+  <p class="lede">Persistent connections, message ordering, delivery receipts, group fan-out and who is online. Chat is the design where the server must be able to <em>push</em>, so state moves to the connection layer: the interesting questions are where each connection lives, what "ordered" means, and how to keep the cheap, noisy signals (presence, typing) from endangering the valuable one (the message).</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chat flips the usual request-response picture. Millions of long-lived connections each hold a little state, a message is addressed to a <em>person</em> who may be on zero, one or four devices, and users notice a reordered or lost message immediately, in a way they never notice a stale like count. It forces choices about transport, routing, ordering, delivery guarantees and fan-out that reappear in notifications, collaboration tools, live streaming chat and gaming back ends.</p>
+</div>
+
+<h2>The problem</h2>
+<p><em>"Design a chat service. Users message each other one-to-one and in groups, on phones and on the web. They should see when a message is delivered and read, see who is online, and get a notification if the app is closed."</em></p>
+<p>The prompt hides several systems: a connection layer, a message pipeline, durable storage, a notification path and a presence system. It does not say how big a group can be (ten friends and a hundred-thousand-person channel are different problems), whether messages are end-to-end encrypted, or what "online" must mean. We pin those down with the <a href="01-framework.html">framework</a>.</p>
+
+<h2>Clarify requirements</h2>
+<table>
+  <thead><tr><th>Question</th><th>Assumed answer</th></tr></thead>
+  <tbody>
+    <tr><td>Scale?</td><td>100M daily active users, about 20% connected at the daily peak, roughly 40 messages sent per active user per day.</td></tr>
+    <tr><td>Conversation types?</td><td>One-to-one, small groups up to a few hundred members, and large channels (thousands to 100,000 members) that behave like a broadcast with replies.</td></tr>
+    <tr><td>Ordering?</td><td>Everyone in a conversation sees the same order. No ordering across conversations is needed.</td></tr>
+    <tr><td>Delivery guarantee?</td><td>A message accepted by the server is never lost and is shown exactly once to the user, even if the network delivers it twice.</td></tr>
+    <tr><td>Latency?</td><td>Online recipient: under 200 ms at the median, under about a second at p99, within a region.</td></tr>
+    <tr><td>History and devices?</td><td>Persistent history. Up to 4 devices per user, all kept in sync.</td></tr>
+    <tr><td>Presence?</td><td>Online/offline and last seen, for contacts you chat with. Approximate is fine.</td></tr>
+    <tr><td>Encryption?</td><td>Transport encryption everywhere; end-to-end encryption discussed as a variation, not designed in full.</td></tr>
+  </tbody>
+</table>
+<p><strong>Functional.</strong> Send and receive text and media references; create and manage groups; sent, delivered and read states; unread counts and a conversation list; push notifications when offline; sync across devices; presence and typing indicators.</p>
+<p><strong>Non-functional.</strong> Never lose an acknowledged message; same order for everyone in a conversation; message delivery stays healthy even when presence traffic misbehaves; availability favoured over perfect consistency of the soft signals (presence, typing, read counts); reconnect storms survivable.</p>
+<p><strong>Out of scope.</strong> Voice and video calls (media paths and NAT traversal), message search, bots and integrations, spam and abuse detection, full end-to-end key management, and media storage (<a href="08-object-storage.html">object storage</a>).</p>
+
+<h2>Estimate</h2>
+<p>The numbers sort the system into parts that scale with <em>connections</em> (gateways, registry, heartbeats), parts that scale with <em>messages</em> (sequencer, storage) and a part that scales with <em>social graph size</em> (presence). The method is from <a href="02-estimation.html">chapter 2</a>; every figure is an assumption you can change.</p>
+<pre class="terminal" data-title="napkin.py"><code>&quot;&quot;&quot;Napkin maths for chat and presence: connections, gateways, message load, storage, presence fan-out.&quot;&quot;&quot;
+SECONDS = 86_400
+dau = 100_000_000                 # assumption: 100M daily active users
+concurrent_frac = 0.2             # assumption: 20% of DAU hold a connection at peak
+conns = dau * concurrent_frac
+per_gateway = 100_000             # assumption: connections one gateway handles comfortably (memory + heartbeats)
+kb_per_conn = 20                  # assumption: socket buffers + session state, ~20 KB
+print(f&quot;concurrent connections at peak: {conns:,.0f}&quot;)
+print(f&quot;gateways at {per_gateway:,} conns each: {conns/per_gateway:,.0f}  (x1.3 headroom = {conns/per_gateway*1.3:,.0f})&quot;)
+print(f&quot;memory per gateway for connections: {per_gateway*kb_per_conn/1e6:.1f} GB&quot;)
+
+msgs_per_user = 40                # assumption: sent per DAU per day
+avg_recipients = 3                # assumption: mean recipients per message (1:1 mostly, some groups)
+sent = dau * msgs_per_user / SECONDS
+print(f&quot;\nmessages sent: {sent:,.0f}/s avg, {sent*3:,.0f}/s peak; deliveries (x{avg_recipients}): {sent*avg_recipients:,.0f}/s avg&quot;)
+
+size = 300                        # bytes stored per message incl. metadata (text mostly)
+days = 365
+store = dau * msgs_per_user * size * days
+print(f&quot;storage per year (1 copy of each message): {store/1e12:,.0f} TB; with RF=3: {3*store/1e15:.1f} PB&quot;)
+
+# Registry: user -&gt; gateway
+entry = 64                        # bytes per registry entry incl. device id (assumed)
+print(f&quot;\nconnection registry: {conns:,.0f} x {entry} B = {conns*entry/1e9:.1f} GB; &quot;
+      f&quot;writes: connect+disconnect, one refresh per {60}s per conn = {conns/60:,.0f}/s&quot;)
+
+# Presence
+hb = 30                           # heartbeat every 30 s
+print(f&quot;\nheartbeats: {conns:,.0f} / {hb} s = {conns/hb:,.0f}/s arriving at presence service&quot;)
+friends_online = 40               # assumption: mean number of online contacts who watch my status
+flips_per_hour = 4                # assumption: online/offline transitions per connected user per hour
+flips = conns * flips_per_hour / 3600
+print(f&quot;status transitions: {flips:,.0f}/s; each fans out to ~{friends_online} watchers = {flips*friends_online:,.0f} presence pushes/s&quot;)
+print(f&quot;  versus {sent*avg_recipients:,.0f} message deliveries/s: presence pushes are {flips*friends_online/(sent*avg_recipients):.1f}x the message traffic if sent naively&quot;)
+big = 100_000
+print(f&quot;  one big channel of {big:,} members: a single join/leave flip is {big:,} pushes; &quot;
+      f&quot;10 flips/s would be {10*big:,}/s&quot;)
+
+# Group fan-out: one send per recipient versus one send per gateway that holds at least one member.
+gateways = 260
+print(f&quot;\ngroup fan-out with {gateways} gateways (members assumed spread evenly, all online):&quot;)
+for members in (5, 200, 5_000, 100_000):
+    per_gateway = min(members, gateways * (1 - (1 - 1 / gateways) ** members))   # expected distinct gateways hit
+    print(f&quot;  {members:&gt;7,} members: {members:&gt;7,} per-user sends vs ~{per_gateway:&gt;5,.0f} per-gateway sends&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>concurrent connections at peak: 20,000,000
+gateways at 100,000 conns each: 200  (x1.3 headroom = 260)
+memory per gateway for connections: 2.0 GB
+
+messages sent: 46,296/s avg, 138,889/s peak; deliveries (x3): 138,889/s avg
+storage per year (1 copy of each message): 438 TB; with RF=3: 1.3 PB
+
+connection registry: 20,000,000 x 64 B = 1.3 GB; writes: connect+disconnect, one refresh per 60s per conn = 333,333/s
+
+heartbeats: 20,000,000 / 30 s = 666,667/s arriving at presence service
+status transitions: 22,222/s; each fans out to ~40 watchers = 888,889 presence pushes/s
+  versus 138,889 message deliveries/s: presence pushes are 6.4x the message traffic if sent naively
+  one big channel of 100,000 members: a single join/leave flip is 100,000 pushes; 10 flips/s would be 1,000,000/s
+
+group fan-out with 260 gateways (members assumed spread evenly, all online):
+        5 members:       5 per-user sends vs ~    5 per-gateway sends
+      200 members:     200 per-user sends vs ~  140 per-gateway sends
+    5,000 members:   5,000 per-user sends vs ~  260 per-gateway sends
+  100,000 members: 100,000 per-user sends vs ~  260 per-gateway sends</code></pre>
+<p>What the output decides. Twenty million concurrent connections at about 100,000 per gateway is a couple of hundred gateways: a fleet, not a cluster of giants, and two gigabytes of connection state each fits comfortably. Message traffic is modest: 46,000 sends per second on average and well under 200,000 at peak, which one sharded store can handle, and it is the 1.3 PB per year (replicated) that dictates a distributed wide-column store partitioned by conversation. The surprise is in the last rows: heartbeats alone are 667,000 per second, <em>more than three times the message rate</em>, and naive presence fan-out is over six times the message traffic. Presence is the expensive part, not messaging, so the design must keep heartbeats at the edge and fan presence out lazily. And the last block shows why group fan-out is done <em>per gateway</em> for big groups: a 100,000-member channel needs about 260 sends, not 100,000.</p>
+
+<h2>API</h2>
+<p>The client talks to a gateway over one long-lived connection carrying small frames, plus ordinary HTTP for things that are not real-time (history, uploads, group management).</p>
+<pre class="terminal" data-title="surfaces"><code>-- Over the persistent connection (client -&gt; server)
+SEND   { conv_id, client_msg_id, body | media_ref }       -- client_msg_id: UUID chosen by the client
+ACK    { conv_id, upto_seq, kind: "delivered" | "read" }  -- a watermark, not a per-message ack
+TYPING { conv_id }                                         -- ephemeral, never stored
+PING   {}                                                  -- heartbeat
+
+-- Over the persistent connection (server -&gt; client)
+SENT   { client_msg_id, conv_id, seq, ts }                 -- the server accepted and stored it
+MSG    { conv_id, seq, sender, body, ts }                  -- a message for you
+RECEIPT{ conv_id, user, kind, upto_seq }
+PRESENCE { user, state: "online" | "offline", last_seen }
+
+-- HTTP
+GET  /v1/conversations/{id}/messages?after_seq=40&amp;limit=50   -- history and gap fill
+GET  /v1/sync?since=&lt;device_cursor&gt;                           -- catch-up after being offline
+POST /v1/conversations      PUT /v1/conversations/{id}/members</code></pre>
+<ul>
+  <li><strong>Two ids per message.</strong> <code>client_msg_id</code> makes sends idempotent: if the connection drops before <code>SENT</code> arrives, the client retries with the same id and the server returns the original sequence number instead of storing a duplicate. <code>(conv_id, seq)</code> is the server's identity, used for ordering and acknowledgements.</li>
+  <li><strong>Acknowledgements are watermarks.</strong> "I have everything up to seq 41" is one small frame, survives lost acks, and is what the server stores (see Deep dive 2).</li>
+  <li><strong>History is plain HTTP, paginated by sequence.</strong> Reconnection and gap filling both reduce to "give me messages after seq N", following the cursor principle in <a href="../../architecture/chapters/09-api-design.html">API design</a>.</li>
+</ul>
+
+<h2>Data model</h2>
+<ul>
+  <li><strong>Messages</strong> (wide-column store): partition key <code>(conv_id, bucket)</code>, clustering key <code>seq</code> descending, columns <code>sender, body_or_ref, ts, deleted</code>. A "bucket" is a time slice or a range of sequence numbers, so that a very busy conversation spreads over many partitions instead of one ever-growing one. The same shape and the same hot-partition lessons appear in <a href="../../data/cases/case-02-discord-messages.html">the Discord messages case study</a>. Reads are almost always "the latest N" or "after seq N", which is exactly what this layout serves.</li>
+  <li><strong>Conversation metadata</strong>: members, type, settings, and the counter that issues sequence numbers (<code>next_seq</code>). Small; kept with the conversation's owner (Deep dive 2).</li>
+  <li><strong>Per-member state</strong> keyed by <code>(conv_id, user_id)</code>: <code>delivered_upto</code> and <code>read_upto</code>, two integers. Plus a per-user <strong>conversation list</strong> ordered by last activity with unread counts.</li>
+  <li><strong>Connection registry</strong> (in-memory, sharded by <code>user_id</code>, TTL on entries): <code>user_id → {device_id → gateway_id, conn_id}</code>. Derived, rebuildable by reconnecting clients.</li>
+  <li><strong>Presence</strong> (separate in-memory store, TTL): <code>presence:{user_id} → {state, last_seen}</code>.</li>
+</ul>
+<p>Partition by conversation is the key decision: a conversation's messages are read together and ordered together, so they should live together. The price is that "all my messages across conversations" becomes a different access pattern, served by the per-user conversation list, not by a scan.</p>
+
+<h2>High-level design</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Architecture of a chat service. A sender connects to gateway A, which forwards to the chat service. The chat service assigns a sequence number and stores the message, looks up the recipient's gateway in the connection registry, and routes the message through gateway B to the receiver; if the recipient is offline it calls the push gateway. Gateways register connections and send aggregated heartbeats to the presence store.">
+<defs><marker id="ahG10a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="30" width="80" height="44" rx="8" class="fs-green s-green sw-2"/><text x="50" y="57" text-anchor="middle" class="t-sm t-bold">Sender</text></g>
+<g><rect x="130" y="30" width="100" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="180" y="49" text-anchor="middle" class="t-sm t-bold">Gateway A</text><text x="180" y="65" text-anchor="middle" class="t-xs t-muted">sockets</text></g>
+<g><rect x="280" y="30" width="120" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="340" y="49" text-anchor="middle" class="t-sm t-bold">Chat service</text><text x="340" y="65" text-anchor="middle" class="t-xs t-muted">sequence + route</text></g>
+<g><rect x="470" y="30" width="130" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="535" y="49" text-anchor="middle" class="t-sm t-bold">Message store</text><text x="535" y="65" text-anchor="middle" class="t-xs t-muted">by conversation</text></g>
+<g><rect x="470" y="120" width="130" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="535" y="139" text-anchor="middle" class="t-sm t-bold">Registry</text><text x="535" y="155" text-anchor="middle" class="t-xs t-muted">user to gateway</text></g>
+<g><rect x="280" y="130" width="120" height="44" rx="8" class="box2"/><text x="340" y="149" text-anchor="middle" class="t-sm t-bold">Push gateway</text><text x="340" y="165" text-anchor="middle" class="t-xs t-muted">APNs / FCM</text></g>
+<g><rect x="10" y="230" width="80" height="44" rx="8" class="fs-green s-green sw-2"/><text x="50" y="257" text-anchor="middle" class="t-sm t-bold">Receiver</text></g>
+<g><rect x="130" y="230" width="100" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="180" y="249" text-anchor="middle" class="t-sm t-bold">Gateway B</text><text x="180" y="265" text-anchor="middle" class="t-xs t-muted">sockets</text></g>
+<g><rect x="470" y="230" width="130" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="535" y="249" text-anchor="middle" class="t-sm t-bold">Presence</text><text x="535" y="265" text-anchor="middle" class="t-xs t-muted">TTL per user</text></g>
+<line x1="90" y1="52" x2="130" y2="52" class="line" marker-end="url(#ahG10a)"/>
+<line x1="230" y1="52" x2="280" y2="52" class="line" marker-end="url(#ahG10a)"/>
+<line x1="400" y1="52" x2="470" y2="52" class="line" marker-end="url(#ahG10a)"/>
+<text x="406" y="44" text-anchor="start" class="t-xs t-faint">seq, store</text>
+<line x1="400" y1="68" x2="470" y2="128" class="line-dash" marker-end="url(#ahG10a)"/>
+<text x="428" y="112" text-anchor="start" class="t-xs t-faint">where?</text>
+<line x1="340" y1="74" x2="340" y2="130" class="line-dash" marker-end="url(#ahG10a)"/>
+<text x="348" y="108" text-anchor="start" class="t-xs t-faint">offline</text>
+<line x1="290" y1="74" x2="200" y2="230" class="line" marker-end="url(#ahG10a)"/>
+<text x="232" y="152" text-anchor="start" class="t-xs t-faint">route</text>
+<line x1="130" y1="252" x2="90" y2="252" class="line" marker-end="url(#ahG10a)"/>
+<line x1="230" y1="238" x2="510" y2="164" class="line-dash" marker-end="url(#ahG10a)"/>
+<text x="400" y="216" text-anchor="start" class="t-xs t-faint">register</text>
+<line x1="230" y1="264" x2="470" y2="256" class="line-dash" marker-end="url(#ahG10a)"/>
+<text x="260" y="284" text-anchor="start" class="t-xs t-faint">aggregated heartbeats</text>
+<text x="620" y="150" text-anchor="start" class="t-xs tc-red">fan-out and presence</text>
+<text x="620" y="166" text-anchor="start" class="t-xs tc-red">need separate budgets</text>
+  </svg>
+  <figcaption>A message enters through one gateway, is sequenced and stored by the chat service, and leaves through whichever gateway holds the recipient's connection, found in the registry. Offline recipients are reached by push. Blue is stateless services (the gateways hold sockets but no business state), purple the durable store, cyan derived in-memory state, grey-bordered the external push services.</figcaption>
+</figure>
+<p>Notice the split. <strong>Gateways</strong> own sockets and nothing else: they authenticate, parse frames, keep heartbeats and forward. The <strong>chat service</strong> owns the message path: sequencing, storage, routing. The <strong>registry</strong> and <strong>presence</strong> are soft state in memory. Because gateways hold no durable state, you can add, drain and replace them freely, and a gateway crash costs reconnects, not messages. Here is a one-to-one message end to end:</p>
+<div class="widget stepper" data-autoplay-ms="5000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One message, sender to receiver</h4></div>
+  <svg viewBox="0 0 760 280" role="img" aria-label="Message flow: sender to gateway A to chat service, which stores with a sequence number and acknowledges as sent, looks up the registry, routes via gateway B to the receiver, which acknowledges delivery; an offline recipient is reached by push.">
+<defs><marker id="ahG10d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g data-active="1,3"><rect x="10" y="95" width="80" height="60" rx="8" class="fs-green s-green sw-2"/><text x="50" y="130" text-anchor="middle" class="t-sm t-bold">Sender</text></g>
+<g data-active="1,3"><rect x="150" y="95" width="100" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="200" y="130" text-anchor="middle" class="t-sm t-bold">Gateway A</text></g>
+<g data-active="2-4,6"><rect x="330" y="95" width="110" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="385" y="122" text-anchor="middle" class="t-sm t-bold">Chat service</text><text x="385" y="140" text-anchor="middle" class="t-xs t-muted">sequencer</text></g>
+<g data-active="2"><rect x="520" y="20" width="200" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="620" y="47" text-anchor="middle" class="t-sm t-bold">Message store</text></g>
+<g data-active="4"><rect x="520" y="100" width="200" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="620" y="127" text-anchor="middle" class="t-sm t-bold">Registry</text></g>
+<g data-active="7"><rect x="520" y="180" width="200" height="44" rx="8" class="box2"/><text x="620" y="207" text-anchor="middle" class="t-sm t-bold">Push gateway</text></g>
+<g data-active="5-6"><rect x="330" y="200" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="385" y="227" text-anchor="middle" class="t-sm t-bold">Gateway B</text></g>
+<g data-active="5-6"><rect x="150" y="200" width="100" height="44" rx="8" class="fs-green s-green sw-2"/><text x="200" y="227" text-anchor="middle" class="t-sm t-bold">Receiver</text></g>
+<line x1="90" y1="115" x2="150" y2="115" class="line" marker-end="url(#ahG10d)" data-steps="1-"/>
+<text x="94" y="108" text-anchor="start" class="t-xs t-faint" data-steps="1">SEND id=c9</text>
+<line x1="250" y1="115" x2="330" y2="115" class="line" marker-end="url(#ahG10d)" data-steps="2-"/>
+<line x1="440" y1="105" x2="520" y2="50" class="line" marker-end="url(#ahG10d)" data-steps="2-"/>
+<text x="462" y="64" text-anchor="start" class="t-xs t-faint" data-steps="2">seq=41</text>
+<line x1="330" y1="140" x2="250" y2="140" class="line-dash" marker-end="url(#ahG10d)" data-steps="3-"/>
+<line x1="150" y1="140" x2="90" y2="140" class="line-dash" marker-end="url(#ahG10d)" data-steps="3-"/>
+<text x="94" y="168" text-anchor="start" class="t-xs t-faint" data-steps="3">SENT (one tick)</text>
+<line x1="440" y1="122" x2="520" y2="122" class="line" marker-end="url(#ahG10d)" data-steps="4-"/>
+<text x="446" y="114" text-anchor="start" class="t-xs t-faint" data-steps="4">u2 on gw-B?</text>
+<line x1="385" y1="155" x2="385" y2="200" class="line" marker-end="url(#ahG10d)" data-steps="5-6"/>
+<line x1="330" y1="215" x2="250" y2="215" class="line" marker-end="url(#ahG10d)" data-steps="5-6"/>
+<text x="256" y="208" text-anchor="start" class="t-xs t-faint" data-steps="5">MSG seq=41</text>
+<line x1="250" y1="236" x2="330" y2="236" class="line-dash" marker-end="url(#ahG10d)" data-steps="6"/>
+<text x="256" y="258" text-anchor="start" class="t-xs t-faint" data-steps="6">ACK upto=41</text>
+<line x1="440" y1="145" x2="520" y2="195" class="line-dash" marker-end="url(#ahG10d)" data-steps="7"/>
+<text x="462" y="186" text-anchor="start" class="t-xs tc-red" data-steps="7">no connection</text>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Send.</strong> The sender's client puts the message on its socket with a fresh <code>client_msg_id</code>. The gateway authenticates the frame (the connection already carries identity) and forwards it, adding nothing.</li>
+    <li><strong>Sequence and persist.</strong> The chat service owns this conversation's sequence counter. It assigns the next number (41), writes the message to the store, and only then considers it accepted. If the same <code>client_msg_id</code> was seen before, it returns the earlier sequence number instead.</li>
+    <li><strong>Sent.</strong> The sender gets <code>SENT</code> with the sequence number and timestamp: the single tick. From here the message is durable, whatever happens next.</li>
+    <li><strong>Find the recipient.</strong> The service looks up the recipient's devices in the registry: for each, which gateway and connection holds it. This is one in-memory read.</li>
+    <li><strong>Route.</strong> The service sends the message to the owning gateway (B), which writes it to the recipient's socket. No broadcasting: the registry makes the delivery a targeted call.</li>
+    <li><strong>Delivered.</strong> The receiving client acknowledges up to seq 41. The service advances that member's <code>delivered_upto</code> watermark and tells the sender's devices, which show the second tick. A read receipt works the same way with <code>read_upto</code>.</li>
+    <li><strong>Offline.</strong> If the registry has no live connection for the recipient, the message stays in the store (already durable) and the push gateway is asked to send a notification. When the user reconnects they fetch everything after their watermark.</li>
+  </ol>
+</div>
+
+<h2>Deep dive 1: connections, transports and the registry</h2>
+<h3>Transport: WebSocket gateways, long polling or SSE?</h3>
+<p>The server must be able to deliver a message the moment it arrives, so the client needs a channel that stays open. Three standard options exist; all three run over TCP and ordinary HTTP infrastructure (<a href="../../networking/chapters/10-http.html">HTTP</a>, <a href="../../networking/chapters/08-tcp.html">TCP</a>).</p>
+<table>
+  <thead><tr><th></th><th>WebSocket</th><th>Long polling</th><th>Server-Sent Events (SSE)</th></tr></thead>
+  <tbody>
+    <tr><td>Direction</td><td>Full duplex, either side sends any time</td><td>Client requests, server answers when it has data; the client immediately asks again</td><td>Server to client only; sends go over separate HTTP requests</td></tr>
+    <tr><td>Overhead per message</td><td>A few bytes of framing</td><td>A full HTTP request/response each time</td><td>Small framing; uplink pays full HTTP cost</td></tr>
+    <tr><td>Latency</td><td>Lowest: no new request needed in either direction</td><td>Good when idle, worse under churn (request setup between events)</td><td>Low downlink; uplink as expensive as plain HTTP</td></tr>
+    <tr><td>Infrastructure friction</td><td>Needs upgrade support from proxies and load balancers; some corporate proxies break it</td><td>Works through anything that speaks HTTP</td><td>Works through most HTTP proxies; browsers reconnect and resume with an event id</td></tr>
+    <tr><td>Server cost</td><td>One idle socket per client; cheap with an event-driven server</td><td>A held-open request per client plus constant re-requests</td><td>One held connection per client</td></tr>
+    <tr><td>Best fit</td><td><strong>Chat clients</strong> on apps and modern browsers</td><td>Fallback when WebSockets are blocked</td><td>One-way feeds, notifications, live scores</td></tr>
+  </tbody>
+</table>
+<p><strong>Recommendation.</strong> WebSocket as the primary transport, with long polling as an automatic fallback where it is blocked (libraries typically negotiate this), and SSE if the product is mostly one-way. For mobile, a plain TCP or QUIC-based protocol with a compact binary framing is common in practice and saves battery and bytes, but the gateway design is the same. For the server side, the reason this is feasible is an event-driven runtime: an idle connection costs a few kilobytes of memory, not a thread (<a href="../../systems/chapters/16-event-loops.html">event loops</a>, <a href="../../systems/chapters/15-blocking-io.html">blocking I/O</a>, and the Erlang-based approach in <a href="../cases/case-03-whatsapp.html">WhatsApp's per-server connection counts</a>).</p>
+<h3>Sizing and shape of the gateway tier</h3>
+<p>Per the estimate, about 200 gateways carry the peak, 260 with headroom. Three constraints decide the real number more than raw connection counts: memory for buffers, CPU for TLS and heartbeats, and the <strong>blast radius</strong> of losing one: each gateway failure forces 100,000 clients to reconnect. Keep that bounded (do not run a few huge gateways), deploy by <em>draining</em> a gateway slowly rather than killing it, and have clients reconnect with exponential backoff and jitter so a restart does not become a stampede (<a href="../../architecture/chapters/17-resilience.html">resilience</a>, <a href="../../reliability/chapters/11-overload.html">overload</a>). Load balance by connection count at accept time, then the connection is pinned (<a href="../../networking/chapters/14-load-balancers.html">load balancers</a>).</p>
+<h3>The connection registry</h3>
+<p>To deliver, the chat service must answer "which gateway holds user U's connections?". Options:</p>
+<table>
+  <thead><tr><th>Approach</th><th>How it works</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Registry store</strong></td><td>On connect, the gateway writes <code>user → (device, gateway)</code> with a TTL, refreshed periodically; the chat service reads it.</td><td>One write per connect and per refresh; one read per delivery. Entries can be briefly stale.</td></tr>
+    <tr><td>Hash users to gateways</td><td>A user always connects to the gateway chosen by consistent hashing of their id, so routing needs no lookup.</td><td>Hot users cannot be rebalanced; reconnect and failover are awkward; ties your load balancing to a hash.</td></tr>
+    <tr><td>Broadcast to all gateways</td><td>Publish the message; each gateway delivers if it has the user.</td><td>Work proportional to the fleet for every message. Fine at tiny scale, not at 260 gateways.</td></tr>
+    <tr><td>Per-user pub/sub topic</td><td>Each gateway subscribes to topics for its connected users.</td><td>Millions of topics; it is the registry again, hidden in the broker.</td></tr>
+  </tbody>
+</table>
+<p>The registry store is the default: it is small (a gigabyte or two for 20 million entries) and sharded by user id with <a href="../../networking/chapters/19-partitioning.html">consistent hashing</a>. Two details matter. <strong>Entries are hints, not truth.</strong> A gateway may have died, so the registry can name a dead gateway; a delivery to it fails fast and the system treats the user as offline (push plus sync on reconnect). A short TTL, refreshed by the gateway rather than by every heartbeat, bounds the staleness; at one refresh per 60 seconds per connection that is the 333,000 writes per second in the estimate, which is why the refresh interval is a tuning parameter, not a constant. <strong>Multiple devices</strong> are a set per user, so one message fans to up to four sockets.</p>
+
+<h2>Deep dive 2: ids, ordering, storage and delivery states</h2>
+<h3>What "ordered" has to mean</h3>
+<p>We need all members of a conversation to see the same order, and a total order across <em>all</em> conversations is neither needed nor affordable. That reduces the problem to one counter per conversation. Options:</p>
+<table>
+  <thead><tr><th>Approach</th><th>Order comes from</th><th>Problem</th></tr></thead>
+  <tbody>
+    <tr><td>Client timestamps</td><td>The sender's clock</td><td>Clocks are wrong and users can lie. Never use them for order.</td></tr>
+    <tr><td>Server timestamps / time-ordered ids (Snowflake style)</td><td>The accepting server's clock (<a href="07-unique-ids.html">unique ids</a>)</td><td>Two servers can stamp concurrent messages in either order, and skew reorders them; ties are broken arbitrarily but consistently, which is acceptable only if everyone reads the same stored order.</td></tr>
+    <tr><td><strong>Per-conversation sequence number</strong></td><td>A single writer per conversation increments a counter</td><td>Needs one owner per conversation at a time (and safe failover); throughput per conversation is bounded by that owner.</td></tr>
+    <tr><td>Consensus per conversation</td><td>A replicated state machine for each conversation (<a href="../../distributed/chapters/08-consensus-smr.html">SMR</a>)</td><td>Strong but heavy; overkill unless the sequencer's failover must be automatic and instant.</td></tr>
+    <tr><td>Logical/hybrid clocks</td><td>Causal timestamps (<a href="../../distributed/chapters/07-time-revisited.html">time revisited</a>)</td><td>Gives causality, not a gap-free sequence, so clients cannot detect missing messages.</td></tr>
+  </tbody>
+</table>
+<p><strong>Recommendation:</strong> a sequence number per conversation, issued by that conversation's owner. The sequence has two decisive advantages over timestamps: it is <em>gap-free</em>, so a client that sees 38, 39, 41 knows exactly that 40 is missing and can fetch it; and it makes acknowledgements trivial (a watermark). The owner is the partition leader for the conversation's key range, so the partitioning that places the messages also places the counter. When the owner fails, a new one must not issue duplicates: elect it with a lease and protect the store with a fencing token, so a slow old owner cannot write after the new one has begun (<a href="../../distributed/chapters/04-leases-fencing.html">leases and fencing</a>). The sketch below shows the pieces that make this work end to end on the client and server: idempotent appends keyed by <code>client_msg_id</code>, and a client buffer that releases messages strictly in order.</p>
+<pre class="terminal" data-title="ordering.py"><code>&quot;&quot;&quot;Per-conversation ordering: one sequencer per conversation, idempotent sends, a client reorder buffer.&quot;&quot;&quot;
+import random
+
+class Conversation:
+    &quot;&quot;&quot;Owns the sequence counter for one conversation. In production this is a single partition leader.&quot;&quot;&quot;
+    def __init__(self):
+        self.seq = 0
+        self.log = []                 # (seq, sender, text), the source of truth
+        self.seen = {}                # (sender, client_msg_id) -&gt; seq, makes retries idempotent
+
+    def append(self, sender, client_msg_id, text):
+        key = (sender, client_msg_id)
+        if key in self.seen:          # a retry after a lost ack: return the old answer, store nothing
+            return self.seen[key], False
+        self.seq += 1
+        self.log.append((self.seq, sender, text))
+        self.seen[key] = self.seq
+        return self.seq, True
+
+class Client:
+    &quot;&quot;&quot;Delivers strictly in sequence order; remembers the highest contiguous seq it has shown.&quot;&quot;&quot;
+    def __init__(self):
+        self.shown, self.buffer, self.display = 0, {}, []
+
+    def receive(self, seq, text):
+        if seq &lt;= self.shown or seq in self.buffer:
+            return                    # duplicate delivery: ignore
+        self.buffer[seq] = text
+        while self.shown + 1 in self.buffer:
+            self.shown += 1
+            self.display.append((self.shown, self.buffer.pop(self.shown)))
+
+    def gap(self):
+        return [s for s in range(self.shown + 1, max(self.buffer, default=self.shown)) if s not in self.buffer]
+
+conv = Conversation()
+sends = [(&quot;ana&quot;, 1, &quot;hi&quot;), (&quot;ben&quot;, 1, &quot;hello&quot;), (&quot;ana&quot;, 2, &quot;lunch?&quot;), (&quot;ana&quot;, 2, &quot;lunch?&quot;),   # ana&#x27;s retry
+         (&quot;ben&quot;, 2, &quot;yes&quot;), (&quot;ana&quot;, 3, &quot;12:30&quot;), (&quot;ben&quot;, 3, &quot;ok&quot;)]
+acks = [conv.append(*s) for s in sends]
+print(&quot;append results (seq, newly stored):&quot;, acks)
+print(&quot;log:&quot;, [(s, who, t) for s, who, t in conv.log])
+
+rng = random.Random(7)
+wire = [(s, t) for s, _, t in conv.log]
+wire += rng.sample(wire, 2)           # at-least-once delivery produces duplicates
+rng.shuffle(wire)                     # and the network reorders
+print(&quot;\narrival order at the client:&quot;, [s for s, _ in wire])
+c = Client()
+for s, t in wire:
+    c.receive(s, t)
+    if c.gap():
+        print(f&quot;  after seq {s}: shown up to {c.shown}, waiting for missing {c.gap()}&quot;)
+print(&quot;displayed:&quot;, c.display)
+assert [s for s, _ in c.display] == list(range(1, conv.seq + 1))
+print(&quot;same order as the log, no duplicates:&quot;, True)</code></pre>
+<pre class="terminal" data-title="output"><code>append results (seq, newly stored): [(1, True), (2, True), (3, True), (3, False), (4, True), (5, True), (6, True)]
+log: [(1, &#x27;ana&#x27;, &#x27;hi&#x27;), (2, &#x27;ben&#x27;, &#x27;hello&#x27;), (3, &#x27;ana&#x27;, &#x27;lunch?&#x27;), (4, &#x27;ben&#x27;, &#x27;yes&#x27;), (5, &#x27;ana&#x27;, &#x27;12:30&#x27;), (6, &#x27;ben&#x27;, &#x27;ok&#x27;)]
+
+arrival order at the client: [3, 4, 2, 5, 2, 1, 6, 3]
+  after seq 3: shown up to 0, waiting for missing [1, 2]
+  after seq 4: shown up to 0, waiting for missing [1, 2]
+  after seq 2: shown up to 0, waiting for missing [1]
+  after seq 5: shown up to 0, waiting for missing [1]
+  after seq 2: shown up to 0, waiting for missing [1]
+displayed: [(1, &#x27;hi&#x27;), (2, &#x27;hello&#x27;), (3, &#x27;lunch?&#x27;), (4, &#x27;yes&#x27;), (5, &#x27;12:30&#x27;), (6, &#x27;ok&#x27;)]
+same order as the log, no duplicates: True</code></pre>
+<p>The retried send from "ana" returned the same sequence number and was stored once; the shuffled, duplicated arrival order still displayed as 1 to 6, because the client held back anything after a gap until the gap filled (and a real client would fetch the missing numbers with <code>after_seq</code> if they did not arrive soon). The guarantee is therefore at-least-once <em>delivery</em> with idempotent <em>processing</em>, which is the practical meaning of "exactly once" (<a href="../../distributed/chapters/17-logs-exactly-once.html">logs and exactly-once</a>).</p>
+<h3>Storage</h3>
+<p>Messages are append-mostly, read by recent range within one conversation, and large in total. That fits a wide-column or LSM-based store (<a href="../../data/chapters/05-lsm-trees.html">LSM trees</a>) partitioned by <code>(conv_id, bucket)</code> with <code>seq</code> as the clustering key. Hot conversations are the risk: a single partition that grows without bound or takes all the traffic. Buckets cap partition size, and a giant channel's traffic is spread across bucket partitions as it grows, with the current bucket still hot. The Discord case study shows what happens at scale with the storage engine itself, including operational issues like compaction and hot partitions, so read it with this layout in mind: <a href="../../data/cases/case-02-discord-messages.html">Discord's messages</a>. Replication factor 3 with quorum writes (<a href="../../distributed/chapters/05-consistency-models.html">consistency models</a>) gives durability before <code>SENT</code> is returned; reads of recent messages can often be served from the same replicas without further coordination because the sequencer already serialised the writes.</p>
+<h3>Delivery states are watermarks</h3>
+<table>
+  <thead><tr><th>State</th><th>Meaning</th><th>Stored as</th><th>Who sees it</th></tr></thead>
+  <tbody>
+    <tr><td>Sending</td><td>On the sender's device only</td><td>Client's outbox with a <code>client_msg_id</code></td><td>Sender</td></tr>
+    <tr><td>Sent</td><td>The server accepted and stored it</td><td>The message row with its <code>seq</code></td><td>Sender</td></tr>
+    <tr><td>Delivered</td><td>A recipient's device received it</td><td><code>delivered_upto</code> for that member</td><td>Sender (aggregated in groups)</td></tr>
+    <tr><td>Read</td><td>The recipient opened the conversation past it</td><td><code>read_upto</code> for that member</td><td>Sender, if the recipient's privacy setting allows</td></tr>
+  </tbody>
+</table>
+<p>Storing one integer per member per conversation, instead of a flag per message per recipient, is what makes receipts affordable: acknowledging a hundred messages is one frame and one row update, a lost ack is repaired by the next one, and in a group of 200 the sender's UI computes "delivered to 187" from 200 integers, not 200 times the message count. For big channels, drop per-message receipts altogether; keep only the member's own read position for unread badges.</p>
+
+<h2>Deep dive 3: groups, offline users, multiple devices and encryption</h2>
+<h3>Fan-out for groups, large and small</h3>
+<p>This is the same question as <a href="09-news-feed.html">the news feed</a>, with a lower tolerance for delay. The numbers from the estimate pick the strategy:</p>
+<table>
+  <thead><tr><th>Group size</th><th>Delivery</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Up to a few hundred</td><td>The chat service looks up each member in the registry and sends per user.</td><td>Registry reads are cheap and the number of sends is bounded by the group size. Per-member receipts are affordable.</td></tr>
+    <tr><td>Thousands to 100,000+</td><td>A <strong>channel server</strong> per channel (consistent-hashed) keeps the set of gateways with at least one subscriber. It sends one copy to each such gateway, which fans out to its local sockets.</td><td>Sends scale with the gateway count (about 260), not the member count (100,000). This is the design described in <a href="../cases/case-07-slack-realtime.html">Slack's real-time messaging</a>.</td></tr>
+    <tr><td>Passive members of huge channels</td><td>Do not push to members who are not looking. They pull on open, with a push notification only for mentions.</td><td>Most members of a large channel are inactive at any moment; pushing to them is the wasted work of chapter 9.</td></tr>
+  </tbody>
+</table>
+<p>Persisting is separate from pushing: a group message is stored once, in the conversation's partition, not once per member. Each member's state is the two watermarks. That keeps write cost independent of group size and moves the per-member cost to the last mile.</p>
+<h3>Offline delivery and push notifications</h3>
+<p>The message is durable before the sender is told <code>SENT</code>, so "offline delivery" needs no extra storage: the recipient's reconnect asks for everything after their watermark. What the system adds is a nudge. When the registry shows no live connection, or a connection stops acknowledging within a short deadline, the chat service asks the platform push services (APNs for Apple devices, FCM for Android; external systems we do not control) to wake the app. Design rules that matter:</p>
+<ul>
+  <li><strong>Push is a hint, never the transport.</strong> It can be delayed, dropped or coalesced. The client must sync on open regardless of whether a notification arrived.</li>
+  <li><strong>Collapse and rate-limit.</strong> Ten messages in a minute should produce one updated notification (collapse keys), not ten; mute settings and "active on another device" suppress pushes.</li>
+  <li><strong>Mind the payload.</strong> With end-to-end encryption the server cannot read the content, so the notification is "new message" and the app decrypts locally.</li>
+  <li><strong>Sync is incremental.</strong> A reconnecting device sends its cursor (per conversation watermarks, or a per-device change sequence) and receives only what it missed. For a user in many conversations, a per-user inbox of "conversations with news" is cheaper to scan than all conversation partitions: a small push-style fan-out of pointers, used only for small groups, with the big channels pulled on demand, exactly the hybrid idea of chapter 9.</li>
+</ul>
+<h3>Multiple devices</h3>
+<p>The registry holds a set of devices per user and each device keeps its own delivered watermark, so a phone that was off for a day and a laptop that was on both converge to the same history through the same "after seq N" fetches. Messages the user sends from one device must also appear on their other devices, so the sender's own devices are recipients of every message. The <em>read</em> watermark is per user, not per device, so reading on the laptop clears the badge on the phone. Typing indicators and presence are ephemeral and never stored or synced. A new device needs history: for non-encrypted designs it fetches it from the server; with end-to-end encryption older messages cannot be decrypted by a fresh device unless another device transfers them or a protected backup exists, which is a product trade-off, not a technical oversight.</p>
+<h3>End-to-end encryption, briefly</h3>
+<p>If the server must not read messages, the clients encrypt, and the server stores and routes ciphertext plus the metadata it still needs (conversation id, sender, sequence number, size, timestamp). The standard shape, used by several widely deployed messengers, is per-device keys and a ratcheting session between devices (the Signal protocol is the best-known published design), so a message to a user with three devices is encrypted once per device; groups either encrypt per member or use sender keys that are distributed pairwise and rotated when membership changes. See <a href="../../security/chapters/03-applied-crypto.html">applied cryptography</a> for the primitives. What it changes in our design: server-side search, link previews, spam filtering and history sync for new devices all become hard or client-side; push payloads are opaque; key verification and device add/remove become part of the product; and what the server can still see (who talks to whom, when, how much) is a privacy surface of its own. The architecture above does not change; the content of the frames does.</p>
+
+<h2>Deep dive 4: presence</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="Presence pipeline: a client sends a heartbeat every 30 seconds to its gateway, which refreshes a presence key with a time-to-live in the presence store; when the key expires or the client disconnects cleanly, a change is published to the watchers' channel, which a limited set of watching clients receive.">
+<defs><marker id="ahG10b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="60" width="90" height="50" rx="8" class="fs-green s-green sw-2"/><text x="55" y="90" text-anchor="middle" class="t-sm t-bold">Client</text></g>
+<g><rect x="160" y="60" width="110" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="215" y="82" text-anchor="middle" class="t-sm t-bold">Gateway</text><text x="215" y="98" text-anchor="middle" class="t-xs t-muted">batches refreshes</text></g>
+<g><rect x="330" y="60" width="140" height="50" rx="8" class="fs-cyan s-cyan sw-2"/><text x="400" y="82" text-anchor="middle" class="t-sm t-bold">Presence store</text><text x="400" y="98" text-anchor="middle" class="t-xs t-muted">key + TTL 75 s</text></g>
+<g><rect x="530" y="60" width="100" height="50" rx="8" class="fs-orange s-orange sw-2"/><text x="580" y="82" text-anchor="middle" class="t-sm t-bold">Changes</text><text x="580" y="98" text-anchor="middle" class="t-xs t-muted">on/off events</text></g>
+<g><rect x="670" y="60" width="80" height="50" rx="8" class="fs-green s-green sw-2"/><text x="710" y="82" text-anchor="middle" class="t-sm t-bold">Watchers</text><text x="710" y="98" text-anchor="middle" class="t-xs t-muted">viewport only</text></g>
+<line x1="100" y1="85" x2="160" y2="85" class="line" marker-end="url(#ahG10b)"/>
+<text x="104" y="76" text-anchor="start" class="t-xs t-faint">PING 30 s</text>
+<line x1="270" y1="85" x2="330" y2="85" class="line" marker-end="url(#ahG10b)"/>
+<text x="272" y="76" text-anchor="start" class="t-xs t-faint">refresh</text>
+<line x1="470" y1="85" x2="530" y2="85" class="line-dash" marker-end="url(#ahG10b)"/>
+<text x="474" y="76" text-anchor="start" class="t-xs t-faint">state flip</text>
+<line x1="630" y1="85" x2="670" y2="85" class="line-dash" marker-end="url(#ahG10b)"/>
+<text x="330" y="140" text-anchor="start" class="t-xs tc-red">no refresh for 75 s: key expires, user goes offline</text>
+<text x="10" y="170" text-anchor="start" class="t-xs t-muted">Heartbeats stop at the gateway and the store; only state changes travel onward, and only to people looking.</text>
+<text x="10" y="188" text-anchor="start" class="t-xs t-muted">Clean disconnects delete the key at once, after a short grace period for flapping mobile networks.</text>
+  </svg>
+  <figcaption>Presence is a leased flag. The heartbeat keeps the lease alive; absence of heartbeats, not an explicit "I left", is what eventually marks someone offline.</figcaption>
+</figure>
+<h3>Heartbeats and TTLs</h3>
+<p>Presence is failure detection applied to people. A client cannot be relied on to announce a crash or a dead battery, so "online" is a lease: the client pings every 30 seconds; the gateway refreshes <code>presence:{user}</code> with a TTL; if no refresh arrives before the TTL, the key expires and the user is shown offline. This is a timeout-based detector, with the trade-offs described in <a href="../../distributed/chapters/03-failure-detection.html">failure detection</a>: a longer TTL means slower detection of real departures, a shorter one means false "offline" flickers when a mobile network drops two packets. A TTL of about two and a half heartbeat periods (75 seconds here) tolerates a lost heartbeat plus jitter; clean disconnects delete the key immediately, but with a few seconds of grace so a phone switching from Wi-Fi to cellular does not flash offline and back. Presence is allowed to be wrong by tens of seconds; that is a stated requirement, and it is what makes the cheap design acceptable.</p>
+<p>The same cost lesson applies to the heartbeat itself. In the estimate, 667,000 heartbeats per second arrive; the TCP connection already provides liveness, so the gateway should absorb pings locally and only write to the presence store when something changes or when a lease needs renewing, batching refreshes for many users into one call per interval.</p>
+<h3>Presence fan-out cost</h3>
+<p>The expensive part is telling the right people. In the estimate, each of about 22,000 status flips per second reaches around 40 watchers, which is nearly 900,000 pushes per second, over six times the message rate. At 100,000 members, one flip would be 100,000 pushes. Options:</p>
+<table>
+  <thead><tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr></thead>
+  <tbody>
+    <tr><td>Push every change to every contact</td><td>Naive fan-out on write</td><td>Cost grows with contacts; most receivers are not looking. Avoid.</td></tr>
+    <tr><td><strong>Subscribe to what is on screen</strong></td><td>A client subscribes to presence only for the users in its current view (open chat, visible contact list page) and unsubscribes on scroll or close.</td><td>Cost tracks attention, not graph size. Needs subscription state at the gateways.</td></tr>
+    <tr><td>Pull on open</td><td>Fetch presence for the open conversation when it opens, then rely on subscriptions.</td><td>One batched read; slightly stale right after opening.</td></tr>
+    <tr><td>Coalesce and rate-limit</td><td>Collapse flaps into one event per user per interval; send at most one update per watcher per few seconds.</td><td>Hides rapid flapping, which is a feature.</td></tr>
+    <tr><td>Aggregate for big groups</td><td>Show "1,204 online" or nothing, never per-member presence.</td><td>Loses detail nobody needs at that size.</td></tr>
+  </tbody>
+</table>
+<p>Whichever you choose, give presence its own queues, its own capacity and a kill switch. After a regional outage every client reconnects, flips online and triggers a presence storm; if that shares a pipeline with messages, the least valuable signal can delay the most valuable one. Under pressure, presence is the first thing to degrade ("last seen is hidden for now"), and typing indicators the second.</p>
+
+<h2>Failure modes &amp; operations</h2>
+<table>
+  <thead><tr><th>What breaks</th><th>Blast radius</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>A gateway crashes or is deployed</td><td>About 100,000 clients reconnect</td><td>Drain on deploy; reconnect with backoff and jitter; clients resume from their watermarks, so nothing is lost</td></tr>
+    <tr><td>Reconnect storm after a regional event</td><td>Gateways, registry, presence, sync reads all spike together</td><td>Admission control at the gateways, jittered retry, sync reads rate-limited, presence updates suppressed during recovery (<a href="../../reliability/chapters/11-overload.html">overload</a>)</td></tr>
+    <tr><td>Stale registry entry</td><td>One delivery to a dead gateway</td><td>Fast failure treated as offline; push plus sync; short TTLs; gateway refreshes entries</td></tr>
+    <tr><td>Conversation owner fails over</td><td>That partition's conversations pause briefly</td><td>Leases with fencing so two owners never issue the same seq; clients retry with <code>client_msg_id</code></td></tr>
+    <tr><td>Hot conversation or channel</td><td>One partition or channel server</td><td>Time buckets; per-gateway fan-out; slow-mode or rate limits on huge channels (<a href="05-rate-limiter.html">rate limiter</a>)</td></tr>
+    <tr><td>Message store node loss</td><td>Reads and writes for its ranges</td><td>RF 3, quorum, repair; <code>SENT</code> only after the quorum write</td></tr>
+    <tr><td>Push provider outage or throttling</td><td>Offline users are notified late</td><td>The message is still durable; sync on open; queue and retry pushes with backoff; collapse</td></tr>
+    <tr><td>Clock skew</td><td>Misleading timestamps and last-seen</td><td>Order by <code>seq</code>, never by wall clock; timestamps are display only</td></tr>
+  </tbody>
+</table>
+<p><strong>SLOs.</strong> Send-to-<code>SENT</code> p99 under 300 ms; send-to-delivery p99 under about a second for online users; zero acknowledged messages lost (measured by reconciliation: the sequence per conversation has no gaps in the store); gateway connection success rate above 99.9%. <strong>Alert</strong> on delivery latency percentiles, reconnect rate, registry miss ratio, per-partition write latency, push error rate, and presence queue depth, using burn-rate alerts (<a href="../../reliability/chapters/07-alerting-oncall.html">alerting</a>). <strong>Roll out</strong> gateway versions by draining a small slice first, keeping the wire protocol backward compatible for old app versions that will connect for years (<a href="../../architecture/chapters/10-evolving-contracts.html">evolving contracts</a>). Test the unpleasant paths on purpose: kill a gateway under load, fail a conversation owner, drop heartbeats (<a href="../../reliability/chapters/19-chaos-gamedays.html">chaos days</a>).</p>
+
+<h2>Trade-offs &amp; alternatives</h2>
+<ul>
+  <li><strong>Per-conversation order versus global order.</strong> We pay a sequencer per conversation and give up cross-conversation ordering, which nobody needs. A single global sequence would be a bottleneck for no benefit.</li>
+  <li><strong>Server stores plaintext versus end-to-end encryption.</strong> Plaintext enables search, moderation and easy history sync; E2E gives privacy and removes those features server-side.</li>
+  <li><strong>Strong versus soft state.</strong> Messages and sequence numbers are strongly consistent and durable; presence, typing, registry and read counts are soft, lossy and TTL-bound. The line between them is the main architectural idea.</li>
+  <li><strong>If ordering had to survive region loss with no gaps.</strong> Replicate each conversation's log with consensus across regions and accept cross-region write latency, or make one region authoritative per conversation (<a href="../../distributed/chapters/18-multi-region.html">multi-region</a>).</li>
+  <li><strong>If it were a small app.</strong> One database with a table of messages, a counter per conversation and a single WebSocket server would be correct up to a surprising size; every piece here exists because of a number above.</li>
+  <li><strong>Where it breaks down.</strong> Gigantic live events (millions of simultaneous viewers in one chat) need sampling, sharded rooms and message dropping, which changes the guarantee from "everyone sees everything" to "everyone sees a representative stream".</li>
+</ul>
+
+<h2>What a strong answer adds</h2>
+<ul>
+  <li>Splits the system into connection layer, message path, soft state and notification path, and says gateways hold sockets but no business state.</li>
+  <li>Compares WebSocket, long polling and SSE by direction, overhead and infrastructure friction, and names the fallback.</li>
+  <li>Uses a per-conversation sequence number rather than timestamps, explains that gap-freeness lets clients detect loss, and protects the sequencer with a lease and fencing.</li>
+  <li>Makes sends idempotent with a client-chosen id and treats delivery as at-least-once with dedupe.</li>
+  <li>Models receipts as per-member watermarks instead of per-message flags.</li>
+  <li>Quantifies presence (heartbeats and fan-out) and shows that it can exceed message traffic, then limits it by subscribing to what is on screen.</li>
+  <li>Fans out big groups per gateway, not per user, and does not push to passive members.</li>
+  <li>Treats push as a hint, designs for reconnect storms, and isolates presence from message delivery.</li>
+</ul>
+
+<h2>Follow-up questions</h2>
+<details class="deeper">
+  <summary>Why not give every message a globally unique, time-ordered id and sort by that?</summary>
+  <p>Time-ordered ids are great for uniqueness and rough order, but two servers can stamp concurrent messages in either order, clock skew reorders them, and a client can never tell whether a message is missing. A per-conversation sequence is gap-free and cheap because only one component writes each conversation. You can still carry a time-ordered id for other purposes (deduplication across systems, analytics).</p>
+</details>
+<details class="deeper">
+  <summary>The sender's connection dropped after the server stored the message but before <code>SENT</code> arrived. What happens?</summary>
+  <p>The client keeps the message in its outbox and retries with the same <code>client_msg_id</code> when it reconnects. The server finds the id in its idempotency record (kept for the conversation, with a retention window longer than any plausible retry) and returns the original sequence number. No duplicate is stored, and the sender then shows the message as sent. Everyone else already received the original once.</p>
+</details>
+<details class="deeper">
+  <summary>How do read receipts stay in sync across a user's phone and laptop?</summary>
+  <p>The read watermark is stored per user and conversation, not per device. When any device reports "read up to 41", the service stores the maximum, broadcasts a receipt to the other members, and also pushes a small sync frame to the user's other devices so they clear unread badges. Because watermarks only move forward, concurrent reports from two devices merge by taking the larger one, with no conflict to resolve.</p>
+</details>
+<details class="deeper">
+  <summary>How would a channel with a million members work?</summary>
+  <p>As a broadcast, not a chat. Messages are stored once; only members who currently have the channel open hold a subscription at their gateway, and delivery is one copy per gateway. Replies are rate-limited and sampled, receipts and presence are disabled, and unread counts are computed from each member's own position. Posting to the channel may itself go through a limiter or a slower moderation queue.</p>
+</details>
+<details class="deeper">
+  <summary>What do you do when presence is wrong, say a user shows online but their phone is dead?</summary>
+  <p>Accept it within the stated bound: the lease expires after at most the TTL, so the error lasts about 75 seconds. If product needs less, shorten the heartbeat and TTL for the contacts someone is actively chatting with, not for everyone, because heartbeat cost scales with connections. For actual delivery the system does not rely on presence at all: messages are sent to the connection if it acknowledges and to push otherwise.</p>
+</details>
+<details class="deeper">
+  <summary>How would you add message search?</summary>
+  <p>Index messages asynchronously from the store's change stream into a search service partitioned by user or conversation (<a href="11-search-typeahead.html">chapter 11</a>), with access control by membership at query time. With end-to-end encryption the server cannot index plaintext, so search runs on the device over locally stored messages, which limits it to what that device has synced.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In the ordering script, change the seed and the number of duplicates, then add a rule so the client requests a missing sequence number after waiting for two later arrivals. Next, change <code>gateways</code> in the napkin script to 50 and 1,000 and see where per-gateway fan-out stops being cheaper than per-user for a 200-member group. Last, double the heartbeat period and recompute what TTL you would need.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>The sequencer is a single-writer log per partition, the building block of replicated state machines (<a href="../../distributed/chapters/08-consensus-smr.html">consensus and SMR</a>), and its failover is the leases-and-fencing problem. Presence is a failure detector with a lease, and its trade-off between speed and false positives is the same one every detector faces (<a href="../../distributed/chapters/03-failure-detection.html">failure detection</a>). Idempotent sends with watermarks are the practical form of effectively-once processing over an at-least-once network.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Use WebSocket gateways for real-time chat, with long polling as a fallback; gateways hold sockets and no durable state, and are drained rather than killed.</li>
+    <li>A connection registry (user to devices to gateways) in sharded memory with TTLs makes delivery a targeted call; entries are hints, and a miss means offline.</li>
+    <li>Order within a conversation by a gap-free sequence number issued by one owner, protected by a lease and fencing; never by wall-clock timestamps.</li>
+    <li>Sends are idempotent via a client-chosen id; delivery is at-least-once; clients reorder and dedupe by sequence.</li>
+    <li>Store messages in a wide-column store partitioned by conversation and time bucket; store receipts as per-member watermarks.</li>
+    <li>Fan out small groups per user and large channels per gateway; do not push to passive members.</li>
+    <li>Push notifications are hints; messages are durable before <code>SENT</code>, and clients sync from their watermark.</li>
+    <li>Presence is a leased flag with TTL about 2.5 heartbeats; its fan-out can exceed message traffic, so limit it to what users are looking at and isolate it from message delivery.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why use a per-conversation sequence number instead of timestamps to order messages?</p>
+    <ol class="q-options">
+      <li>Sequence numbers are smaller to store</li>
+      <li>One owner issues them without gaps, so order is agreed and clients can detect missing messages; clocks cannot offer either</li>
+      <li>Timestamps cannot be indexed</li>
+      <li>It removes the need for a database</li>
+    </ol>
+    <div class="q-explain">With a single writer per conversation the sequence is a total order and gap-free. Timestamps depend on clocks that skew, and a missing message leaves no visible hole.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A client sends a message, the connection drops, and it retries. How do you avoid a duplicate?</p>
+    <ol class="q-options">
+      <li>Reject all retries</li>
+      <li>Use the arrival time to detect duplicates</li>
+      <li>Ask the user to confirm</li>
+      <li>Have the client send a stable <code>client_msg_id</code>; the server returns the original sequence number if it has already stored that id</li>
+    </ol>
+    <div class="q-explain">An idempotency key chosen by the client turns an at-least-once retry into an effectively-once store.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">In the napkin maths, which component of chat turned out to cost more than messaging itself?</p>
+    <ol class="q-options">
+      <li>Presence: heartbeats and status fan-out</li>
+      <li>Storage of message bodies</li>
+      <li>The sequence counter</li>
+      <li>Group creation</li>
+    </ol>
+    <div class="q-explain">Heartbeats alone exceed the message rate, and naive presence fan-out is several times it. That is why heartbeats stop at the gateway and presence goes only to watchers who are looking.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">How should read receipts be stored for a group of 200?</p>
+    <ol class="q-options">
+      <li>One row per message per member per state</li>
+      <li>Only on the sender's device</li>
+      <li>As a read_upto sequence number per member per conversation</li>
+      <li>Not at all; receipts cannot work in groups</li>
+    </ol>
+    <div class="q-explain">A watermark per member makes acknowledgements one small frame, tolerates lost acks, and lets the sender's UI derive "read by 150" without per-message state.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">For a 100,000-member channel on 260 gateways, the cheapest delivery step is to:</p>
+    <ol class="q-options">
+      <li>Send one message per member from the chat service</li>
+      <li>Send one copy to each gateway that has a subscriber and let the gateway fan out locally</li>
+      <li>Broadcast to every client at once from a single server</li>
+      <li>Store a copy in each member's inbox</li>
+    </ol>
+    <div class="q-explain">Sends scale with the number of gateways (about 260), not the number of members, and the last-mile fan-out is parallel across gateways.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

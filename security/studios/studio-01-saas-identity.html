@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Identity &amp; Access for a Multi-Tenant SaaS · Security Engineering</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="sec" data-studio="S1">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design Identity &amp; Access for a Multi-Tenant SaaS</h1>
+  <p class="lede">A B2B product lives or dies on whether a customer's IT department trusts it: their people sign in through their own identity provider, leave the company and lose access the same hour, and never, ever see another customer's data. This studio designs the whole identity and access layer for a project-management SaaS, from single sign-on to the audit log a customer can export.</p>
+</header>
+<div class="callout why">
+  <p class="callout-title">How a design studio works</p>
+  <p>This page is a design problem, not a chapter. At each stage there is a <strong>Your turn</strong> question. Write your answer in the notes box first (it saves in this browser), <em>then</em> open the worked answer and compare. The worked answer is not the only right design; it is one strong one with its reasoning. A rubric at the end lets you check whether you covered what an experienced engineer would. Being wrong first and then seeing why is the point. Every number on this page is an assumption to reason with, not a measurement.</p>
+</div>
+
+<div class="studio-brief">
+  <p class="brief-title">📐 The brief</p>
+  <p>You are the security lead for <strong>Taskloom</strong>, a B2B project-management SaaS. Customers are companies (<strong>tenants</strong>); each has from 20 to 20,000 users. The product needs:</p>
+  <ul>
+    <li><strong>enterprise single sign-on</strong> per tenant through OpenID Connect or SAML, with proof that the tenant owns its email domain;</li>
+    <li><strong>automated provisioning</strong> of users and groups from the customer's directory with SCIM;</li>
+    <li><strong>roles</strong> (owner, admin, member, guest) <em>plus</em> per-project sharing, including sharing with a guest from another company;</li>
+    <li><strong>API keys</strong> and <strong>OAuth apps</strong> so customers and partners can integrate;</li>
+    <li><strong>admin impersonation</strong> so support staff can reproduce a customer's problem, with the customer's consent and an audit trail;</li>
+    <li><strong>tenant isolation</strong> in a shared database;</li>
+    <li><strong>session management</strong>, including prompt revocation when someone is offboarded;</li>
+    <li>an <strong>audit log</strong> the customer can search and export.</li>
+  </ul>
+  <p>Assume one shared application and one shared PostgreSQL cluster (the pool model of <a href="../chapters/15-multi-tenancy.html">chapter 15</a>). Use <a href="../chapters/06-sessions-tokens.html">sessions and tokens</a>, <a href="../chapters/07-oauth-oidc.html">OAuth and OIDC</a> and <a href="../chapters/08-authorization.html">authorization</a>. The inspection tools in the <a href="../toolbox.html#jwt-tools">toolbox</a> let you look at real tokens. <a href="../cases/case-08-zanzibar.html">Zanzibar</a> is the model behind the sharing design.</p>
+</div>
+
+<h2>Your notes</h2>
+<p>Keep a running list of decisions. Plain text is fine.</p>
+<textarea class="studio-notes" aria-label="Your design notes for this studio" placeholder="Tenancy and login…&#10;Roles and sharing…&#10;Keys, impersonation, isolation, sessions, audit…"></textarea>
+
+<section class="stage">
+<h2><span class="h-num">1</span>Tenants, users and the identity model</h2>
+<p class="stage-q">Before any login flow: what are the entities? Is a person one account or one account per tenant? What happens when the same email address belongs to two companies, and to a contractor who works with both?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Separate <em>who someone is</em> from <em>what they can do in a tenant</em>.</p>
+  <ul>
+    <li><strong>Three entities:</strong> <code>tenant</code> (the customer), <code>user</code> (a person, keyed by an opaque internal id), and <code>membership</code> (user × tenant, carrying role, status and the identity provider connection used). A contractor is one user with two memberships, not two accounts.</li>
+    <li><strong>The key rule: identity in a tenant is the pair (issuer, subject), never the email.</strong> An email address is an attribute the identity provider asserts and can change or be recycled. Link by the OIDC <code>iss</code> plus <code>sub</code> pair (or the SAML NameID in a stable, persistent format) and treat email as a display and lookup hint (<a href="../chapters/07-oauth-oidc.html">chapter 7</a>).</li>
+    <li><strong>Every record carries <code>tenant_id</code>,</strong> and every unique constraint includes it (<code>UNIQUE (tenant_id, slug)</code>). That is the foundation of stage 7.</li>
+    <li><strong>Membership has a status:</strong> <code>invited</code>, <code>active</code>, <code>suspended</code>, <code>deprovisioned</code>. Deprovisioned memberships are kept (for audit and for reassigning work), never reused for another person.</li>
+    <li><strong>Tenant settings that change security behaviour</strong> live on the tenant: allowed login methods, whether SSO is enforced, session lifetime, domain list, IP allow-list, whether support impersonation is permitted.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">2</span>Enterprise SSO and domain verification</h2>
+<p class="stage-q">Draw the sign-in flow when a tenant has its own identity provider (IdP). How does the app know which IdP to send a user to? How do you stop a hostile tenant from claiming <code>bigbank.example</code> and capturing its employees' logins? Sketch every token that exists and where it is checked.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>The app is the <em>relying party</em> (RP) and each tenant brings its own IdP. For OIDC the app runs the authorization-code flow with PKCE; for SAML it receives a signed assertion at an assertion consumer endpoint. Recap from <a href="../chapters/07-oauth-oidc.html">chapter 7</a>; here is the design on top.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 330" role="img" aria-label="Token flow. A browser in the user zone starts login at the Taskloom app. The app redirects it to the tenant's identity provider, an external system. The browser authenticates there and returns with an authorization code. The app exchanges the code at the provider's token endpoint, validates the ID token, and issues its own session cookie. API clients use a separate path with API keys or OAuth access tokens, checked by the same authorization service.">
+<defs><marker id="ahSS1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahSS1ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahSS1ao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahSS1ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker></defs>
+<rect x="8" y="8" width="150" height="314" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="20" y="28" class="t-xs t-muted">user zone</text>
+<rect x="590" y="8" width="162" height="314" rx="12" class="line-dash s-yellow" style="fill:none"/>
+<text x="602" y="28" class="t-xs t-muted">customer's zone</text>
+<rect x="30" y="120" width="106" height="52" rx="8" class="fs-green s-green sw-2"/><text x="83" y="143" text-anchor="middle" class="t-sm t-bold">browser</text><text x="83" y="160" text-anchor="middle" class="t-xs t-muted">user</text>
+<rect x="260" y="110" width="140" height="72" rx="8" class="fs-blue s-blue sw-2"/><text x="330" y="138" text-anchor="middle" class="t-sm t-bold">Taskloom app</text><text x="330" y="156" text-anchor="middle" class="t-xs t-muted">relying party</text><text x="330" y="171" text-anchor="middle" class="t-xs t-muted">(session issuer)</text>
+<rect x="610" y="110" width="126" height="72" rx="8" class="fs-purple s-purple sw-2"/><text x="673" y="138" text-anchor="middle" class="t-sm t-bold">tenant IdP</text><text x="673" y="156" text-anchor="middle" class="t-xs t-muted">OIDC or SAML</text>
+<rect x="260" y="250" width="140" height="48" rx="8" class="fs-cyan s-cyan sw-2"/><text x="330" y="272" text-anchor="middle" class="t-sm t-bold">authz service</text><text x="330" y="288" text-anchor="middle" class="t-xs t-muted">same checks for all</text>
+<rect x="30" y="250" width="106" height="48" rx="8" class="box2"/><text x="83" y="272" text-anchor="middle" class="t-sm t-bold">API client</text><text x="83" y="288" text-anchor="middle" class="t-xs t-muted">script or app</text>
+<line x1="138" y1="136" x2="258" y2="136" class="line" marker-end="url(#ahSS1a)"/><text x="198" y="128" text-anchor="middle" class="t-xs">1 /login</text>
+<line x1="262" y1="158" x2="138" y2="158" class="line" marker-end="url(#ahSS1a)"/><text x="198" y="174" text-anchor="middle" class="t-xs">2 302 to IdP</text>
+<path d="M 110 120 C 110 50, 673 50, 673 108" class="line s-purple" fill="none" marker-end="url(#ahSS1ap)"/><text x="390" y="62" text-anchor="middle" class="t-xs tc-purple">3 user authenticates at the IdP (state, nonce, PKCE challenge)</text>
+<path d="M 650 184 C 650 220, 150 220, 118 174" class="line s-orange" fill="none" marker-end="url(#ahSS1ao)"/><text x="430" y="226" text-anchor="middle" class="t-xs tc-orange">4 code returns via browser</text>
+<line x1="610" y1="146" x2="402" y2="146" class="line s-orange" marker-end="url(#ahSS1ao)" stroke-dasharray="5 4"/><text x="506" y="140" text-anchor="middle" class="t-xs tc-orange">5 code + verifier to token endpoint</text>
+<text x="506" y="162" text-anchor="middle" class="t-xs tc-orange">6 ID token back</text>
+<text x="330" y="204" text-anchor="middle" class="t-xs tc-orange">7 check iss, aud, exp, nonce, signature</text>
+<line x1="83" y1="250" x2="258" y2="274" class="line s-cyan" marker-end="url(#ahSS1ac)"/><text x="170" y="250" text-anchor="middle" class="t-xs tc-cyan">key or access token</text>
+<line x1="330" y1="184" x2="330" y2="248" class="line s-cyan" marker-end="url(#ahSS1ac)"/>
+</svg>
+<figcaption><strong>Token flow.</strong> Orange marks the secrets and tokens, purple the customer's IdP, cyan the policy decision. Step 7 is the whole point: the app trusts the ID token only after checking issuer, audience, expiry, nonce and signature, then issues its <em>own</em> session so everything after login works the same for every tenant.</figcaption>
+</figure>
+  <ul>
+    <li><strong>Which IdP? Home-realm discovery.</strong> The user types an email or opens the tenant's vanity URL (<code>acme.taskloom.example</code>). The app maps the <em>verified</em> domain or tenant slug to a stored connection (issuer, client id, secret reference, or SAML metadata and signing certificate). It does not guess from an unverified claim.</li>
+    <li><strong>Domain verification</strong> stops the squatting attack. Before a tenant can bind <code>bigbank.example</code> to SSO, it proves control by publishing a random token in a DNS TXT record, which the app queries and re-checks periodically. The same proof gates "automatically join anyone with this email domain". Without it, an attacker creates a tenant, claims someone else's domain and receives their employees at login.</li>
+    <li><strong>Per-connection validation.</strong> Each tenant's connection pins its own <code>iss</code>, <code>aud</code> (your client id) and signing keys (from the IdP's published key set, cached with refresh). A token valid for tenant A's IdP must never be accepted for tenant B; the connection is selected <em>before</em> validation and the expected issuer comes from the stored connection, not from the token.</li>
+    <li><strong>SAML specifics.</strong> Verify the XML signature over the assertion you actually use (signature-wrapping is the classic bug), check <code>Audience</code>, <code>Recipient</code>, <code>InResponseTo</code> and <code>NotOnOrAfter</code>, and use a well-reviewed library. Never write an XML-signature verifier yourself.</li>
+    <li><strong>Just-in-time provisioning</strong> (create the membership on first login) is convenient but only safe for a verified domain with a tenant-chosen default role of "member". Prefer SCIM (stage 3) for anything beyond that.</li>
+    <li><strong>Enforcement and the break-glass owner.</strong> A tenant can require SSO, which disables passwords for its members. Keep one or two owner accounts exempt, with strong MFA, in case the IdP is misconfigured and everyone is locked out. Log every use.</li>
+    <li><strong>Session creation.</strong> After step 7 the app issues a server-side session (an opaque id in a <code>Secure; HttpOnly; SameSite=Lax</code> cookie; <a href="../chapters/06-sessions-tokens.html">chapter 6</a>). It records the tenant, membership, authentication time and the IdP's <code>amr</code> or <code>acr</code> if given, so a sensitive action can demand a recent or stronger login.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">3</span>SCIM provisioning</h2>
+<p class="stage-q">The customer's directory is the source of truth for who works there. How does the directory create, update and disable users and groups in your system? How is the SCIM endpoint authenticated, and what can go wrong if it is trusted too much?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p><strong>SCIM</strong> (System for Cross-domain Identity Management) is a REST protocol for moving identity records between systems. Two RFCs define it: <strong>RFC 7643</strong> is the core <em>schema</em> (the <code>User</code> and <code>Group</code> resources and their attributes) and <strong>RFC 7644</strong> is the <em>protocol</em> (the HTTP operations and the PATCH and filter syntax). Your system is the <em>service provider</em>; the customer's IdP or directory is the SCIM client.</p>
+<pre class="terminal" data-title="SCIM user (illustrative shape of RFC 7643's core schema)"><code>POST /scim/v2/Users
+Authorization: Bearer &lt;tenant-scoped SCIM token&gt;
+{
+  "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+  "externalId": "dir-88431",
+  "userName": "mira@acme.example",
+  "name": {"givenName": "Mira", "familyName": "Okafor"},
+  "emails": [{"value": "mira@acme.example", "primary": true}],
+  "active": true
+}</code></pre>
+  <ul>
+    <li><strong>Authentication.</strong> Each tenant gets a long random bearer token (or an OAuth client-credentials client) used <em>only</em> for <code>/scim/v2</code>. It maps to exactly one tenant, can be rotated, is stored hashed, and cannot call the product API. The tenant id is taken from the credential, never from the URL or body.</li>
+    <li><strong>Disabling is the important operation.</strong> The directory sends <code>PATCH ... active: false</code> or <code>DELETE</code>. Treat both as <em>deprovision</em>: mark the membership, <strong>revoke all its sessions, API keys and OAuth grants in the same transaction</strong> (stage 8), and keep the record. A soft state beats a hard delete because audit entries and task ownership still point to it.</li>
+    <li><strong>Groups to roles.</strong> A SCIM <code>Group</code> maps to an app group. The tenant admin configures which group means which role (for example "Taskloom Admins" gives <code>admin</code>). Do the mapping in your database, so a directory typo cannot create an unmapped super-role, and never allow SCIM to grant <code>owner</code>.</li>
+    <li><strong>Idempotency and ordering.</strong> IdPs retry and send updates out of order. Key on <code>externalId</code> plus tenant, make create-if-exists an update, and use version or <code>meta.lastModified</code> checks. Support pagination and filters (<code>userName eq "..."</code>), because IdPs look a user up before creating.</li>
+    <li><strong>What can go wrong.</strong> A leaked SCIM token lets an attacker create admin-group members or deactivate everyone: limit it to the tenant, forbid privileged mappings, rate-limit, alert on bulk changes and offer a tenant-visible log. Email collisions: SCIM may create a user whose email matches an existing member, so link by <code>externalId</code> and reject a silent merge.</li>
+    <li><strong>The lag problem.</strong> SCIM pushes are eventual: an IdP may batch every 40 minutes. SCIM alone is therefore not an instant offboarding mechanism; stage 8 adds short sessions and re-validation to bound the gap.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">4</span>Authorization: roles plus per-project sharing</h2>
+<p class="stage-q">Design the permission model. Four tenant roles are not enough: a project can be shared with one colleague, a team or an outside guest. Which model, which relations, and how does one request get checked? Where do you enforce it?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Coarse tenant roles (RBAC) answer "what kind of member is this?". Sharing is relationship-based (ReBAC): access flows along edges in a graph, the model of <a href="../chapters/08-authorization.html">chapter 8</a> and <a href="../cases/case-08-zanzibar.html">Zanzibar</a>. Use both: a role is simply one more relationship.</p>
+<pre class="terminal" data-title="authorization model (schema in the Zanzibar style; illustrative)"><code>type tenant
+  relations: owner, admin, member            # from SCIM / invitations
+type group
+  relations: member                          # a team inside a tenant
+type project
+  relations:
+    parent_tenant : tenant
+    editor        : user | group#member
+    viewer        : user | group#member | guest-user
+  permissions:
+    edit   = editor + parent_tenant.admin + parent_tenant.owner
+    view   = viewer + edit
+    delete = parent_tenant.admin + parent_tenant.owner
+    share  = edit and (parent_tenant allows external sharing, for guests)</code></pre>
+  <ul>
+    <li><strong>Check path.</strong> "Can mira edit project P?" asks: is mira an <code>editor</code> of P directly, a member of a group that is an editor, or an admin or owner of P's parent tenant? Each step is a tuple lookup like <code>project:P#editor@group:design#member</code>. This is why one sharing mechanism also covers teams.</li>
+    <li><strong>Tenant boundary first.</strong> Every check starts with "does the caller's membership belong to the project's tenant, or hold an explicit guest tuple?" This is the same rule as stage 7, enforced a second time at a different layer (defence in depth, <a href="../chapters/02-principles.html">chapter 2</a>).</li>
+    <li><strong>Guests</strong> from other companies are users with a membership of kind <code>guest</code> that grants nothing except explicit tuples. Tenants can switch off external sharing; the check reads that setting.</li>
+    <li><strong>Where to enforce.</strong> Authorization in one library or service that every code path calls (complete mediation), never in the front end. List endpoints are the weak spot: filter in the query ("which projects can mira view?" via a reverse lookup or a materialised permission index), never fetch-then-filter in the client. Broken object-level authorization (<code>GET /projects/{id}</code> without a check) is the top bug in this kind of product.</li>
+    <li><strong>Freshness.</strong> Revoking a share must take effect quickly. Cache decisions for seconds, not minutes, or attach a version token (Zanzibar's "zookie") to the write so the next read is at least as new. The "new-enemy problem" (an old cached permission applied to new content) is the failure to name.</li>
+    <li><strong>Scale numbers (assumed).</strong> 1M users × 50 projects each is on the order of 50M tuples, small for an indexed table. A check touches a handful of rows. Start with Postgres tables and a library; adopt a dedicated authorization service when several products share the model.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">5</span>API keys and OAuth apps</h2>
+<p class="stage-q">Customers want scripts; partners want to build integrations. What credentials do you offer, what are they scoped to, how are they stored, and who owns them when the person who made one leaves?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Offer two mechanisms with different purposes.</p>
+  <table>
+    <thead><tr><th></th><th>API key (a personal or service token)</th><th>OAuth app (authorization code + PKCE)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>For</strong></td><td>a customer's own scripts and automation</td><td>third-party integrations used by many tenants</td></tr>
+      <tr><td><strong>Acts as</strong></td><td>a <em>service account</em> membership in one tenant</td><td>the consenting user, limited to granted scopes</td></tr>
+      <tr><td><strong>Lifetime</strong></td><td>long-lived, with an optional expiry set by the tenant admin</td><td>short access token (minutes to an hour; shorter for tenants with a tight offboarding target) plus rotating refresh token</td></tr>
+      <tr><td><strong>Scope</strong></td><td>a role and, ideally, specific projects</td><td>scopes such as <code>projects:read</code>, intersected with the user's own permissions</td></tr>
+      <tr><td><strong>Revoke</strong></td><td>admin deletes it; listed with last-used time</td><td>user or admin revokes the grant; app can be disabled for the tenant</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>Make keys good secrets.</strong> Generate 32 random bytes from a cryptographically secure source, give a readable prefix (<code>tl_live_</code>) so secret scanners and humans recognise it (<a href="../toolbox.html#secrets-scan">toolbox</a>), show the full value once, and store only a hash. Because the key is already high-entropy, a plain SHA-256 is enough (a slow password hash is unnecessary), and the lookup is by a separate non-secret key id.</li>
+    <li><strong>Service accounts, not people.</strong> A key owned by a person dies when that person is deprovisioned, which breaks the integration at 2 a.m. but is the safe default for <em>personal</em> tokens. Production automation should use a service account owned by the tenant, which admins can audit and reassign.</li>
+    <li><strong>Scopes are a ceiling, not a grant.</strong> An OAuth token can do what its scope <em>and</em> the user's permissions both allow. Checking only the scope turns the app into a confused deputy (<a href="../chapters/08-authorization.html">chapter 8</a>).</li>
+    <li><strong>OAuth app hygiene.</strong> Exact-match registered redirect URIs, PKCE for everyone, no implicit flow, and a consent screen showing the app's verified publisher. Tenants can restrict to an allow-list of approved apps; consent phishing (tricking a user into authorising a malicious app) is the threat this control addresses (<a href="../chapters/07-oauth-oidc.html">chapter 7</a>).</li>
+    <li><strong>Rate limits and anomaly alerts</strong> per key and per tenant, with a tenant-visible "last used from" column. Alert when a key suddenly reads everything.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">6</span>Support impersonation with consent and audit</h2>
+<p class="stage-q">Support staff need to see what a customer sees. Impersonation is also one of the most dangerous powers in the company. Design it so it is rare, bounded, visible to the customer and impossible to use quietly.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Treat it as <em>delegated, time-boxed, consented access</em>, not as "log in as the user".</p>
+  <ol>
+    <li><strong>Customer consent first.</strong> A tenant admin (or the affected user) grants a support access window from the settings page: scope (this user, this project, or read-only for the tenant), duration (default 4 hours, maximum 7 days), reason or ticket reference. Tenants can disable it entirely. No active grant means no impersonation, whatever the support engineer's role.</li>
+    <li><strong>Separate identity.</strong> The support engineer authenticates through the company's own SSO with phishing-resistant MFA, from a managed device. The impersonation session is a distinct session type that records <code>actor = support:jlee</code> and <code>subject = user:mira</code>. It is never the subject's own session, and it cannot be created by copying the user's cookie.</li>
+    <li><strong>Restricted by default.</strong> Read-only mode is the default; write needs a second approval. Block the actions that change identity or exfiltrate: no password or MFA changes, no creating API keys or OAuth grants, no data export, no deleting the audit log, no accepting terms on the user's behalf. The check is in the authorization layer: <code>actor_can(action)</code> <em>and</em> <code>subject_can(action)</code>.</li>
+    <li><strong>Visible.</strong> A banner in the UI ("Support is viewing as you") and an email to the tenant admin when a session starts. Every request carries both actor and subject into the log (stage 9), and the customer sees the entries in their export.</li>
+    <li><strong>Break-glass is separate.</strong> If a grant is impossible (the customer's only admin is unreachable during an outage), a second path requires two staff approvals, alerts the security team in real time and is reviewed the next day (<a href="../studios/studio-03-secrets-manager.html">studio 3</a> uses the same pattern for secrets).</li>
+    <li><strong>Why it matters.</strong> Every large SaaS support tool is a target: an attacker who compromises one support engineer would otherwise hold the keys to every tenant. Bounded scope, short windows and a customer-visible trail turn that from a catastrophe into an alert.</li>
+  </ol>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">7</span>Tenant isolation in the data layer</h2>
+<p class="stage-q">All tenants share tables. How do you make "forgot the tenant filter" a bug that cannot ship? Name at least two independent layers, and the places a leak still hides.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Follow <a href="../chapters/15-multi-tenancy.html">chapter 15</a>: derive the tenant from the authenticated credential, carry it in a request context, and make the database enforce it too.</p>
+  <ul>
+    <li><strong>Layer 1, derive and carry.</strong> The tenant id comes from the session or token and is placed in a request-scoped context. Handlers never read it from a URL, header or body field. A repository layer takes the context and adds <code>WHERE tenant_id = :t</code>; there is no query helper without it.</li>
+    <li><strong>Layer 2, the database says no.</strong> PostgreSQL <strong>row-level security</strong> policies on every tenant table: <code>USING (tenant_id = current_setting('app.tenant_id')::uuid)</code>. The app sets <code>app.tenant_id</code> per transaction (<code>SET LOCAL</code>), connects as a role that does <em>not</em> own the tables and is not a superuser (table owners bypass the policy unless you also set FORCE ROW LEVEL SECURITY; superusers and roles with BYPASSRLS always bypass it). A missing filter then returns zero rows instead of everyone's.</li>
+    <li><strong>Layer 3, composite keys.</strong> Foreign keys include <code>tenant_id</code> so a task cannot reference another tenant's project even through a bug: <code>FOREIGN KEY (tenant_id, project_id) REFERENCES project (tenant_id, id)</code>.</li>
+    <li><strong>Layer 4, test it.</strong> A CI test creates two tenants, performs every API call as tenant A with tenant B's ids and asserts 404 (not 403, which confirms existence). Fuzz object ids across tenants. Add a canary row per tenant whose appearance in another tenant's responses pages someone.</li>
+    <li><strong>Where leaks hide anyway.</strong> Caches keyed without the tenant; search indexes and background jobs that run outside the request context; file storage paths; export and reporting queries run as a privileged role; logs and error messages; connection-pool state that keeps the previous request's <code>app.tenant_id</code> (use <code>SET LOCAL</code> in a transaction so it resets).</li>
+    <li><strong>The blast-radius dial.</strong> Large or regulated tenants may move to a silo (own schema or database, own encryption key) as an enterprise tier. Per-tenant keys also make "delete tenant" a key deletion (<a href="../chapters/04-keys-secrets-pki.html">chapter 4</a>).</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">8</span>Sessions and revocation on offboarding</h2>
+<p class="stage-q">An employee is fired at 10:00. By when must every browser tab, mobile app, API key and OAuth grant of theirs stop working? Which mechanisms give you that bound, and what does each cost?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Pick a <strong>target</strong> and design to it. Say, "access ends within 5 minutes of the deprovision event, 1 minute for explicit admin 'sign out everywhere'". The recap from <a href="../chapters/06-sessions-tokens.html">chapter 6</a>: signed stateless tokens cannot be recalled before they expire, server-side sessions can.</p>
+  <table>
+    <thead><tr><th>Credential</th><th>How it is cut off</th><th>Worst-case delay</th></tr></thead>
+    <tbody>
+      <tr><td>Browser session</td><td>server-side session row; deprovisioning deletes all rows for the membership, and every request looks the session up (an indexed key in a cache)</td><td>effectively immediate</td></tr>
+      <tr><td>Short-lived access token (for the API and mobile)</td><td>5-minute expiry (so the worst case fits the 5-minute target); refresh requires the membership to be <code>active</code>; refresh tokens rotate and are deleted on deprovision</td><td>up to the token lifetime</td></tr>
+      <tr><td>API keys and service tokens</td><td>owned by the membership or by a service account; deprovisioning disables personal keys; a deny-list in the cache for the rest</td><td>seconds (cache TTL)</td></tr>
+      <tr><td>OAuth grants</td><td>grant rows tied to the membership; deleted on deprovision; third-party refresh fails</td><td>up to one access-token lifetime, unless the API also checks grant status on each call</td></tr>
+      <tr><td>Long-running connections (WebSocket, SSE)</td><td>subscribe to a revocation channel and close; re-authorize every N minutes</td><td>seconds</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>The trigger.</strong> Three sources: the SCIM deactivate (stage 3, possibly delayed by the IdP), an admin's click, and the app's own periodic check that the IdP still considers the user active (SSO re-authentication every 8 to 12 hours forces the IdP to say no). Use a <strong>single "revoke subject" function</strong> that all three call, so no path forgets a credential type.</li>
+    <li><strong>Session policy.</strong> Idle timeout (30 minutes for sensitive tenants), absolute lifetime (12 hours), re-authentication for high-risk actions (changing SSO settings, exporting data), and a list of active sessions with device and IP for users and admins. Rotate the session id on login and privilege change.</li>
+    <li><strong>Why not only JWTs?</strong> If the browser session is a self-contained JWT, a deprovisioned user keeps access until it expires. Either keep sessions server-side or keep JWT lifetimes to minutes and check a revocation list.</li>
+    <li><strong>The IdP's own logout.</strong> OIDC back-channel logout (a signed logout token the IdP posts to the app) and SAML single logout exist, but they are best-effort; do not make them the only control.</li>
+    <li><strong>Test it.</strong> A scheduled synthetic offboarding in staging: create a user, log in on three clients, deprovision, and measure how long each remains valid. The measured number is your SLO.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">9</span>The customer-exportable audit log</h2>
+<p class="stage-q">What events do you record, with which fields, how do you keep them trustworthy, and how does a customer get them into their own SIEM? What must never be in the log?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>An audit log answers "who did what to which object, when, from where, and was it allowed?" (<a href="../chapters/18-detection-response.html">chapter 18</a>).</p>
+<pre class="terminal" data-title="audit event (illustrative)"><code>{
+  "id": "evt_01J...", "ts": "2026-03-04T14:07:31.482Z", "tenant_id": "t_acme",
+  "actor": {"type": "user", "id": "u_mira", "via": "support:jlee"},   // via set when impersonated
+  "action": "project.share", "outcome": "allowed",
+  "target": {"type": "project", "id": "p_9981"},
+  "details": {"grantee": "guest:partner@vendor.example", "role": "viewer"},
+  "client": {"ip": "203.0.113.9", "ua_hash": "7c1e9a", "session": "s_4f2", "auth": "sso+mfa"},
+  "request_id": "r-8f31c2"
+}</code></pre>
+  <ul>
+    <li><strong>What to record.</strong> Sign-ins (success and failure), SSO and SCIM configuration changes, role and membership changes, shares and unshares, API key and OAuth grant creation and use of privileged scopes, exports, impersonation start and end, deprovisioning, and <em>denied</em> authorization decisions on sensitive objects. Not every read: a policy for which reads are audited keeps volume sane.</li>
+    <li><strong>Never log</strong> passwords, tokens, API key values, SCIM tokens or document contents; record ids and hashes instead (<a href="../../reliability/chapters/05-logs-events.html">reliability chapter 5</a> on PII in logs).</li>
+    <li><strong>Trustworthy.</strong> Append-only table or a write-once store, written in the same transaction as the change when correctness matters; separate from application logs; retention that survives account deletion for the contractual period. For tamper evidence, chain each event's hash to the previous one per tenant and publish the head hash periodically.</li>
+    <li><strong>Customer access.</strong> A searchable UI for admins with filters (actor, action, date), a paginated <code>GET /audit-events</code> API using a cursor, a bulk export to JSON lines or CSV through an asynchronous job writing to a short-lived signed URL, and a streaming option (push to the customer's SIEM or storage bucket). Export is itself an audited, admin-only action, and the tenant filter is enforced exactly as in stage 7.</li>
+    <li><strong>Size (assumed).</strong> 5,000 audit events per tenant per day × 1,000 tenants × 1 KB is about 5 GB per day. Partition by tenant and month; keep 90 days hot, the rest in cheaper storage.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">10</span>Threats and mitigations</h2>
+<p class="stage-q">Step back and apply STRIDE (<a href="../chapters/01-threat-modeling.html">chapter 1</a>) to the design. List the five threats you worry about most, say what stops each, and what remains.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <table>
+    <thead><tr><th>Threat (STRIDE)</th><th>How it happens</th><th>Mitigation in this design</th><th>Residual risk</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Cross-tenant data access</strong> (information disclosure)</td><td>missing tenant filter, id guessing, shared cache key</td><td>derived tenant context, RLS, composite foreign keys, cross-tenant CI tests (stage 7), 404 on foreign ids</td><td>logic bugs outside the covered paths; privileged jobs</td></tr>
+      <tr><td><strong>Domain squatting or IdP confusion</strong> (spoofing)</td><td>hostile tenant claims another company's domain or sends a token from a different IdP</td><td>DNS-proven domain ownership, per-connection pinned issuer and keys, identity = (iss, sub), no email-based linking (stages 1, 2)</td><td>a customer's own IdP is compromised: their problem, but audit shows it</td></tr>
+      <tr><td><strong>Compromised support account</strong> (elevation of privilege)</td><td>phished engineer reads customer data</td><td>consent grants, scoped read-only sessions, banner and email, forbidden actions, break-glass with two approvers (stage 6)</td><td>insider with an active grant sees that tenant's data</td></tr>
+      <tr><td><strong>Stolen long-lived credential</strong> (spoofing)</td><td>API key in a public repository; refresh token theft</td><td>prefixed keys for scanner detection, hashed storage, scopes, rotation with reuse detection, last-used alerts (stages 5, 8)</td><td>window between leak and detection</td></tr>
+      <tr><td><strong>Slow offboarding</strong> (elevation of privilege)</td><td>SCIM lag, long JWTs, forgotten token type</td><td>single revoke-subject function, server sessions, short tokens, periodic IdP re-authentication, measured delay (stage 8)</td><td>seconds to minutes by design</td></tr>
+      <tr><td><strong>Audit tampering or gaps</strong> (repudiation)</td><td>admin or attacker deletes evidence; events not written on error paths</td><td>append-only, same-transaction writes, hash chain, separate store, export to the customer's own SIEM (stage 9)</td><td>an attacker with database superuser can still rewrite; the exported copy is the check</td></tr>
+      <tr><td><strong>SCIM abuse</strong> (tampering)</td><td>leaked SCIM token creates admins or deactivates everyone</td><td>tenant-bound token, no owner mapping, rate limits, bulk-change alerts (stage 3)</td><td>mass deactivation is a denial of service within one tenant</td></tr>
+    </tbody>
+  </table>
+  <p>Rank by impact: cross-tenant disclosure sits at the top because it harms every customer at once and is a contractual and reputational event, which is why the design enforces it in four independent layers.</p>
+</details>
+</section>
+
+<h2>Self-check rubric</h2>
+<p>Tick what your own design (before reading the answers) covered. An experienced engineer would hit most of these.</p>
+<ul class="rubric">
+  <li>Separated <strong>user, tenant and membership</strong>, and keyed identity on (issuer, subject) rather than email.</li>
+  <li>Described the <strong>SSO flow</strong> with state, nonce, PKCE and validation of issuer, audience, expiry and signature, per tenant connection.</li>
+  <li>Required <strong>DNS-proven domain verification</strong> before binding a domain or auto-joining.</li>
+  <li>Used <strong>SCIM (RFC 7643 schema, RFC 7644 protocol)</strong> with a tenant-bound token, group-to-role mapping that cannot grant owner, and deprovisioning that revokes credentials.</li>
+  <li>Combined <strong>roles and relationship-based sharing</strong>, with a tenant-boundary check on every request.</li>
+  <li>Handled <strong>list endpoints and object-level checks</strong> rather than only single-object reads.</li>
+  <li>Offered <strong>API keys (hashed, prefixed, service accounts) and OAuth apps</strong> with scopes as a ceiling.</li>
+  <li>Designed <strong>impersonation</strong> with customer consent, time limit, restricted actions, a visible banner and a distinct actor/subject record.</li>
+  <li>Enforced <strong>tenant isolation in more than one layer</strong> (context, row-level security, composite keys, tests).</li>
+  <li>Listed where isolation leaks anyway: caches, jobs, search, exports, connection state.</li>
+  <li>Set an <strong>offboarding time target</strong> and cut off sessions, tokens, keys, grants and long connections through one revoke function.</li>
+  <li>Specified <strong>audit events</strong>, their fields, what must not be logged, tamper evidence and customer export.</li>
+  <li>Produced a <strong>ranked threat list</strong> with mitigations and residual risk.</li>
+</ul>
+<p class="studio-status" id="studio-status"></p>
+
+<h2>Saying it in an interview</h2>
+<div class="callout mentor">
+  <p class="callout-title">How a senior engineer would summarise this</p>
+  <p>"I'd model tenant, user and membership separately and key identity on issuer plus subject, never email. Each tenant brings its own OIDC or SAML connection; I pick it from a DNS-verified domain, validate issuer, audience, nonce and signature against that connection, then issue my own server-side session. SCIM, RFC 7643 and 7644, handles lifecycle with a tenant-bound token; deactivation calls one revoke-subject function that kills sessions, keys and grants. Authorization is roles plus relationship tuples for project sharing, checked in one place, always starting with the tenant boundary. Tenant isolation is enforced in the application context, in Postgres row-level security and in composite foreign keys, and tested with cross-tenant calls in CI. Support impersonation is consented, scoped, time-boxed, read-only by default and recorded with both actor and subject. The audit log is append-only and exportable to the customer's SIEM. The measured offboarding delay is the SLO."</p>
+  <p>Notice the shape: <strong>identity model → login → provisioning → authorization → machine credentials → privileged access → isolation → revocation → audit → threats.</strong></p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Identity is (issuer, subject) inside a tenant; email is an attribute, not a key.</li>
+    <li>Prove domain ownership before trusting a domain, and pin issuer and keys per tenant connection.</li>
+    <li>SCIM (RFC 7643, 7644) is lifecycle automation; deprovisioning must revoke every credential type.</li>
+    <li>Roles and ReBAC work together; scopes limit but never grant.</li>
+    <li>Impersonation needs consent, limits, visibility and a separate emergency path.</li>
+    <li>Enforce tenant isolation in layers and test it adversarially.</li>
+    <li>Choose an offboarding time target and measure it.</li>
+    <li>An exportable, append-only audit log is a product feature and a security control.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/studio.js"></script>
+</body>
+</html>

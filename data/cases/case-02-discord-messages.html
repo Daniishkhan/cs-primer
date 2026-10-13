@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storing Trillions of Messages: Discord · Data Systems</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="data" data-case="C2">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Storing Trillions of Messages: Discord</h1>
+  <p class="lede">Discord has written about its message store twice, six years apart. The first post is about a young company choosing a database and a partition key. The second is about what that choice looked like at trillions of messages: hot partitions, compaction debt, and a new layer in front of the database. Read together they show how one data model is stretched, patched and finally moved.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">The pattern in one sentence</p>
+  <p><strong>The partition key decides where your load lands:</strong> choose it so that data and traffic spread evenly and a read touches few partitions, then expect a few keys to be much hotter than the rest, and plan to shield the database from them.</p>
+</div>
+
+<h2>The cast</h2>
+
+<p>The ideas come from <a href="../chapters/05-lsm-trees.html">chapter 5</a> (how write-optimised stores keep data), <a href="../chapters/16-sharding.html">chapter 16</a> (shard keys and hot keys) and <a href="../chapters/14-caching.html">chapter 14</a> (stampedes). The facts below are from Discord's two posts.</p>
+
+<dl class="terms">
+  <dt>MongoDB (2015 to 2017)</dt><dd>Discord's first version was built in just under two months in early 2015, and its messages lived in a single MongoDB replica set with a compound index on channel and creation time.</dd>
+  <dt>Cassandra</dt><dd>The database that replaced MongoDB. Discord describes it as a store where the <span class="term">partition key</span> decides which nodes hold a row and a <span class="term">clustering key</span> orders rows within a partition. Discord's 2017 cluster was 12 nodes; by the start of 2022 the messages cluster had grown to 177 nodes and trillions of messages.</dd>
+  <dt>Snowflake IDs</dt><dd>Chronologically sortable message ids, so sorting by id sorts by time. They replaced a separate timestamp in the key.</dd>
+  <dt>ScyllaDB</dt><dd>A Cassandra-compatible database written in C++, so it has no garbage collector. The destination of the 2022 migration.</dd>
+  <dt>Data services</dt><dd>Rust services between Discord's API monolith and the database clusters, roughly one gRPC endpoint per query and no business logic.</dd>
+</dl>
+
+<h2>Chapter one: from MongoDB to Cassandra (2017)</h2>
+
+<p>Discord decided early to keep all chat history. The 2017 post says message volume went from 40 million a day in July 2016 to 100 million in December 2016, and was "well past 120 million" at the time of writing. Around November 2015, with about 100 million stored messages, the data and index no longer fit in RAM and latency became unpredictable. The reads were highly random, with a read/write ratio of about 50/50. The post says that just returning 50 messages can cause many random disk seeks and disk cache evictions. The post lists what the team wanted: linear scalability, automatic failover, low maintenance, proven technology, predictable performance, and open source. Cassandra was the only option they judged to meet all of them.</p>
+
+<h3>The key, in two versions</h3>
+
+<p>The first Cassandra key was <code>(channel_id, message_id)</code>: all of a channel's messages in one partition, sorted by id. That gives the read pattern the product needs (the newest messages in a channel, in order, from one place). The team then ran into partition size. During the data import they saw warnings for partitions over 100 MB. Cassandra supports partitions up to 2 GB, but the post says large partitions put heavy garbage-collection pressure on the system during compaction and cluster expansion, and cannot be spread across the cluster.</p>
+
+<p>The fix was a time bucket of about 10 days, sized so that the largest channels stay under 100 MB. The final key is <code>((channel_id, bucket), message_id)</code>, where the inner parentheses name the partition key. To load recent messages the code starts at the current bucket and walks backward, querying one partition at a time until it has enough.</p>
+
+<div class="widget stepper" data-autoplay-ms="4000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One channel, three ways to cut it</h4></div>
+  <svg viewBox="0 0 760 250" role="img" aria-label="A channel's messages from oldest to newest. First as one huge partition, then split into six ten-day buckets, then a read that walks backward from the newest bucket.">
+    <defs>
+      <marker id="ahDC2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="40" y="30" class="t-xs t-muted">older</text>
+    <text x="720" y="30" text-anchor="end" class="t-xs t-muted">newer</text>
+    <!-- step 1 -->
+    <g data-steps="1"><rect x="40" y="46" width="680" height="54" rx="8" class="fs-red s-red sw-2"/>
+      <text x="380" y="78" text-anchor="middle" class="t-sm t-bold tc-red">one partition: channel 42, all of its history</text>
+      <text x="380" y="140" text-anchor="middle" class="t-sm tc-red">It only ever grows. Large partitions strain GC during compaction and expansion.</text></g>
+    <!-- buckets -->
+    <g data-steps="2-">
+      <rect x="40" y="46" width="106" height="54" rx="8" class="box"/>
+      <rect x="153" y="46" width="106" height="54" rx="8" class="box"/>
+      <rect x="266" y="46" width="106" height="54" rx="8" class="box"/>
+      <rect x="379" y="46" width="106" height="54" rx="8" class="box"/>
+    </g>
+    <g data-steps="2-3">
+      <rect x="492" y="46" width="106" height="54" rx="8" class="box"/>
+      <rect x="605" y="46" width="106" height="54" rx="8" class="box"/>
+    </g>
+    <g data-steps="3"><rect x="492" y="46" width="106" height="54" rx="8" class="fs-yellow s-yellow sw-2"/>
+      <rect x="605" y="46" width="106" height="54" rx="8" class="fs-yellow s-yellow sw-2"/></g>
+    <g data-steps="2-">
+      <text x="93" y="78" text-anchor="middle" class="t-sm t-bold">bucket 0</text>
+      <text x="206" y="78" text-anchor="middle" class="t-sm t-bold">bucket 1</text>
+      <text x="319" y="78" text-anchor="middle" class="t-sm t-bold">bucket 2</text>
+      <text x="432" y="78" text-anchor="middle" class="t-sm t-bold">bucket 3</text>
+      <text x="545" y="78" text-anchor="middle" class="t-sm t-bold">bucket 4</text>
+      <text x="658" y="78" text-anchor="middle" class="t-sm t-bold">bucket 5</text></g>
+    <g data-steps="2"><text x="380" y="140" text-anchor="middle" class="t-sm">Each (channel, bucket) pair is its own partition, about 10 days wide.</text>
+      <text x="380" y="162" text-anchor="middle" class="t-sm t-muted">Different buckets can live on different nodes, and each stays bounded in size.</text></g>
+    <g data-steps="3" data-active="3"><line x1="700" y1="130" x2="500" y2="130" class="line s-orange" marker-end="url(#ahDC2a)"/>
+      <text x="600" y="152" text-anchor="middle" class="t-sm t-bold tc-orange">start at the newest bucket</text>
+      <line x1="480" y1="130" x2="300" y2="130" class="line-dash s-orange" marker-end="url(#ahDC2a)"/>
+      <text x="390" y="152" text-anchor="middle" class="t-sm tc-orange">...and keep going back</text>
+      <text x="380" y="200" text-anchor="middle" class="t-sm">Busy channels finish in one or two queries. Quiet channels may need many.</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Partition key = channel.</strong> Every message for the channel in one partition, ordered by Snowflake id. Good for reads; bad when a partition keeps growing.</li>
+    <li><strong>Add a time bucket.</strong> Splitting by roughly 10 days keeps the largest channels' partitions under about 100 MB, and lets a channel's history spread over many nodes.</li>
+    <li><strong>The read path.</strong> Start at the current bucket, query it, and step back one bucket at a time until you have enough messages. The post notes that rarely active channels need more bucket queries and the team judged that acceptable.</li>
+  </ol>
+</div>
+
+<h3>What Cassandra's design cost them</h3>
+
+<p>The 2017 post is candid about two consequences. First, Cassandra is an AP system, and all writes behave as upserts with last-write-wins per column. An edit racing a delete could leave a row holding only its primary key and text; the team chose to detect such rows by a missing <code>author_id</code> and delete them rather than rewrite whole messages, which could resurrect deleted ones. Second, deletes leave tombstones, which persist for 10 days by default, and writing nulls creates them too. The schema has 16 columns but an average message sets 4, so about 12 tombstones were written needlessly until they changed to write only non-null values.</p>
+
+<p>Six months after the move away from MongoDB, Cassandra became unresponsive with repeated 10-second stop-the-world garbage-collection pauses. The cause was a public server whose channel took 20 seconds to load: its users had deleted millions of messages, leaving one, and Cassandra had to scan millions of tombstones to reach it. The fixes were to cut the tombstone lifetime from 10 days to 2 (relying on nightly repairs) and to have the query code remember empty buckets so later queries skip them.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "a good key means no hot spots"</p>
+  <p>The 2017 key spreads data well, and the post reports writes under 1 ms and reads under 5 ms in testing. The 2017 post notes that large public servers mostly request recent messages, so some channels are read far more than others, and the 2023 post later describes hot partitions. A key can balance <em>storage</em> and still concentrate <em>traffic</em>.</p>
+</div>
+
+<h2>Chapter two: trillions of messages (2023)</h2>
+
+<p>The 2023 post, by Bo Ingram, describes the same schema, now at trillions of messages. Messages are partitioned by channel and a static time-window bucket, each partition replicated on three nodes (or whatever replication factor is configured). By the beginning of 2022 the cluster had 177 nodes. The problems the post lists:</p>
+
+<ul>
+  <li><strong>Hot partitions.</strong> Heavy concurrent reads on one channel and bucket slow the node serving it. Because reads and writes use quorum consistency, the slowdown spreads to other queries and users.</li>
+  <li><strong>Compaction.</strong> The team fell behind on compactions, which made reads more expensive. Their workaround was a manual "gossip dance": take a node out of rotation, let it compact, put it back.</li>
+  <li><strong>Garbage collection.</strong> GC pauses caused latency spikes, and some long pauses needed operators to reboot nodes by hand.</li>
+  <li><strong>On-call toil.</strong> Frequent pages, unpredictable latency, and maintenance dropped because it was too costly.</li>
+</ul>
+
+<p>The two ideas that follow are separable. One is a layer in front of the database; the other is a different database.</p>
+
+<h3>Shield the hot partition: data services</h3>
+
+<p>Before moving databases, Discord built the data services layer in Rust. Its key feature is <span class="term">request coalescing</span>: when several users ask for the same row at once, the service queries the database once. The first request starts a worker task, and later requests subscribe to it. The second feature is consistent hash routing: requests are routed by key (for messages, the channel id), so all requests for one channel reach the same service instance, which makes coalescing more effective. The post says these changes reduced traffic spikes but did not eliminate hot partitions on Cassandra.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Three API requests for the same channel are routed to one data service instance, which sends a single query to the database.">
+    <defs>
+      <marker id="ahDC2b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="40" width="110" height="40" rx="8" class="fs-pink s-pink sw-2"/>
+    <text x="75" y="65" text-anchor="middle" class="t-sm t-bold t-dark">request A</text>
+    <rect x="20" y="100" width="110" height="40" rx="8" class="fs-pink s-pink sw-2"/>
+    <text x="75" y="125" text-anchor="middle" class="t-sm t-bold t-dark">request B</text>
+    <rect x="20" y="160" width="110" height="40" rx="8" class="fs-pink s-pink sw-2"/>
+    <text x="75" y="185" text-anchor="middle" class="t-sm t-bold t-dark">request C</text>
+    <rect x="270" y="50" width="220" height="140" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="380" y="82" text-anchor="middle" class="t-sm t-bold">data service instance</text>
+    <text x="380" y="110" text-anchor="middle" class="t-xs">routed by channel id</text>
+    <text x="380" y="130" text-anchor="middle" class="t-xs">same row, same moment:</text>
+    <text x="380" y="150" text-anchor="middle" class="t-xs">first starts a task, others wait</text>
+    <rect x="600" y="70" width="140" height="100" rx="10" class="box"/>
+    <text x="670" y="115" text-anchor="middle" class="t-sm t-bold">Cassandra /</text>
+    <text x="670" y="135" text-anchor="middle" class="t-sm t-bold">ScyllaDB</text>
+    <line x1="132" y1="62" x2="268" y2="105" class="line" marker-end="url(#ahDC2b)"/>
+    <line x1="132" y1="120" x2="268" y2="120" class="line" marker-end="url(#ahDC2b)"/>
+    <line x1="132" y1="178" x2="268" y2="135" class="line" marker-end="url(#ahDC2b)"/>
+    <line x1="492" y1="120" x2="598" y2="120" class="line s-orange" marker-end="url(#ahDC2b)"/>
+    <text x="545" y="108" text-anchor="middle" class="t-xs t-bold tc-orange">1 query</text>
+    <text x="380" y="232" text-anchor="middle" class="t-sm">Many identical reads in, one read out.</text>
+  </svg>
+  <figcaption>Request coalescing in the data services layer, as described in the 2023 post. This is the single-flight idea from the stampede section of chapter 14, applied in front of a database.</figcaption>
+</figure>
+
+<h3>Change the engine: ScyllaDB</h3>
+
+<p>By 2020 every other Discord database had moved to ScyllaDB; the messages cluster waited because of its size and the team's wish for more production experience. ScyllaDB's team improved reverse-query performance, which the post says removed the last blocker. The migration worked like this:</p>
+
+<ul>
+  <li>The new cluster used a "super-disk" topology: local SSDs mirrored with RAID onto a persistent disk.</li>
+  <li>New data was dual-written to both databases. The off-the-shelf Spark-based migrator was estimated at three months.</li>
+  <li>The team extended its Rust data-service library into a migrator that reads token ranges and checkpoints progress in SQLite. The new estimate was nine days, so they migrated everything in one pass rather than cutting over by time period.</li>
+  <li>It ran at up to 3.2 million messages per second and stalled at 99.9999% because a few token ranges held many uncompacted tombstones. Compacting those ranges finished the job.</li>
+  <li>Validation sent a small percentage of reads to both databases and compared results. Discord switched the messages database over in May 2022; the post names "no downtime" as a requirement but does not separately report the outcome.</li>
+</ul>
+
+<p>A section headed "Several Months Later" reports 72 ScyllaDB nodes where there had been 177 Cassandra nodes, with disk per node rising from an average of 4 TB to 9 TB. Historical message fetch p99 latency dropped from 40 to 125 ms to 15 ms, and message insert p99 from 5 to 70 ms to a steady 5 ms. The post says the system stayed stable through the December 2022 World Cup final.</p>
+
+<h2>The pattern: partition for balance, then protect against skew</h2>
+
+<p>Three general ideas sit under this story. <em>These are general patterns, not claims the posts make in these words.</em></p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the library with a bookshelf per author and year</p>
+  <p>Imagine a library that shelves each popular author's works on a single shelf. As the author keeps writing, the shelf overflows, and the shelf's shelver is the only person who can reach it. So you re-shelve by author <em>and</em> decade: no shelf gets enormous, and several staff can work different decades at once. But when a new bestseller is announced, everyone queues at the same decade shelf anyway. A front-desk clerk who fetches the book once and lends the same copy around to everyone waiting is request coalescing.</p>
+  <p><em>Where it breaks down:</em> in a database the front desk must keep the copy correct while others are changing it; the posts describe coalescing for reads of the same row at the same moment.</p>
+</div>
+
+<div class="cols">
+  <div class="card accent-purple"><h4>Time-bucketing bounds partitions</h4><p>Adding a time component to a key stops any one logical group from growing without limit. The cost is a read that may span several partitions, here a walk backward through buckets.</p></div>
+  <div class="card accent-red"><h4>Deletes are writes</h4><p><em>General pattern:</em> stores in the LSM family (<a href="../chapters/05-lsm-trees.html">chapter 5</a>) record a delete as a marker that must be scanned and later compacted away. The 2017 post shows tombstones causing an outage, and the 2023 post shows them stalling the last token ranges of the migration.</p></div>
+  <div class="card accent-orange"><h4>A garbage collector is part of your latency</h4><p>Both posts tie latency spikes to GC pauses. The 2023 post names a runtime without a garbage collector as one reason for ScyllaDB.</p></div>
+  <div class="card accent-green"><h4>Protect the database from your own hot keys</h4><p>Coalescing and key-based routing reduced load without changing the schema, a cheaper step than a migration. The post says it did not remove hot partitions entirely.</p></div>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">What the posts do not tell us</p>
+  <p>The 2017 post does not use the phrase "hot partition"; its concerns were large partitions and tombstone scans. Neither post gives per-node request rates, and the 2023 post's latency figures are from several months after the switch, not a controlled benchmark. Treat the numbers as Discord's measurements of Discord's workload.</p>
+</div>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Buckets and coalescing, in Python and SQLite</p>
+  <p>This script uses an in-memory SQLite table to mimic the key <code>(channel, bucket, message_id)</code>, fills a busy and a quiet channel, shows the partition sizes, walks buckets backward, and then compares 100 concurrent reads with and without coalescing. It writes nothing to disk. The data is random (seeded), so your row counts match mine only if you keep the seed.</p>
+</div>
+
+<pre class="terminal" data-title="python3 buckets.py"><code><span class="cmd">import sqlite3, random, threading, time
+random.seed(7)
+DAY = 86400
+BUCKET = 10 * DAY                       # a 10-day window, as in the 2017 post
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE messages (channel_id INT, bucket INT, message_id INT, text TEXT,"
+           " PRIMARY KEY (channel_id, bucket, message_id))")
+seq = 0
+def put(ch, ts):                        # message_id: a sortable number, time first (like a Snowflake)
+    global seq; seq += 1
+    db.execute("INSERT INTO messages VALUES (?,?,?,?)", (ch, ts // BUCKET, ts * 1000 + seq % 1000, "hi"))
+busy, quiet = 1, 2
+for _ in range(5000): put(busy, random.randrange(0, 60 * DAY))   # busy: 5000 msgs over 60 days
+for ts in (3 * DAY, 55 * DAY): put(quiet, ts)                    # quiet: 2 msgs
+print("rows per partition (channel, bucket) for the busy channel:")
+for b, n in db.execute("SELECT bucket, COUNT(*) FROM messages WHERE channel_id=? GROUP BY bucket", (busy,)):
+    print(f"  bucket {b}: {n}")
+print("without buckets, the busy channel would be ONE partition of",
+      db.execute("SELECT COUNT(*) FROM messages WHERE channel_id=?", (busy,)).fetchone()[0], "rows")
+
+def latest(ch, want, now_bucket):       # walk buckets backward until we have enough
+    got, queries = [], 0
+    for b in range(now_bucket, -1, -1):
+        queries += 1
+        got += [r[0] for r in db.execute(
+            "SELECT message_id FROM messages WHERE channel_id=? AND bucket=? ORDER BY message_id DESC LIMIT ?",
+            (ch, b, want - len(got)))]
+        if len(got) &gt;= want: break
+    return got, queries
+print("busy  channel, last 50 messages -> bucket queries:", latest(busy, 50, 6)[1])
+print("quiet channel, last 2 messages  -> bucket queries:", latest(quiet, 2, 6)[1])
+
+# request coalescing: many concurrent readers of one key, one database query
+calls = {"db": 0}; inflight = {}; lock = threading.Lock()
+def slow_db(key):
+    calls["db"] += 1; time.sleep(0.2); return f"value-of-{key}"
+def get(key, coalesce):
+    if not coalesce: return slow_db(key)
+    with lock:
+        ev = inflight.get(key)
+        leader = ev is None
+        if leader: ev = inflight[key] = {"done": threading.Event(), "v": None}
+    if leader:
+        ev["v"] = slow_db(key); ev["done"].set()
+        with lock: del inflight[key]
+    else: ev["done"].wait()
+    return ev["v"]
+for coalesce in (False, True):
+    calls["db"] = 0
+    ts = [threading.Thread(target=get, args=("chan-1", coalesce)) for _ in range(100)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    print(f"100 concurrent reads, coalescing={coalesce}: database queries = {calls['db']}")</span></code></pre>
+
+<p>Output when run:</p>
+
+<pre class="terminal" data-title="output"><code>rows per partition (channel, bucket) for the busy channel:
+  bucket 0: 890
+  bucket 1: 846
+  bucket 2: 836
+  bucket 3: 855
+  bucket 4: 792
+  bucket 5: 781
+without buckets, the busy channel would be ONE partition of 5000 rows
+busy  channel, last 50 messages -> bucket queries: 2
+quiet channel, last 2 messages  -> bucket queries: 7
+100 concurrent reads, coalescing=False: database queries = 100
+100 concurrent reads, coalescing=True: database queries = 1</code></pre>
+
+<p>Two things to notice. The busy channel's first query (bucket 6, "now") found nothing, so even it took two queries; the quiet channel had to scan seven. That is the trade-off the 2017 post accepted. And the coalesced run is a miniature of the 2023 data services: it collapses a thundering herd into one query. (The timing is a simple 0.2-second sleep standing in for the database, so the counts, not the speed, are the point. In a real system the waiting readers also need a plan for the leader failing.)</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>The shard key chapter (<a href="../chapters/16-sharding.html">chapter 16</a>) says to choose a key that spreads data and queries evenly, and warns about hot keys. Discord's story is that advice applied twice: first to bound partition <em>size</em> (the time bucket), then to blunt a skewed <em>access</em> pattern (coalescing and key-aware routing). The coalescing is the same idea as the single-flight defence in <a href="../chapters/14-caching.html">chapter 14</a>'s stampede section, placed in a service rather than a cache. And the migration, with dual writes, a checkpointed backfill and sampled comparison of reads, is a pattern you will meet again in the <a href="case-07-stripe-migrations.html">online migrations case on Stripe</a>.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Discord's 2017 key, <code>((channel_id, bucket), message_id)</code>, bounded partitions to roughly 100 MB with 10-day buckets, at the price of reads that may walk several buckets.</li>
+    <li>Tombstones from deleted messages caused an incident about six months after the move off MongoDB: a channel with millions of deletions forced scans over millions of markers.</li>
+    <li>By 2022, 177 Cassandra nodes were fighting hot partitions, compaction debt, GC pauses and on-call load.</li>
+    <li>Data services with request coalescing and channel-based routing reduced load spikes; ScyllaDB then reduced the cluster to 72 nodes with lower reported p99 latencies.</li>
+    <li>A migration is dual writes, a fast checkpointed backfill, and validation by comparing reads.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why did Discord add a time bucket to the partition key?</p>
+    <ol class="q-options">
+      <li>To make timestamps unique</li>
+      <li>To avoid using Snowflake ids</li>
+      <li>To keep any single channel's partition below roughly 100 MB, since large partitions strain GC during compaction and expansion</li>
+      <li>Because Cassandra cannot sort data</li>
+    </ol>
+    <div class="q-explain">The 2017 post sized 10-day buckets so the largest channels stay under 100 MB. Without buckets a channel's partition only grows.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">What does request coalescing do?</p>
+    <ol class="q-options">
+      <li>When many requests want the same row at once, the service queries the database once and shares the result</li>
+      <li>It merges two different databases</li>
+      <li>It compresses messages on disk</li>
+      <li>It splits one request into many to run in parallel</li>
+    </ol>
+    <div class="q-explain">The first request starts a worker task and later ones subscribe to it, so a hot row costs one database query.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">What does the cost of the bucketed key look like on the read side?</p>
+    <ol class="q-options">
+      <li>Reads can never be ordered</li>
+      <li>Every read must scan all buckets of all channels</li>
+      <li>Reads need a separate cache layer</li>
+      <li>Rarely active channels may need to query several buckets to fill a page of messages</li>
+    </ol>
+    <div class="q-explain">The read path walks back from the newest bucket until it has enough messages, so quiet channels take more partition queries. Discord judged this acceptable, and also tracked empty buckets so later queries skip them.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Which of these is stated as a reason for the 2022 migration in Discord's 2023 post?</p>
+    <ol class="q-options">
+      <li>MongoDB had become too slow</li>
+      <li>Hot partitions, compaction backlog, GC pauses and on-call burden on a 177-node Cassandra cluster</li>
+      <li>Cassandra could not store trillions of rows</li>
+      <li>A change of cloud vendor</li>
+    </ol>
+    <div class="q-explain">The post lists hot partitions, falling behind on compactions, GC pauses and on-call toil. It does not say Cassandra was unable to store the data.</div>
+  </div>
+</section>
+
+<h2>Sources</h2>
+<ul class="sources">
+  <li>Stanislav Vishnevskiy, Discord Blog, <a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noopener">"How Discord Stores Billions of Messages"</a> (January 2017).</li>
+  <li>Bo Ingram, Discord Blog, <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages" target="_blank" rel="noopener">"How Discord Stores Trillions of Messages"</a> (6 March 2023).</li>
+</ul>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

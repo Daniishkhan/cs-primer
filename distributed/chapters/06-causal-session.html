@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Causal Consistency &amp; Session Guarantees · Distributed Systems, Deep</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dist" data-chapter="06">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Causal Consistency &amp; Session Guarantees</h1>
+  <p class="lede">Linearizability is expensive, and eventual consistency is too weak to program against. In between sits a family of promises that cost almost nothing and remove the most jarring surprises: "you can see your own writes", "time doesn't run backwards for you", and "nobody sees a reply before the thing it replies to". This chapter defines them precisely, shows how real systems implement them with a small token or a few bytes of metadata, and explains why causal consistency is the strongest of them that can keep answering during a network partition.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Most user-visible weirdness in replicated systems is not about two strangers disagreeing. It is about <em>one person</em> seeing the system contradict itself: you post a comment and it vanishes on refresh; a page shows 3 replies, then 2; a reply appears under a post that is not there yet. These bugs are cheap to prevent when you know exactly which guarantee you are missing, and expensive when you reach for "make everything linearizable". Knowing the names, and what each costs, is how you buy back sanity without paying for a majority round trip on every read.</p>
+</div>
+
+<h2>The bargain: no coordination, but not chaos</h2>
+
+<p>You met the top of the <a href="05-consistency-models.html">consistency map</a> in the last chapter: models that make a replicated system look like one copy, at the price of replicas waiting for each other. You also met the bottom, eventual consistency, which makes no promise about <em>what you see in the meantime</em>. This chapter is about the band in between. Its models let each replica answer from its own state, with no round trip to anyone, and still give a coherent picture to each user.</p>
+
+<p>You have seen the idea before: <a href="../../networking/chapters/18-replication.html">networking chapter 18</a> listed the session guarantees and causal consistency in a few lines each. Here we make them precise, say how they are built, and do the one thing that chapter could not: show the mechanism end to end in code.</p>
+
+<h2>Session guarantees (Terry et al., 1994)</h2>
+
+<p>The four guarantees come from the Bayou project at Xerox PARC, in "Session Guarantees for Weakly Consistent Replicated Data" by Douglas Terry and colleagues (1994). Bayou was a database for mobile, often-disconnected devices, where any replica could accept writes and replicas exchanged updates when they met. Reasoning about the global state was hopeless, so the authors asked a smaller question: what does <em>one application</em>, reading and writing through a sequence of replicas, need in order to make sense?</p>
+
+<p>A <span class="term">session</span> is that sequence: the reads and writes issued by one client (a user's browser tab, a mobile app, a request chain), over time, possibly to different replicas. The four guarantees, each stated about one session:</p>
+
+<table>
+  <thead><tr><th>Guarantee</th><th>Says</th><th>Without it you see</th></tr></thead>
+  <tbody>
+    <tr><td><span class="term">Read your writes</span> (RYW)</td><td>A read reflects all writes previously made in this session.</td><td>You save your profile, reload, and the old one is back.</td></tr>
+    <tr><td><span class="term">Monotonic reads</span> (MR)</td><td>If a read saw the effect of a write, later reads in the session also do. Time does not run backwards for you.</td><td>A page shows 5 replies; refresh shows 4; refresh shows 5 again.</td></tr>
+    <tr><td><span class="term">Monotonic writes</span> (MW)</td><td>Writes from one session take effect in the order the session issued them, at every replica.</td><td>You edit a document twice; replicas apply "version 2" and then "version 1", ending with the old text.</td></tr>
+    <tr><td><span class="term">Writes follow reads</span> (WFR)</td><td>A write is applied after the writes whose effects the session had read when it issued it.</td><td>A reply is visible to others while the post it answers is missing.</td></tr>
+  </tbody>
+</table>
+
+<p>Two things to notice. First, all four are <em>per session</em>: nothing here constrains what two different users see, so there is no global order and no waiting for strangers. Second, they are cheap to state as invariants on <em>sets of writes</em>. A session remembers which writes it has made (its <em>write set</em>) and which it has read (its <em>read set</em>), and each guarantee says some replica-side set must contain some session-side set before a request is served. RYW needs the replica's state to include the session's write set at read time. MR needs it to include the read set. MW and WFR are about what must already be present at a replica before a <em>write</em> is applied there.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Space-time diagram with three timelines: a client, a leader replica R1 and a follower replica R2. The client writes x=7 to R1 and gets an acknowledgement with token v7. Asynchronous replication from R1 to R2 is slow. A first read sent to R2 without a token returns the stale value 6, shown in red. A second read carrying token v7 reaches R2 and is held in an orange box until the replication arrives, then returns 7, shown in green.">
+<defs><marker id="ahX06a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="54" class="t-sm t-bold tc-green">client</text>
+<text x="10" y="124" class="t-sm t-bold tc-purple">R1 leader</text>
+<text x="10" y="194" class="t-sm t-bold tc-blue">R2 follower</text>
+<line x1="90" y1="50" x2="745" y2="50" class="line-thin"/><line x1="90" y1="120" x2="745" y2="120" class="line-thin"/><line x1="90" y1="190" x2="745" y2="190" class="line-thin"/>
+<line x1="120" y1="50" x2="180" y2="120" class="line s-blue" marker-end="url(#ahX06a)"/>
+<text x="148" y="92" text-anchor="end" class="t-xs">write x=7</text>
+<line x1="220" y1="120" x2="260" y2="50" class="line s-green" marker-end="url(#ahX06a)"/>
+<text x="238" y="86" text-anchor="end" class="t-xs">ack, token v7</text>
+<line x1="220" y1="120" x2="640" y2="190" class="line-dash s-orange" marker-end="url(#ahX06a)"/>
+<text x="255" y="158" class="t-xs">async replication (slow)</text>
+<line x1="290" y1="50" x2="340" y2="190" class="line s-blue" marker-end="url(#ahX06a)"/>
+<text x="333" y="98" class="t-xs">read x</text>
+<line x1="380" y1="190" x2="420" y2="50" class="line s-red" marker-end="url(#ahX06a)"/>
+<text x="420" y="36" text-anchor="middle" class="t-xs t-bold tc-red">x = 6 (stale!)</text>
+<line x1="520" y1="50" x2="600" y2="190" class="line s-blue" marker-end="url(#ahX06a)"/>
+<text x="578" y="104" class="t-xs">read x, token ≥ v7</text>
+<rect x="600" y="178" width="40" height="24" rx="5" class="fs-orange s-orange sw-2"/>
+<text x="620" y="226" text-anchor="middle" class="t-xs">held until v7 arrives</text>
+<line x1="645" y1="190" x2="710" y2="50" class="line s-green" marker-end="url(#ahX06a)"/>
+<text x="705" y="36" text-anchor="middle" class="t-xs t-bold tc-green">x = 7</text>
+<circle cx="120" cy="50" r="4" class="f-green"/><circle cx="260" cy="50" r="4" class="f-green"/><circle cx="290" cy="50" r="4" class="f-green"/><circle cx="420" cy="50" r="4" class="f-red"/><circle cx="520" cy="50" r="4" class="f-green"/><circle cx="710" cy="50" r="4" class="f-green"/>
+</svg>
+  <figcaption>The same session reading its own write twice. The first read goes to a follower that has not caught up and breaks read-your-writes. The second carries the token the leader returned (<code>v7</code>); the follower holds the request until replication delivers <code>v7</code>, then answers correctly.</figcaption>
+</figure>
+
+<h3>How a system gives you these</h3>
+
+<p>There are two standard mechanisms, and almost every product implementation is one of them or a blend.</p>
+
+<p><strong>Sticky sessions.</strong> Route every request of a session to the same replica (by cookie, connection or hash of the user id). A single replica applies updates in some order and never goes backwards, so reading from one replica is automatically monotonic. If that replica also receives the session's writes, RYW and MW come for free as well, and WFR too. It costs nothing but load-balancer discipline. Its weaknesses: the replica can fail (the session moves, and the guarantee can silently break), load becomes uneven, and many deployments send <em>writes to a leader</em> and <em>reads to a follower</em>, in which case stickiness to the follower gives monotonic reads but not read-your-writes. The experiment below shows this.</p>
+
+<p><strong>Version tokens (client-tracked state).</strong> The client carries a small piece of state: the version it last wrote and last read, in whatever unit the system has (a log position, a timestamp, a vector of counters). Every request includes it ("give me x, but at least as new as v7"). A replica that has applied at least that version answers; one that has not either <em>waits</em> for replication to catch up, <em>redirects</em> to another replica, or falls back to the leader. This is the right-hand half of the diagram. The guarantee now holds across replica changes, and the choice of what to do when behind is a latency policy: waiting for replication keeps load off the leader, redirecting is faster but loads it.</p>
+
+<p>Real systems expose this directly. MongoDB's "causally consistent sessions" (from version 3.6) carry operation and cluster times between operations; Azure Cosmos DB's "session" consistency level uses a session token passed with requests; and with PostgreSQL streaming replication the same pattern is built by hand from write-ahead-log positions (read the leader's position after a write, ask the follower to wait until it has replayed past it). The details differ; the shape is always "token from write or read, checked at the next replica".</p>
+
+<p>Here is a deterministic simulation that measures all of this. A primary commits writes; three followers apply them in order after a random delay of up to 40 ms; each of 300 sessions makes 12 operations (30% writes, which go to the primary, and 70% reads). Three read policies are compared: a random replica per read; sticky (each session reads only from its own follower); and token (pick any replica whose applied version is at least the larger of the session's last write and last read, else ask the primary).</p>
+
+<pre class="terminal" data-title="session.py"><code>import random
+
+N_REPLICAS = 3
+
+def arrival_times(commit_times, rng):
+    """Replica i applies write v at arrival[i][v]; a FIFO channel keeps them in order."""
+    out = []
+    for _ in range(N_REPLICAS):
+        arr, prev = [], 0.0
+        for c in commit_times:
+            prev = max(prev, c + rng.uniform(0, 40))     # 0-40 ms replication lag
+            arr.append(prev)
+        out.append(arr)
+    return out
+
+def applied(arr, t):                                      # newest version a replica has at time t
+    return sum(1 for a in arr if a &lt;= t)
+
+def run(policy: str, seed: int, sessions: int = 300, steps: int = 12):
+    rng = random.Random(seed)
+    ryw = mr = reads = 0
+    for _ in range(sessions):
+        # decide this session's script first: (time, "w" or "r")
+        t, script = 0.0, []
+        for _ in range(steps):
+            t += rng.uniform(1, 25)
+            script.append((t, "w" if rng.random() &lt; 0.3 else "r"))
+        # the primary commits other people's writes too; versions are positions in commit order
+        commits = sorted([(rng.uniform(0, 400), "other") for _ in range(40)] +
+                         [(t, "mine") for t, k in script if k == "w"])
+        times = [c[0] for c in commits]
+        arr = arrival_times(times, rng)
+        my_version = {c[0]: i + 1 for i, c in enumerate(commits) if c[1] == "mine"}
+        home = rng.randrange(N_REPLICAS)                  # sticky: this session's replica
+        my_write = last_read = 0
+        for t, kind in script:
+            if kind == "w":
+                my_write = my_version[t]                  # writes go to the primary
+                continue
+            if policy == "random":
+                v = applied(arr[rng.randrange(N_REPLICAS)], t)
+            elif policy == "sticky":
+                v = applied(arr[home], t)
+            else:                                         # "token": need version &gt;= all this session saw/wrote
+                need = max(my_write, last_read)
+                v = next((applied(arr[r], t) for r in rng.sample(range(N_REPLICAS), N_REPLICAS)
+                          if applied(arr[r], t) &gt;= need), sum(1 for x in times if x &lt;= t))   # else the primary
+            reads += 1
+            ryw += v &lt; my_write
+            mr += v &lt; last_read
+            last_read = max(last_read, v)
+    return reads, ryw, mr
+
+print(f"{'policy':&lt;8} {'reads':&gt;6} {'read-your-writes violations':&gt;28} {'monotonic-reads violations':&gt;27}")
+for p in ("random", "sticky", "token"):
+    reads, ryw, mr = run(p, seed=11)
+    print(f"{p:&lt;8} {reads:&gt;6} {ryw:&gt;28} {mr:&gt;27}")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>policy    reads  read-your-writes violations  monotonic-reads violations
+random     2490                          879                         138
+sticky     2497                          871                           0
+token      2525                            0                           0</code></pre>
+
+<p>Read the table closely. A random replica violates both guarantees often. Sticky reads fix monotonic reads completely (0), as argued, but barely touch read-your-writes (871 violations), because the session's <em>writes</em> go somewhere else. The token policy gives both guarantees, at the price of occasionally asking the primary (that fallback is where its latency goes). The figures come from one seed and a toy lag model, so trust the pattern, not the counts.</p>
+
+<div class="callout warn">
+  <p class="callout-title">A session is not a user</p>
+  <p>The guarantees are per <em>session</em>, and a session lives wherever the token or the cookie lives. If a user writes on their phone and reads on their laptop, those are two sessions unless you deliberately share the token (store it with the account, server-side). Likewise a chain of microservices serving one request is a session only if each hop forwards the token, exactly as it forwards a trace id. Most "read-your-writes" bugs in production are a hop that dropped the token.</p>
+</div>
+
+<h2>Causal consistency</h2>
+
+<p>The session guarantees are about one client. <span class="term">Causal consistency</span> extends the idea to everything one write could have influenced, across all clients. It rests on the happens-before relation from <a href="../../networking/chapters/17-time.html">networking chapter 17</a> (Lamport, 1978). In a data store, write <code>a</code> <span class="term">causally precedes</span> write <code>b</code> if any of these holds:</p>
+
+<ul>
+  <li><strong>Same session:</strong> the same client issued <code>a</code> before <code>b</code> (program order).</li>
+  <li><strong>Reads-from:</strong> some client read the value written by <code>a</code> and later issued <code>b</code>. The value it read may have influenced what it wrote.</li>
+  <li><strong>Transitivity:</strong> <code>a</code> precedes <code>c</code> and <code>c</code> precedes <code>b</code>.</li>
+</ul>
+
+<p>The promise: <strong>if <code>a</code> causally precedes <code>b</code>, no client ever sees the effect of <code>b</code> without also seeing <code>a</code></strong> (at least in the state it reads). Writes that are not related by this order are <span class="term">concurrent</span> and may become visible in different orders at different replicas; that is the freedom that makes causal consistency cheap, and the vector clocks of chapter 17 are the classic way to tell which pair you have.</p>
+
+<p>Notice how the four session guarantees fit: monotonic writes and read-your-writes are about same-session order, monotonic reads and writes-follow-reads are about reads-from. Taken together they amount to causal consistency, which is why the box labelled "causal" sits above all four on the map. (There is a formal statement of this equivalence in the research literature; the intuition is enough here.)</p>
+
+<h3>The classic anomaly: a reply before its post</h3>
+
+<p>Alice posts "I got the job!" in a datacenter in the US. The post replicates to Europe, where Bob sees it and writes "Congratulations!". His comment is a new write that <em>causally depends</em> on the post. Both writes now head to Asia, where the long link delivers the comment first. Under plain eventual consistency, Asia shows a comment with no post. Under causal consistency, the comment must not become visible until the post is.</p>
+
+<div class="widget stepper" data-autoplay-ms="3600">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">A comment overtakes its post</h4></div>
+  <svg viewBox="0 0 760 290" role="img" aria-label="Space-time diagram with three datacenters: US, Europe and Asia. Alice posts in the US. The post reaches Europe, where Bob reads it and comments. The comment reaches Asia before the slower post. Without a dependency check Asia shows the comment alone, marked in red. With a check, Asia holds the comment until the post arrives, and then shows both.">
+    <defs><marker id="ahX06b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="10" y="64" class="t-sm t-bold tc-purple">US</text>
+    <text x="10" y="144" class="t-sm t-bold tc-blue">Europe</text>
+    <text x="10" y="224" class="t-sm t-bold tc-blue">Asia</text>
+    <line x1="70" y1="60" x2="745" y2="60" class="line-thin"/><line x1="70" y1="140" x2="745" y2="140" class="line-thin"/><line x1="70" y1="220" x2="745" y2="220" class="line-thin"/>
+
+    <g data-steps="1-" data-active="1">
+      <circle cx="110" cy="60" r="7" class="f-yellow s-yellow"/>
+      <text x="110" y="42" text-anchor="middle" class="t-xs t-bold">Alice: post P</text>
+    </g>
+    <g data-steps="2-" data-active="2">
+      <line x1="110" y1="60" x2="230" y2="140" class="line s-blue" marker-end="url(#ahX06b)"/>
+      <circle cx="230" cy="140" r="5" class="f-blue"/>
+      <text x="170" y="86" class="t-xs">P replicates</text>
+    </g>
+    <g data-steps="3-" data-active="3">
+      <circle cx="270" cy="140" r="5" class="f-green"/>
+      <circle cx="320" cy="140" r="7" class="f-yellow s-yellow"/>
+      <text x="300" y="162" text-anchor="end" class="t-xs t-bold">Bob reads P, then writes C</text>
+      <text x="300" y="176" text-anchor="end" class="t-xs">(C depends on P)</text>
+    </g>
+    <g data-steps="4-" data-active="4">
+      <line x1="320" y1="140" x2="440" y2="220" class="line s-blue" marker-end="url(#ahX06b)"/>
+      <line x1="110" y1="60" x2="630" y2="220" class="line-dash s-orange" marker-end="url(#ahX06b)"/>
+      <text x="520" y="106" class="t-xs">P is on a slow link</text>
+      <circle cx="440" cy="220" r="5" class="f-blue"/>
+      <text x="440" y="204" text-anchor="middle" class="t-xs">C arrives first</text>
+    </g>
+    <g data-steps="5" data-active="5">
+      <rect x="395" y="236" width="150" height="40" rx="6" class="fs-red s-red sw-2"/>
+      <text x="470" y="252" text-anchor="middle" class="t-xs t-bold">plain eventual: shows</text>
+      <text x="470" y="266" text-anchor="middle" class="t-xs t-bold">comment without post</text>
+      <rect x="560" y="236" width="180" height="40" rx="6" class="fs-green s-green sw-2"/>
+      <text x="650" y="252" text-anchor="middle" class="t-xs t-bold">causal: C is held, its</text>
+      <text x="650" y="266" text-anchor="middle" class="t-xs t-bold">dependency P is missing</text>
+    </g>
+    <g data-steps="6" data-active="6">
+      <circle cx="630" cy="220" r="5" class="f-blue"/>
+      <rect x="560" y="236" width="180" height="40" rx="6" class="fs-green s-green sw-2"/>
+      <text x="650" y="252" text-anchor="middle" class="t-xs t-bold">P arrives; C released:</text>
+      <text x="650" y="266" text-anchor="middle" class="t-xs t-bold">readers see both, in order</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Alice posts P in the US datacenter.</strong> The write is accepted immediately at home; replication to the other datacenters happens in the background.</li>
+    <li><strong>P replicates to Europe.</strong> The European datacenter now has the post. Nobody waited for Asia.</li>
+    <li><strong>Bob reads P, then writes a comment C.</strong> Bob's client library remembers that its context contains P, so C is tagged "depends on P" (it is causally after P: it was written by someone who had read P).</li>
+    <li><strong>C races to Asia, and wins.</strong> The dashed line is P on a slower path (a congested link, a retry, a lagging queue). Asia receives C first. Nothing about the network is broken; this is ordinary reordering.</li>
+    <li><strong>The two behaviours differ here.</strong> With plain eventual consistency Asia applies C on arrival, and a reader sees a comment under no post. A causal store checks C's dependencies, finds P is not visible yet, and holds C back. The comment is still durable at Asia; it just is not exposed yet.</li>
+    <li><strong>P arrives and C is released.</strong> From the first moment a reader in Asia sees C, P is already visible. No coordination with the other datacenters was needed, only the dependency tag and a local check.</li>
+  </ol>
+</div>
+
+<h3>Causal+ and COPS: tracking dependencies</h3>
+
+<p>Plain causal consistency has a loose end: two concurrent writes to the same key. Replica 1 sees A then B and ends with B; replica 2 sees B then A and ends with A. Both orders are causally legal, but the replicas stay different forever. <span class="term">Causal+ consistency</span>, introduced with the COPS system by Wyatt Lloyd, Michael Freedman, Michael Kaminsky and David Andersen (SOSP 2011), adds <em>convergence</em>: replicas must resolve such conflicts the same way (last-writer-wins by timestamp, a merge function, or a CRDT; <a href="15-crdts.html">chapter 15</a>), so they all end in the same state.</p>
+
+<p>COPS is a geo-replicated key-value store: each datacenter holds a full copy, and inside a datacenter the data is partitioned across many nodes. The mechanism is the one in the stepper above, made efficient:</p>
+
+<ul>
+  <li>A <strong>client library</strong> keeps a <em>context</em>: the set of values this client has read or written recently.</li>
+  <li>Each <code>put</code> is sent with its <strong>dependencies</strong> taken from that context. After a <code>put</code>, the new write <em>replaces</em> the context, because it transitively depends on everything before it. That keeps the dependency list small (the paper calls the surviving ones the "nearest" dependencies).</li>
+  <li>The write is applied at the local datacenter right away, then replicated. A <strong>remote datacenter</strong> receiving a write first runs a <em>dependency check</em>: for each dependency, ask the node that owns that key whether that version (or a newer one) is already visible. Only when all are does it make the write visible.</li>
+  <li>COPS-GT adds <em>get transactions</em>: a way to read several keys that is a causally consistent snapshot, since reading them one at a time can show a mix of old and new.</li>
+</ul>
+
+<p>The same mechanism, in 40 lines. A datacenter holds a store and a set of visible write ids; a write is applied when its dependencies are all visible, and drained from a waiting list in a loop, since applying one write may unblock another. With <code>check_deps=False</code> it is plain eventual consistency.</p>
+
+<pre class="terminal" data-title="cops.py"><code>import random
+from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class Write:
+    key: str
+    value: str
+    wid: int                       # unique id of this write
+    deps: frozenset = frozenset()  # ids of writes the writer had seen: its causal past (nearest dependencies)
+
+class Datacenter:
+    def __init__(self, check_deps: bool):
+        self.check_deps, self.visible, self.waiting, self.store = check_deps, set(), [], {}
+    def receive(self, w: Write):
+        self.waiting.append(w)
+        self._drain()
+    def _drain(self):
+        progress = True
+        while progress:
+            progress = False
+            for w in list(self.waiting):
+                if not self.check_deps or w.deps &lt;= self.visible:     # dependency check
+                    self.store[w.key] = w.value
+                    self.visible.add(w.wid)
+                    self.waiting.remove(w)
+                    progress = True
+    def read(self, key):
+        return self.store.get(key)
+
+post    = Write("post:1",    "Alice: I got the job!", wid=1)
+comment = Write("comment:1", "Bob: congratulations!", wid=2, deps=frozenset({1}))   # Bob read the post first
+
+for check in (False, True):
+    eu = Datacenter(check_deps=check)
+    eu.receive(comment)                                  # the network delivers the comment first
+    print(f"dependency check={check!s:&lt;5} after comment arrives: post={eu.read('post:1')!r:&lt;26} comment={eu.read('comment:1')!r}")
+    eu.receive(post)
+    print(f"{'':&lt;22} after post arrives:    post={eu.read('post:1')!r:&lt;26} comment={eu.read('comment:1')!r}")
+
+rng = random.Random(5)
+for check in (False, True):
+    anomalies = 0
+    for i in range(10_000):
+        p = Write(f"p{i}", "post", wid=2 * i)
+        c = Write(f"c{i}", "comment", wid=2 * i + 1, deps=frozenset({2 * i}))
+        dc = Datacenter(check)
+        order = [p, c] if rng.random() &lt; 0.7 else [c, p]       # 30% of the time the network reorders them
+        for w in order:
+            dc.receive(w)
+            if dc.read(f"c{i}") is not None and dc.read(f"p{i}") is None:
+                anomalies += 1                                  # a reader could see the reply without the post
+    print(f"dependency check={check!s:&lt;5}: {anomalies} of 10000 post/comment pairs showed a comment without its post")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>dependency check=False after comment arrives: post=None                       comment='Bob: congratulations!'
+                       after post arrives:    post='Alice: I got the job!'    comment='Bob: congratulations!'
+dependency check=True  after comment arrives: post=None                       comment=None
+                       after post arrives:    post='Alice: I got the job!'    comment='Bob: congratulations!'
+dependency check=False: 3007 of 10000 post/comment pairs showed a comment without its post
+dependency check=True : 0 of 10000 post/comment pairs showed a comment without its post</code></pre>
+
+<p>With the check on, the comment is invisible until the post is, in all 10,000 trials, including the roughly 3,000 where the network reordered them. Later systems in this line (Eiger, Orbe, GentleRain, Cure, and others) change how dependencies are represented, with timestamps or vectors instead of explicit lists, trading metadata size against false waiting. The shared lesson is that causal metadata has a cost of its own: it grows with the amount of concurrency and has to be trimmed. It is cheap compared with coordination, not free.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a conversation by letter</p>
+  <p>Think of the committee that communicates by unreliable post. Two letters from different members may reach the secretary in either order, and that is fine as long as neither refers to the other. But if Bob's letter says "in reply to Alice's letter of the 3rd", a careful secretary will not file Bob's letter in the minutes until Alice's has arrived. The dependency note on the envelope is the causal tag; the secretary's wait is the dependency check.</p>
+  <p><em>Where it breaks down:</em> a secretary knows Alice's letter exists because Bob names it. A replica knows a write is missing only because the dependency tag says so. If a client never read a thing, nothing orders its writes after it, and causal consistency has no opinion, even when real-world causality (Alice phoned Bob) did exist.</p>
+</div>
+
+<h2>The strongest model that never has to wait</h2>
+
+<p>Why is causal consistency a famous landmark rather than just one more point on the map? Because of what it does not need. Every replica can apply a client's write immediately, accept reads from its local state, and ship updates (with their dependency tags) in the background. A write becomes visible at another replica only when its causal past is already there, so the state any replica exposes is always <em>causally closed</em>. During a network partition each side keeps serving, and when the partition heals the two sides exchange what they missed. No client request ever needs a message from another replica to be answered.</p>
+
+<p>Contrast linearizability, which fails this test by the CAP argument: a client on one side cannot learn of a write on the other side. And a formal result says that causal consistency is, in a precise sense, the best you can do without waiting: Prince Mahajan, Lorenzo Alvisi and Mike Dahlin showed in "Consistency, Availability, and Convergence" (2011) that a variant they call real-time causal consistency is the strongest model achievable by a system that is always available and whose replicas converge. Read the slogan as the paper states it: it holds in a specific model of the system and of "availability", and a different model (for example one that lets operations block) yields a different answer. Work on highly available transactions by Peter Bailis and colleagues reaches a consistent picture: read-your-writes and causal consistency require that a client's requests keep reaching replicas that have seen its history ("sticky" availability), while some weaker guarantees need nothing of the kind.</p>
+
+<div class="callout warn">
+  <p class="callout-title">"Available" has a footnote</p>
+  <p>If a client in a partition is bounced to a replica that has not seen its dependencies, a causal system has two options: serve something that breaks causality, or wait. So the practical claim is: causal consistency stays available <em>for clients that stay with replicas that have seen their context</em> (their own datacenter, typically), and it never needs a cross-datacenter round trip. That is a very strong property for a geo-replicated product, and it is the reason COPS and its successors target multi-datacenter deployments. It is not a promise that every client always gets an answer from every replica.</p>
+</div>
+
+<h3>What causal consistency still cannot do</h3>
+
+<p>It is a model of <em>visibility order</em>, not a way to protect an invariant. Two clients who each read a balance of 100 and each withdraw 80, concurrently, are not causally related, so causal consistency lets both succeed and the account goes to -60. The same goes for "usernames must be unique" and "only one holder of this lock". Those need agreement, which is the job of consensus (chapters 8 to 10), or a design that avoids the need (<a href="16-coordination-avoidance.html">chapter 16</a> asks which invariants can survive without coordination). A good rule: causal is a great default for <em>feeds, comments, collaboration, and caches</em>, and the wrong tool for <em>money, uniqueness and mutual exclusion</em>.</p>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Both scripts use only the standard library. Save the listings above as <code>session.py</code> and <code>cops.py</code> and run <code>python3 session.py</code> and <code>python3 cops.py</code>. The numbers should match those shown (the seeds are fixed).</p>
+</div>
+
+<ol>
+  <li>In <code>session.py</code>, change the sticky policy so the session's <em>writes</em> also go to its home replica, which then replicates them to the primary and the others. Does sticky now deliver read-your-writes? What new problem appears if that replica crashes?</li>
+  <li>Make the token policy <em>wait</em> for a lagging replica instead of falling back to the primary. Measure the extra delay (the time until the replica's applied version reaches the token), averaged over reads. Compare with the primary fallback.</li>
+  <li>In <code>cops.py</code>, add a third write: a reply to Bob's comment, depending on the comment only. Verify with the dependency check on that all six delivery orders of the three writes show a consistent picture. Why does the new write not need to list the post as a dependency?</li>
+  <li>Think about it: two datacenters each accept <code>put("title", ...)</code> concurrently. Which causal+ conflict-handling rule would you choose for a document title, and what would you lose?</li>
+</ol>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Session guarantees are what a read replica needs to be usable by humans, and the token pattern shows up everywhere: log positions, hybrid timestamps (<a href="07-time-revisited.html">chapter 7</a>), cluster times. Causal order is the glue of collaborative systems and CRDTs (<a href="15-crdts.html">chapter 15</a>), where operations carry their causal context so that merging can be done in any order, and of the Figma-style editors in <a href="../cases/case-08-figma-multiplayer.html">the Figma case study</a>. Coordination-avoiding designs (<a href="16-coordination-avoidance.html">chapter 16</a>) ask which parts of an application can live at this level and which need the stronger models of chapters 8 to 14.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A session is one client's sequence of operations. The four session guarantees (Terry et al., 1994) are read your writes, monotonic reads, monotonic writes and writes follow reads. Each constrains one session only, so none needs global coordination.</li>
+    <li>Sticky routing gives monotonic reads cheaply, but not read-your-writes when writes go elsewhere. Version tokens, which the client carries and the replica checks, give the guarantees across replica changes, at the cost of waiting, redirecting or asking the leader when a replica is behind.</li>
+    <li>Write <code>a</code> causally precedes <code>b</code> if they are in the same session, if <code>b</code>'s author had read <code>a</code>, or transitively. Causal consistency: no one sees <code>b</code> without <code>a</code>. Concurrent writes may appear in different orders.</li>
+    <li>Causal+ (COPS, 2011) adds convergence for concurrent conflicts. It works by tagging each write with its nearest dependencies and delaying visibility at a replica until those are visible there.</li>
+    <li>Causal consistency is the strongest model that needs no cross-replica wait: replicas answer locally and ship updates later. This is the content of the result by Mahajan, Alvisi and Dahlin (2011), true in their formal model, and it needs clients to stay with replicas that have seen their context.</li>
+    <li>It orders visibility but does not protect invariants such as balances, uniqueness or locks. Those need consensus or a design that avoids the need.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">An app sends all writes to the primary and all reads to a follower chosen by a sticky cookie (the same follower each time). Which guarantee does it get reliably?</p>
+    <ol class="q-options">
+      <li>Read your writes</li>
+      <li>Both read your writes and monotonic reads</li>
+      <li>Monotonic reads, but not read your writes</li>
+      <li>Neither, because followers lag</li>
+    </ol>
+    <div class="q-explain">A single follower applies updates in order and never goes backwards, so reads from it are monotonic. But the user's own write went to the primary and may not have reached that follower yet, so a read can miss it. Tokens, or reading from the primary right after a write, fix that half.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A write is tagged with a token v7 and sent to a follower that has applied only up to v5. Which of these is NOT a reasonable thing for the follower to do?</p>
+    <ol class="q-options">
+      <li>Answer with its current state anyway, since v5 is close enough</li>
+      <li>Wait until replication delivers v7, then answer</li>
+      <li>Redirect the request to a replica that has applied v7</li>
+      <li>Forward the request to the primary</li>
+    </ol>
+    <div class="q-explain">The token exists to make the guarantee hold. Waiting, redirecting and forwarding all keep it (at different latency and load costs). Answering from v5 silently breaks read-your-writes or monotonic reads.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">In the COPS design, why is a dependency check done at the remote datacenter before a replicated write becomes visible?</p>
+    <ol class="q-options">
+      <li>To make sure the write is durable on disk</li>
+      <li>To make sure everything the write causally depends on is already visible there, so no reader sees an effect without its cause</li>
+      <li>To decide which of two concurrent writes wins</li>
+      <li>To get agreement from a majority of datacenters</li>
+    </ol>
+    <div class="q-explain">The check is purely local ordering: hold a write until its causal past is visible. It is not about durability, conflict resolution (that is the "plus" in causal+) or agreement; no cross-datacenter vote is involved, which is why it stays cheap and available.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Two customers, each having seen a balance of 100, withdraw 80 at the same time at two different replicas of a causally consistent store. What happens?</p>
+    <ol class="q-options">
+      <li>The second withdrawal is rejected because it causally follows the first</li>
+      <li>Causal consistency makes the replicas coordinate and only one succeeds</li>
+      <li>Both are held until a majority agrees</li>
+      <li>Both succeed: the withdrawals are concurrent, not causally related, so the model puts no constraint on them and an application-level invariant is broken</li>
+    </ol>
+    <div class="q-explain">Causal consistency orders visibility of causally related writes. It says nothing about concurrent writes beyond convergence, so it cannot enforce "balance never below zero". That takes coordination (a consensus-backed counter or lock) or a design such as escrow (chapter 16).</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Which statement best describes the status of causal consistency among models that never block on a partition?</p>
+    <ol class="q-options">
+      <li>It is the weakest of them</li>
+      <li>It is the strongest known to be achievable without replicas having to wait for each other, in the formal model of Mahajan, Alvisi and Dahlin, with clients staying with replicas that hold their history</li>
+      <li>It is equivalent to linearizability when there is no partition, so it is the same thing</li>
+      <li>It is impossible without a global clock</li>
+    </ol>
+    <div class="q-explain">The result is stated in a specific formal model (always available, convergent replicas), and in practice it assumes sticky clients. It does not need a global clock; dependency tracking is enough. It is strictly weaker than linearizability even when no partition occurs.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serve 10,000 Connections on One Machine · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="sys" data-studio="S1">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Serve 10,000 Connections on One Machine</h1>
+  <p class="lede">Ten thousand phones each keep a connection open to your server, mostly saying nothing, sometimes needing a message <em>right now</em>. One machine has to hold all of them. Your job is to design the server process: how it waits, how it remembers each connection, and what breaks first.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">How a design studio works</p>
+  <p>This page is a design problem, not a chapter. At each stage there's a <strong>Your turn</strong> question. Write your answer in the notes box first (it saves in this browser), <em>then</em> open the worked answer and compare. The worked answer isn't the only right design; it's one strong one with its reasoning. A rubric at the end lets you check whether you covered what an experienced engineer would. Being wrong first and then seeing why is the point of the exercise.</p>
+</div>
+
+<div class="studio-brief">
+  <p class="brief-title">📐 The brief</p>
+  <p>You're building the <strong>presence gateway</strong> for a chat app: the server that shows a little green dot when your friends are online.</p>
+  <ul>
+    <li>Every running app keeps <strong>one TCP connection</strong> open to a gateway and sends a tiny <strong>heartbeat every 30 seconds</strong>.</li>
+    <li>If a client misses heartbeats for <strong>90 seconds</strong>, the gateway marks it offline.</li>
+    <li>When a friend comes online or goes offline, the gateway <strong>pushes</strong> a small message (about 200 bytes) to each affected connected client. Pushes should arrive within <strong>100 ms</strong> for 99% of clients.</li>
+    <li>Target: <strong>10,000 connections per machine</strong> today, with a plan for 100,000. The machine has 8 CPU cores and 16 GB of RAM.</li>
+    <li>Another service (which you don't design) tells your gateway which friends to notify. Assume that call is fast.</li>
+  </ul>
+</div>
+
+<h2>Your notes</h2>
+<p>Keep notes as you go: decisions, numbers, open questions. Plain text is fine; try sketching boxes with characters, as in an interview whiteboard.</p>
+<textarea class="studio-notes" aria-label="Your design notes for this studio" placeholder="Requirements I'd confirm…&#10;Back-of-envelope numbers…&#10;My architecture…"></textarea>
+
+<section class="stage">
+<h2><span class="h-num">1</span>Clarify the requirements</h2>
+<p class="stage-q">What would you ask before designing anything? Which requirement is the hard one: throughput, latency, memory or something else? What happens to the user if this server dies?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Good questions to ask (in an interview you'd say them out loud):</p>
+  <ul>
+    <li><strong>How chatty are connections?</strong> Here: a heartbeat every 30 s and occasional pushes. Almost all connections are <em>idle</em> almost all the time. That's the key fact.</li>
+    <li><strong>How bad is losing a push?</strong> Presence is soft information: a green dot that's a few seconds late or briefly wrong is annoying, not a disaster. That gives us room. If this were payments, the answers would change completely.</li>
+    <li><strong>What happens if a gateway dies?</strong> Its clients' connections drop. They will reconnect (to another machine), and their friends may briefly see them as offline. We should make sure those 10,000 reconnects don't arrive all at once (stage 7).</li>
+    <li><strong>Is anything slow done per message?</strong> Looking up friends is a call to another service. If that call can be slow, it must not stall everything else.</li>
+  </ul>
+  <p><strong>The hard requirement is concurrency, not throughput:</strong> holding a huge number of mostly-idle connections cheaply, and still reacting within milliseconds when any one of them needs attention. Spotting which requirement dominates is often the most valuable sentence in a design discussion.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">2</span>Back-of-the-envelope numbers</h2>
+<p class="stage-q">Estimate: heartbeats per second, pushes per second (make a reasonable assumption), network bandwidth, and memory if every connection costs 10 KB. Which of these is anywhere near a limit?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <ul>
+    <li><strong>Heartbeats:</strong> 10,000 connections ÷ 30 s ≈ <strong>333 messages/s</strong>. For a CPU that runs billions of instructions per second, that's nothing.</li>
+    <li><strong>Pushes:</strong> assume each user changes status about every 5 minutes and has around 20 online friends. 10,000 ÷ 300 s ≈ 33 changes/s, × 20 ≈ <strong>roughly 700 pushes/s</strong>. Some of those friends are connected to other gateways, but let's assume the worst and say a bit under 1,000/s land on this machine.</li>
+    <li><strong>Bandwidth:</strong> ~1,000 × 200 bytes ≈ <strong>200 KB/s</strong>, plus heartbeats, plus TCP and TLS overhead. A tiny fraction of even a 1 Gbit/s link (about 125 MB/s).</li>
+    <li><strong>Memory:</strong> 10,000 × 10 KB = <strong>100 MB</strong>. At 100,000 connections, 1 GB. Comfortable on 16 GB, <em>if</em> we keep the per-connection cost near 10 KB. Stage 4 checks whether that's realistic.</li>
+  </ul>
+  <p>So no single resource is under pressure from the <em>work</em>. Whatever limits us will come from the <strong>cost of each waiting connection</strong>: memory, file descriptors and the overhead of whatever does the waiting. That's why the architecture choice in stage 5 matters so much.</p>
+  <div class="callout warn">
+    <p class="callout-title">Common misconception</p>
+    <p>"A server can only have about 65,000 connections because there are only 65,535 ports." The <em>server</em> uses one port (say 443) for all of them. Each TCP connection is identified by four things together: client IP, client port, server IP, server port (<a href="../../networking/chapters/07-ports-udp.html">networking ch. 7</a>). Different clients make different four-tuples, so the limit on one port is far beyond any real machine's memory. Port limits do bite on the <em>client</em> side, when one machine opens very many outgoing connections to the same destination.</p>
+  </div>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">3</span>What crosses the wire</h2>
+<p class="stage-q">Sketch the messages between client and gateway. How does each side find message boundaries in a TCP byte stream? What does the gateway need to know when a client first connects?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Keep the protocol tiny. TCP is a byte stream (<a href="../../networking/chapters/08-tcp.html">networking ch. 8</a>), so each message needs framing: a length prefix or newline-delimited JSON (as in <a href="../../networking/labs/lab-01-sockets.html">networking Lab 1</a>). In production you'd probably use WebSocket over TLS, which provides framing for you (<a href="../../networking/chapters/12-apis.html">networking ch. 12</a>).</p>
+  <table>
+    <thead><tr><th>Direction</th><th>Message</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>client → gateway</td><td><code>HELLO {user, token}</code></td><td>First message. Authenticate, then register "user 42 is on this connection".</td></tr>
+      <tr><td>client → gateway</td><td><code>PING</code></td><td>Every 30 s. Resets the client's offline deadline.</td></tr>
+      <tr><td>gateway → client</td><td><code>PRESENCE {friend, online}</code></td><td>The push. About 200 bytes.</td></tr>
+      <tr><td>gateway → client</td><td><code>PONG</code></td><td>Lets the <em>client</em> notice a dead connection too.</td></tr>
+    </tbody>
+  </table>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">4</span>State: what each connection costs</h2>
+<p class="stage-q">List everything the machine holds for one connection, in the kernel and in your process. Roughly how big is each piece? Which one depends on the architecture you choose?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <ul>
+    <li><strong>A file descriptor</strong> (<a href="../chapters/08-files.html">ch. 8</a>). Each socket is an open file. The per-process limit is often 256 (macOS) or 1,024 (many Linux setups) by default, so it <em>must</em> be raised for this server. Forgetting this is a classic production incident: the server works perfectly at 900 users and starts refusing connections a little before 1,024 (a few descriptors are already taken by the listener, logs and so on).</li>
+    <li><strong>Kernel socket buffers.</strong> Send and receive buffers live in kernel memory. They grow with in-flight data and are small for idle connections, but a slow client that isn't reading can keep its send buffer full.</li>
+    <li><strong>Application state.</strong> User id, auth info, the offline deadline, an output queue. A few hundred bytes to a few KB if we're careful.</li>
+    <li><strong>Whatever does the waiting.</strong> This is the architecture-dependent part. With one thread per connection, every connection also owns a <strong>thread</strong> with its own stack (<a href="../chapters/03-stack-heap.html">ch. 3</a>, <a href="../chapters/10-threads.html">ch. 10</a>). A common Linux default reserves 8 MB of <em>virtual</em> address space per thread stack. Only the pages actually touched use real RAM (<a href="../chapters/06-virtual-memory.html">ch. 6</a>), often tens of KB, but that's still often more than everything else on this list combined. With an event loop, waiting costs almost nothing per connection: the connection is just an entry in the kernel's interest list.</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">5</span>The architecture: who waits, and how?</h2>
+<p class="stage-q">Compare one thread per connection with an event loop. For each, say what happens when a heartbeat arrives on connection #7,341. Then pick one, and say how you'd use all 8 cores.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 330" role="img" aria-label="Thread per connection compared with one event loop per core">
+      <defs><marker id="ahS1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+      <!-- left: thread per connection -->
+      <text x="185" y="24" text-anchor="middle" class="t-bold">A. Thread per connection</text>
+      <g>
+        <rect x="30" y="40" width="310" height="34" rx="7" class="box"/><text x="44" y="62" class="t-sm mono">thread 1</text><text x="326" y="62" text-anchor="end" class="t-xs t-muted">blocked in read()</text>
+        <rect x="30" y="80" width="310" height="34" rx="7" class="box"/><text x="44" y="102" class="t-sm mono">thread 2</text><text x="326" y="102" text-anchor="end" class="t-xs t-muted">blocked in read()</text>
+        <rect x="30" y="120" width="310" height="34" rx="7" class="fs-green s-green"/><text x="44" y="142" class="t-sm mono">thread 3</text><text x="326" y="142" text-anchor="end" class="t-xs">running: got a PING</text>
+        <rect x="30" y="160" width="310" height="34" rx="7" class="box"/><text x="44" y="182" class="t-sm mono">thread 4</text><text x="326" y="182" text-anchor="end" class="t-xs t-muted">blocked in read()</text>
+        <text x="185" y="216" text-anchor="middle" class="t-sm t-faint">⋮ 9,996 more threads</text>
+      </g>
+      <text x="185" y="252" text-anchor="middle" class="t-xs">Simple code: read, handle, repeat.</text>
+      <text x="185" y="272" text-anchor="middle" class="t-xs t-muted">Cost: a stack per thread, scheduler work,</text>
+      <text x="185" y="290" text-anchor="middle" class="t-xs t-muted">locks around every bit of shared state.</text>
+
+      <line x1="380" y1="20" x2="380" y2="310" class="line-dash"/>
+
+      <!-- right: event loop per core -->
+      <text x="570" y="24" text-anchor="middle" class="t-bold">B. One event loop per core</text>
+      <rect x="410" y="40" width="150" height="54" rx="10" class="fs-purple s-purple sw-2"/><text x="485" y="64" text-anchor="middle" class="t-sm t-bold">loop on core 1</text><text x="485" y="82" text-anchor="middle" class="t-xs t-muted">1,250 connections</text>
+      <rect x="580" y="40" width="150" height="54" rx="10" class="fs-purple s-purple sw-2"/><text x="655" y="64" text-anchor="middle" class="t-sm t-bold">loop on core 2</text><text x="655" y="82" text-anchor="middle" class="t-xs t-muted">1,250 connections</text>
+      <text x="570" y="116" text-anchor="middle" class="t-xs t-faint">… one per core, 8 in all</text>
+      <rect x="410" y="132" width="320" height="50" rx="8" class="box2"/><text x="570" y="153" text-anchor="middle" class="t-sm">kernel: epoll / kqueue</text><text x="570" y="171" text-anchor="middle" class="t-xs t-muted">"tell me which sockets are ready"</text>
+      <line x1="485" y1="132" x2="485" y2="98" class="line" marker-end="url(#ahS1a)"/>
+      <line x1="655" y1="132" x2="655" y2="98" class="line" marker-end="url(#ahS1a)"/>
+      <rect x="470" y="208" width="200" height="44" rx="8" class="fs-orange s-orange"/><text x="570" y="235" text-anchor="middle" class="t-sm">small worker pool</text>
+      <line x1="570" y1="182" x2="570" y2="204" class="line-thin" marker-end="url(#ahS1a)"/>
+      <text x="570" y="272" text-anchor="middle" class="t-xs">Cheap waiting: a connection is just a registration.</text>
+      <text x="570" y="290" text-anchor="middle" class="t-xs t-muted">Cost: handlers must never block the loop;</text>
+      <text x="570" y="308" text-anchor="middle" class="t-xs t-muted">slow work goes to the pool.</text>
+    </svg>
+    <figcaption><strong>Two ways to wait.</strong> On the left, each connection's waiting is a sleeping thread. On the right, the kernel watches all the sockets and wakes a loop only when one has something to say.</figcaption>
+  </figure>
+
+  <p><strong>A. Thread per connection.</strong> A heartbeat on #7,341 wakes the one thread blocked in <code>read()</code> on that socket. The scheduler gives it a core, it handles the PING and blocks again. The code is beautifully simple. The costs: 10,000 stacks (stage 4), scheduler bookkeeping and context switches for every wake-up (<a href="../chapters/07-scheduling.html">ch. 7</a>), and every piece of shared state (the user → connection map) needs locks (<a href="../chapters/12-locks.html">ch. 12</a>). It works at 10,000 on a modern machine if tuned, but it gets uncomfortable at 100,000.</p>
+
+  <p><strong>B. Event loop.</strong> The loop asks the kernel "which of my sockets are ready?" (<code>epoll</code> on Linux, <code>kqueue</code> on macOS; <a href="../chapters/16-event-loops.html">ch. 16</a>). The kernel answers "#7,341 is readable". The loop reads the bytes without blocking, updates that connection's deadline and goes back to asking. Idle connections cost almost nothing, and within one loop there's no locking, because only one thing runs at a time.</p>
+
+  <p><strong>Pick B</strong>, with <strong>one loop per core</strong> (8 loops), each owning a share of the connections. Several processes or threads can share the listening port with <code>SO_REUSEPORT</code> on Linux, or one acceptor can hand new connections out. Each connection belongs to exactly one loop forever, so its state is never touched by two threads. Anything slow, like the friend lookup if it might stall, goes to a small <strong>worker pool</strong> (<a href="../chapters/14-queues-backpressure.html">ch. 14</a>), and the result is handed back to the loop. This is the shape of nginx, Redis, Node.js and Netty-based servers.</p>
+
+  <div class="callout analogy">
+    <p class="callout-title">Analogy: waiters vs a host with a buzzer system</p>
+    <p>Thread-per-connection is one waiter assigned to every table, standing there even when the table is just chatting. An event loop is one host with a board of buzzers: they stand still until a table presses its buzzer, deal with it, and go back to the board.</p>
+    <p><em>Where it breaks down:</em> if one table asks the host for something that takes ten minutes, every other table waits too. That's why slow work must go to the kitchen (the worker pool).</p>
+  </div>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">6</span>Deep dives</h2>
+<p class="stage-q">Pick two and go deep. (a) How do you detect 90-second silences on 10,000 connections without 10,000 timers firing constantly? (b) A client on a bad mobile network stops reading. What happens to pushes queued for it? (c) What exactly must be raised or tuned at the OS level?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p><strong>(a) Timeouts.</strong> Don't set a fresh timer every time a PING arrives. Store each connection's <em>deadline</em> (last heartbeat + 90 s) and check them in batches. A simple way is to wake up once a second and close any connection whose deadline has passed. Smarter structures (a heap ordered by deadline, or a <em>timer wheel</em> of one-second buckets) avoid scanning everyone. Use the <strong>monotonic clock</strong>, never wall-clock time: if the wall clock jumps (an NTP correction, a leap second), you could disconnect everyone at once.</p>
+  <p><strong>(b) Slow consumers.</strong> If a client isn't reading, its kernel send buffer fills up and <code>write()</code> stops accepting bytes. In an event loop you must <em>not</em> wait. Queue the push in that connection's output buffer instead, and register interest in "writable". Then <strong>bound that buffer</strong> (<a href="../chapters/14-queues-backpressure.html">ch. 14</a>). Presence is soft state, so when it overflows we can drop older updates for the same friend (only the latest status matters) or simply close the connection and let the client reconnect and resync. An unbounded buffer turns one bad network into the whole server running out of memory.</p>
+  <p><strong>(c) OS limits.</strong></p>
+  <ul>
+    <li>Raise the open-files limit (<code>ulimit -n</code>, or the service manager's setting) well above the target.</li>
+    <li>Make the listen backlog large enough for bursts of new connections.</li>
+    <li>Watch kernel socket-buffer memory.</li>
+    <li>Make sure logging can't block the loop: a synchronous disk write for every heartbeat would be a disaster (<a href="../chapters/09-durability.html">ch. 9</a>).</li>
+  </ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">7</span>Failure modes and trade-offs</h2>
+<p class="stage-q">What happens when this machine restarts? What could make the loop stall? What changes at 100,000 connections, or at 1,000,000 spread over many machines?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <ul>
+    <li><strong>Reconnect storm.</strong> When a gateway dies, 10,000 clients notice within seconds and all reconnect, each doing TLS and HELLO (and authentication), to the <em>other</em> gateways. If clients retry immediately and in sync, the healthy machines get a burst that can knock <em>them</em> over too. Clients must reconnect with <strong>exponential backoff and jitter</strong> (<a href="../../networking/chapters/16-failure.html">networking ch. 16</a>, <a href="../../networking/cases/case-08-retry-storms.html">case study</a>). Gateways should <strong>shed load</strong> (refuse quickly) rather than accept more than they can handle.</li>
+    <li><strong>Blocking the loop.</strong> One accidental blocking call (a DNS lookup, a disk write, a slow regex) freezes <em>every</em> connection on that loop. Pushes miss the 100 ms target and heartbeats are processed late. Measure <em>loop lag</em> (how late timers fire) as a key metric.</li>
+    <li><strong>Pauses.</strong> In a garbage-collected language, a long GC pause looks exactly like a blocked loop (<a href="../chapters/03-stack-heap.html">ch. 3</a>). Keep per-connection allocations small and steady.</li>
+    <li><strong>100,000 connections:</strong> the event-loop design scales almost linearly in memory (roughly 1 GB at 10 KB each). Thread-per-connection is now clearly the wrong choice.</li>
+    <li><strong>1,000,000 over many machines:</strong> now it's a distributed system. A load balancer spreads connections (<a href="../../networking/chapters/14-load-balancers.html">networking ch. 14</a>). The service that tracks "which gateway holds user 42" becomes the interesting design problem. The networking course's <a href="../../networking/cases/case-05-persistent-connections.html">Millions of Open Connections</a> case study picks up here.</li>
+  </ul>
+</details>
+</section>
+
+<h2>Self-check rubric</h2>
+<p>Tick what your own design (before reading the answers) covered. An experienced engineer would hit most of these. Missing several is normal the first time, and worth a second try in a week.</p>
+<ul class="rubric">
+  <li>Identified that the problem is <strong>many idle connections</strong>, not throughput.</li>
+  <li>Did the arithmetic: heartbeats/s, pushes/s, bandwidth and memory, and noticed which one matters.</li>
+  <li>Defined message framing on top of TCP.</li>
+  <li>Accounted for <strong>per-connection cost</strong>: file descriptor, kernel buffers, app state, thread stack.</li>
+  <li>Compared thread-per-connection with an <strong>event loop</strong>, and gave reasons for the choice.</li>
+  <li>Used all cores (one loop per core, or similar) without sharing per-connection state between threads.</li>
+  <li>Kept slow work <strong>off the loop</strong> (worker pool).</li>
+  <li>Handled timeouts efficiently, with a <strong>monotonic clock</strong>.</li>
+  <li><strong>Bounded</strong> per-connection output buffers and said what happens on overflow.</li>
+  <li>Raised the <strong>open-file limit</strong>.</li>
+  <li>Planned for a <strong>reconnect storm</strong>: backoff with jitter, plus load shedding.</li>
+  <li>Named metrics to watch: connections, loop lag, buffer sizes, memory.</li>
+</ul>
+<p class="studio-status" id="studio-status"></p>
+
+<h2>Saying it in an interview</h2>
+<div class="callout mentor">
+  <p class="callout-title">How a senior engineer would summarise this</p>
+  <p>"The workload is tiny: a few hundred heartbeats a second and maybe a thousand pushes. The challenge is holding ten thousand mostly idle connections cheaply. So I'd use non-blocking sockets with one event loop per core. Each connection is owned by one loop, so there's no locking on the hot path. I'd push anything slow to a small worker pool. Per-connection output buffers are bounded, and since presence is soft state, we can drop stale updates or disconnect slow clients. Then the operational bits: raise the file-descriptor limit, use monotonic deadlines for timeouts, and make clients reconnect with jittered backoff so a gateway restart doesn't cascade. Going from ten thousand to a hundred thousand is mostly memory; at a million it becomes a routing problem across machines."</p>
+  <p>Notice the shape: <strong>name what dominates → choose the mechanism → explain the trade-off → name the failure modes → say how it scales.</strong> That's the same shape for any design question.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>First find which resource actually limits you. Here it's the cost of each <em>waiting</em> connection, not the work.</li>
+    <li>Event loops make waiting nearly free; threads make code simple. At high connection counts with little work each, the loop wins.</li>
+    <li>An event loop has one cardinal rule: never block it. Slow work goes to a worker pool.</li>
+    <li>Every buffer must be bounded, and you must decide what happens when it's full.</li>
+    <li>OS limits (open files, backlog) and failure dynamics (reconnect storms) matter as much as the code.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/studio.js"></script>
+</body>
+</html>

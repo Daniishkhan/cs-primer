@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parallelism, SIMD &amp; GPUs · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/amdahl-calc.css">
+</head>
+<body data-root="../.." data-course="sys" data-chapter="21">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Parallelism, SIMD &amp; GPUs</h1>
+  <p class="lede">A single core stopped getting dramatically faster years ago, so hardware went wide instead: more instructions at once, more numbers per instruction, more cores, and finally chips with thousands of tiny cores. This chapter shows the four kinds of parallelism, the law that limits all of them, and why the machines that run modern AI are limited less by arithmetic than by how fast they can move bytes.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>"Just add more cores" and "just use a GPU" are two of the most common answers to a slow system, and both are often wrong. Whether they work depends on how much of the job can really run side by side (Amdahl's law) and on whether the job is waiting for arithmetic or for memory (the roofline idea). These two questions explain why NumPy beats a Python loop by a factor of a hundred, why training a neural network needs GPUs, why serving a language model is mostly a memory problem, and why a service that batches requests can be several times cheaper than one that doesn't. They are also the questions you will ask in a design review long before you write any code.</p>
+</div>
+
+<h2>Four kinds of parallelism</h2>
+
+<p><span class="term">Parallelism</span> means doing more than one thing at the same moment. (That is different from <em>concurrency</em>, from chapters 10 to 18, which is about <em>structuring</em> a program so several tasks can make progress. A single core can be concurrent without being parallel.) Hardware offers parallelism at four different scales, and they stack on top of each other.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Four stacked cards: instruction-level parallelism inside one core, data parallelism with SIMD vector instructions, thread parallelism across cores, and accelerators such as GPUs, each with its scale and who controls it">
+    <text x="20" y="20" class="t-xs t-faint t-bold">FOUR KINDS OF PARALLELISM, FROM INSIDE ONE CORE TO A WHOLE ACCELERATOR</text>
+
+    <rect x="20" y="32" width="720" height="50" rx="8" class="fs-cyan s-cyan sw-1"/>
+    <text x="36" y="55" class="t-sm t-bold">1. Instruction-level</text><text x="36" y="72" class="t-xs t-muted">inside one core</text>
+    <text x="240" y="55" class="t-sm">Independent instructions overlap in the pipeline and run several per cycle.</text>
+    <text x="240" y="72" class="t-xs t-muted">You write nothing special: the CPU and compiler find it.</text>
+
+    <rect x="20" y="92" width="720" height="50" rx="8" class="fs-green s-green sw-1"/>
+    <text x="36" y="115" class="t-sm t-bold">2. Data parallelism (SIMD)</text><text x="36" y="132" class="t-xs t-muted">inside one core</text>
+    <text x="240" y="115" class="t-sm">One instruction works on 4, 8 or 16 numbers at once.</text>
+    <text x="240" y="132" class="t-xs t-muted">Compilers and libraries (NumPy, BLAS) use it for you.</text>
+
+    <rect x="20" y="152" width="720" height="50" rx="8" class="fs-blue s-blue sw-1"/>
+    <text x="36" y="175" class="t-sm t-bold">3. Thread parallelism</text><text x="36" y="192" class="t-xs t-muted">across cores</text>
+    <text x="240" y="175" class="t-sm">Several cores each run their own instruction stream.</text>
+    <text x="240" y="192" class="t-xs t-muted">You write threads or processes (chapters 5 and 10).</text>
+
+    <rect x="20" y="212" width="720" height="50" rx="8" class="fs-pink s-pink sw-1"/>
+    <text x="36" y="235" class="t-sm t-bold">4. Accelerators</text><text x="36" y="252" class="t-xs t-muted">own chip and memory</text>
+    <text x="240" y="235" class="t-sm">GPUs and TPUs: thousands of simple lanes, built for data parallelism.</text>
+    <text x="240" y="252" class="t-xs t-muted">You call a library or write kernels; data must be copied over.</text>
+    <text x="380" y="282" text-anchor="middle" class="t-xs t-muted">Each level is "more of the same work at once", at a bigger scale and a bigger cost to program.</text>
+  </svg>
+  <figcaption><strong>Parallelism stacks.</strong> A fast numerical program uses all four at once: pipelined instructions, vector registers, many cores, and sometimes a GPU on top.</figcaption>
+</figure>
+
+<p>Chapter 1 already met the first: the CPU pipeline overlaps instructions, and a modern core can finish several per cycle when they don't depend on each other. The third you know from chapters 10 to 13. This chapter spends most of its time on the second and fourth, because they are what the rest of the industry now leans on, and then on a law that governs all of them.</p>
+
+<h2>Amdahl's law: the serial part always wins</h2>
+
+<p>Suppose a job takes 100 seconds, and 80 of those seconds can be split perfectly across workers while 20 seconds are stubbornly serial (reading the input, combining the results, waiting for a lock). With 8 workers the parallel part shrinks to 10 seconds, but the serial part stays: the job takes 30 seconds, a speedup of 3.3x on 8 workers, not 8x. With a million workers the parallel part vanishes and the job still takes 20 seconds. The speedup can never exceed 100 / 20 = 5x.</p>
+
+<p>That is <span class="term">Amdahl's law</span>. If a fraction <code>p</code> of the original runtime can be parallelised across <code>n</code> workers, then:</p>
+
+<pre class="terminal" data-title="the formula"><code>speedup = 1 / ((1 - p) + p / n)
+
+limit as n grows without bound:  1 / (1 - p)</code></pre>
+
+<p>The surprise is how harsh the limit is. If 5% of the job is serial, you can never go beyond 20x, even with a million cores. Here it is as a runnable table:</p>
+
+<pre class="terminal" data-title="amdahl.py"><code>def speedup(p, n):
+    """Amdahl: p = parallel fraction of the ORIGINAL runtime, n = workers."""
+    return 1 / ((1 - p) + p / n)
+
+print(f"{'workers':&gt;8} {'p=0.50':&gt;8} {'p=0.90':&gt;8} {'p=0.95':&gt;8} {'p=0.99':&gt;8}")
+for n in (1, 2, 4, 8, 16, 64, 1024, 10**9):
+    label = f"{n:,}" if n &lt; 10**9 else "infinite"
+    print(f"{label:&gt;8}", *(f"{speedup(p, n):8.2f}" for p in (0.5, 0.9, 0.95, 0.99)))
+
+# Worked example: a 100 s job, 80 s parallelisable, on 8 workers
+t_serial, t_par, n = 20, 80, 8
+print("\n100 s job, 80 s parallel part, 8 workers:")
+print("new time =", t_serial + t_par / n, "s  speedup =", round(100 / (t_serial + t_par / n), 2))
+print("limit with infinite workers =", 100 / t_serial, "x")
+
+# Gustafson: scaled speedup = (1 - p) + p * n  (p = parallel fraction of the PARALLEL run)
+def gustafson(p, n):
+    return (1 - p) + p * n
+print("\nGustafson, p=0.9 on the parallel run:")
+for n in (8, 64, 1024):
+    print(f"  n={n:5d}  scaled speedup = {gustafson(0.9, n):7.1f}")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 amdahl.py</span>
+ workers   p=0.50   p=0.90   p=0.95   p=0.99
+       1     1.00     1.00     1.00     1.00
+       2     1.33     1.82     1.90     1.98
+       4     1.60     3.08     3.48     3.88
+       8     1.78     4.71     5.93     7.48
+      16     1.88     6.40     9.14    13.91
+      64     1.97     8.77    15.42    39.26
+   1,024     2.00     9.91    19.64    91.18
+infinite     2.00    10.00    20.00   100.00
+
+100 s job, 80 s parallel part, 8 workers:
+new time = 30.0 s  speedup = 3.33
+limit with infinite workers = 5.0 x
+
+Gustafson, p=0.9 on the parallel run:
+  n=    8  scaled speedup =     7.3
+  n=   64  scaled speedup =    57.7
+  n= 1024  scaled speedup =   921.7</code></pre>
+
+<p>Read down the <code>p=0.90</code> column: 64 workers give 8.8x, and 1,024 workers give 9.9x. The last 960 workers bought you one extra "x". Read across the <code>p=0.50</code> column and you will see why a job that is half serial barely notices a second core. Try your own numbers here:</p>
+
+<div class="widget" id="amdahl-calc">
+  <div class="widget-head"><span class="widget-tag">Interactive</span><h4 class="widget-title">Amdahl's law calculator</h4></div>
+  <p class="widget-help">A 100-second job. Slide the parallel fraction and the number of workers. The orange part is serial work, which never shrinks; the blue part is what extra workers divide.</p>
+  <div class="am-ctl">
+    <div><label for="am-p">Parallel fraction: <strong data-act="p-out"></strong></label>
+      <input id="am-p" type="range" min="0" max="100" step="1" value="80" data-act="p"></div>
+    <div><label for="am-n">Workers: <strong data-act="n-out"></strong></label>
+      <input id="am-n" type="range" min="0" max="10" step="1" value="3" data-act="n"></div>
+  </div>
+  <div><p class="am-sec">Before (1 worker)</p><div class="am-bar" data-act="before"></div></div>
+  <div><p class="am-sec">After</p><div class="am-bar" data-act="after"></div></div>
+  <div class="am-stats" data-act="stats"></div>
+  <div class="widget-out" data-act="note" aria-live="polite"></div>
+</div>
+
+<p>Things to try. Set the parallel fraction to 95% and slide the workers from 1 to 1,024 (the slider's last stop is 100,000): the speedup climbs quickly, then flattens just under 20x, while the efficiency (speedup divided by workers) collapses. Then set the fraction to 99% and note that 64 workers are already near 40x. The lesson is not "parallelism is useless". It is that <strong>the serial fraction is the thing to attack</strong>: shrinking the serial part from 5% to 1% is worth more than a thousand extra workers.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>Amdahl's law is optimistic, not pessimistic. It ignores the costs of parallelism itself: starting workers, splitting the data, locks and cache-line fights (chapters 11 to 13), and combining results. Real speedup is usually <em>below</em> the formula's number, and past some worker count it can go <em>down</em>.</p>
+</div>
+
+<h3>Gustafson's law: when the problem grows too</h3>
+
+<p>Amdahl asks: <em>how much faster can I do this fixed job?</em> <span class="term">Gustafson's law</span> asks a different question: with more workers, <em>how much bigger a job can I do in the same time?</em> If you have 1,024 cores you probably don't run the same small simulation faster; you run a finer-grained one. When the serial part stays about the same size while the parallel part grows with the machine, the "scaled speedup" is roughly <code>(1 - p) + p * n</code>, where <code>p</code> is now the parallel fraction of the time on the <em>parallel</em> run. With <code>p = 0.9</code> and 1,024 workers that is about 922x. Both laws are right; they answer different questions. Latency-bound work (one user waiting) obeys Amdahl; throughput-bound work with growing data (training on a bigger dataset, serving more users) looks like Gustafson.</p>
+
+<h2>SIMD: one instruction, many numbers</h2>
+
+<p>A normal ("scalar") add instruction adds two numbers. A <span class="term">SIMD</span> instruction (single instruction, multiple data) adds <em>vectors</em> of numbers: the CPU has wide <span class="term">vector registers</span> and ALUs that apply the same operation to every lane. An x86 chip with AVX2 has 256-bit registers, which hold 8 32-bit floats; AVX-512 doubles that to 16; Arm's NEON, on Apple's M-series and most phones, has 128-bit registers holding 4 floats (Arm also has wider vector extensions on some chips). So one instruction does 4 to 16 adds. The cost is almost the same as a scalar add, because the heavy part of running an instruction is fetching, decoding and scheduling it, and that is paid once.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 230" role="img" aria-label="Left: scalar addition takes four separate add instructions, one per pair of numbers. Right: a single SIMD add instruction adds four pairs at once in four lanes of a vector register">
+    <defs><marker id="ahSx21a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="180" y="22" text-anchor="middle" class="t-sm t-bold">Scalar: 4 instructions</text>
+    <text x="570" y="22" text-anchor="middle" class="t-sm t-bold">SIMD: 1 instruction, 4 lanes</text>
+
+    <rect x="30" y="40" width="40" height="28" rx="4" class="fs-blue s-blue sw-1"/><text x="50" y="59" text-anchor="middle" class="mono t-xs">a0</text>
+    <rect x="76" y="40" width="40" height="28" rx="4" class="fs-green s-green sw-1"/><text x="96" y="59" text-anchor="middle" class="mono t-xs">b0</text>
+    <line x1="73" y1="70" x2="73" y2="84" class="line-thin" marker-end="url(#ahSx21a)"/>
+    <rect x="46" y="86" width="54" height="28" rx="4" class="fs-yellow s-yellow sw-1"/><text x="73" y="105" text-anchor="middle" class="mono t-xs">add</text>
+
+    <rect x="140" y="40" width="40" height="28" rx="4" class="fs-blue s-blue sw-1"/><text x="160" y="59" text-anchor="middle" class="mono t-xs">a1</text>
+    <rect x="186" y="40" width="40" height="28" rx="4" class="fs-green s-green sw-1"/><text x="206" y="59" text-anchor="middle" class="mono t-xs">b1</text>
+    <line x1="183" y1="70" x2="183" y2="84" class="line-thin" marker-end="url(#ahSx21a)"/>
+    <rect x="156" y="86" width="54" height="28" rx="4" class="fs-yellow s-yellow sw-1"/><text x="183" y="105" text-anchor="middle" class="mono t-xs">add</text>
+
+    <rect x="250" y="40" width="40" height="28" rx="4" class="fs-blue s-blue sw-1"/><text x="270" y="59" text-anchor="middle" class="mono t-xs">a2</text>
+    <rect x="296" y="40" width="40" height="28" rx="4" class="fs-green s-green sw-1"/><text x="316" y="59" text-anchor="middle" class="mono t-xs">b2</text>
+    <line x1="293" y1="70" x2="293" y2="84" class="line-thin" marker-end="url(#ahSx21a)"/>
+    <rect x="266" y="86" width="54" height="28" rx="4" class="fs-yellow s-yellow sw-1"/><text x="293" y="105" text-anchor="middle" class="mono t-xs">add</text>
+
+    <rect x="360" y="40" width="40" height="28" rx="4" class="fs-blue s-blue sw-1"/><text x="380" y="59" text-anchor="middle" class="mono t-xs">a3</text>
+    <rect x="406" y="40" width="40" height="28" rx="4" class="fs-green s-green sw-1"/><text x="426" y="59" text-anchor="middle" class="mono t-xs">b3</text>
+    <line x1="403" y1="70" x2="403" y2="84" class="line-thin" marker-end="url(#ahSx21a)"/>
+    <rect x="376" y="86" width="54" height="28" rx="4" class="fs-yellow s-yellow sw-1"/><text x="403" y="105" text-anchor="middle" class="mono t-xs">add</text>
+    <text x="238" y="136" text-anchor="middle" class="t-xs t-muted">four fetches, four decodes, four adds</text>
+
+    <line x1="470" y1="30" x2="470" y2="150" class="line-thin"/>
+
+    <text x="486" y="56" class="t-xs t-muted">vector a</text>
+    <rect x="550" y="40" width="46" height="28" rx="2" class="fs-blue s-blue sw-1"/><text x="573" y="59" text-anchor="middle" class="mono t-xs">a0</text>
+    <rect x="598" y="40" width="46" height="28" rx="2" class="fs-blue s-blue sw-1"/><text x="621" y="59" text-anchor="middle" class="mono t-xs">a1</text>
+    <rect x="646" y="40" width="46" height="28" rx="2" class="fs-blue s-blue sw-1"/><text x="669" y="59" text-anchor="middle" class="mono t-xs">a2</text>
+    <rect x="694" y="40" width="46" height="28" rx="2" class="fs-blue s-blue sw-1"/><text x="717" y="59" text-anchor="middle" class="mono t-xs">a3</text>
+    <text x="486" y="92" class="t-xs t-muted">vector b</text>
+    <rect x="550" y="76" width="46" height="28" rx="2" class="fs-green s-green sw-1"/><text x="573" y="95" text-anchor="middle" class="mono t-xs">b0</text>
+    <rect x="598" y="76" width="46" height="28" rx="2" class="fs-green s-green sw-1"/><text x="621" y="95" text-anchor="middle" class="mono t-xs">b1</text>
+    <rect x="646" y="76" width="46" height="28" rx="2" class="fs-green s-green sw-1"/><text x="669" y="95" text-anchor="middle" class="mono t-xs">b2</text>
+    <rect x="694" y="76" width="46" height="28" rx="2" class="fs-green s-green sw-1"/><text x="717" y="95" text-anchor="middle" class="mono t-xs">b3</text>
+    <text x="486" y="128" class="t-xs t-muted">a + b</text>
+    <rect x="550" y="112" width="46" height="28" rx="2" class="fs-yellow s-yellow sw-1"/><text x="573" y="131" text-anchor="middle" class="mono t-xs">s0</text>
+    <rect x="598" y="112" width="46" height="28" rx="2" class="fs-yellow s-yellow sw-1"/><text x="621" y="131" text-anchor="middle" class="mono t-xs">s1</text>
+    <rect x="646" y="112" width="46" height="28" rx="2" class="fs-yellow s-yellow sw-1"/><text x="669" y="131" text-anchor="middle" class="mono t-xs">s2</text>
+    <rect x="694" y="112" width="46" height="28" rx="2" class="fs-yellow s-yellow sw-1"/><text x="717" y="131" text-anchor="middle" class="mono t-xs">s3</text>
+    <text x="620" y="158" text-anchor="middle" class="t-xs t-muted">one fetch, one decode, four adds</text>
+    <text x="620" y="172" text-anchor="middle" class="t-xs t-muted">(4 lanes shown; real ones have 4 to 16)</text>
+
+    <rect x="20" y="182" width="720" height="38" rx="8" class="box2"/>
+    <text x="380" y="206" text-anchor="middle" class="t-sm">The lanes must do the <tspan class="t-bold">same operation</tspan> on <tspan class="t-bold">neighbouring data</tspan>. Branchy or scattered code can't use them.</text>
+  </svg>
+  <figcaption><strong>SIMD in one picture.</strong> The same work, a quarter of the instructions. The hardware gets the speedup for free whenever the data is laid out contiguously and the operation is uniform.</figcaption>
+</figure>
+
+<p>Two conditions make SIMD pay off. The numbers must sit <strong>side by side in memory</strong> (so one wide load fetches a whole vector, and it is the cache-line idea from chapter 2 again), and every lane must do <strong>the same operation</strong>, with no per-element branches. Compilers try to <span class="term">auto-vectorise</span> simple loops in C, C++ and Rust, and libraries such as BLAS, which sits under NumPy, contain hand-tuned vector code.</p>
+
+<h3>Why NumPy is fast, and what pure Python can and can't show</h3>
+
+<p>When you write <code>for i in range(n): total += a[i] * b[i]</code> in Python, every step runs through the interpreter from chapter 1: look up the objects, check their types, call the multiply function, allocate a new float object for the result. Dozens of machine instructions to do one multiply-add. NumPy takes the opposite approach: one Python call hands a whole array to compiled code, which loops over packed numbers in machine code, with vector instructions, without touching the interpreter per element. The gain comes from <em>three</em> things at once: no per-element interpreter overhead, contiguous memory, and SIMD.</p>
+
+<div class="callout warn">
+  <p class="callout-title">An honest note about the demo below</p>
+  <p>You cannot demonstrate SIMD itself in pure Python with the standard library. Python's <code>array</code> module stores packed machine doubles, which is the right <em>layout</em>, but it gives you no vector arithmetic: every operation on its elements still goes through ordinary Python objects. Built-in functions like <code>sum</code>, <code>map</code> and (3.12+) <code>math.sumprod</code> move the loop into C and so remove most of the interpreter overhead, which is the biggest part of the gap, but they are plain scalar C loops, not SIMD. The demo shows the "interpreter overhead" part of the story honestly, and then we compare against NumPy once to see the whole thing.</p>
+</div>
+
+<pre class="terminal" data-title="simd_demo.py"><code>import array, math, operator, random, sys, timeit
+
+N = 1_000_000
+random.seed(1)
+a = [random.random() for _ in range(N)]
+b = [random.random() for _ in range(N)]
+arr_a = array.array("d", a)
+arr_b = array.array("d", b)
+
+def loop():
+    total = 0.0
+    for i in range(N):
+        total += a[i] * b[i]
+    return total
+
+def zip_loop():
+    total = 0.0
+    for x, y in zip(a, b):
+        total += x * y
+    return total
+
+def builtin_map():
+    return sum(map(operator.mul, a, b))
+
+def builtin_array():
+    return sum(map(operator.mul, arr_a, arr_b))
+
+cases = [("index loop", loop), ("zip loop", zip_loop),
+         ("sum(map(mul))", builtin_map), ("sum(map(mul)) on array", builtin_array)]
+if hasattr(math, "sumprod"):               # Python 3.12+
+    cases.append(("math.sumprod", lambda: math.sumprod(a, b)))
+
+base = None
+for name, fn in cases:
+    t = min(timeit.repeat(fn, number=1, repeat=5))
+    base = base or t
+    print(f"{name:26s} {t*1000:8.1f} ms   {base/t:5.1f}x vs index loop")
+
+print()
+print("list     :", sys.getsizeof(a) // 1000, "KB of pointers, plus",
+      sys.getsizeof(a[0]) * N // 1000, "KB of float objects")
+print("array('d'):", sys.getsizeof(arr_a) // 1000, "KB, packed 8-byte doubles")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 simd_demo.py</span>
+index loop                     18.6 ms     1.0x vs index loop
+zip loop                       17.2 ms     1.1x vs index loop
+sum(map(mul))                  10.5 ms     1.8x vs index loop
+sum(map(mul)) on array         15.2 ms     1.2x vs index loop
+math.sumprod                    3.3 ms     5.6x vs index loop
+
+list     : 8448 KB of pointers, plus 24000 KB of float objects
+array('d'): 8000 KB, packed 8-byte doubles</code></pre>
+
+<p>Your numbers will differ, but the shape should hold. Moving the loop into C (<code>sum(map(...))</code>) helps a little; <code>math.sumprod</code>, a single C function that multiplies and adds without creating any intermediate Python objects, is several times faster. The <code>array</code> version is <em>slower</em> than the list version here, which looks backwards until you remember why: the elements are packed doubles, so every access has to build a fresh Python float object from the raw bytes. Packed storage saves memory (8 MB against about 32 MB in the list, shown at the bottom) but pays off only when compiled code reads it directly. Now the same dot product in NumPy, if you have it installed (<code>pip install numpy</code>):</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 np_demo.py</span>
+numpy dot product: 0.07 ms</code></pre>
+
+<p>About 0.1 ms against about 19 ms: roughly a 190x gap on this machine, from one function call. Most of it is removed interpreter overhead and the rest is contiguous memory and vector instructions. Notice also that the 1M-element dot product reads 16 MB of data in about 0.1 ms, which is on the order of 100 GB/s or more: at that point the loop is close to what the memory system (or, for data this small, the large caches) can deliver, so it is limited by <em>data movement</em> rather than arithmetic. That is the next idea.</p>
+
+<h2>Compute versus bandwidth: the roofline idea</h2>
+
+<p>A processor can be slow for two very different reasons: it can't do arithmetic fast enough, or it can't get the numbers fast enough. Which one applies depends on a single ratio, the <span class="term">arithmetic intensity</span> of your code: <strong>how many arithmetic operations you do per byte you move from memory</strong>, measured in FLOP per byte (a <span class="term">FLOP</span> is one floating-point operation, such as an add or a multiply).</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the cooks and the pantry door</p>
+  <p>In the kitchen from chapter 0, imagine a hundred cooks (compute) and one narrow pantry door through which all ingredients arrive (memory bandwidth). If every dish needs hours of chopping per ingredient, the door is irrelevant: the cooks are the limit. If every dish is "put one tomato on a plate", the cooks idle and the door sets the pace. Intensity is the amount of cooking per ingredient carried through the door.</p>
+  <p><em>Where it breaks down:</em> real memory has a hierarchy (chapter 2). Ingredients reused soon after arriving are served from the cutting board, not the pantry, so the "door" that matters is the one at the level where your data actually lives.</p>
+</div>
+
+<p>The <span class="term">roofline model</span> draws exactly this. The speed you can achieve is the lower of two ceilings: your peak compute rate, and (memory bandwidth) x (your arithmetic intensity). At low intensity, the second is the smaller, so you sit on a sloped line and doubling the intensity doubles your speed. At high intensity you hit the flat ceiling of peak compute, and only a faster processor helps. The corner where the two meet is the <span class="term">ridge point</span>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="A roofline sketch. The horizontal axis is arithmetic intensity in FLOP per byte and the vertical axis is achievable speed. A sloped line rises from the left to a ridge point and then becomes flat. Language-model decoding at batch size 1 and batch size 64 sit on the sloped, memory-bound part; a large matrix multiplication sits on the flat, compute-bound part">
+    <line x1="70" y1="220" x2="730" y2="220" class="line"/>
+    <line x1="70" y1="220" x2="70" y2="24" class="line"/>
+    <text x="76" y="18" class="t-xs t-muted">achievable speed (FLOP/s)</text>
+    <text x="730" y="242" text-anchor="end" class="t-xs t-muted">arithmetic intensity (FLOP per byte), log scale, not to scale</text>
+    <line x1="70" y1="215" x2="430" y2="60" class="line s-orange"/>
+    <line x1="430" y1="60" x2="730" y2="60" class="line s-blue"/>
+    <line x1="430" y1="60" x2="430" y2="220" class="line-dash"/>
+    <text x="430" y="40" text-anchor="middle" class="t-xs t-bold">ridge point</text>
+    <text x="580" y="46" text-anchor="middle" class="t-xs tc-blue">peak compute (flat roof)</text>
+    <text x="352" y="214" text-anchor="middle" class="t-xs tc-orange">slope = memory bandwidth</text>
+    <circle cx="130" cy="189" r="6" class="fs-red s-red sw-2"/>
+    <text x="142" y="208" class="t-xs">decode, batch 1</text>
+    <circle cx="260" cy="133" r="6" class="fs-red s-red sw-2"/>
+    <text x="272" y="156" class="t-xs">decode, batch 64</text>
+    <circle cx="620" cy="60" r="6" class="fs-green s-green sw-2"/>
+    <text x="620" y="88" text-anchor="middle" class="t-xs">large matrix multiply</text>
+    <text x="100" y="100" class="t-xs t-muted">left of the ridge: memory-bound</text>
+    <text x="100" y="116" class="t-xs t-muted">(buy bandwidth, reuse data)</text>
+    <text x="520" y="160" class="t-xs t-muted">right of the ridge: compute-bound</text>
+    <text x="520" y="176" class="t-xs t-muted">(buy FLOPs)</text>
+  </svg>
+  <figcaption><strong>The roofline.</strong> Your code lands somewhere on the x-axis according to its intensity, and the roof above it is the best speed it can reach. Most simple loops are on the slope.</figcaption>
+</figure>
+
+<p>Some intensities worth feeling. An element-wise add, <code>c[i] = a[i] + b[i]</code> in 32-bit floats, does 1 FLOP and moves 12 bytes (read two, write one): about 0.08 FLOP/byte. A dot product does 2 FLOPs per 8 bytes read: 0.25. Both are hopelessly memory-bound on any machine; faster arithmetic does nothing for them, which is why that 16 MB dot product ran at memory speed. A large matrix multiplication is the opposite, as we will see in a moment. For modern chips the ridge point sits at a surprising place: the GPUs below need on the order of a hundred or more FLOPs of work per byte fetched to keep their arithmetic units busy. Almost nothing is that dense unless you reuse each loaded number many times.</p>
+
+<h2>GPUs: thousands of simple cores</h2>
+
+<p>A CPU core is built to run <em>one</em> instruction stream as fast as possible: deep pipelines, branch prediction, out-of-order execution and large caches all exist to hide delays in unpredictable code (chapters 1 and 2). That machinery takes much of the die. A <span class="term">GPU</span> (graphics processing unit) makes the opposite trade. It strips each core down to simple arithmetic, drops most of the latency-hiding hardware, and uses the space for thousands of them, plus very wide memory. The result is poor at running one thread of branchy code and extraordinary at running the same small program on millions of data items.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 310" role="img" aria-label="A CPU with four large cores, big caches and DRAM, connected over PCIe to a GPU with a grid of many small cores and high-bandwidth memory. Below, a warp of 32 threads executes the same instruction at once, one per lane">
+    <defs><marker id="ahSx21b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="170" y="22" text-anchor="middle" class="t-sm t-bold">CPU: a few clever cores</text>
+    <rect x="30" y="38" width="62" height="62" rx="6" class="fs-purple s-purple sw-1"/><text x="61" y="73" text-anchor="middle" class="t-xs">core</text>
+    <rect x="102" y="38" width="62" height="62" rx="6" class="fs-purple s-purple sw-1"/><text x="133" y="73" text-anchor="middle" class="t-xs">core</text>
+    <rect x="174" y="38" width="62" height="62" rx="6" class="fs-purple s-purple sw-1"/><text x="205" y="73" text-anchor="middle" class="t-xs">core</text>
+    <rect x="246" y="38" width="62" height="62" rx="6" class="fs-purple s-purple sw-1"/><text x="277" y="73" text-anchor="middle" class="t-xs">core</text>
+    <rect x="30" y="110" width="278" height="34" rx="6" class="box"/><text x="169" y="132" text-anchor="middle" class="t-xs">big caches (latency hiding)</text>
+    <rect x="30" y="156" width="278" height="34" rx="6" class="box2"/><text x="169" y="178" text-anchor="middle" class="t-xs">DRAM: roughly 50 to 100 GB/s</text>
+
+    <line x1="310" y1="173" x2="448" y2="173" class="line-dash" marker-end="url(#ahSx21b)"/>
+    <text x="379" y="162" text-anchor="middle" class="t-xs tc-red">PCIe link</text>
+    <text x="379" y="192" text-anchor="middle" class="t-xs t-muted">tens of GB/s</text>
+
+    <text x="590" y="22" text-anchor="middle" class="t-sm t-bold">GPU: thousands of simple lanes</text>
+    <g class="gpu-grid">
+      <rect x="453" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="481" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="509" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="537" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="565" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="593" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="621" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="649" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="677" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="705" y="38" width="22" height="22" rx="3" class="fs-green s-green sw-1"/>
+      <rect x="453" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="481" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="509" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="537" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="565" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="593" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="621" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="649" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="677" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="705" y="66" width="22" height="22" rx="3" class="fs-green s-green sw-1"/>
+      <rect x="453" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="481" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="509" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="537" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="565" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="593" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="621" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="649" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="677" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/><rect x="705" y="94" width="22" height="22" rx="3" class="fs-green s-green sw-1"/>
+    </g>
+    <text x="590" y="132" text-anchor="middle" class="t-xs t-muted">a grid of small cores (a real GPU has thousands)</text>
+    <rect x="453" y="156" width="274" height="34" rx="6" class="fs-yellow s-yellow sw-1"/><text x="590" y="178" text-anchor="middle" class="t-xs">HBM: very wide, roughly 1 to 3+ TB/s</text>
+
+    <text x="20" y="224" class="t-sm t-bold">A warp: 32 threads running the same instruction in lockstep</text>
+    <g class="warp">
+      <rect x="20" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="42" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="64" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="86" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="108" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="130" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="152" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="174" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/>
+      <rect x="196" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="218" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="240" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="262" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="284" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="306" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="328" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="350" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/>
+      <rect x="372" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="394" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="416" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="438" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="460" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="482" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="504" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="526" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/>
+      <rect x="548" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="570" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="592" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="614" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="636" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="658" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="680" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/><rect x="702" y="236" width="18" height="26" rx="3" class="fs-cyan s-cyan sw-1"/>
+    </g>
+    <text x="380" y="286" text-anchor="middle" class="t-xs t-muted">each lane has its own data; if lanes disagree at an "if", both paths run in turn with some lanes switched off</text>
+  </svg>
+  <figcaption><strong>CPU versus GPU.</strong> The CPU spends silicon on making one thread fast; the GPU spends it on lanes and on memory bandwidth. The two chips have separate memories joined by a much narrower link.</figcaption>
+</figure>
+
+<p>Four ideas make a GPU tick.</p>
+
+<ul>
+  <li><strong>SIMT.</strong> You write the program for <em>one</em> thread and launch it for thousands or millions of threads, each with its own index to pick its slice of the data. The hardware runs them in groups: this is <span class="term">SIMT</span> (single instruction, multiple threads), a close cousin of SIMD in which the vector lanes look like independent threads.</li>
+  <li><strong>Warps.</strong> On NVIDIA GPUs a group of 32 threads that execute the same instruction together is a <span class="term">warp</span> (AMD uses 32 or 64, and calls its groups wavefronts). If the threads of a warp disagree at an <code>if</code>, the hardware runs both branches one after the other with some threads switched off, a cost called <span class="term">divergence</span>. GPU code is fastest when it is uniform, exactly as with SIMD.</li>
+  <li><strong>Hide latency with more threads, not caches.</strong> A CPU hides a 100 ns memory wait with caches and speculation. A GPU hides it by keeping many more warps resident than it can run, so when one warp stalls on memory the hardware switches to another within a cycle. This only works if you launch far more threads than there are cores.</li>
+  <li><strong>High-bandwidth memory.</strong> GPUs pair the cores with very wide memory, today usually <span class="term">HBM</span> (high-bandwidth memory) stacked right next to the chip. Top data-centre GPUs deliver roughly 2 to 8 terabytes per second depending on generation, against roughly 50 to 100 GB/s for a typical desktop's main memory. Apple's M-series chips sit in between: a single pool of memory shared by the CPU and GPU (so no copy), at a few hundred GB/s in the larger models (up to roughly 800 GB/s on the biggest).</li>
+</ul>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: one master chef versus a school cafeteria line</p>
+  <p>A CPU core is a master chef who can cook any dish in any order, adapting as orders change. A GPU is a long assembly line of thousands of trained helpers who each do one simple step, all at the same moment, on a thousand identical sandwiches. For a thousand identical sandwiches the line wins by a mile. For one complicated, ever-changing dinner it is useless.</p>
+  <p><em>Where it breaks down:</em> the helpers on the line only stay in step in groups of 32, and a sandwich with an unusual filling (a divergent branch) stalls its whole group.</p>
+</div>
+
+<h3>The catch: moving data to the GPU</h3>
+
+<p>A discrete GPU has its own memory, separate from the CPU's. To compute on data you must copy it over the <span class="term">PCIe</span> link (roughly tens of GB/s, an order of magnitude below the GPU's own memory bandwidth, and with a latency of microseconds per transfer), and copy results back. So the question is always: <em>does the GPU do enough work per byte copied to pay for the trip?</em> A million-element vector add finishes in microseconds on the GPU and then waits longer than that to be copied in and out, so the CPU wins. A matrix multiply that does thousands of operations per number copied wins easily. Serious GPU programs keep data on the device across many operations and overlap copies with computation. This is the roofline argument again, one level further out: the PCIe link is just another, narrower, pantry door.</p>
+
+<h2>Why matrix multiplication suits GPUs</h2>
+
+<p>Multiplying two <code>n x n</code> matrices produces <code>n²</code> outputs, each a dot product of length <code>n</code>. That is about <code>2n³</code> FLOPs, but the inputs and outputs hold only <code>3n²</code> numbers. The work grows as the cube of the size and the data as the square, so <strong>the arithmetic intensity grows with n</strong>: each number loaded can be reused about <code>n</code> times. Libraries exploit this by cutting the matrices into tiles that fit in fast on-chip memory, reusing each tile many times before going back to main memory (chapter 2's locality, applied deliberately). Better still, the outputs are all independent, so there are millions of identical, uniform, branch-free jobs: just what a GPU wants.</p>
+
+<pre class="terminal" data-title="matmul_ai.py"><code>def intensity(n, bytes_per=4):
+    flops = 2 * n**3                  # n*n outputs, each n multiplies + n adds
+    traffic = 3 * n * n * bytes_per   # read A and B once, write C once (ideal)
+    return flops / traffic
+for n in (8, 64, 1024, 8192):
+    print(f"n={n:5d}  {intensity(n):8.1f} FLOP/byte")
+print("elementwise add (c = a + b), float32:", round(1 / (3 * 4), 3), "FLOP/byte")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 matmul_ai.py</span>
+n=    8       1.3 FLOP/byte
+n=   64      10.7 FLOP/byte
+n= 1024     170.7 FLOP/byte
+n= 8192    1365.3 FLOP/byte
+elementwise add (c = a + b), float32: 0.083 FLOP/byte</code></pre>
+
+<p>(These are ideal values that assume perfect tiling, so each number crosses the memory bus once.) A 1,024 x 1,024 matrix product reaches about 170 FLOP/byte, and 8,192 x 8,192 passes 1,000: far right of the ridge, firmly compute-bound. Contrast that with the 0.08 of an element-wise add. This is why neural networks, which are dominated by large matrix products, took off on GPUs, and why chip makers added dedicated <span class="term">tensor cores</span> (small fixed-function units that multiply small matrix tiles in a single step) which lift the compute roof to around a thousand trillion FLOP/s for 16-bit numbers on the top data-centre parts. The roof got so high that the ridge point moved right: an op needs a few hundred FLOP/byte to reach it, and many operations in a real model do not have that.</p>
+
+<h2>Why LLM decoding is bound by memory bandwidth</h2>
+
+<p>A large language model generates text one token at a time. To produce each token the system must run the whole network once, which means reading <strong>every weight</strong> from memory and doing a multiply-add with each. For a single sequence the "matrix" is really a matrix times one vector, so each weight is used for just one multiply-add before being thrown away: about 2 FLOPs per weight. If a weight is stored in 16 bits (2 bytes), that is about <strong>1 FLOP per byte</strong>, a few hundred times below the ridge point. The chip's multipliers are mostly idle, waiting for weights to arrive. So the speed limit is simply:</p>
+
+<pre class="terminal" data-title="the napkin rule"><code>tokens per second  &lt;=  memory bandwidth / bytes of weights read per token</code></pre>
+
+<pre class="terminal" data-title="napkin.py"><code># Upper bound on decode speed when weights must be streamed from memory.
+# Assumptions: batch size 1, every weight is read once per generated token,
+# nothing else (KV cache, activations) costs anything.  Real systems do worse.
+GB = 1e9
+models = [("7B  params, 16-bit", 7e9, 2.0),
+          ("70B params, 16-bit", 70e9, 2.0),
+          ("70B params, 4-bit ", 70e9, 0.5)]
+memories = [("laptop DRAM, ~100 GB/s", 100 * GB),
+            ("one big GPU, ~3,000 GB/s", 3000 * GB)]
+
+for mname, params, bytes_per_param in models:
+    weights = params * bytes_per_param
+    for bname, bandwidth in memories:
+        print(f"{mname}  weights {weights/GB:6.1f} GB  {bname:26s}"
+              f" -&gt; at most {bandwidth/weights:6.1f} tokens/s")
+
+# Arithmetic intensity of that decode step: ~2 FLOPs (multiply + add) per weight
+print("\nFLOPs per byte at batch 1, 16-bit weights:", 2 / 2.0)
+print("FLOPs per byte at batch 64:", 64 * 2 / 2.0)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 napkin.py</span>
+7B  params, 16-bit  weights   14.0 GB  laptop DRAM, ~100 GB/s     -&gt; at most    7.1 tokens/s
+7B  params, 16-bit  weights   14.0 GB  one big GPU, ~3,000 GB/s   -&gt; at most  214.3 tokens/s
+70B params, 16-bit  weights  140.0 GB  laptop DRAM, ~100 GB/s     -&gt; at most    0.7 tokens/s
+70B params, 16-bit  weights  140.0 GB  one big GPU, ~3,000 GB/s   -&gt; at most   21.4 tokens/s
+70B params, 4-bit   weights   35.0 GB  laptop DRAM, ~100 GB/s     -&gt; at most    2.9 tokens/s
+70B params, 4-bit   weights   35.0 GB  one big GPU, ~3,000 GB/s   -&gt; at most   85.7 tokens/s
+
+FLOPs per byte at batch 1, 16-bit weights: 1.0
+FLOPs per byte at batch 64: 64.0</code></pre>
+
+<p>The assumptions are on the first lines of the script, and they matter: <strong>batch size 1</strong>, every weight read exactly once per token, bandwidth figures that are round numbers (about 100 GB/s for a laptop, about 3 TB/s for a top data-centre GPU), and no cost for anything else. A 70-billion-parameter model in 16 bits is 140 GB, more than one GPU holds, so in practice its weights are split across several GPUs whose bandwidths add up; read the "one big GPU" row as the aggregate bandwidth of the memory the weights live in. Real speeds come out lower, because attention also reads a growing cache of past keys and values (the "KV cache", which is extra bytes per token that grow with context length), and nothing reaches full bandwidth. But the shape of the estimate is right and explains three real-world facts. Smaller models are faster. Stored in 4 bits ("quantised") a model takes a quarter of the bytes and decodes up to four times faster, which is why quantisation is so popular. And a laptop with fast unified memory can run a medium-sized model usefully while a machine with lots of arithmetic but slow memory cannot.</p>
+
+<h3>The fix is batching</h3>
+
+<p>If the weights are being read anyway, use them for <em>many requests at once</em>. At batch size 64, one pass over the weights serves 64 sequences: the intensity rises to roughly 64 FLOP/byte and the cost of reading the weights is shared by 64 users. In the roofline picture you slide to the right along the slope. Throughput rises almost in proportion until you approach the ridge point (or run out of memory for the KV caches, which are per-sequence), after which you are compute-bound. That one fact shapes how model-serving systems are built: they wait a few milliseconds to group requests, use <em>continuous batching</em> (adding new requests to a running batch as old ones finish), and trade a little latency for a large gain in tokens per second per dollar.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A faster GPU means faster chatbot replies." Only if it has more memory <em>bandwidth</em>. For single-user decoding, doubling the FLOPs does almost nothing; doubling the bandwidth nearly doubles the speed. Training and processing a long prompt (which handles many tokens at once, so intensity is high) are the compute-bound cases.</p>
+</div>
+
+<h2>TPUs and other accelerators</h2>
+
+<p>The GPU is not the only way to spend silicon on matrix arithmetic. A <span class="term">TPU</span> (tensor processing unit), Google's design, is built around a large systolic array: a grid of multiply-add units through which numbers flow rhythmically, so each value fetched is reused across a whole row or column before leaving the chip, which pushes the intensity up by construction. Other companies build their own neural-network accelerators (often called NPUs), and phones and laptops now include small ones for on-device models. Some designs put large amounts of fast on-chip SRAM next to the arithmetic to avoid the off-chip memory bottleneck, and others focus on packing the numbers into fewer bits. The details differ and change quickly, so hold on to the shared pattern: fewer general-purpose mechanisms, more arithmetic units, and a design built around keeping data close to them. The trade-off is flexibility. Each is excellent on the workloads it targets and awkward on anything else, which is why the CPU stays in the middle of every machine to run the operating system, the branchy code and the glue.</p>
+
+<h2>What this means for system design</h2>
+
+<ul>
+  <li><strong>Batch to amortise fixed costs.</strong> Every weight read, every PCIe copy, every kernel launch and every disk or network call has a fixed price. Doing more work per trip (batching) is the general remedy, in model serving and in databases (<a href="../../data/chapters/09-column-stores.html">column stores</a> work the same way: they scan columns in bulk with vectorised code).</li>
+  <li><strong>Data movement is the cost.</strong> In most real systems the question is not "how many FLOPs?" but "how many bytes move, and how far?" The memory hierarchy (chapter 2) from L1 to a PCIe link to a network hop is one continuous ladder with the same rule at every rung. Design to move less, and to reuse what you moved.</li>
+  <li><strong>Cost follows utilisation.</strong> A GPU costs the same whether its multipliers are busy or idle. A serving system that is bandwidth-bound at batch 1 is wasting most of an expensive chip, which is why batching, quantisation and request routing matter to the bill. We take this up in <a href="../../design/chapters/20-ml-systems.html">Designing with ML &amp; LLMs</a>.</li>
+  <li><strong>Find the serial fraction.</strong> Before adding hardware, ask what Amdahl's serial part is: a lock, a single-threaded coordinator, a data load. That is where the next 10x hides. Chapter 22 shows how to find it by measuring.</li>
+  <li><strong>Match the tool to the shape of the work.</strong> Branchy, latency-sensitive, small-data code belongs on the CPU. Uniform bulk arithmetic over big arrays belongs on vector units or accelerators. Network-bound or lock-bound code needs neither (chapters 12 and 15).</li>
+</ul>
+
+<details class="deeper">
+  <summary>Go deeper: Python threads, the GIL and where parallelism shows up <span class="hint">optional</span></summary>
+  <p>In standard CPython (chapter 10) the global interpreter lock lets only one thread run Python bytecode at a time, so threads give no thread-level parallelism for pure-Python CPU work. The escape routes all match this chapter: use <code>multiprocessing</code> or separate processes (each with its own interpreter and lock), or call into libraries such as NumPy that release the lock while compiled code runs (and use SIMD and often several cores inside). Python 3.13 added an optional, experimental free-threaded build, but ordinary installs still have the GIL. Amdahl's law applies to all of these: process start-up, pickling arguments and merging results are the serial fraction.</p>
+</details>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: what parallel hardware do you have?</p>
+  <p>All read-only, no sudo. Output will differ. Then run <code>amdahl.py</code> and <code>simd_demo.py</code> from this chapter, and use <a href="../toolbox.html#hyperfine">hyperfine</a> from the toolbox to time a whole script from the shell if you want a second opinion.</p>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="cmt"># macOS: core count, and whether the CPU has Arm's NEON vector unit (Apple Silicon)</span>
+<span class="prompt">$ </span><span class="cmd">sysctl hw.ncpu hw.optional.neon</span>
+hw.ncpu: 10
+hw.optional.neon: 1
+<span class="cmt"># Intel Macs instead report x86 vector extensions:</span>
+<span class="prompt">$ </span><span class="cmd">sysctl hw.optional.avx2_0</span>
+
+<span class="cmt"># Linux / WSL: cores, and the vector extensions your CPU supports (look for avx2, avx512f)</span>
+<span class="prompt">$ </span><span class="cmd">nproc</span>
+8
+<span class="prompt">$ </span><span class="cmd">grep -o -w -E 'sse4_2|avx2|avx512f' /proc/cpuinfo | sort | uniq -c</span>
+      8 avx2
+      8 sse4_2
+
+<span class="cmt"># Any platform, from Python</span>
+<span class="prompt">$ </span><span class="cmd">python3 -c "import os; print(os.cpu_count())"</span>
+10
+
+<span class="cmt"># If you have an NVIDIA GPU and its driver: model, memory, utilisation</span>
+<span class="prompt">$ </span><span class="cmd">nvidia-smi</span></code></pre>
+
+<p>Experiments: change <code>p</code> in <code>amdahl.py</code> to match a real program you know, and ask what its serial fraction might be. In <code>simd_demo.py</code>, shrink <code>N</code> to 1,000 and notice the ratios change (small arrays are dominated by call overhead). If you have NumPy, time <code>a + b</code> for a 100-million-element array and work out the bytes per second: it will be close to your RAM's bandwidth, which is the roofline's sloped line made visible.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Amdahl's law is the same law that limits scaling out across machines, with a bigger serial fraction: coordination, data shuffles and the slowest straggler. The roofline idea scales up too: a cluster training a model is bound by the network between GPUs the way one GPU is bound by its memory, and good designs keep data local the way chapter 2 taught. The ML-serving chapter in the system-design course applies this chapter's arithmetic directly: <a href="../../design/chapters/20-ml-systems.html">Designing with ML &amp; LLMs</a>. For latency numbers at network scale see <a href="../../networking/chapters/13-performance.html">networking chapter 13</a>, and for how analytics databases use vectorised scans see <a href="../../data/chapters/09-column-stores.html">Column Stores &amp; Analytics</a>.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Parallelism comes at four scales: instruction-level, SIMD vectors, multiple cores, and accelerators. Fast numerical code uses all of them.</li>
+    <li>Amdahl's law: speedup = 1 / ((1 - p) + p/n). The serial fraction sets a hard ceiling (5% serial means at most 20x), so shrink the serial part before adding workers. Gustafson's view: bigger machines usually run bigger problems.</li>
+    <li>SIMD applies one instruction to 4 to 16 numbers; it needs contiguous data and uniform operations. NumPy is fast because it removes interpreter overhead, uses packed memory and uses vector code. Pure Python can show the first effect honestly, not SIMD itself.</li>
+    <li>Arithmetic intensity (FLOP per byte) decides whether you are memory-bound or compute-bound. Most simple loops are memory-bound; the roofline shows the ceiling for each.</li>
+    <li>GPUs trade clever cores for thousands of simple lanes running in warps of 32, with very high memory bandwidth. They shine on uniform bulk work such as matrix multiplication and pay a toll for every host-to-device copy.</li>
+    <li>LLM decoding at small batch sizes reads all the weights per token, so tokens/s is at most bandwidth divided by model bytes. Batching and quantisation are the main remedies.</li>
+    <li>In system design, parallel hardware pays only when you keep it fed: batch, move less data, and know your serial fraction.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A job takes 100 s, of which 10 s is inherently serial. What is the best possible speedup however many workers you add?</p>
+    <ol class="q-options">
+      <li>About 9x</li>
+      <li>About 90x</li>
+      <li>10x</li>
+      <li>There is no limit if you add enough workers</li>
+    </ol>
+    <div class="q-explain">The limit is 1 / (serial fraction) = 1 / 0.1 = 10x. Even with infinitely many workers the 10 serial seconds remain, so the job cannot finish in under 10 s.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Which statement about the pure-Python array demo is honest?</p>
+    <ol class="q-options">
+      <li>It mostly shows interpreter overhead being removed; real SIMD needs compiled code such as NumPy or a vectorising compiler</li>
+      <li>It proves that Python uses AVX instructions for <code>sum</code></li>
+      <li>The <code>array</code> module gives vector arithmetic, so it is always faster than a list</li>
+      <li>It shows that SIMD gives a 5x speedup on every machine</li>
+    </ol>
+    <div class="q-explain">Built-ins like <code>sum</code> and <code>math.sumprod</code> run a scalar C loop. They avoid the interpreter's per-element cost, which is a large part of the gap, but SIMD needs compiled kernels. The array module only changes the layout, and can even be slower in pure Python because each access creates a float object.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">An element-wise add of two big float arrays does about 0.08 FLOP per byte moved. What limits it?</p>
+    <ol class="q-options">
+      <li>The number of multiplier units</li>
+      <li>The clock speed of the CPU</li>
+      <li>Branch mispredictions</li>
+      <li>Memory bandwidth, so a faster ALU would not help</li>
+    </ol>
+    <div class="q-explain">It sits far left of the ridge point, on the sloped, bandwidth-limited part of the roofline. The arithmetic units spend most of their time waiting for data.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A model has 14 GB of weights and a GPU has about 2,000 GB/s of memory bandwidth. At batch size 1, roughly what is the upper bound on decoding speed?</p>
+    <ol class="q-options">
+      <li>About 14 tokens per second</li>
+      <li>About 140 tokens per second</li>
+      <li>About 2,000 tokens per second</li>
+      <li>About 28,000 tokens per second</li>
+    </ol>
+    <div class="q-explain">Each token reads all the weights once: 2,000 / 14 is about 143 tokens per second at best, ignoring the KV cache and real-world inefficiency. The 14 and 2,000 answers come from using the wrong quantity; 28,000 multiplies instead of dividing.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why does batching many requests together raise LLM serving throughput so much?</p>
+    <ol class="q-options">
+      <li>One read of the weights serves every sequence in the batch, raising arithmetic intensity so the idle compute is used</li>
+      <li>Batches make the GPU's memory physically faster</li>
+      <li>It removes the need to load the weights at all</li>
+      <li>It avoids the PCIe link entirely</li>
+    </ol>
+    <div class="q-explain">The cost of streaming the weights is the same whether one sequence or many use them, so the cost per token falls almost in proportion, until compute or per-sequence memory (the KV cache) becomes the limit.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">What does a GPU warp (on NVIDIA hardware) do when its 32 threads reach an <code>if</code> and half of them take the branch?</p>
+    <ol class="q-options">
+      <li>The warp splits into two independent warps that run on different cores</li>
+      <li>The threads that take the branch stop and the others finish the program</li>
+      <li>Both paths run one after the other, with the non-participating threads switched off, so the warp takes the time of both</li>
+      <li>The program crashes with a divergence error</li>
+    </ol>
+    <div class="q-explain">This is warp divergence. The threads share one instruction stream, so the hardware serialises the paths. Uniform control flow keeps all 32 lanes useful.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/amdahl-calc.js"></script>
+</body>
+</html>

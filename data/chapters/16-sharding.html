@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sharding in Practice · Data Systems</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/shard-key.css">
+</head>
+<body data-root="../.." data-course="data" data-chapter="16">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+<header class="chapter-head">
+  <h1>Sharding in Practice</h1>
+  <p class="lede">The networking course showed you how to cut data into pieces and find the right machine for a key. This chapter is about the decisions that hurt later: which column to cut on, what happens to your indexes and joins when the data is in pieces, and how to move the pieces while the system is running.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Sharding is the one scaling step you cannot easily take back. The shard key you choose on day one decides which queries stay fast, which ones become fan-outs across every machine, and whether a single popular user can melt one server while the rest sit idle. Teams that choose well barely notice they are sharded. Teams that choose badly spend a year migrating.</p>
+</div>
+
+<h2>Why shard, and when not to</h2>
+
+<p>In <a href="../../networking/chapters/19-partitioning.html">networking chapter 19</a> you met <span class="term">partitioning</span>: cutting a dataset into <span class="term">shards</span>, each owned by a different machine, plus the mechanics of consistent hashing. Here we use the database word <em>sharding</em> and look at what it costs in a real application. There are three honest reasons to shard:</p>
+<ul>
+  <li><strong>Data size.</strong> The data no longer fits on one machine's disks, or the working set no longer fits in its RAM, so every query pays for disk reads (<a href="06-b-trees.html">chapter 6</a>'s buffer pool is too small).</li>
+  <li><strong>Write throughput.</strong> Read replicas (<a href="15-replication-practice.html">chapter 15</a>) multiply read capacity, but every replica still applies every write. Once one leader cannot absorb the writes, only splitting the writes helps.</li>
+  <li><strong>Blast radius.</strong> With one database, one bad query, one corrupted table or one failed machine hurts every customer. With many shards, an incident hurts a fraction of them, and a maintenance task can proceed one shard at a time.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Shard last, not first</p>
+  <p>Sharding takes away things relational databases give you for free: cross-row transactions, joins, unique constraints across the whole table, simple backups. Before you accept that, exhaust the cheaper options: better indexes, caching (<a href="14-caching.html">chapter 14</a>), a bigger machine, read replicas, archiving cold data. A single well-tuned PostgreSQL or MySQL server handles far more than most people expect. Shard when the numbers say you must, not because it sounds scalable.</p>
+</div>
+
+<h2>Two ways to cut: vertical and horizontal</h2>
+
+<p><span class="term">Vertical partitioning</span> splits by <em>table or feature</em>: the users and billing tables stay on one database, the activity feed and notifications move to another. Each piece is a normal, unsharded database. It is the cheapest first step because the application code just learns about a second connection. Its limit is that each feature's data can still outgrow one machine, and you lose joins and transactions <em>between</em> the pieces.</p>
+
+<p><span class="term">Horizontal sharding</span> splits the <em>rows of one table</em>: every shard has the same schema, but holds different rows. A <span class="term">shard key</span> (a column, or several) decides which shard owns a row. This is what scales a single huge table, and it is the subject of the rest of the chapter. Real systems do both, in that order: <a href="../cases/case-06-figma-sharding.html">case 6</a> follows one company through vertical partitions first and horizontal shards second.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a library that outgrew its building</p>
+  <p>You met the library branches in the networking course. Vertical partitioning is moving the whole children's section into its own building. Horizontal sharding is opening branches that each stock <em>every</em> section but only for some readers, say by the first letter of the author's surname. The rule that decides which branch holds a book is the shard key, and every librarian must agree on it.</p>
+  <p><em>Where it breaks down:</em> a patron can wander between branches in an afternoon. A query cannot. Every extra shard a query must visit is a network round trip, and the query is as slow as its slowest branch.</p>
+</div>
+
+<h2>Choosing a shard key</h2>
+
+<p>The shard key answers "which shard owns this row?" and, just as importantly, "which queries can find their rows without asking everyone?". The two classic strategies make opposite trades.</p>
+
+<h3>By key range</h3>
+<p>Give each shard a contiguous slice of the key space: shard 0 owns keys A to F, shard 1 owns G to M. Neighbouring keys live together, so a <span class="term">range scan</span> ("all orders from 1 March to 7 March") reads one or two shards, in order. Range partitioning is what ordered stores such as B-tree-based databases and HBase-style systems naturally offer, and it is how you split a table by date.</p>
+<p>The trap is the <span class="term">hot spot</span>. If the key is a timestamp, <em>all new writes have the newest timestamp</em>, so they all land in the last range. One shard does all the work while the others hold cold history. Sequential ids behave the same way. The data is spread out, but the <em>load</em> is not.</p>
+
+<h3>By hash</h3>
+<p>Hash the key and shard on the hash, as in networking chapter 19. Similar keys are scattered, so load spreads evenly, whatever the key looks like. The price is the range scan: neighbouring keys are on unrelated shards, so "all of March's orders" must ask <em>every</em> shard and merge the answers (<span class="term">scatter/gather</span>). Hashing buys balance and gives up order.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 262" role="img" aria-label="Four shards drawn twice. Under range on timestamp, shards 0 to 2 receive 0 percent of new writes and shard 3 receives 100 percent. Under hash of user id, each of the four shards receives about 25 percent.">
+<text x="20" y="22" class="t-sm t-bold">RANGE on timestamp: shards are consecutive time slices</text>
+<rect x="20" y="34" width="165" height="46" rx="8" class="box"/>
+<text x="102" y="54" text-anchor="middle" class="t-sm t-bold">shard 0</text>
+<text x="102" y="70" text-anchor="middle" class="t-xs t-muted">days 1-2</text>
+<rect x="205" y="34" width="165" height="46" rx="8" class="box"/>
+<text x="287" y="54" text-anchor="middle" class="t-sm t-bold">shard 1</text>
+<text x="287" y="70" text-anchor="middle" class="t-xs t-muted">days 3-4</text>
+<rect x="390" y="34" width="165" height="46" rx="8" class="box"/>
+<text x="472" y="54" text-anchor="middle" class="t-sm t-bold">shard 2</text>
+<text x="472" y="70" text-anchor="middle" class="t-xs t-muted">days 5-6</text>
+<rect x="575" y="34" width="165" height="46" rx="8" class="fs-red s-red sw-2"/>
+<text x="657" y="54" text-anchor="middle" class="t-sm t-bold">shard 3</text>
+<text x="657" y="70" text-anchor="middle" class="t-xs t-muted">days 7-8: today</text>
+<text x="102" y="102" text-anchor="middle" class="t-sm t-muted">0% of new writes</text>
+<text x="287" y="102" text-anchor="middle" class="t-sm t-muted">0%</text>
+<text x="472" y="102" text-anchor="middle" class="t-sm t-muted">0%</text>
+<text x="657" y="102" text-anchor="middle" class="t-sm t-bold tc-red">100% of new writes</text>
+
+<text x="20" y="146" class="t-sm t-bold">HASH of user_id: users are scattered over all shards</text>
+<rect x="20" y="158" width="165" height="46" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="102" y="178" text-anchor="middle" class="t-sm t-bold">shard 0</text>
+<text x="102" y="194" text-anchor="middle" class="t-xs t-muted">hash mod 4 = 0</text>
+<rect x="205" y="158" width="165" height="46" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="287" y="178" text-anchor="middle" class="t-sm t-bold">shard 1</text>
+<text x="287" y="194" text-anchor="middle" class="t-xs t-muted">hash mod 4 = 1</text>
+<rect x="390" y="158" width="165" height="46" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="472" y="178" text-anchor="middle" class="t-sm t-bold">shard 2</text>
+<text x="472" y="194" text-anchor="middle" class="t-xs t-muted">hash mod 4 = 2</text>
+<rect x="575" y="158" width="165" height="46" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="657" y="178" text-anchor="middle" class="t-sm t-bold">shard 3</text>
+<text x="657" y="194" text-anchor="middle" class="t-xs t-muted">hash mod 4 = 3</text>
+<text x="102" y="226" text-anchor="middle" class="t-sm t-muted">about 25%</text>
+<text x="287" y="226" text-anchor="middle" class="t-sm t-muted">about 25%</text>
+<text x="472" y="226" text-anchor="middle" class="t-sm t-muted">about 25%</text>
+<text x="657" y="226" text-anchor="middle" class="t-sm t-muted">about 25%</text>
+<text x="380" y="252" text-anchor="middle" class="t-xs t-faint">but "everything posted in the last day" now has to ask all four shards</text>
+</svg>
+<figcaption>The same four shards under two keys. Range keeps time slices together and piles today's writes onto one shard. Hash balances the writes and scatters the time slices.</figcaption>
+</figure>
+
+<h3>Compound keys: the best of both, in the right order</h3>
+<p>Often you want both: an even spread <em>and</em> cheap scans for the common query. A <span class="term">compound key</span> does it by using two parts for two jobs. Take <code>(user_id, timestamp)</code>. Hash only the <em>first</em> part to choose the shard, so users spread evenly. Inside the shard, keep rows sorted by the whole key, so one user's rows sit together in time order. "Posts of user X in the last day" then goes to exactly one shard and reads one contiguous run of keys. Cassandra calls the parts the partition key and the clustering columns; the same idea shows up in DynamoDB (partition key and sort key) and elsewhere. <a href="../cases/case-02-discord-messages.html">Case 2</a> shows how this kind of key shaped Discord's message storage.</p>
+
+<p>The order matters. <code>(timestamp, user_id)</code> sharded by its first part is the hot-spot design again. Put the high-cardinality, evenly-spread part first.</p>
+
+<div class="callout warn">
+  <p class="callout-title">The shard key is hard to change</p>
+  <p>Every row's location, every query's routing, and often your uniqueness guarantees depend on it. Changing it later means rewriting every row into a new layout while serving traffic. Choose it from the <em>queries</em> you must make fast, not from the table's primary key by default, and check it against the heaviest users, not just the average one.</p>
+</div>
+
+<h2>Hot keys, celebrities and salting</h2>
+
+<p>Hashing spreads <em>keys</em> evenly. It cannot spread the <em>load on one key</em>. If a single user, product or chat room receives a huge share of the traffic (a celebrity account, a viral post), then all of it goes to the one shard that owns that key, however good the hash is. Real popularity is heavily skewed: a few keys are enormously busy and a long tail is quiet, a shape called a <span class="term">Zipf-like</span> distribution.</p>
+
+<p>The standard remedy is <span class="term">salting</span>: for known-hot keys only, append a small number to the key (<code>celebrity42#0</code>, <code>#1</code>, … <code>#7</code>) and choose the suffix at random or round-robin when writing. The hash of each salted key is different, so the writes fan out over several shards. The cost moves to reads: to see everything about that key you must read every salt bucket and merge. So you salt only keys you know are hot (typically a small list the application maintains), and you accept slower reads for them. <a href="14-caching.html">Chapter 14</a> showed the cache-side version of the same problem, hot keys that overwhelm one cache node.</p>
+
+<h2>Play with shard keys</h2>
+
+<p>Time to feel the trade-offs. The widget below generates the same deterministic workload every time: 4,000 writes from 200 users, a few of them far busier than the rest, with timestamps increasing through the day. Try each key, then flip between 4 and 8 shards. Watch two things: the <strong>bars</strong> (is the load even?) and the <strong>query line</strong> (how many shards must be asked?). The tick on each bar is the fair share.</p>
+
+<div class="widget" id="shard-key"><p class="widget-help">The shard key explorer needs JavaScript.</p></div>
+
+<p>Things to look for. Range on timestamp sends everything to one shard, but a "last day" read touches just that one. Hash(user_id) is mostly even, yet the shard that owns the busiest user stands out, and it gets worse as you add shards, because the busiest user's share of the <em>total</em> does not shrink. Range on user_id keeps one user's rows together but, because the busy users have low ids, is badly skewed too (second only to timestamp here). Salting fixes the writes and makes the busiest user's read touch many shards.</p>
+
+<div class="callout warn">
+  <p class="callout-title">More shards do not fix a hot key</p>
+  <p>If one key takes 17% of all writes, no number of shards can bring that shard below 17%. Adding machines helps only the load that <em>can</em> be split. A hot key needs a different remedy: salting, a cache in front, splitting the entity, or batching the writes.</p>
+</div>
+
+<h2>Secondary indexes across shards</h2>
+
+<p>An index on something other than the shard key (find all cars where <code>color = 'red'</code>, when cars are sharded by id) gets awkward, because matching rows live on every shard. The two designs, from <em>Designing Data-Intensive Applications</em>, trade write cost against read cost.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 284" role="img" aria-label="Left: a local index. Shard A holds cars 1 and 2 with its own index of red to car 1 and blue to car 2. Shard B holds cars 3 and 4 with its own index of red to cars 3 and 4. The query color equals red is sent to both shards and the results are merged. Right: a global index. Index shard 1 holds terms a to m with blue to car 2. Index shard 2 holds terms n to z with red to cars 1, 3 and 4. The query asks only index shard 2, then fetches cars from shards A and B.">
+<defs><marker id="ahD16a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="20" y="20" class="t-sm t-bold">LOCAL index (document-partitioned)</text>
+<rect x="20" y="36" width="165" height="130" rx="8" class="box"/>
+<text x="34" y="54" class="t-xs t-bold">shard A</text>
+<rect x="32" y="62" width="141" height="22" rx="4" class="box2"/><text x="42" y="77" class="t-xs mono">car 1 red</text>
+<rect x="32" y="88" width="141" height="22" rx="4" class="box2"/><text x="42" y="103" class="t-xs mono">car 2 blue</text>
+<rect x="32" y="118" width="141" height="38" rx="4" class="fs-purple s-purple sw-2"/>
+<text x="42" y="134" class="t-xs mono">red  -&gt; 1</text><text x="42" y="149" class="t-xs mono">blue -&gt; 2</text>
+<rect x="205" y="36" width="165" height="130" rx="8" class="box"/>
+<text x="219" y="54" class="t-xs t-bold">shard B</text>
+<rect x="217" y="62" width="141" height="22" rx="4" class="box2"/><text x="227" y="77" class="t-xs mono">car 3 red</text>
+<rect x="217" y="88" width="141" height="22" rx="4" class="box2"/><text x="227" y="103" class="t-xs mono">car 4 red</text>
+<rect x="217" y="118" width="141" height="38" rx="4" class="fs-purple s-purple sw-2"/>
+<text x="227" y="134" class="t-xs mono">red  -&gt; 3, 4</text>
+<rect x="95" y="200" width="180" height="28" rx="6" class="fs-yellow s-yellow sw-2"/>
+<text x="185" y="219" text-anchor="middle" class="t-xs t-bold mono">color = red</text>
+<line x1="135" y1="200" x2="105" y2="170" class="line" marker-end="url(#ahD16a)"/>
+<line x1="235" y1="200" x2="265" y2="170" class="line" marker-end="url(#ahD16a)"/>
+<text x="195" y="252" text-anchor="middle" class="t-xs">query asks BOTH shards, merges: 1, 3, 4</text>
+<text x="195" y="270" text-anchor="middle" class="t-xs t-muted">a write touches only its own shard</text>
+
+<text x="390" y="20" class="t-sm t-bold">GLOBAL index (term-partitioned)</text>
+<rect x="470" y="34" width="170" height="26" rx="6" class="fs-yellow s-yellow sw-2"/>
+<text x="555" y="52" text-anchor="middle" class="t-xs t-bold mono">color = red</text>
+<rect x="390" y="84" width="160" height="50" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="402" y="102" class="t-xs t-bold">index shard 1 (a-m)</text>
+<text x="402" y="122" class="t-xs mono">blue -&gt; 2</text>
+<rect x="580" y="84" width="160" height="50" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="592" y="102" class="t-xs t-bold">index shard 2 (n-z)</text>
+<text x="592" y="122" class="t-xs mono">red -&gt; 1, 3, 4</text>
+<line x1="590" y1="60" x2="640" y2="82" class="line" marker-end="url(#ahD16a)"/>
+<rect x="390" y="170" width="160" height="40" rx="8" class="box"/>
+<text x="470" y="194" text-anchor="middle" class="t-xs">shard A: cars 1, 2</text>
+<rect x="580" y="170" width="160" height="40" rx="8" class="box"/>
+<text x="660" y="194" text-anchor="middle" class="t-xs">shard B: cars 3, 4</text>
+<line x1="610" y1="134" x2="500" y2="168" class="line-dash" marker-end="url(#ahD16a)"/>
+<line x1="665" y1="134" x2="665" y2="168" class="line-dash" marker-end="url(#ahD16a)"/>
+<text x="565" y="252" text-anchor="middle" class="t-xs">query asks ONE index shard, then fetches the cars</text>
+<text x="565" y="270" text-anchor="middle" class="t-xs t-muted">a write touches the car's shard AND an index shard</text>
+</svg>
+<figcaption>Purple is the index. A local index keeps writes cheap and reads wide. A global index keeps reads narrow and makes a single write reach more than one machine.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Local (document-partitioned) index.</strong> Each shard indexes only its own rows. Writes are simple: one shard updates its data and its index together, perhaps in one local transaction. Reads on the indexed column are not: the row could be anywhere, so the query goes to <em>all</em> shards and the results are merged. This is scatter/gather, and its tail latency is that of the slowest shard. MongoDB and Cassandra's built-in secondary indexes, and Elasticsearch, work this way.</li>
+  <li><strong>Global (term-partitioned) index.</strong> One index covers all the rows, and the index itself is split across shards, by the indexed value. A read asks just the shard that owns the value. A write is the problem: a car on shard B that turns blue changes its row on B <em>and</em> the index entries on whichever index shards hold "red" and "blue". That is a cross-shard write, so global indexes are often updated asynchronously and can briefly lag behind the data.</li>
+</ul>
+
+<p>The choice is a classic read-versus-write trade. If you query through a secondary index constantly, a global one pays off. If writes dominate, or you can tolerate wide reads, local is simpler. Often the better answer is to <em>avoid</em> the question by picking a shard key that makes your main queries single-shard.</p>
+
+<h2>Cross-shard queries, joins and transactions</h2>
+
+<p>Everything that was one cheap local operation on a single database can become a distributed one:</p>
+<ul>
+  <li><strong>Queries without the shard key</strong> scatter to every shard. An aggregate such as <code>SUM(total)</code> is computed as a partial sum per shard, and a coordinator adds the partials.</li>
+  <li><strong>Joins</strong> between tables sharded differently need rows from different machines brought together, either by shipping one side over the network or by running a distributed join. It works, but slowly, and the cost grows with the data.</li>
+  <li><strong>Transactions</strong> that touch two shards need an atomic commit protocol such as two-phase commit, which adds round trips and can block while a coordinator is down (the problem behind <a href="10-acid.html">chapter 10</a>'s atomicity promise, now across machines). Many sharded systems simply do not offer them, or offer them with caveats.</li>
+</ul>
+
+<p>The best fix is not a smarter protocol but <strong>co-location</strong>: choose the shard key so that rows used together live together. In a multi-tenant product (a SaaS where each customer is a tenant), shard <em>every</em> table by <code>tenant_id</code>. A tenant's users, orders and items then sit on one shard, so the common joins and transactions are local, and only genuinely global questions fan out. It also gives a neat blast-radius story: one tenant's runaway query hurts one shard. You can see co-location in miniature below, using two SQLite databases as two shards.</p>
+
+<pre><code>import sqlite3
+# Two "shards" are two separate SQLite databases; tenant_id picks the shard.
+shards = [sqlite3.connect(":memory:") for _ in range(2)]
+for db in shards:
+    db.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, tenant_id INT, total INT)")
+    db.execute("CREATE TABLE items(order_id INT, sku TEXT)")
+def shard_of(tenant): return shards[tenant % 2]
+for tenant in (1, 2, 3, 4):
+    db = shard_of(tenant)
+    cur = db.execute("INSERT INTO orders(tenant_id,total) VALUES(?,?)", (tenant, tenant * 10))
+    db.execute("INSERT INTO items VALUES(?,?)", (cur.lastrowid, f"sku-{tenant}"))
+
+# Co-located: tenant 3's order and items live on the same shard, so the JOIN is local.
+db = shard_of(3)
+print("tenant 3 (one shard):", db.execute(
+    "SELECT o.id, o.total, i.sku FROM orders o JOIN items i ON i.order_id=o.id WHERE o.tenant_id=3").fetchall())
+# Global total: scatter to every shard, gather and combine.
+partials = [db.execute("SELECT COALESCE(SUM(total),0) FROM orders").fetchone()[0] for db in shards]
+print("per-shard partial sums:", partials, "-&gt; total", sum(partials))</code></pre>
+
+<pre class="terminal" data-title="terminal (python3; two SQLite databases as two shards)"><code><span class="prompt">$ </span><span class="cmd">python3 shards.py</span>
+<span class="out">tenant 3 (one shard): [(2, 30, 'sku-3')]
+per-shard partial sums: [60, 40] -&gt; total 100</span></code></pre>
+
+<div class="callout warn">
+  <p class="callout-title">Co-location has a price too</p>
+  <p>If one tenant is a hundred times bigger than the others, "all of a tenant on one shard" makes that tenant a hot spot, exactly as a celebrity user does. Mature multi-tenant systems keep the ability to move or split a large tenant onto its own shard. Auto-increment ids are another casualty: each shard counting 1, 2, 3 would collide, so sharded systems use per-shard ranges, UUIDs, or time-ordered ids generated by the application.</p>
+</div>
+
+<h2>Rebalancing: changing the shard count while live</h2>
+
+<p>Data grows, so shards must be added and the data redistributed. The obvious scheme, <code>hash(key) mod N</code>, is a disaster: changing N from 4 to 5 reassigns most keys. The three practical schemes all avoid it.</p>
+
+<ol>
+  <li><strong>A fixed number of logical shards, mapped to nodes.</strong> Cut the hash space into many more logical shards than machines (say 64, or Redis Cluster's 16,384 slots) and keep a small table "logical shard → node". A key's logical shard never changes, because the modulus is fixed forever. Adding a node means moving some <em>whole logical shards</em> to it and changing their table entries. This is the simplest to reason about and to operate.</li>
+  <li><strong>Dynamic splitting.</strong> Used with range sharding. Start with a few ranges; when one grows past a size threshold (or gets too busy), split it in two and let the new half move elsewhere, much like a B-tree page split in <a href="06-b-trees.html">chapter 6</a>. MongoDB's balancer and HBase-style systems work this way. The count of shards follows the data, at the cost of a more complex shard map.</li>
+  <li><strong>Consistent hashing.</strong> Nodes and keys are placed on a ring and a key belongs to the next node clockwise, so adding a node steals keys only from its neighbours. Networking chapter 19 built it, with virtual nodes and an <a href="../../networking/chapters/19-partitioning.html">interactive ring</a> you can poke. It is the same idea as fixed logical shards, with the boundaries chosen by hashing.</li>
+</ol>
+
+<p>Here is the first scheme beside the naive one, run on 2,000 tenant keys. Adding a fifth node moves 13 of 64 logical shards, about a fifth of the keys, while <code>mod N</code> moves most of them.</p>
+
+<pre><code>import hashlib
+
+def h(key):
+    return int(hashlib.md5(str(key).encode()).hexdigest(), 16)
+
+LOGICAL = 64                                   # fixed forever
+node_of = {s: f"node{s % 4}" for s in range(LOGICAL)}   # the shard map
+
+def shard(key):  return h(key) % LOGICAL
+def route(key):  return node_of[shard(key)]
+
+keys = [f"tenant:{i}" for i in range(2000)]
+before = {k: route(k) for k in keys}
+
+# add a 5th node: move only some logical shards to it (every 5th shard here)
+for s in range(0, LOGICAL, 5):
+    node_of[s] = "node4"
+moved = sum(before[k] != route(k) for k in keys)
+print(f"logical shards moved: {sum(1 for s in node_of if node_of[s]=='node4')} of {LOGICAL}")
+print(f"keys that changed node: {moved} of {len(keys)}")
+
+# the naive way for comparison: hash(key) % nodes, 4 -&gt; 5 nodes
+moved_naive = sum(h(k) % 4 != h(k) % 5 for k in keys)
+print(f"naive hash % N, 4 -&gt; 5 nodes: {moved_naive} of {len(keys)} keys move")</code></pre>
+
+<pre class="terminal" data-title="terminal (python3)"><code><span class="prompt">$ </span><span class="cmd">python3 rebalance.py</span>
+<span class="out">logical shards moved: 13 of 64
+keys that changed node: 411 of 2000
+naive hash % N, 4 -&gt; 5 nodes: 1589 of 2000 keys move</span></code></pre>
+
+<h3>Moving data online</h3>
+<p>Deciding what moves is the easy half. Moving it while users keep writing is the careful half. The usual recipe:</p>
+<ol>
+  <li>Copy a consistent <strong>snapshot</strong> of the shard to the new node in the background, throttled so it does not starve live traffic.</li>
+  <li>Keep <strong>streaming the changes</strong> made since the snapshot, from the shard's write-ahead log or a change feed (the machinery of <a href="19-streams-cdc.html">chapter 19</a>), until the copy is nearly caught up.</li>
+  <li>Do a short <strong>cutover</strong>: pause writes to that shard for a moment (or fence the old owner), apply the last changes, flip the shard-map entry, and resume. Readers and writers now go to the new node.</li>
+  <li>Verify, then delete the old copy. Keep the ability to flip back until you trust the result.</li>
+</ol>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: moving a bookshelf between branches</p>
+  <p>You photocopy the shelf's catalogue and ship the books while the old branch keeps lending. A clerk notes every loan and return made during the move and replays them at the new branch. On a quiet minute you close the old shelf, replay the last few notes, and hang the new sign. Patrons barely notice.</p>
+  <p><em>Where it breaks down:</em> a library clerk can see the whole shelf. A database must stop two nodes both believing they own the shard during the flip, a split-brain risk handled with fencing tokens and a consensus-backed shard map.</p>
+</div>
+
+<h2>Routing: who knows where the data lives?</h2>
+
+<p>Someone must turn a key into a node. There are three standard places to put that knowledge, and the networking chapter's request-routing section covers the same trio.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 304" role="img" aria-label="A client sends a request to a stateless router, which consults a shard map held in a configuration service and forwards the request for shard 7 to node B. Twelve logical shards are spread over three nodes: node A holds shards 0, 3, 6 and 9, node B holds 1, 4, 7 and 10, node C holds 2, 5, 8 and 11.">
+<defs><marker id="ahD16b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="20" y="120" width="90" height="44" rx="8" class="box"/>
+<text x="65" y="147" text-anchor="middle" class="t-sm t-bold">client</text>
+<rect x="160" y="120" width="120" height="44" rx="8" class="box2"/>
+<text x="220" y="139" text-anchor="middle" class="t-sm t-bold">router</text>
+<text x="220" y="154" text-anchor="middle" class="t-xs t-muted">stateless proxy</text>
+<rect x="145" y="20" width="150" height="56" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="220" y="42" text-anchor="middle" class="t-sm t-bold">shard map</text>
+<text x="220" y="60" text-anchor="middle" class="t-xs t-muted">config service</text>
+<line x1="110" y1="142" x2="158" y2="142" class="line" marker-end="url(#ahD16b)"/>
+<line x1="220" y1="118" x2="220" y2="78" class="line-dash" marker-end="url(#ahD16b)"/>
+<line x1="280" y1="142" x2="398" y2="145" class="line" marker-end="url(#ahD16b)"/>
+<text x="340" y="132" text-anchor="middle" class="t-xs mono">shard 7</text>
+
+<rect x="400" y="20" width="340" height="70" rx="8" class="box"/>
+<text x="412" y="40" class="t-xs t-bold">node A</text>
+<rect x="416" y="48" width="44" height="32" rx="5" class="box2"/><text x="438" y="68" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="468" y="48" width="44" height="32" rx="5" class="box2"/><text x="490" y="68" text-anchor="middle" class="t-xs mono">3</text>
+<rect x="520" y="48" width="44" height="32" rx="5" class="box2"/><text x="542" y="68" text-anchor="middle" class="t-xs mono">6</text>
+<rect x="572" y="48" width="44" height="32" rx="5" class="box2"/><text x="594" y="68" text-anchor="middle" class="t-xs mono">9</text>
+<text x="632" y="68" class="t-xs t-muted">4 logical shards</text>
+
+<rect x="400" y="110" width="340" height="70" rx="8" class="box"/>
+<text x="412" y="130" class="t-xs t-bold">node B</text>
+<rect x="416" y="138" width="44" height="32" rx="5" class="box2"/><text x="438" y="158" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="468" y="138" width="44" height="32" rx="5" class="box2"/><text x="490" y="158" text-anchor="middle" class="t-xs mono">4</text>
+<rect x="520" y="138" width="44" height="32" rx="5" class="fs-yellow s-yellow sw-2"/><text x="542" y="158" text-anchor="middle" class="t-xs t-bold mono">7</text>
+<rect x="572" y="138" width="44" height="32" rx="5" class="box2"/><text x="594" y="158" text-anchor="middle" class="t-xs mono">10</text>
+<text x="632" y="158" class="t-xs t-muted">4 logical shards</text>
+
+<rect x="400" y="200" width="340" height="70" rx="8" class="box"/>
+<text x="412" y="220" class="t-xs t-bold">node C</text>
+<rect x="416" y="228" width="44" height="32" rx="5" class="box2"/><text x="438" y="248" text-anchor="middle" class="t-xs mono">2</text>
+<rect x="468" y="228" width="44" height="32" rx="5" class="box2"/><text x="490" y="248" text-anchor="middle" class="t-xs mono">5</text>
+<rect x="520" y="228" width="44" height="32" rx="5" class="box2"/><text x="542" y="248" text-anchor="middle" class="t-xs mono">8</text>
+<rect x="572" y="228" width="44" height="32" rx="5" class="box2"/><text x="594" y="248" text-anchor="middle" class="t-xs mono">11</text>
+<text x="632" y="248" class="t-xs t-muted">4 logical shards</text>
+<text x="20" y="294" class="t-xs t-muted">Moving shard 7 to node C = copy it, then flip one entry in the shard map. Keys never re-hash.</text>
+</svg>
+<figcaption>Yellow is the shard the request is following. The router holds no data, only a cached copy of the shard map; the map itself lives in a small, reliable configuration service.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Client-side routing.</strong> The application (or a driver library) holds the shard map and connects straight to the right node. No extra hop, but every client must be updated when the map changes, and every language needs the logic.</li>
+  <li><strong>A proxy / router tier.</strong> Clients talk to a stateless router that knows the map and forwards each query. Clients stay simple and can stay unaware of sharding. The router is an extra hop and must itself be scaled and made highly available, but it can also merge scatter/gather results.</li>
+  <li><strong>A coordination service holding the map.</strong> Whichever of the above does the routing, the authoritative shard map is stored somewhere that survives failures and agrees on one version: ZooKeeper or etcd, or a replicated config database. Routers and clients cache the map and are told when it changes. Getting machines to agree on that map is the consensus problem of later in the distributed-systems material.</li>
+</ul>
+
+<h2>How real systems do it</h2>
+
+<p>Three well-known systems package these ideas, each on top of an existing single-node database. I describe them qualitatively; check each one's documentation for the details of your version.</p>
+<ul>
+  <li><strong>Vitess</strong> shards MySQL. Applications talk to a proxy tier (VTGate) that speaks the MySQL protocol and routes queries to the right underlying MySQL instances. A configuration called a <em>vindex</em> says how a column's value maps to a shard, and Vitess includes tooling for splitting and moving shards online. It began as a way to scale YouTube's MySQL.</li>
+  <li><strong>Citus</strong> is an extension that makes PostgreSQL distributed. You choose a <em>distribution column</em> for each table; Citus cuts the table into shards across worker nodes behind a coordinator node. Tables distributed by the same column are co-located, so joins on that column stay local, which is why it is popular for multi-tenant applications with <code>tenant_id</code> as the key. Small shared tables can be replicated to every node as <em>reference tables</em>.</li>
+  <li><strong>MongoDB</strong> has built-in sharding. You pick a shard key, ranged or hashed; data is divided into chunks; <code>mongos</code> routers send operations to the right shards; and config servers hold the shard metadata. A background balancer moves chunks between shards as they grow uneven.</li>
+</ul>
+
+<p>The two cases in this course are a good pair. <a href="../cases/case-06-figma-sharding.html">Case 6</a> shows a team horizontally sharding PostgreSQL with a query proxy in front, and the long road of co-locating data so queries stay single-shard. <a href="../cases/case-02-discord-messages.html">Case 2</a> shows partition keys and hot partitions deciding which database a chat product could use at each stage.</p>
+
+<details class="deeper">
+  <summary>Go deeper: resharding by splitting versus moving <span class="hint">optional</span></summary>
+  <p>Adding capacity can mean two different operations. <em>Moving</em> takes whole existing shards and relocates them to new machines (cheap to plan, limited by the number of logical shards you started with). <em>Splitting</em> makes more, smaller shards out of existing ones, which is needed when you run out of logical shards. Splitting with hash sharding means picking a new, larger modulus consistently, and systems that support it usually split each shard into two so that each key's new home is one of just two places. This is why starting with a generous number of logical shards (many times your node count) is cheap insurance.</p>
+</details>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Python 3 is all you need. The script below makes 20,000 writes from 1,000 users with Zipf-like popularity, then counts the load per shard under a hash and under a range of user ids. Your output will match mine because the seed is fixed. Then change <code>N_SHARDS</code> to 8, and try a salt for the top user.</p>
+</div>
+
+<pre><code>import hashlib, random
+from collections import Counter
+
+def h(key):                      # stable hash (Python's built-in hash() is randomised per run)
+    return int(hashlib.md5(str(key).encode()).hexdigest(), 16)
+
+random.seed(7)
+# 20,000 writes from 1,000 users; a few users are far more active (Zipf-like)
+weights = [1 / (rank + 1) for rank in range(1000)]
+writes = random.choices(range(1000), weights, k=20000)
+
+N_SHARDS = 4
+by_hash = Counter(h(u) % N_SHARDS for u in writes)
+by_range = Counter(min(u // 250, N_SHARDS - 1) for u in writes)   # user_id ranges of 250
+print("hash(user_id) % 4 :", sorted(by_hash.items()))
+print("range on user_id  :", sorted(by_range.items()))
+top = Counter(writes).most_common(3)
+print("busiest users     :", top)</code></pre>
+
+<pre class="terminal" data-title="terminal (python3)"><code><span class="prompt">$ </span><span class="cmd">python3 skew.py</span>
+<span class="out">hash(user_id) % 4 : [(0, 5185), (1, 3695), (2, 5511), (3, 5609)]
+range on user_id  : [(0, 16323), (1, 1804), (2, 1092), (3, 781)]
+busiest users     : [(0, 2669), (1, 1345), (2, 937)]</span></code></pre>
+
+<p>Notice that even the hash is lopsided: shard 1 holds 3,695 writes and shard 3 holds 5,609, purely because of where the busy users happen to hash to. The range split is far worse here only because, in this synthetic data, the busiest users have the lowest ids. In a real system the correlation is usually weaker, but old accounts having low ids and being busier is common.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Sharding turns every operation that was local into a question about a <em>set</em> of machines: which one owns this key, who has the current shard map, what if two nodes both think they own a shard during a move. Those questions are answered with the tools of the networking course: <a href="../../networking/chapters/19-partitioning.html">consistent hashing</a>, <a href="../../networking/chapters/18-replication.html">replication</a> of each shard for failure, and agreement protocols for the shard map. Cross-shard transactions need atomic commit, which is why the next big question in a sharded design is always "can I make the transaction single-shard?". Ordering across shards is its own problem, which <a href="../../networking/cases/case-10-ordering-at-scale.html">networking case 10</a> examines.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Shard for data size, write throughput or blast radius, and only after cheaper options (indexes, caches, replicas, a bigger machine) are exhausted.</li>
+    <li>Vertical partitioning splits by table or feature; horizontal sharding splits the rows of one table by a shard key.</li>
+    <li>Range keys keep neighbours together (good scans) but create hot spots, like timestamps. Hash keys spread load but scatter ranges. Compound keys such as (user_id, timestamp) hash the first part and sort by the second.</li>
+    <li>More shards do not cure a hot key. Salt the known-hot keys, accepting that reading them fans out.</li>
+    <li>Local secondary indexes make writes cheap and reads scatter/gather; global ones make reads narrow and writes cross-shard.</li>
+    <li>Avoid cross-shard joins and transactions by co-locating related rows, for example by sharding everything on tenant_id.</li>
+    <li>Rebalance by moving whole logical shards (fixed count), splitting ranges, or consistent hashing, never <code>hash mod N</code>. Move data online with snapshot, stream, short cutover.</li>
+    <li>Route through the client, a proxy tier, or both, with the authoritative shard map in a coordination service.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A table is range-sharded by <code>created_at</code> and the write rate suddenly doubles. Why does adding two more shards barely help?</p>
+    <ol class="q-options">
+      <li>New shards must be warmed up for an hour before taking writes</li>
+      <li>Range sharding cannot be combined with replication</li>
+      <li>New rows always have the newest timestamp, so they all land in the last range, and the new shards sit idle</li>
+      <li>Timestamps cannot be hashed</li>
+    </ol>
+    <div class="q-explain">With a monotonically increasing key, one shard owns "now". The data is spread out but the write load is not. A hashed or compound key (hash a leading part, such as user_id, then sort by time) spreads the writes.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Posts are sharded by <code>hash(user_id)</code>. Which query is cheapest?</p>
+    <ol class="q-options">
+      <li>All posts by one given user</li>
+      <li>All posts in the last hour, across users</li>
+      <li>The ten most recent posts site-wide</li>
+      <li>Posts containing the word "database", via a local index</li>
+    </ol>
+    <div class="q-explain">The user's id hashes to one shard, so one shard answers. The other three have no shard key in the predicate, so every shard must be asked and the answers merged.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">One celebrity user receives 20% of all writes. You go from 8 to 16 shards. What is true?</p>
+    <ol class="q-options">
+      <li>The celebrity's shard now gets 10% of the writes</li>
+      <li>Hashing automatically spreads one user's rows over all shards</li>
+      <li>The celebrity's rows move to a quieter shard</li>
+      <li>The shard that owns the celebrity still gets about 20% of all writes, because the load is on a single key</li>
+    </ol>
+    <div class="q-explain">A hash spreads keys, not the traffic of a single key. To split that load you need salting (several keys for the one user), a cache, or another application-level remedy, and reads of that user then have to gather several salt buckets.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">What is the main cost of a <em>global</em> (term-partitioned) secondary index?</p>
+    <ol class="q-options">
+      <li>Reads must ask every shard</li>
+      <li>A single write may update the row's shard and one or more index shards, so writes become cross-shard or are applied asynchronously</li>
+      <li>It cannot be used with hash sharding</li>
+      <li>It makes the primary key non-unique</li>
+    </ol>
+    <div class="q-explain">The index is split by the indexed value, so a read goes to one index shard. But the row and its index entries live on different machines, so keeping them consistent costs a distributed write or accepts lag. Option A describes the local index.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A SaaS product shards every table by <code>tenant_id</code>. What does this buy most directly?</p>
+    <ol class="q-options">
+      <li>Perfectly even load regardless of tenant size</li>
+      <li>Cheap queries across all tenants</li>
+      <li>Joins and transactions within one tenant stay on one shard, and one tenant's trouble stays on one shard</li>
+      <li>No need for a shard map</li>
+    </ol>
+    <div class="q-explain">Co-location keeps the common work local. It does not even out load (a huge tenant is a hot spot) and cross-tenant queries still scatter. You still need a shard map to find the tenant's shard.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why do many systems use a fixed number of logical shards, mapped to nodes by a table?</p>
+    <ol class="q-options">
+      <li>It guarantees no shard can ever be hot</li>
+      <li>A key's logical shard never changes, so adding a node only moves whole logical shards and updates table entries instead of rehashing keys</li>
+      <li>It removes the need for a router</li>
+      <li>It makes cross-shard joins free</li>
+    </ol>
+    <div class="q-explain">Because the modulus (the number of logical shards) is fixed, keys never change logical shard. Rebalancing becomes "move shard 7 to the new node, flip its entry", which is also easy to do online.</div>
+  </div>
+</section>
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/shard-key.js"></script>
+</body>
+</html>

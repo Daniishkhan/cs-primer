@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Replicated Key-Value Store · Networking from Zero</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="net" data-lab="L5">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 5: A Replicated Key-Value Store</h1>
+  <p class="lede">Three storage nodes, one client library, and the dial from <a href="../chapters/18-replication.html">chapter 18</a> that you can finally turn with your own hands: how many copies must a write reach, and how many must a read ask? You'll watch stale reads appear and disappear, cut nodes off the network and see what the client does, and make a retried "add one" count exactly once. About 100 lines of your own Python on top of a provided node server, standard library only.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Chapters <a href="../chapters/16-failure.html">16</a> and <a href="../chapters/18-replication.html">18</a> make claims that sound abstract on the page: "a timeout is a guess, not a fact", "<code>R + W &gt; N</code> means reads see the latest write", "a retry can charge a customer twice". In this lab each claim becomes a test you can run, break and fix. The design you'll build is the one behind Dynamo-style databases such as Cassandra and Riak: no leader, just a client that talks to a few replicas and trusts arithmetic.</p>
+</div>
+
+<h2>What you'll build</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="A client library connected over TCP to three storage nodes, each holding a key to value-and-version table and a table of operations it has already applied">
+    <defs>
+      <marker id="ahL5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="60" width="210" height="180" rx="14" class="fs-purple s-purple sw-2"/>
+    <text x="125" y="90" text-anchor="middle" class="t-bold tc-purple">KVClient (your code)</text>
+    <text x="125" y="116" text-anchor="middle" class="t-sm mono">put · get</text>
+    <text x="125" y="136" text-anchor="middle" class="t-sm mono">increment · append</text>
+    <text x="125" y="164" text-anchor="middle" class="t-xs t-muted">writes to W replicas</text>
+    <text x="125" y="181" text-anchor="middle" class="t-xs t-muted">reads from R replicas</text>
+    <text x="125" y="198" text-anchor="middle" class="t-xs t-muted">timeouts, backoff, retries</text>
+    <text x="125" y="222" text-anchor="middle" class="t-xs t-muted">read repair</text>
+    <g class="line">
+      <line x1="230" y1="125" x2="418" y2="55" marker-end="url(#ahL5a)"/>
+      <line x1="230" y1="150" x2="418" y2="150" marker-end="url(#ahL5a)"/>
+      <line x1="230" y1="175" x2="418" y2="245" marker-end="url(#ahL5a)"/>
+    </g>
+    <text x="318" y="106" text-anchor="middle" class="t-xs t-faint">one JSON line</text>
+    <text x="318" y="124" text-anchor="middle" class="t-xs t-faint">per request</text>
+    <g>
+      <rect x="420" y="10" width="320" height="88" rx="10" class="box"/>
+      <text x="436" y="33" class="t-bold">node 0</text>
+      <text x="726" y="33" text-anchor="end" class="t-xs t-faint mono">127.0.0.1:port</text>
+      <text x="436" y="55" class="t-sm mono">store:   key → (value, version)</text>
+      <text x="436" y="73" class="t-sm mono">applied: op_id → what it did</text>
+      <text x="436" y="90" class="t-xs t-muted">switches: pause · kill · restart · drop reply</text>
+      <rect x="420" y="106" width="320" height="88" rx="10" class="box"/>
+      <text x="436" y="129" class="t-bold">node 1</text>
+      <text x="726" y="129" text-anchor="end" class="t-xs t-faint mono">127.0.0.1:port</text>
+      <text x="436" y="151" class="t-sm mono">store:   key → (value, version)</text>
+      <text x="436" y="169" class="t-sm mono">applied: op_id → what it did</text>
+      <text x="436" y="186" class="t-xs t-muted">switches: pause · kill · restart · drop reply</text>
+      <rect x="420" y="202" width="320" height="88" rx="10" class="box"/>
+      <text x="436" y="225" class="t-bold">node 2</text>
+      <text x="726" y="225" text-anchor="end" class="t-xs t-faint mono">127.0.0.1:port</text>
+      <text x="436" y="247" class="t-sm mono">store:   key → (value, version)</text>
+      <text x="436" y="265" class="t-sm mono">applied: op_id → what it did</text>
+      <text x="436" y="282" class="t-xs t-muted">switches: pause · kill · restart · drop reply</text>
+    </g>
+  </svg>
+  <figcaption><strong>The finished system.</strong> Three nodes (N = 3), each a small TCP server in its own thread. The client library is the only place that knows about replication: the nodes never talk to each other.</figcaption>
+</figure>
+
+<p>Six milestones, each building on the last:</p>
+<ol class="steps">
+  <li><strong>One node:</strong> a store that remembers <code>key → (value, version)</code>, and a <code>call()</code> that talks to it over a socket.</li>
+  <li><strong>Replicated writes:</strong> the client writes to <em>W</em> of the three nodes.</li>
+  <li><strong>Quorum reads:</strong> the client reads from <em>R</em> nodes and keeps the newest. You'll see stale reads when <code>R + W ≤ N</code> and none when <code>R + W &gt; N</code>.</li>
+  <li><strong>Failures:</strong> a per-replica timeout, nodes that are paused, killed and restarted, and an operation that fails cleanly when a quorum can't be reached.</li>
+  <li><strong>Retries and idempotency keys:</strong> exponential backoff with jitter, and an "increment" that is safe to repeat.</li>
+  <li><strong>Read repair:</strong> a read that quietly fixes the replicas it found behind.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>You need Python 3.8 or newer (<code>python3 --version</code>; on Windows, <code>py --version</code>). The lab's files are in <code>networking/labs/code/lab05/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab05/starter.py"><code>starter.py</code></a></td><td>Your file. The node server, fault switches and cluster launcher are written for you. You fill in the <code>Store</code>, <code>call()</code>, and the client library.</td></tr>
+    <tr><td><a href="code/lab05/check.py"><code>check.py</code></a></td><td>The self-check. It starts real nodes on random ports, injects failures with switches instead of racing the clock, and finishes in a few seconds.</td></tr>
+    <tr><td><a href="code/lab05/solution.py"><code>solution.py</code></a></td><td>A complete reference answer, and a hand-driven shell (<code>python3 solution.py shell</code>) that you can use for the experiments below.</td></tr>
+  </tbody>
+</table></div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd networking/labs/code/lab05</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 5 checks against starter.py
+
+  … Milestone 1: a single node (get/put with versions): not implemented yet (TODO milestone 1: call)
+  … Milestone 2: replicated writes to W nodes: not implemented yet (TODO milestone 2: put)
+  … Milestone 3: quorum reads, and when they go stale: not implemented yet (TODO milestone 2: put)
+  … Milestone 4: timeouts, failures and QuorumNotReached: not implemented yet (TODO milestone 2: put)
+  … Milestone 5: retries with backoff, and idempotency keys: not implemented yet (TODO milestone 5: backoff_delay)
+  … Milestone 6: read repair: not implemented yet (TODO milestone 2: put)
+
+0/6 milestones passing</span></code></pre>
+
+<h2>Three design decisions, up front</h2>
+
+<p>Real systems answer these in many ways. Here is what this lab does, and why.</p>
+
+<h3>1. The version is a Lamport pair, not a timestamp</h3>
+
+<p>Every stored value carries a <span class="term">version</span>, and a replica keeps whichever version is newest (<a href="../chapters/18-replication.html">chapter 18</a>: "the reader takes the answer with the highest version"). What should a version be?</p>
+
+<p>The tempting answer is the wall-clock time of the write. <a href="../chapters/17-time.html">Chapter 17</a> showed why that is dangerous: if one client's clock is two seconds slow, its later write gets an earlier timestamp and silently loses (last-write-wins with skewed clocks). So we use a <span class="term">Lamport clock</span> instead: a plain counter that every client keeps and moves forward. The version is a pair <code>(counter, tag)</code>:</p>
+<ul>
+  <li><strong>counter</strong>: before a write, the client bumps its counter. Whenever it <em>sees</em> a version from a replica, it moves its counter up to at least that value (the "receive" rule from chapter 17). So a client that has read version 7 will write version 8 or higher.</li>
+  <li><strong>tag</strong>: the id of the operation that wrote it (say <code>"c1-4"</code>). If two clients pick the same counter, the tag breaks the tie, so all replicas agree on a single winner: tuples compare left to right in Python, so <code>(3, "c2-1") &gt; (3, "c1-9")</code>.</li>
+</ul>
+<p>This is the "order by (L, process id)" trick from chapter 17. The tag does a second job in milestone 5, where it doubles as an <span class="term">idempotency key</span>.</p>
+
+<div class="callout warn">
+  <p class="callout-title">The limit of this design</p>
+  <p>A client that has <em>never read</em> a key has a counter of 0, so a blind <code>put</code> can get a lower version than an existing value and be silently ignored by the replicas. (The cure is to read before you write, which is exactly what <code>increment</code> does.) And two clients writing the same key at the same moment produce two versions where one simply wins; detecting that they were <em>concurrent</em> needs version vectors (chapter 17). The lab keeps one writer per key to stay focused.</p>
+</div>
+
+<h3>2. Fault switches, not real timing races</h3>
+
+<p>Failures in a real cluster happen at random. That is hopeless for a repeatable test, so each <code>Node</code> has switches that you flip from code:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Switch</th><th>What the client sees</th><th>Real-world cause it stands for</th></tr></thead>
+  <tbody>
+    <tr><td><code>node.pause()</code> / <code>resume()</code></td><td>The connection works, but no reply ever comes: a <strong>timeout</strong>.</td><td>Overload, a long garbage-collection pause, a lost packet: "slow or dead, can't tell" (<a href="../chapters/16-failure.html">chapter 16</a>).</td></tr>
+    <tr><td><code>node.kill()</code></td><td>Connection refused at once: a definite answer.</td><td>Process crashed; machine up, nobody listening.</td></tr>
+    <tr><td><code>node.restart(wipe=False)</code></td><td>The node is back with its data.</td><td>The process restarted and reloaded its data from disk.</td></tr>
+    <tr><td><code>node.restart(wipe=True)</code></td><td>The node is back, empty.</td><td>The data lived only in memory (or the disk was replaced).</td></tr>
+    <tr><td><code>node.drop_next_replies(n, "put")</code></td><td>A timeout, <em>but the node did the work</em>.</td><td>The reply packet was lost on the way back. The nastiest failure of all.</td></tr>
+  </tbody>
+</table></div>
+
+<p><strong>Kept or lost on restart?</strong> Both, on purpose, because real systems differ. A node that writes every change to disk before replying keeps its data across a crash (<code>wipe=False</code>); a purely in-memory node loses it (<code>wipe=True</code>). The lab's nodes store everything in a Python dict, so the default for a "restart" in your experiments is a choice you make each time. Keep in mind what the choice means for the quorum arithmetic: a wiped node that rejoins <em>looks healthy but has forgotten acknowledged writes</em>, which quietly lowers the number of copies below W. Milestone 6 shows how reads can heal this.</p>
+
+<h3>3. The client is the coordinator, and it asks one replica at a time</h3>
+
+<p>Dynamo-style systems send a request to all replicas at once and use the first W (or R) answers. We send to replicas <em>one after another</em>, in an order you can control with <code>prefer=[0, 1, 2]</code>. It is slower, but it means "which replicas got the write" is exactly determined, which is what makes stale reads reproducible instead of a coin toss. (Making it parallel is a stretch goal.)</p>
+
+<div class="callout note">
+  <p class="callout-title">Two ideas you'll use everywhere</p>
+  <ul>
+    <li><strong>One JSON object per line</strong> is the framing from Lab 1's milestone 3: <code>json.dumps(obj) + "\n"</code> out, read up to the newline, <code>json.loads</code> in. <code>encode()</code> and <code>read_line()</code> are provided.</li>
+    <li><strong>The nodes never talk to each other.</strong> All replication logic lives in the client. That keeps the lab small, and it is exactly how leaderless systems work: the "coordinator" is just whoever takes the client's request.</li>
+  </ul>
+</div>
+
+<h2>Milestone 1: a single node</h2>
+
+<p>Start small: one server that stores values, and a function that talks to it. The provided <code>Node</code> class does the socket work and calls <code>Store</code> for every <code>get</code> and <code>put</code>. The protocol is two requests:</p>
+
+<pre class="terminal" data-title="the wire protocol (one line each way)"><code><span class="cmt">→ {"op": "put", "key": "x", "value": "hello", "version": [1, "c1-1"]}</span>
+<span class="cmt">← {"ok": true, "applied": true}</span>
+<span class="cmt">→ {"op": "get", "key": "x"}</span>
+<span class="cmt">← {"ok": true, "value": "hello", "version": [1, "c1-1"], "done": null}</span></code></pre>
+
+<p>Two rules make the <code>Store</code> safe for replication. First, a <code>put</code> is applied <strong>only if its version is newer</strong> than what the node already holds. That makes every write idempotent and order-independent: a delayed, duplicated or reordered <code>put</code> can never move a key backwards. Second, a key that was never written reads as <code>(None, (0, ""))</code>, so "never written" is just the oldest possible version and comparisons need no special case.</p>
+
+<p><code>call()</code> is the client's only way to talk to a node. It must tell apart two kinds of failure, because they mean different things (<a href="../chapters/16-failure.html">chapter 16</a>): <code>ReplicaDown</code> (refused or hung up: the machine answered "nobody here", a <em>definite</em> failure) and <code>ReplicaTimeout</code> (no reply within the deadline: <em>unknown</em>).</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Store.get</code>, <code>Store.put</code> and <code>call(port, request, timeout)</code> in <code>starter.py</code>.</p>
+  <p class="checkpoint">run <code>python3 check.py</code>: milestone 1 shows ✔. It also checks that <code>call()</code> raises <code>ReplicaDown</code> for a closed port and <code>ReplicaTimeout</code> for a server that accepts the connection and never answers.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Versions are tuples, and Python compares tuples element by element. JSON turns tuples into lists, so wrap incoming versions in <code>tuple(...)</code> before comparing, and store tuples.</li>
+      <li><code>socket.create_connection((HOST, port), timeout=timeout)</code> already applies the timeout to connecting; call <code>sock.settimeout(timeout)</code> too so that waiting for the reply is bounded.</li>
+      <li><code>socket.timeout</code> is a subclass of <code>OSError</code>, so catch it <em>first</em>. <code>ConnectionRefusedError</code> and <code>ConnectionResetError</code> are also <code>OSError</code>s.</li>
+      <li><code>read_line()</code> returns <code>None</code> if the other side closed the connection before sending a newline. That is a "down" too.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> get(self, key):
+    <span class="kw">return</span> self.data.get(key, (<span class="kw">None</span>, NO_VERSION))</code></pre>
+<pre><code><span class="kw">def</span> put(self, key, value, version):
+    version = tuple(version)
+    <span class="kw">if</span> version &gt; self.get(key)[<span class="num">1</span>]:
+        self.data[key] = (value, version)
+        <span class="kw">return</span> <span class="kw">True</span>
+    <span class="kw">return</span> <span class="kw">False</span></code></pre>
+<pre><code><span class="kw">def</span> call(port, request, timeout=<span class="num">1.0</span>):
+    <span class="kw">try</span>:
+        <span class="kw">with</span> socket.create_connection((HOST, port), timeout=timeout) <span class="kw">as</span> sock:
+            sock.settimeout(timeout)
+            sock.sendall(encode(request))
+            line = read_line(sock)
+    <span class="kw">except</span> socket.timeout:
+        <span class="kw">raise</span> ReplicaTimeout(<span class="str">f"no reply from port {port} within {timeout}s"</span>)
+    <span class="kw">except</span> OSError <span class="kw">as</span> e:                       <span class="cmt"># refused, reset, broken pipe ...</span>
+        <span class="kw">raise</span> ReplicaDown(<span class="str">f"port {port}: {e}"</span>)
+    <span class="kw">if</span> line <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">raise</span> ReplicaDown(<span class="str">f"port {port} closed the connection"</span>)
+    <span class="kw">return</span> json.loads(line.decode(<span class="str">"utf-8"</span>))</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: replicated writes</h2>
+
+<p>Now the client library. A write is <em>successful</em> once <em>W</em> replicas have acknowledged it. With N = 3 and W = 2, the value is stored on two machines before the caller hears "OK", so losing any one machine cannot lose it. This is the synchronous-replication trade-off of <a href="../chapters/18-replication.html">chapter 18</a>, applied per request instead of per cluster.</p>
+
+<p>The heart of the client is one helper, <code>_quorum_call(request, need, prefer)</code>: send the same request to replicas in order until <code>need</code> of them have answered, and return those answers. Both <code>put</code> (need = W) and <code>get</code> (need = R) are built on it. For now, assume a healthy cluster; milestone 4 makes it robust.</p>
+
+<p><code>put</code> itself is short: get a fresh <code>op_id</code>, bump the Lamport counter to make the version <code>(counter, op_id)</code>, and send <code>{"op": "put", ...}</code> to W replicas through <code>_quorum_call</code>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 215" role="img" aria-label="Two panels. Left: with W=2 and R=2 on three replicas, the replicas written and the replicas read always share at least one node, so the read finds the new value. Right: with W=1 and R=1 the read can land on a replica that missed the write and return the old value.">
+    <text x="190" y="22" text-anchor="middle" class="t-bold tc-green">W = 2, R = 2  (R + W = 4 &gt; N = 3)</text>
+    <text x="30" y="46" class="t-xs t-muted">write reached:</text>
+    <rect x="30" y="52" width="90" height="40" rx="8" class="fs-green s-green sw-2"/><text x="75" y="77" text-anchor="middle" class="t-sm mono">n0: new</text>
+    <rect x="140" y="52" width="90" height="40" rx="8" class="fs-green s-green sw-2"/><text x="185" y="77" text-anchor="middle" class="t-sm mono">n1: new</text>
+    <rect x="250" y="52" width="90" height="40" rx="8" class="box"/><text x="295" y="77" text-anchor="middle" class="t-sm mono t-muted">n2: old</text>
+    <text x="30" y="118" class="t-xs t-muted">read asked:</text>
+    <rect x="30" y="124" width="90" height="40" rx="8" class="box2"/><text x="75" y="149" text-anchor="middle" class="t-sm t-faint">not asked</text>
+    <rect x="140" y="124" width="90" height="40" rx="8" class="fs-purple s-purple sw-2"/><text x="185" y="149" text-anchor="middle" class="t-sm mono">says new</text>
+    <rect x="250" y="124" width="90" height="40" rx="8" class="fs-purple s-purple sw-2"/><text x="295" y="149" text-anchor="middle" class="t-sm mono">says old</text>
+    <text x="185" y="192" text-anchor="middle" class="t-sm">n1 is in both sets: newest version wins</text>
+    <text x="570" y="22" text-anchor="middle" class="t-bold tc-red">W = 1, R = 1  (R + W = 2 ≤ N = 3)</text>
+    <text x="410" y="46" class="t-xs t-muted">write reached:</text>
+    <rect x="410" y="52" width="90" height="40" rx="8" class="fs-green s-green sw-2"/><text x="455" y="77" text-anchor="middle" class="t-sm mono">n0: new</text>
+    <rect x="520" y="52" width="90" height="40" rx="8" class="box"/><text x="565" y="77" text-anchor="middle" class="t-sm mono t-muted">n1: old</text>
+    <rect x="630" y="52" width="90" height="40" rx="8" class="box"/><text x="675" y="77" text-anchor="middle" class="t-sm mono t-muted">n2: old</text>
+    <text x="410" y="118" class="t-xs t-muted">read asked:</text>
+    <rect x="410" y="124" width="90" height="40" rx="8" class="box2"/><text x="455" y="149" text-anchor="middle" class="t-sm t-faint">not asked</text>
+    <rect x="520" y="124" width="90" height="40" rx="8" class="box2"/><text x="565" y="149" text-anchor="middle" class="t-sm t-faint">not asked</text>
+    <rect x="630" y="124" width="90" height="40" rx="8" class="fs-red s-red sw-2"/><text x="675" y="149" text-anchor="middle" class="t-sm mono">says old</text>
+    <text x="570" y="192" text-anchor="middle" class="t-sm">the two sets never meet: a stale read</text>
+  </svg>
+  <figcaption><strong>Why quorums overlap (milestone 3 preview).</strong> A write that reached W replicas and a read that asked R replicas must share a replica when R + W &gt; N. The pigeonhole argument from chapter 18, drawn for N = 3.</figcaption>
+</figure>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>_quorum_call</code> (the simple, healthy-cluster version) and <code>KVClient.put</code>.</p>
+  <p class="checkpoint">milestone 2 shows ✔. The check writes with <code>prefer=[0, 1, 2]</code> and W = 2 and looks <em>inside</em> the nodes: exactly nodes 0 and 1 must hold the value, node 2 must not. Then it checks W = 1 (one copy) and W = 3 (all three).</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>self._order(prefer)</code> gives you the replicas to try, in order (indexes into <code>self.ports</code>). Stop once you have <code>need</code> answers.</li>
+      <li>A new version must beat every earlier version this client made, so increment <code>self.clock</code> <em>before</em> building the version. Return the version from <code>put</code>.</li>
+      <li>Version tuple: <code>(self.clock, op_id)</code>. When sending it in JSON, <code>list(version)</code> is fine; the node converts it back.</li>
+      <li>The helper <code>self._write(key, value, version, op_id, prefer)</code> already builds and sends the <code>put</code> request through <code>_quorum_call</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> _quorum_call(self, request, need, prefer=<span class="kw">None</span>):
+    replies, errors = [], []
+    <span class="kw">for</span> i <span class="kw">in</span> self._order(prefer):
+        <span class="kw">if</span> len(replies) == need:
+            <span class="kw">break</span>
+        <span class="kw">try</span>:
+            reply = call(self.ports[i], request, self.timeout)
+        <span class="kw">except</span> ReplicaUnavailable <span class="kw">as</span> e:
+            errors.append((i, e))
+            <span class="kw">continue</span>
+        <span class="kw">if</span> reply.get(<span class="str">"ok"</span>):
+            replies.append((i, reply))
+    <span class="kw">if</span> len(replies) &lt; need:
+        <span class="kw">raise</span> QuorumNotReached(need, len(replies), errors)
+    <span class="kw">return</span> replies</code></pre>
+<pre><code><span class="kw">def</span> put(self, key, value, prefer=<span class="kw">None</span>, op_id=<span class="kw">None</span>):
+    op_id = op_id <span class="kw">or</span> self._new_op_id()
+    self.clock += <span class="num">1</span>
+    version = (self.clock, op_id)
+    self._write(key, value, version, op_id, prefer)
+    <span class="kw">return</span> version</code></pre>
+    <p>The solution's <code>_quorum_call</code> already includes milestone 4's error handling (the <code>try/except</code> and the final <code>raise</code>). For this milestone you can leave those out and let any <code>ReplicaUnavailable</code> propagate.</p>
+  </details>
+</div>
+
+<h2>Milestone 3: quorum reads, and when they go stale</h2>
+
+<p>A read asks <em>R</em> replicas and returns the answer with the <strong>highest version</strong>. That's the whole algorithm, and the whole point of putting a version on every value: the replicas may disagree, and the version tells the client who is right.</p>
+
+<p>Whether that read is guaranteed to see the latest write depends on one inequality (<a href="../chapters/18-replication.html">chapter 18</a>): <strong>if R + W &gt; N, every read set shares at least one replica with every write set.</strong> The figure above shows N = 3. Break the inequality and there are order combinations where the read lands entirely on replicas that missed the write.</p>
+
+<p>The check proves this the brute-force way. For every combination of "which order the write tries replicas" (6 permutations) and "which order the read tries them" (6 permutations), 36 combinations in all, it writes an old value to all three nodes, then writes a new value to W of them, reads with R, and counts how often the read returned the old value. For <code>R + W ≤ 3</code> that count must be above zero; for <code>R + W &gt; 3</code> it must be exactly zero.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>KVClient.get(key, prefer)</code>: ask R replicas with <code>_quorum_call</code>, pick the newest version, move <code>self.clock</code> up to that version's counter, and return <code>(value, version)</code>.</p>
+  <p class="checkpoint">milestone 3 shows ✔ and prints a table like the one below. Read it carefully: the pattern in the "stale in" column is chapter 18's quorum rule, measured.</p>
+  <pre class="terminal" data-title="check.py output"><code><span class="out">W=1 R=1  R+W=2 &lt;= N: stale in 24 of 36 read/write orders
+W=2 R=1  R+W=3 &lt;= N: stale in 12 of 36 read/write orders
+W=1 R=2  R+W=3 &lt;= N: stale in 12 of 36 read/write orders
+W=2 R=2  R+W=4 &gt;  N: stale in  0 of 36 read/write orders
+W=3 R=1  R+W=4 &gt;  N: stale in  0 of 36 read/write orders
+W=1 R=3  R+W=4 &gt;  N: stale in  0 of 36 read/write orders
+W=3 R=3  R+W=6 &gt;  N: stale in  0 of 36 read/write orders</span></code></pre>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Each reply has <code>"value"</code> and <code>"version"</code>. Use <code>max(replies, key=...)</code> with a key that returns <code>tuple(reply["version"])</code>. Remember that <code>replies</code> is a list of <code>(index, reply)</code> pairs.</li>
+      <li>Moving the clock up is what stops a client that has just read version 9 from later writing version 3 and having the replicas ignore it.</li>
+      <li>You do not need to handle read repair yet. That is milestone 6.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> get(self, key, prefer=<span class="kw">None</span>):
+    replies = self._quorum_call({<span class="str">"op"</span>: <span class="str">"get"</span>, <span class="str">"key"</span>: key}, self.r, prefer)
+    i, best = max(replies, key=<span class="kw">lambda</span> ir: tuple(ir[<span class="num">1</span>][<span class="str">"version"</span>]))
+    version = tuple(best[<span class="str">"version"</span>])
+    self.clock = max(self.clock, version[<span class="num">0</span>])
+    <span class="kw">if</span> self.read_repair:
+        self._repair(key, best[<span class="str">"value"</span>], version, replies)
+    <span class="kw">return</span> best[<span class="str">"value"</span>], version</code></pre>
+    <p>The two lines about <code>read_repair</code> belong to milestone 6; leave them out for now.</p>
+  </details>
+</div>
+
+<p>Notice what <code>R + W &gt; N</code> costs. With W = 3 every write needs all three nodes, so one dead node blocks all writes. With R = 3 one dead node blocks all reads. The majority setting (W = R = 2) is the one that survives any single failure for both. Milestone 4 lets you see that.</p>
+
+<h2>Milestone 4: timeouts, failures and clean errors</h2>
+
+<p>So far the cluster was healthy. Now make the client survive broken nodes. <a href="../chapters/16-failure.html">Chapter 16</a>'s rule applies to every replica call: <strong>always have a timeout</strong>, because from the outside "dead", "paused", and "reply lost" all look the same: silence. Your <code>call()</code> already raises <code>ReplicaTimeout</code> or <code>ReplicaDown</code>. Make <code>_quorum_call</code> catch those, <em>skip</em> that replica and try the next one, and only give up when there are not enough replicas left.</p>
+
+<p>When it gives up, it must do so <em>cleanly</em>: raise <code>QuorumNotReached(needed, got, errors)</code>, with the numbers, rather than hanging, returning half an answer, or pretending it worked. The caller needs to know that the write is not safely stored.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: a failed write wrote nothing</p>
+  <p>Suppose W = 2, node 0 accepts the write, and then nodes 1 and 2 are unreachable. The client raises <code>QuorumNotReached</code>... but node 0 still holds the new value. Nothing undoes it, so a later read that happens to ask node 0 may return a value whose write was "reported as failed" (chapter 18 calls these failed writes that aren't undone). "Failed" means <em>not guaranteed durable</em>, not <em>did not happen</em>. This is the same lesson as "a timeout means you stopped waiting, not that the operation failed".</p>
+</div>
+
+<p>The check exercises each switch. A killed node is refused instantly and costs nothing. A paused node costs exactly one timeout (0.2 s in the check), then the client moves on. With two of three nodes gone and W = 2, <code>put</code> raises <code>QuorumNotReached</code> with <code>needed=2, got=1</code>. It also restarts nodes with the data kept and with the data wiped, so you can see both behaviours.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Upgrade <code>_quorum_call</code>: catch <code>ReplicaUnavailable</code>, record it, continue with the next replica, and raise <code>QuorumNotReached(need, len(replies), errors)</code> if fewer than <code>need</code> replicas answered. Replies whose <code>"ok"</code> is false don't count.</p>
+  <p class="checkpoint">milestone 4 shows ✔ and prints how long skipping a paused replica took (about 0.2 s: one timeout). Then try the shell: <code>python3 starter.py shell</code>, <code>r 3</code>, <code>pause 1</code>, <code>get x</code> (waits one timeout, then fails), then <code>kill 2</code> and <code>put x 1</code> (fails with W = 2: only node 0 is left).</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>The loop shape: <code>for i in order: if len(replies) == need: break</code>, then <code>try: reply = call(...) except ReplicaUnavailable as e: errors.append((i, e)); continue</code>.</li>
+      <li>Check the count <em>after</em> the loop. The loop can end because you ran out of replicas.</li>
+      <li>You don't need to change <code>put</code> or <code>get</code>: they get the new behaviour for free, because they only call <code>_quorum_call</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+    <p>The same <code>_quorum_call</code> shown in milestone 2, with the error handling in place:</p>
+<pre><code><span class="kw">def</span> _quorum_call(self, request, need, prefer=<span class="kw">None</span>):
+    replies, errors = [], []
+    <span class="kw">for</span> i <span class="kw">in</span> self._order(prefer):
+        <span class="kw">if</span> len(replies) == need:
+            <span class="kw">break</span>
+        <span class="kw">try</span>:
+            reply = call(self.ports[i], request, self.timeout)
+        <span class="kw">except</span> ReplicaUnavailable <span class="kw">as</span> e:
+            errors.append((i, e))
+            <span class="kw">continue</span>
+        <span class="kw">if</span> reply.get(<span class="str">"ok"</span>):
+            replies.append((i, reply))
+    <span class="kw">if</span> len(replies) &lt; need:
+        <span class="kw">raise</span> QuorumNotReached(need, len(replies), errors)
+    <span class="kw">return</span> replies</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: retries and idempotency keys</h2>
+
+<p>A transient failure (a node restarting, one lost packet) is often gone a moment later, so retrying is worth it. But <a href="../chapters/16-failure.html">chapter 16</a> warned about two dangers, and you'll handle both.</p>
+
+<h3>Danger 1: the retry storm</h3>
+
+<p>If every client retries immediately, a struggling cluster gets more traffic exactly when it can least cope. The cure is <span class="term">exponential backoff</span> (wait longer after each failure) plus <span class="term">jitter</span> (wait a <em>random</em> time, so clients that failed together don't retry together). The "full jitter" formula:</p>
+<pre class="terminal" data-title="full jitter"><code>delay = random between 0 and min(cap, base × 2<sup>attempt</sup>)
+<span class="cmt"># base = 0.1 s, cap = 5 s:  attempt 0 → 0–0.1 s,  1 → 0–0.2 s,  2 → 0–0.4 s,  ...  7 → 0–5 s (capped)</span></code></pre>
+<p>Write <code>backoff_delay(attempt, base, cap, rng)</code> and a <code>retry(fn, ...)</code> wrapper that calls <code>fn</code>, catches <code>QuorumNotReached</code>, sleeps, and tries again up to <code>attempts</code> times. Two details are tested: it must <strong>not sleep after the last failure</strong> (nothing left to wait for), and it must <strong>not retry other exceptions</strong> (retrying a bug only repeats the bug). The check passes a fake <code>sleep</code> that records the delays, so it never really waits and its random numbers come from a seeded generator.</p>
+
+<h3>Danger 2: doing the work twice</h3>
+
+<p>Here is the scenario the <code>drop_next_replies</code> switch exists for. The client sends "set hits to 1" to a node. The node does it and replies, and the reply is lost. To the client this looks exactly like a lost request. It retries. If the retry blindly computes "read 1, add 1, write 2", the counter is now wrong: the increment was applied twice.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 340" role="img" aria-label="A sequence diagram. The client sends a put with operation id inc-1. The node applies it and records inc-1, but its reply is lost. After a timeout and a random backoff the client sends a get carrying inc-1. The node answers that it already did inc-1 with value 1, and the client returns 1 instead of incrementing again.">
+    <defs>
+      <marker id="ahL5b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="50" y="10" width="160" height="34" rx="8" class="fs-purple s-purple sw-2"/><text x="130" y="32" text-anchor="middle" class="t-bold tc-purple">client</text>
+    <rect x="550" y="10" width="160" height="34" rx="8" class="fs-blue s-blue sw-2"/><text x="630" y="32" text-anchor="middle" class="t-bold tc-blue">node</text>
+    <line x1="130" y1="44" x2="130" y2="330" class="line-dash"/>
+    <line x1="630" y1="44" x2="630" y2="330" class="line-dash"/>
+    <g class="line">
+      <line x1="130" y1="75" x2="626" y2="75" marker-end="url(#ahL5b)"/>
+      <line x1="630" y1="150" x2="330" y2="150" class="line-dash"/>
+      <line x1="130" y1="225" x2="626" y2="225" marker-end="url(#ahL5b)"/>
+      <line x1="630" y1="265" x2="134" y2="265" marker-end="url(#ahL5b)"/>
+    </g>
+    <text x="380" y="66" text-anchor="middle" class="t-sm mono">put hits=1  (version (1, "inc-1"))</text>
+    <rect x="460" y="90" width="240" height="38" rx="8" class="box2"/>
+    <text x="580" y="107" text-anchor="middle" class="t-xs">applies it, and remembers "inc-1"</text>
+    <text x="580" y="121" text-anchor="middle" class="t-xs t-muted">(atomically, same lock)</text>
+    <text x="478" y="170" text-anchor="middle" class="t-xs t-muted">reply lost on the way back</text>
+    <text x="316" y="154" text-anchor="middle" class="t-bold tc-red">✗</text>
+    <rect x="60" y="165" width="250" height="38" rx="8" class="box2"/>
+    <text x="185" y="182" text-anchor="middle" class="t-xs">timeout → QuorumNotReached</text>
+    <text x="185" y="196" text-anchor="middle" class="t-xs t-muted">sleep random(0, 0.2 s), then retry</text>
+    <text x="380" y="216" text-anchor="middle" class="t-sm mono">get hits  (op_id "inc-1")</text>
+    <text x="380" y="256" text-anchor="middle" class="t-sm mono">done: value 1, version (1, "inc-1")</text>
+    <rect x="60" y="285" width="250" height="38" rx="8" class="fs-green s-green sw-2"/>
+    <text x="185" y="302" text-anchor="middle" class="t-xs">"inc-1 already happened":</text>
+    <text x="185" y="316" text-anchor="middle" class="t-xs">return 1, do not add again</text>
+  </svg>
+  <figcaption><strong>Retry with an idempotency key.</strong> The client reuses the same <code>op_id</code> on every attempt of one logical operation. The node, which recorded the id together with the effect, lets the client discover that the work was already done.</figcaption>
+</figure>
+
+<p>The fix is an <span class="term">idempotency key</span> (<a href="../chapters/16-failure.html">chapter 16</a>). The caller makes one id per <em>logical</em> operation (<code>"inc-1"</code>) and reuses it on every retry. Two cooperating halves:</p>
+<ul>
+  <li><strong>Node side (provided).</strong> A <code>put</code> carrying an <code>op_id</code> is recorded in the node's <code>applied</code> table <em>in the same locked step</em> as the write itself, so there is no moment where the effect exists but the record doesn't. A <code>get</code> carrying an <code>op_id</code> reports <code>"done"</code> if that node has seen it.</li>
+  <li><strong>Client side (yours).</strong> Before computing anything, <code>_update</code> asks R replicas with the <code>op_id</code>. If any reply has <code>"done"</code>, an earlier attempt got that far: write that result to W replicas (so it's safely stored) and return it. Only if no replica has seen the id does the client compute the new value and write.</li>
+</ul>
+
+<p>Why does asking R replicas find it? If the earlier attempt reached W replicas, the quorum-overlap argument says any read of R replicas includes at least one that recorded the id. In the check's scenario every node did the work, so any replica answers "done".</p>
+
+<div class="callout warn">
+  <p class="callout-title">Pitfall: the id must be made once</p>
+  <p>The common bug is to generate the id <em>inside</em> the code that retries, so each attempt gets a fresh one and the node sees two different operations. The check demonstrates it: the same retry loop with <code>op_id=None</code> (a new id each attempt) ends with the counter at <strong>2</strong>. Also, an id must never be reused for a <em>different</em> operation: the node would think it is a duplicate and quietly ignore it. In production, ids are random UUIDs and the table is trimmed after a window (say 24 hours), as the chapter notes.</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>backoff_delay</code>, <code>retry</code> and <code>KVClient._update</code>. (<code>increment</code> and <code>append</code> are already written on top of <code>_update</code>.)</p>
+  <p class="checkpoint">milestone 5 shows ✔ and prints three lines: a retried increment with a key counts once, the same retry with a fresh id per attempt counts twice, and appending with the same key twice stores one item.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>backoff_delay</code> is one line: <code>rng.uniform(0, min(cap, base * 2 ** attempt))</code>.</li>
+      <li><code>retry</code>: <code>for attempt in range(attempts):</code> then <code>try: return fn()</code> and <code>except retry_on:</code>. On the last attempt re-raise with a bare <code>raise</code>; otherwise <code>sleep(backoff_delay(attempt, base, cap, rng))</code>.</li>
+      <li><code>_update</code> step 1: <code>self._quorum_call({"op": "get", "key": key, "op_id": op_id}, self.r, prefer)</code>. Each reply has a <code>"done"</code> field, or <code>None</code>.</li>
+      <li>If you find a <code>"done"</code> record, re-write it with the <em>same</em> <code>op_id</code> and its <em>own</em> version (<code>tuple(rec["version"])</code>), then return <code>rec["value"]</code>.</li>
+      <li>If not: new value from the newest reply, <code>self.clock = max(self.clock, version_counter) + 1</code>, version <code>(self.clock, op_id)</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> backoff_delay(attempt, base=<span class="num">0.1</span>, cap=<span class="num">5.0</span>, rng=random):
+    <span class="kw">return</span> rng.uniform(<span class="num">0</span>, min(cap, base * (<span class="num">2</span> ** attempt)))</code></pre>
+<pre><code><span class="kw">def</span> retry(fn, attempts=<span class="num">5</span>, base=<span class="num">0.1</span>, cap=<span class="num">5.0</span>, rng=random, sleep=time.sleep,
+          retry_on=(QuorumNotReached,)):
+    <span class="kw">for</span> attempt <span class="kw">in</span> range(attempts):
+        <span class="kw">try</span>:
+            <span class="kw">return</span> fn()
+        <span class="kw">except</span> retry_on:
+            <span class="kw">if</span> attempt == attempts - <span class="num">1</span>:
+                <span class="kw">raise</span>
+            sleep(backoff_delay(attempt, base, cap, rng))</code></pre>
+<pre><code><span class="kw">def</span> _update(self, key, fn, op_id, prefer=<span class="kw">None</span>):
+    <span class="cmt"># 1. Ask R replicas for the current value, and whether they already did op_id.</span>
+    replies = self._quorum_call({<span class="str">"op"</span>: <span class="str">"get"</span>, <span class="str">"key"</span>: key, <span class="str">"op_id"</span>: op_id}, self.r, prefer)
+    done = [rep[<span class="str">"done"</span>] <span class="kw">for</span> _, rep <span class="kw">in</span> replies <span class="kw">if</span> rep.get(<span class="str">"done"</span>)]
+    <span class="kw">if</span> done:
+        <span class="cmt"># An earlier attempt got at least as far as writing it. Don't apply again:</span>
+        <span class="cmt"># just make sure the result is on W replicas, and return it.</span>
+        rec = max(done, key=<span class="kw">lambda</span> d: tuple(d[<span class="str">"version"</span>]))
+        self._write(key, rec[<span class="str">"value"</span>], tuple(rec[<span class="str">"version"</span>]), op_id, prefer)
+        <span class="kw">return</span> rec[<span class="str">"value"</span>]
+    <span class="cmt"># 2. First time we see this op: compute the new value from the newest copy.</span>
+    _, best = max(replies, key=<span class="kw">lambda</span> ir: tuple(ir[<span class="num">1</span>][<span class="str">"version"</span>]))
+    new_value = fn(best[<span class="str">"value"</span>])
+    self.clock = max(self.clock, best[<span class="str">"version"</span>][<span class="num">0</span>]) + <span class="num">1</span>
+    self._write(key, new_value, (self.clock, op_id), op_id, prefer)
+    <span class="kw">return</span> new_value</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 6: read repair</h2>
+
+<p>Replicas drift apart: a node was down during a write, or restarted empty (<code>wipe=True</code>). A stale replica stays stale until something fixes it. <strong>Read repair</strong> is the cheapest fix, and it falls out of what <code>get</code> already does. The client has just collected R answers with different versions. It knows the newest. So it sends that newest <code>(value, version)</code> back to every replica among the R that returned something older.</p>
+
+<p>Because the node only accepts <em>newer</em> versions, repair is safe to attempt blindly: a repair that arrives late, or races a real write, can never overwrite fresher data (the check verifies this). Repair is best effort: if the stale node is unreachable, ignore the error; a later read will try again. Notice also its limit: it only repairs replicas that this read <em>asked</em>. A key that is never read again stays under-replicated (real systems add a background "anti-entropy" process for that).</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>KVClient._repair</code> and call it from <code>get</code> when <code>self.read_repair</code> is true.</p>
+  <p class="checkpoint">milestone 6 shows ✔. The check writes with W = 1 (one copy), reads with R = 3 and read repair on, and then looks inside the nodes: all three must hold the value. A node restarted with <code>wipe=True</code> must be refilled by the next read, and a stale value must never overwrite a newer one.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Find the stale replicas: those <code>(i, reply)</code> in <code>replies</code> whose <code>tuple(reply["version"])</code> is smaller than the newest version.</li>
+      <li>Repair with the same <code>put</code> request the writes use, but without an <code>op_id</code> (repairs aren't client operations and must not enter the dedup table).</li>
+      <li>Wrap each repair call in <code>try/except ReplicaUnavailable</code>. Return the list of repaired indexes and count them in <code>self.repairs</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> _repair(self, key, value, version, replies):
+    stale = [i <span class="kw">for</span> i, rep <span class="kw">in</span> replies <span class="kw">if</span> tuple(rep[<span class="str">"version"</span>]) &lt; version]
+    <span class="kw">for</span> i <span class="kw">in</span> stale:
+        <span class="kw">try</span>:
+            call(self.ports[i], {<span class="str">"op"</span>: <span class="str">"put"</span>, <span class="str">"key"</span>: key, <span class="str">"value"</span>: value,
+                                 <span class="str">"version"</span>: list(version)}, self.timeout)
+            self.repairs += <span class="num">1</span>
+        <span class="kw">except</span> ReplicaUnavailable:
+            <span class="kw">pass</span>                       <span class="cmt"># best effort: it can be repaired next time</span>
+    <span class="kw">return</span> stale</code></pre>
+  </details>
+</div>
+
+<h2>Look under the hood</h2>
+
+<p>The provided shell gives you a live three-node cluster and the fault switches by hand. (The shuffle of replica order is seeded, so which nodes get the first write is repeatable for the same commands, but yours may differ from the transcript below.)</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 solution.py shell</span>
+<span class="out">3 nodes on ports [56358, 56359, 56360]</span>
+<span class="prompt">kv&gt; </span><span class="cmd">put cart apple</span>
+<span class="out">stored at version (1, 'c1-1')</span>
+<span class="prompt">kv&gt; </span><span class="cmd">w 1</span>
+<span class="prompt">kv&gt; </span><span class="cmd">put cart pear</span>             <span class="cmt"># W=1: only ONE replica gets the new value</span>
+<span class="out">stored at version (2, 'c1-2')</span>
+<span class="prompt">kv&gt; </span><span class="cmd">show</span>
+<span class="out">  n0 (up): {}
+  n1 (up): {'cart': ('pear', (2, 'c1-2'))}
+  n2 (up): {'cart': ('apple', (1, 'c1-1'))}</span>
+<span class="prompt">kv&gt; </span><span class="cmd">r 1</span>
+<span class="prompt">kv&gt; </span><span class="cmd">get cart</span>                  <span class="cmt"># R=1, W=1: R+W=2 &lt;= N. Which replica you hit decides the answer.</span>
+<span class="out">('pear', (2, 'c1-2'))</span>
+<span class="prompt">kv&gt; </span><span class="cmd">r 3</span>
+<span class="prompt">kv&gt; </span><span class="cmd">repair on</span>
+<span class="prompt">kv&gt; </span><span class="cmd">get cart</span>                  <span class="cmt"># asks all three, returns the newest, fixes the others</span>
+<span class="out">('pear', (2, 'c1-2'))</span>
+<span class="prompt">kv&gt; </span><span class="cmd">pause 1</span>
+<span class="prompt">kv&gt; </span><span class="cmd">get cart</span>                  <span class="cmt"># R=3 needs every node, and one is silent</span>
+<span class="out">FAILED: needed 3 replicas, only 2 answered</span></code></pre>
+
+<p>The failure took one timeout (0.5 s in the shell) to appear. That wait is the price of not knowing whether node 1 is dead or slow.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Break the arithmetic.</strong> In the shell, set <code>w 1</code> and <code>r 1</code>, write a value, then <code>get</code> it repeatedly after <code>kill</code>ing and <code>restart</code>ing different nodes. Find the exact sequence that returns stale data. Now set <code>w 2</code>, <code>r 2</code> and try to reproduce it.</li>
+    <li><strong>The amnesiac node.</strong> With W = 2, R = 2, write a key and use <code>show</code> to see which two nodes hold it, then <code>restart I wipe</code> for both of them with no reads in between (they lose their memory). What does <code>get</code> return now? Which assumption of the quorum argument broke? (Chapter 18: "restored replicas".)</li>
+    <li><strong>Watch backoff.</strong> In Python: <code>import random, solution; print([round(solution.backoff_delay(a, rng=random.Random(a)), 2) for a in range(8)])</code>. Run it with different seeds and watch the ceiling double, then stop at the cap.</li>
+    <li><strong>See the sockets.</strong> Start one node with <code>python3 solution.py node 9101</code>. In another terminal: <code>printf '{"op":"put","key":"x","value":"hi","version":[1,"a"]}\n' | nc -w 1 127.0.0.1 9101</code> then the same with <code>"op":"get","key":"x"</code>. You are speaking the protocol by hand, with the framing from Lab 1.</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>Parallel quorum calls.</strong> Send to all N replicas at once with threads and return as soon as W (or R) answer. Which of your stale-read tests become non-deterministic, and why? (Real systems accept this; the quorum rule still holds.)</li>
+  <li><strong>Hinted handoff.</strong> When a write can't reach one of its "home" replicas, store it on another node with a hint "this belongs to node 2", and hand it over when node 2 returns. Check chapter 18's box on <em>sloppy quorums</em>: why does this break the overlap guarantee until the handoff completes?</li>
+  <li><strong>Read before you write.</strong> Make plain <code>put</code> first read the current version from R replicas so a blind write can never be ignored. What does that cost in latency?</li>
+  <li><strong>Detect concurrent writes.</strong> Replace the version pair with a version vector (<a href="../chapters/17-time.html">chapter 17</a>) so two clients writing the same key at once produce "siblings" instead of one silently losing.</li>
+  <li><strong>Dedup table expiry.</strong> The <code>applied</code> table grows forever. Add a timestamp to each entry and drop entries older than a window. What goes wrong if a retry arrives after the window?</li>
+  <li><strong>Anti-entropy.</strong> A background thread that periodically compares replicas and copies missing keys, so data nobody reads still gets repaired.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>You've built the skeleton of Dynamo, Cassandra and Riak: leaderless writes to W, reads from R, versions to pick a winner, and read repair to heal. You've also felt why it is called <em>tunable</em> consistency: every setting of W and R is a point on the dial between "fast and available" and "fresh and strict". What you could not do is make the replicas agree on one order of concurrent writes, or guarantee that a read sees the latest write while writes are in flight (<a href="../chapters/18-replication.html">chapter 18</a>'s "quorums fall short"). Those guarantees need a leader and consensus. <a href="lab-06-raft.html">Lab 6</a> builds exactly that, in a simulation you can partition.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>A value carries a version; a replica keeps only the newest; the reader takes the highest. A Lamport pair <code>(counter, tag)</code> orders writes without trusting wall clocks.</li>
+    <li>With N replicas, writes to W and reads from R: <strong>R + W &gt; N guarantees overlap</strong>, so a read finds the latest successful write; with R + W ≤ N, stale reads are possible. You measured it.</li>
+    <li>A timeout is a guess. Skip the slow replica, count the answers, and fail cleanly with <code>QuorumNotReached</code> when the quorum is impossible. A failed write may still have left copies behind.</li>
+    <li>Retry with exponential backoff and jitter, never inside a bug, never after the last attempt.</li>
+    <li>Retries are only safe with idempotency: one key per logical operation, reused on every attempt, recorded by the server atomically with the effect.</li>
+    <li>Read repair uses a read's own answers to heal stale replicas, and the "only newer wins" rule makes it safe.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">N = 5 replicas. Which setting guarantees that a read sees the latest successful write (ignoring concurrent writes and failures)?</p>
+    <ol class="q-options">
+      <li>W = 2, R = 2</li>
+      <li>W = 3, R = 3</li>
+      <li>W = 1, R = 4</li>
+      <li>W = 2, R = 3</li>
+    </ol>
+    <div class="q-explain">The rule is R + W &gt; N, i.e. &gt; 5. W = 3, R = 3 gives 6. But W = 1, R = 4 gives exactly 5 (not greater), and W = 2, R = 3 also gives 5, so a read set of 3 can avoid a write set of 2 entirely (3 + 2 = 5 distinct replicas fit). W = 2, R = 2 gives 4. Only 3 + 3 forces an overlap.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A client sends <code>increment("hits")</code> with no idempotency key. The node applies it, but the reply is lost, so the client times out and retries. What is the likely result?</p>
+    <ol class="q-options">
+      <li>The counter ends up at the right value, because TCP never delivers duplicates</li>
+      <li>The node rejects the retry because it recognises the request</li>
+      <li>The counter is unchanged, because the first attempt failed</li>
+      <li>The counter is incremented twice, because the retry looks like a brand-new operation</li>
+    </ol>
+    <div class="q-explain">A timeout means the client stopped waiting, not that the operation failed. Without a key, the node cannot tell a retry from a new request, so the increment counts twice. Reusing one idempotency key per logical operation lets the node (or the client, by asking) discover the work is already done. TCP prevents duplicates inside one connection, not across a fresh retry on a new connection.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why do clients add <em>jitter</em> to exponential backoff?</p>
+    <ol class="q-options">
+      <li>So clients that failed at the same moment don't all retry at the same moment</li>
+      <li>So the waits get shorter over time</li>
+      <li>So the server can tell clients apart</li>
+      <li>Because random numbers make the network faster</li>
+    </ol>
+    <div class="q-explain">Deterministic backoff keeps failed clients in lock step, so they hit the server in synchronised waves. Randomising the wait spreads them out into a trickle (chapter 16's retry-storm simulator).</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A <code>put</code> with W = 2 raises <code>QuorumNotReached(needed=2, got=1)</code>. What can you say about the data?</p>
+    <ol class="q-options">
+      <li>Nothing was written anywhere</li>
+      <li>The value is safely stored on one replica, which is enough</li>
+      <li>One replica may now hold the new value, but it isn't guaranteed durable, and later reads may or may not return it</li>
+      <li>The other two replicas were told to delete the key</li>
+    </ol>
+    <div class="q-explain">Nothing rolls back the replica that did accept the write. The operation is "failed" only in the sense that the quorum guarantee wasn't reached. Depending on which replicas a later read asks, it may see the new value or the old one, which is why the caller must treat the outcome as unknown, ideally retrying with the same idempotency key.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

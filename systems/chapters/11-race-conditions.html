@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Race Conditions · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/interleave.css">
+</head>
+<body data-root="../.." data-course="sys" data-chapter="11">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+
+<header class="chapter-head">
+  <h1>Race Conditions</h1>
+  <p class="lede">Two threads run <code>counter += 1</code> a thousand times each and the total comes out wrong, though no line of code is "wrong". This chapter explains why one innocent-looking line is really three steps, how the scheduler can slip between them, and why the same bug appears whenever two servers update one database row.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Race conditions are the most common serious bug in concurrent software and the hardest to catch. They corrupt data silently, they pass your tests, and they appear in production under load. Every pattern in this chapter (lost updates, check-then-act, read-modify-write) is also a classic distributed-systems failure: change "two threads" to "two servers" and "variable" to "database row" and nothing else changes. Learn to spot the pattern here, in a few lines of Python, and you'll spot it in a system diagram.</p>
+</div>
+
+<h2>One line, three steps</h2>
+
+<p>In <a href="01-cpu.html">chapter 1</a> you saw that a CPU can only do small steps: copy a value from memory into a register, do arithmetic on registers, copy a result back to memory. There is no single instruction that means "add one to the number in that memory location" for ordinary variables (some CPUs do offer one, as we'll see in <a href="12-locks.html">chapter 12</a>, but language runtimes don't generally use it for you). So <code>counter += 1</code> means three separate steps:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 214" role="img" aria-label="counter += 1 as three steps: load the shared counter into a register, add 1 in the register, store the register back to the shared counter. A thread switch can occur between any two steps.">
+    <defs><marker id="ahS11a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="380" y="22" text-anchor="middle" class="mono t-bold">counter += 1</text>
+
+    <rect x="20" y="40" width="200" height="76" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="120" y="64" text-anchor="middle" class="t-bold">1 · LOAD</text>
+    <text x="120" y="84" text-anchor="middle" class="mono t-sm">reg ← counter</text>
+    <text x="120" y="102" text-anchor="middle" class="t-xs t-muted">read the shared value</text>
+
+    <rect x="280" y="40" width="200" height="76" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="64" text-anchor="middle" class="t-bold">2 · ADD</text>
+    <text x="380" y="84" text-anchor="middle" class="mono t-sm">reg ← reg + 1</text>
+    <text x="380" y="102" text-anchor="middle" class="t-xs t-muted">arithmetic on a private copy</text>
+
+    <rect x="540" y="40" width="200" height="76" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="640" y="64" text-anchor="middle" class="t-bold">3 · STORE</text>
+    <text x="640" y="84" text-anchor="middle" class="mono t-sm">counter ← reg</text>
+    <text x="640" y="102" text-anchor="middle" class="t-xs t-muted">write the result back</text>
+
+    <line x1="222" y1="78" x2="278" y2="78" class="line" marker-end="url(#ahS11a)"/>
+    <line x1="482" y1="78" x2="538" y2="78" class="line" marker-end="url(#ahS11a)"/>
+    <circle cx="250" cy="78" r="6" class="f-red"/>
+    <circle cx="510" cy="78" r="6" class="f-red"/>
+
+    <rect x="20" y="130" width="200" height="30" rx="6" class="fs-yellow s-yellow sw-1"/>
+    <text x="120" y="150" text-anchor="middle" class="t-xs">shared memory (everyone sees it)</text>
+    <rect x="280" y="130" width="200" height="30" rx="6" class="box"/>
+    <text x="380" y="150" text-anchor="middle" class="t-xs">register (this thread only)</text>
+    <rect x="540" y="130" width="200" height="30" rx="6" class="fs-yellow s-yellow sw-1"/>
+    <text x="640" y="150" text-anchor="middle" class="t-xs">shared memory (everyone sees it)</text>
+
+    <circle cx="200" cy="190" r="6" class="f-red"/>
+    <text x="214" y="194" class="t-sm">a thread switch can land at either red dot</text>
+  </svg>
+  <figcaption>Between the steps, the value the thread is holding in its register may no longer match what is in memory.</figcaption>
+</figure>
+
+<p>Python makes this visible with its <code>dis</code> module, which shows the <span class="term">bytecode</span> (the instructions Python's interpreter runs) for a function:</p>
+
+<pre class="terminal" data-title="dis1.py"><code>import dis
+
+counter = 0
+
+def bump():
+    global counter
+    counter += 1
+
+dis.dis(bump)</code></pre>
+
+<pre class="terminal" data-title="output (Python 3.14; older versions look very slightly different)"><code><span class="prompt">$ </span><span class="cmd">python3 dis1.py</span>
+  5           RESUME                   0
+
+  7           LOAD_GLOBAL              0 (counter)
+              LOAD_SMALL_INT           1
+              BINARY_OP               13 (+=)
+              STORE_GLOBAL             0 (counter)
+              LOAD_CONST               1 (None)
+              RETURN_VALUE</code></pre>
+
+<p>The four middle lines are our three steps (with one extra to push the constant <code>1</code>): <code>LOAD_GLOBAL</code> reads the shared variable, <code>BINARY_OP</code> adds, <code>STORE_GLOBAL</code> writes it back. On Python 3.11 to 3.13 you'll see <code>LOAD_CONST</code> instead of <code>LOAD_SMALL_INT</code>, and before 3.11 the middle one is called <code>INPLACE_ADD</code>. The shape never changes. The line number column will differ with your file layout.</p>
+
+<p>A note on what can race. If <code>x</code> is a plain local variable inside a function, nobody else can see it (it lives on that thread's own stack), so <code>x += 1</code> is perfectly safe. The trouble starts when the variable is <em>shared</em>: a global, an attribute of an object several threads hold (<code>self.count += 1</code>), or an item in a shared list or dictionary (<code>stats[key] += 1</code>).</p>
+
+<h2>The GIL doesn't save you</h2>
+
+<p>Last chapter we met CPython's GIL, which lets only one thread run bytecode at a time. It's tempting to conclude: "so only one thread touches <code>counter</code> at a time, so it's safe." That's a mistake. The GIL guarantees that a <em>single bytecode</em> finishes without another thread running Python code in the middle of it. It does not promise that a thread keeps the GIL from one bytecode to the next. The interpreter may hand the GIL to another thread between <code>LOAD_GLOBAL</code> and <code>STORE_GLOBAL</code>, and then the load is stale by the time the store happens.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Python has a GIL, so my threaded code can't have race conditions." False. The GIL protects the interpreter's own data structures. It does nothing to make <em>your</em> multi-step operations atomic. The same program is just as broken on a language with no GIL, and, as we'll see below, on Python itself when two <em>processes</em> or two <em>servers</em> are involved.</p>
+</div>
+
+<h2>The lost update</h2>
+
+<p>Suppose <code>counter</code> is 5, and threads A and B each run <code>counter += 1</code>. If A finishes its three steps before B begins, the result is 7. Now consider this order:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 262" role="img" aria-label="Timeline of six steps. A loads 5, B loads 5, A adds to get 6, B adds to get 6, A stores 6, B stores 6. The counter ends at 6 instead of 7.">
+    <text x="20" y="64" class="t-bold tc-blue">Thread A</text>
+    <text x="20" y="116" class="t-bold tc-green">Thread B</text>
+    <text x="20" y="186" class="t-bold">counter</text>
+    <text x="20" y="202" class="t-xs t-muted">in memory</text>
+
+    <rect x="158" y="40" width="84" height="42" rx="6" class="fs-blue s-blue sw-1"/>
+    <text x="200" y="58" text-anchor="middle" class="t-xs t-bold">LOAD</text><text x="200" y="74" text-anchor="middle" class="t-xs mono">reg = 5</text>
+    <rect x="342" y="40" width="84" height="42" rx="6" class="fs-blue s-blue sw-1"/>
+    <text x="384" y="58" text-anchor="middle" class="t-xs t-bold">ADD</text><text x="384" y="74" text-anchor="middle" class="t-xs mono">reg = 6</text>
+    <rect x="526" y="40" width="84" height="42" rx="6" class="fs-blue s-blue sw-1"/>
+    <text x="568" y="58" text-anchor="middle" class="t-xs t-bold">STORE</text><text x="568" y="74" text-anchor="middle" class="t-xs mono">counter = 6</text>
+
+    <rect x="250" y="92" width="84" height="42" rx="6" class="fs-green s-green sw-1"/>
+    <text x="292" y="110" text-anchor="middle" class="t-xs t-bold">LOAD</text><text x="292" y="126" text-anchor="middle" class="t-xs mono">reg = 5</text>
+    <rect x="434" y="92" width="84" height="42" rx="6" class="fs-green s-green sw-1"/>
+    <text x="476" y="110" text-anchor="middle" class="t-xs t-bold">ADD</text><text x="476" y="126" text-anchor="middle" class="t-xs mono">reg = 6</text>
+    <rect x="618" y="92" width="84" height="42" rx="6" class="fs-green s-green sw-1"/>
+    <text x="660" y="110" text-anchor="middle" class="t-xs t-bold">STORE</text><text x="660" y="126" text-anchor="middle" class="t-xs mono">counter = 6</text>
+
+    <rect x="158" y="168" width="84" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="200" y="189" text-anchor="middle" class="t-sm mono">5</text>
+    <rect x="250" y="168" width="84" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="292" y="189" text-anchor="middle" class="t-sm mono">5</text>
+    <rect x="342" y="168" width="84" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="384" y="189" text-anchor="middle" class="t-sm mono">5</text>
+    <rect x="434" y="168" width="84" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="476" y="189" text-anchor="middle" class="t-sm mono">5</text>
+    <rect x="526" y="168" width="84" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="568" y="189" text-anchor="middle" class="t-sm mono">6</text>
+    <rect x="618" y="168" width="84" height="32" rx="6" class="fs-red s-red sw-2"/><text x="660" y="189" text-anchor="middle" class="t-sm mono">6</text>
+
+    <text x="380" y="236" text-anchor="middle" class="t-bold tc-red">Two increments ran. The counter went from 5 to 6. One update was lost.</text>
+    <text x="200" y="154" text-anchor="middle" class="t-xs t-faint">time →</text>
+  </svg>
+  <figcaption>Each step on its own is correct. B's store used a number (5) that was already out of date when B read it, so it overwrote A's work.</figcaption>
+</figure>
+
+<p>This is a <span class="term">lost update</span>: both threads did their job, and one of the effects vanished. Nothing crashed and no error appeared. The program just has a wrong number, which is the worst kind of bug.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: two people updating a whiteboard tally</p>
+  <p>A whiteboard shows "5 customers today". Two door staff each see a customer arrive. Each reads the board (5), adds one in their head (6), walks over and writes 6. If both read before either wrote, the board says 6 though two customers came in.</p>
+  <p><em>Where it breaks down:</em> people can see each other at the board. A thread has no idea another thread read the same value, and it can be suspended <em>after</em> reading and for an arbitrary time (microseconds, or an entire time slice), so its picture of the world can be arbitrarily stale.</p>
+</div>
+
+<h2>Interleavings: how many ways can this go?</h2>
+
+<p>When two threads each run several steps, the scheduler decides how the steps <span class="term">interleave</span>, meaning the single sequence in which they actually happen. Each thread's own steps stay in order, but they can be mixed in any way. For two threads of 3 steps each, how many orders are there? Choose which 3 of the 6 time slots belong to thread A and the rest go to B: that's "6 choose 3" = 20. In general, two threads of <em>n</em> steps give C(2n, n) orders:</p>
+
+<table>
+  <thead><tr><th>Steps per thread</th><th>Possible interleavings</th></tr></thead>
+  <tbody>
+    <tr><td>3 (our <code>counter += 1</code>)</td><td>20</td></tr>
+    <tr><td>5 (a slightly bigger operation)</td><td>252</td></tr>
+    <tr><td>10</td><td>184,756</td></tr>
+    <tr><td>20</td><td>about 138 billion</td></tr>
+  </tbody>
+</table>
+
+<p>Three threads of three steps already give 1,680. Real programs have hundreds of steps and dozens of threads, so the number of possible schedules is astronomical. You can't test them all, and you can't "look" at the code and see the one bad one. You have to argue about <em>all</em> of them at once, which is what locks are for.</p>
+
+<p>Now try it yourself. Below, you are the scheduler.</p>
+
+<div class="widget" id="interleave-widget"></div>
+
+<p>Things to try. First, press the preset <strong>A then B (serial)</strong>: the answer is 2. Then <strong>classic lost update</strong>: the answer is 1. Then reset and find a lost update by hand with as few switches as possible. (Hint: you need B to LOAD before A's STORE.) Look at the count at the bottom: of the 20 interleavings, only 2 are safe, and they're exactly the two where one thread finishes before the other starts. Finally, turn on <strong>use a lock</strong>: the safe orders are all that remain, because the second thread simply can't begin its critical steps while the first holds the lock.</p>
+
+<p>An important point hides in that count. Only 2 of 20 orders are safe, yet in real programs the bad ones are <em>rare</em>. That is because the scheduler doesn't pick orders uniformly at random. Threads typically run for long stretches (milliseconds) between switches, and the dangerous window is a few nanoseconds wide. The bug is always possible and rarely observed, and that's what makes it so nasty.</p>
+
+<h2>Check-then-act</h2>
+
+<p>The lost update is one flavour of a broader pattern. In <span class="term">check-then-act</span>, code checks a condition and then acts on the assumption that it still holds. If something can change the condition in between, the act is based on stale information.</p>
+
+<h3>The bank withdrawal</h3>
+
+<pre class="terminal" data-title="bank.py"><code>import threading, time
+
+balance = 100
+
+def withdraw(amount, who):
+    global balance
+    if balance &gt;= amount:          # CHECK
+        time.sleep(0.01)           # the "slow part": a database call, a fraud check...
+        balance -= amount          # ACT
+        print(f"{who}: withdrew {amount}")
+    else:
+        print(f"{who}: declined")
+
+a = threading.Thread(target=withdraw, args=(80, "A"))
+b = threading.Thread(target=withdraw, args=(80, "B"))
+a.start(); b.start(); a.join(); b.join()
+print("final balance:", balance)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 bank.py</span>
+A: withdrew 80
+B: withdrew 80
+final balance: -60</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 252" role="img" aria-label="A and B both check that the balance 100 covers 80, both pass, and then both subtract 80, leaving the balance at minus 60.">
+    <text x="20" y="64" class="t-bold tc-blue">Thread A</text>
+    <text x="20" y="116" class="t-bold tc-green">Thread B</text>
+    <text x="20" y="186" class="t-bold">balance</text>
+
+    <rect x="160" y="38" width="120" height="46" rx="6" class="fs-blue s-blue sw-1"/>
+    <text x="220" y="57" text-anchor="middle" class="t-xs t-bold">CHECK</text><text x="220" y="73" text-anchor="middle" class="t-xs mono">100 ≥ 80 ✓</text>
+    <rect x="440" y="38" width="120" height="46" rx="6" class="fs-blue s-blue sw-1"/>
+    <text x="500" y="57" text-anchor="middle" class="t-xs t-bold">ACT</text><text x="500" y="73" text-anchor="middle" class="t-xs mono">100 → 20</text>
+
+    <rect x="300" y="90" width="120" height="46" rx="6" class="fs-green s-green sw-1"/>
+    <text x="360" y="109" text-anchor="middle" class="t-xs t-bold">CHECK</text><text x="360" y="125" text-anchor="middle" class="t-xs mono">100 ≥ 80 ✓</text>
+    <rect x="580" y="90" width="120" height="46" rx="6" class="fs-green s-green sw-1"/>
+    <text x="640" y="109" text-anchor="middle" class="t-xs t-bold">ACT</text><text x="640" y="125" text-anchor="middle" class="t-xs mono">20 → -60</text>
+
+    <rect x="160" y="168" width="120" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="220" y="189" text-anchor="middle" class="t-sm mono">100</text>
+    <rect x="300" y="168" width="120" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="360" y="189" text-anchor="middle" class="t-sm mono">100</text>
+    <rect x="440" y="168" width="120" height="32" rx="6" class="fs-yellow s-yellow sw-1"/><text x="500" y="189" text-anchor="middle" class="t-sm mono">20</text>
+    <rect x="580" y="168" width="120" height="32" rx="6" class="fs-red s-red sw-2"/><text x="640" y="189" text-anchor="middle" class="t-sm mono">-60</text>
+
+    <text x="380" y="232" text-anchor="middle" class="t-sm">Each check was true when made. By the time B acted, A had made it false.</text>
+  </svg>
+  <figcaption>Check-then-act: the gap between the check and the act is where the world changes.</figcaption>
+</figure>
+
+<p>Here the gap between the check and the act is made deliberately wide with <code>sleep</code>, standing in for a database call or a fraud check. In real code it might be microseconds, which only changes how often you see it, not whether the bug exists.</p>
+
+<h3>"If the file doesn't exist, create it"</h3>
+
+<p>The same pattern shows up with the file system, and it has a name: <span class="term">TOCTOU</span>, "time of check to time of use". Another <em>process</em> can create the file, or swap it for a link to something sensitive, in the gap. This isn't only a threading bug: it's a bug between any two actors sharing a resource, which is why it is a classic security vulnerability too.</p>
+
+<pre class="terminal" data-title="toctou.py"><code>import os, threading, time
+
+path = "report.txt"
+if os.path.exists(path): os.remove(path)
+
+def create(who):
+    if not os.path.exists(path):          # CHECK
+        time.sleep(0.01)
+        with open(path, "w") as f:        # ACT ("w" truncates!)
+            f.write(f"written by {who}\n")
+        print(who, "created the file")
+
+ts = [threading.Thread(target=create, args=(n,)) for n in "AB"]
+for t in ts: t.start()
+for t in ts: t.join()
+print(open(path).read().strip())
+
+# The fix: let the OS do check-and-create as ONE atomic step.
+os.remove(path)
+def create_safely(who):
+    try:
+        with open(path, "x") as f:        # "x" = fail if it already exists
+            f.write(f"written by {who}\n")
+        print(who, "created the file")
+    except FileExistsError:
+        print(who, "lost the race, file already exists")
+ts = [threading.Thread(target=create_safely, args=(n,)) for n in "AB"]
+for t in ts: t.start()
+for t in ts: t.join()
+os.remove(path)</code></pre>
+
+<pre class="terminal" data-title="terminal (the order of lines can vary)"><code><span class="prompt">$ </span><span class="cmd">python3 toctou.py</span>
+B created the file
+A created the file
+written by A
+B lost the race, file already exists
+A created the file</code></pre>
+
+<p>In the first half both threads saw "no file", and both created it. The second one silently truncated and overwrote the first one's work (mode <code>"w"</code> truncates). The second half is the fix, and it's a general principle: <strong>let the layer that owns the resource do the check and the act as one indivisible operation</strong>. Here, mode <code>"x"</code> asks the OS to create the file <em>only if it doesn't exist</em>, atomically, and report failure otherwise (<code>O_CREAT | O_EXCL</code> underneath, <a href="08-files.html">chapter 8</a>). The same idea gives us atomic rename for safe file replacement (<a href="09-durability.html">chapter 9</a>).</p>
+
+<h3>Lazy initialisation</h3>
+
+<p>"Create the expensive object the first time someone needs it" is another check-then-act:</p>
+
+<pre class="terminal" data-title="lazy.py"><code>import threading, time
+
+config = None
+loads = 0
+
+def get_config():
+    global config, loads
+    if config is None:             # CHECK
+        loads += 1
+        time.sleep(0.01)           # pretend loading is slow
+        config = {"loaded": True}  # ACT
+    return config
+
+ts = [threading.Thread(target=get_config) for _ in range(5)]
+for t in ts: t.start()
+for t in ts: t.join()
+print("config was loaded", loads, "times")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 lazy.py</span>
+config was loaded 5 times</code></pre>
+
+<p>All five threads saw <code>None</code>, so all five loaded the configuration. For a read-only config that's merely wasteful. For something like "open the database connection pool" or "generate the unique ID counter's starting value" it can be disastrous: five pools, or two counters that both start at zero. The fix is to make the check and the initialisation one critical section (<a href="12-locks.html">chapter 12</a>), or to initialise before any threads start.</p>
+
+<h3>Read-modify-write</h3>
+
+<p>The lost update, the bank withdrawal and lazy initialisation are all variations of one shape, <span class="term">read-modify-write</span>: read a value, decide or compute something from it, write the result back, and assume nothing changed in the middle. Spot that shape and you've spotted the bug. You'll find it in "increment a view counter", "append to a shared list if not already present", "take the next job ID", and "update my cached copy of a record".</p>
+
+<h2>Data race versus race condition</h2>
+
+<p>These two terms are used interchangeably in casual speech, but they mean different things, and the difference is useful.</p>
+
+<dl class="terms">
+  <dt>Data race</dt>
+  <dd>A precise, low-level definition: two threads access the <em>same memory location</em> at the same time, <em>at least one of them writes</em>, and nothing orders the accesses (no lock, no atomic operation). In languages such as C, C++ and Rust (in unsafe code) a data race is <em>undefined behaviour</em>: the compiler and CPU may do anything, and tools such as ThreadSanitizer exist to detect them.</dd>
+  <dt>Race condition</dt>
+  <dd>A higher-level bug: the program's <em>correctness depends on the timing or ordering</em> of events it doesn't control. The program is wrong for some schedules.</dd>
+</dl>
+
+<p>Neither implies the other. The bank example is a race condition, and a data race too, because both threads touch <code>balance</code> unprotected. But consider this version, where a lock protects every single access to <code>balance</code>:</p>
+
+<pre class="terminal" data-title="lockcheck.py"><code>import threading, time
+
+balance = 100
+lock = threading.Lock()
+
+def withdraw(amount, who):
+    global balance
+    with lock:
+        enough = balance &gt;= amount      # every access is protected...
+    time.sleep(0.01)
+    if enough:
+        with lock:
+            balance -= amount           # ...but the decision outlives the lock
+        print(f"{who}: withdrew {amount}")
+
+a = threading.Thread(target=withdraw, args=(80, "A"))
+b = threading.Thread(target=withdraw, args=(80, "B"))
+a.start(); b.start(); a.join(); b.join()
+print("final balance:", balance)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 lockcheck.py</span>
+A: withdrew 80
+B: withdrew 80
+final balance: -60</code></pre>
+
+<p>There is <strong>no data race</strong>: every read and write of <code>balance</code> happens under the lock, so no two accesses overlap. Yet there is still a <strong>race condition</strong>: the decision "enough money" was made in one critical section and acted on in another, so the result depends on the interleaving. Locking each variable is not enough. You have to lock the whole <em>invariant</em> (here, "check and withdraw together"). Chapter 12 does exactly that.</p>
+
+<p>The reverse also exists: two threads that both write the same value <code>True</code> to a "done" flag form a data race by the formal definition, but the program's behaviour doesn't depend on the order, so it isn't a race condition. (In C or C++ it is still undefined behaviour; you shouldn't rely on it.) In Python, a data race on a plain variable can't corrupt the interpreter's memory, so almost all the bugs you'll meet are race conditions of the logical kind.</p>
+
+<details class="deeper">
+  <summary>Go deeper: why "it happened to work" proves nothing <span class="hint">optional</span></summary>
+  <p>Languages with a formal memory model (Java, C++, Go) define when one thread's writes are guaranteed to be visible to another: only through synchronisation such as locks, atomics or channels. Without it, a reader may see an old value, or see writes in a different order than the writer made them, because compilers and CPUs reorder and cache (we return to this in chapter 12). So even a program that has never lost an update in testing may, on a different CPU or compiler version, start to. "No synchronisation, but it works on my machine" is a risk, not a design.</p>
+</details>
+
+<h2>Why races are so hard to catch</h2>
+
+<p>A race is a <span class="term">Heisenbug</span>, a bug that seems to vanish or change when you try to observe it. Several things conspire:</p>
+
+<ul>
+  <li><strong>The window is tiny.</strong> The bad order needs a thread switch inside a few nanoseconds of vulnerable time. Most runs never hit it.</li>
+  <li><strong>It depends on timing you don't control:</strong> the number of cores, what else is running, CPU frequency, how loaded the server is. A test machine that is quiet and has few cores may never show it.</li>
+  <li><strong>Observing changes timing.</strong> Add a <code>print</code> or run under a debugger and the timing shifts enough to hide the bug.</li>
+  <li><strong>It leaves no trace.</strong> A wrong number is just a number. There is no exception, no stack trace, no crash to point at.</li>
+  <li><strong>Passing tests proves little.</strong> A test that passes a million times might have seen one schedule a million times.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"I ran it 100 times and it was fine, so it's thread-safe." A race that happens once in a billion operations will fail in production within a day for a busy service, and not once in your test. Safety has to come from <em>reasoning</em> (locks, atomics, no sharing), not from observation.</p>
+</div>
+
+<h3>Making a race reproducible</h3>
+
+<p>To <em>study</em> a race you want it to happen on demand. The trick is to widen the gap between the read and the write. Here is a counter that deliberately loses updates:</p>
+
+<pre class="terminal" data-title="lost.py"><code>import threading, time
+
+counter = 0
+
+def work(n):
+    global counter
+    for _ in range(n):
+        tmp = counter          # LOAD
+        time.sleep(0)          # offer the CPU to another thread
+        counter = tmp + 1      # STORE (using a possibly stale value)
+
+threads = [threading.Thread(target=work, args=(10_000,)) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"expected 40000, got {counter}  (lost {40000 - counter})")</code></pre>
+
+<pre class="terminal" data-title="terminal (exact numbers vary)"><code><span class="prompt">$ </span><span class="cmd">python3 lost.py</span>
+expected 40000, got 10000  (lost 30000)
+<span class="prompt">$ </span><span class="cmd">python3 lost.py</span>
+expected 40000, got 10124  (lost 29876)</code></pre>
+
+<p><code>time.sleep(0)</code> doesn't wait: it just tells the operating system "let someone else run now", which releases the GIL and invites the other threads in. Right between the load and the store, that's the worst possible moment. The threads then run almost in lockstep: in each round all four read the same value and all four write back that value plus one, so four increments count as one, and about three-quarters of the work vanishes.</p>
+
+<div class="callout note">
+  <p class="callout-title">Honest note: the plain <code>+=</code> loop</p>
+  <p>You might expect a plain <code>counter += 1</code> loop with four threads to lose updates too. On recent CPython (I measured 3.14) it very rarely does, and often never, so don't count on it for a demo:</p>
+</div>
+
+<pre class="terminal" data-title="plain.py"><code>import threading
+
+counter = 0
+
+def work(n):
+    global counter
+    for _ in range(n):
+        counter += 1
+
+threads = [threading.Thread(target=work, args=(1_000_000,)) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print("expected 4000000, got", counter)</code></pre>
+
+<pre class="terminal" data-title="terminal (Python 3.14)"><code><span class="prompt">$ </span><span class="cmd">python3 plain.py</span>
+expected 4000000, got 4000000
+<span class="prompt">$ </span><span class="cmd">python3 plain.py</span>
+expected 4000000, got 4000000</code></pre>
+
+<p>That doesn't mean the code is correct. CPython only checks whether it should switch threads at certain instructions (roughly: function calls and jumps back to the top of a loop), and in this loop the load, add and store sit together with no such check between them, so the window is almost closed. Older versions checked at more kinds of instruction, so people used to see losses here more readily. Different Python versions, other implementations such as PyPy or Jython, free-threaded builds, or slightly more complicated code (a function call between the read and the write, an attribute on an object, a custom <code>__add__</code>) open the window again. You can also try shrinking the interval between switches:</p>
+
+<pre class="terminal" data-title="sw.py"><code>import sys, threading
+sys.setswitchinterval(1e-6)
+counter = 0
+def work(n):
+    global counter
+    for _ in range(n):
+        counter += 1
+ts = [threading.Thread(target=work, args=(500_000,)) for _ in range(4)]
+for t in ts: t.start()
+for t in ts: t.join()
+print("expected 2000000, got", counter)</code></pre>
+
+<p>With <code>sys.setswitchinterval(1e-6)</code> (a microsecond instead of the 5 ms default) I still saw <code>2000000</code> on 3.14 for the same reason. That's the honest result: the interpreter's design makes this particular bug hard to trigger, not impossible. Hence the technique that does work: <strong>put a deliberate <code>sleep(0)</code> or <code>sleep(0.001)</code> in the gap</strong>, which is what <code>lost.py</code>, <code>bank.py</code> and <code>lazy.py</code> do. Real-world equivalents: stress tests with many threads and iterations, running tests on machines with more cores, injecting random delays, and tools such as ThreadSanitizer (for C, C++, Go's <code>-race</code> flag, Rust) that watch memory accesses for unordered conflicts.</p>
+
+<p>And here is the same loop with the repair, to compare with <code>lost.py</code>. We'll explain it fully in the next chapter:</p>
+
+<pre class="terminal" data-title="fixed.py"><code>import threading, time
+
+counter = 0
+lock = threading.Lock()
+
+def work(n):
+    global counter
+    for _ in range(n):
+        with lock:
+            tmp = counter
+            time.sleep(0)
+            counter = tmp + 1
+
+threads = [threading.Thread(target=work, args=(10_000,)) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"expected 40000, got {counter}")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 fixed.py</span>
+expected 40000, got 40000</code></pre>
+
+<p>The <code>with lock:</code> block lets only one thread be between the load and the store at a time. The deliberate <code>sleep(0)</code> is still there, but now it can't hurt, because nobody else can enter the block until the lock is released. Lab 3 has you reproduce this race and fix it yourself: <a href="../labs/lab-03-races-locks.html">Lab 3: Races &amp; Locks</a>.</p>
+
+<h2>The same bug across machines</h2>
+
+<p>Now replace "thread" with "server" and "variable" with "row in a database". Two web servers handle two purchases of the same item at the same moment. Each does: read the stock from the database, subtract one in its own memory, write the new value back.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 296" role="img" aria-label="Server 1 and server 2 both read stock 10 from the database, then each writes stock 9. Two items were sold but the database shows only one fewer.">
+    <defs><marker id="ahS11b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="40" y="14" width="140" height="40" rx="8" class="fs-purple s-purple sw-2"/><text x="110" y="39" text-anchor="middle" class="t-sm t-bold">Server 1</text>
+    <rect x="310" y="14" width="140" height="40" rx="8" class="box2"/><text x="380" y="39" text-anchor="middle" class="t-sm t-bold">Database</text>
+    <rect x="580" y="14" width="140" height="40" rx="8" class="fs-purple s-purple sw-2"/><text x="650" y="39" text-anchor="middle" class="t-sm t-bold">Server 2</text>
+    <line x1="110" y1="54" x2="110" y2="216" class="line-dash"/>
+    <line x1="380" y1="54" x2="380" y2="216" class="line-dash"/>
+    <line x1="650" y1="54" x2="650" y2="216" class="line-dash"/>
+
+    <text x="245" y="88" text-anchor="middle" class="t-sm">1 · read stock → 10</text>
+    <line x1="110" y1="96" x2="378" y2="96" class="line" marker-end="url(#ahS11b)"/>
+    <text x="515" y="122" text-anchor="middle" class="t-sm">2 · read stock → 10</text>
+    <line x1="650" y1="130" x2="382" y2="130" class="line" marker-end="url(#ahS11b)"/>
+    <text x="245" y="156" text-anchor="middle" class="t-sm">3 · write stock = 9</text>
+    <line x1="110" y1="164" x2="378" y2="164" class="line" marker-end="url(#ahS11b)"/>
+    <text x="515" y="190" text-anchor="middle" class="t-sm">4 · write stock = 9</text>
+    <line x1="650" y1="198" x2="382" y2="198" class="line" marker-end="url(#ahS11b)"/>
+
+    <rect x="270" y="226" width="220" height="56" rx="10" class="fs-red s-red sw-2"/>
+    <text x="380" y="249" text-anchor="middle" class="t-sm t-bold">stock = 9</text>
+    <text x="380" y="268" text-anchor="middle" class="t-sm">but two items were sold</text>
+  </svg>
+  <figcaption>The identical lost update. The "gap" between read and write is now a network round trip, which is far wider than a few nanoseconds.</figcaption>
+</figure>
+
+<p>This is not hypothetical: it's the classic bug in web applications, and it's <em>easier</em> to hit than the in-process version, because the gap between read and write is milliseconds of network time, not nanoseconds, and the two servers truly run in parallel with no GIL anywhere. Databases give you several remedies, each a cousin of something you'll meet in chapter 12:</p>
+
+<ul>
+  <li><strong>Do the read-modify-write inside the database as one operation</strong>: <code>UPDATE items SET stock = stock - 1 WHERE id = 7</code>. The database applies the arithmetic itself, atomically. This is the "fetch-and-add" idea.</li>
+  <li><strong>Lock the row while you work</strong> (<code>SELECT ... FOR UPDATE</code>). This is a lock, held across a network round trip, with all the costs that implies.</li>
+  <li><strong>Optimistic concurrency</strong>: read the row with a version number, and write back with <code>WHERE version = 3</code>. If someone else changed it, zero rows match and you retry. This is exactly the compare-and-swap retry loop from chapter 12.</li>
+  <li><strong>Ask the database for stronger isolation</strong> (a "serializable" transaction), which makes it behave as though transactions ran one at a time.</li>
+</ul>
+
+<p>"Isolation levels" is a big topic with its own course: the <em>Data Systems</em> course that follows this one explains why a database with the default settings can still lose updates, what "read committed", "snapshot isolation" and "serializable" each guarantee, and what each costs. For now, take away the pattern: <strong>any read-then-write that crosses a gap in time is a race, whether the gap is nanoseconds in a CPU or milliseconds across a network.</strong></p>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: lose some updates, then stop losing them</p>
+  <p>All of these use only the standard library and write nothing to disk except <code>toctou.py</code>, which makes and deletes one small file in the current folder. Save each script from this page and run it a few times. Your numbers will differ.</p>
+</div>
+
+<ol>
+  <li>Run <code>lost.py</code> several times. Then change <code>time.sleep(0)</code> to <code>pass</code> and run again. What changes, and what does that tell you about the size of the window?</li>
+  <li>Run <code>fixed.py</code>. Then make the thread count 8 and the loop 100,000. Does the answer stay right? Does it get slower?</li>
+  <li>Run <code>bank.py</code>, then <code>lockcheck.py</code>, then write your own fix by putting the check and the withdrawal in one <code>with lock:</code> block. (The answer is in chapter 12 and in Lab 3.)</li>
+  <li>Check what you are running: <code>python3 -c "import sys; print(sys.version, sys.getswitchinterval())"</code>.</li>
+</ol>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Everything in this chapter reappears one level up. Two servers reading and writing one row is a lost update. "Check whether the username is free, then create the account" is check-then-act; two sign-ups for the same name both succeed. "If no one holds the job, claim it" without an atomic claim runs a job twice. In distributed systems the interleavings are far more numerous (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>: messages can be delayed, duplicated and retried) and there is usually no shared lock to reach for, which is why the field has invented transactions, idempotency keys, version numbers and consensus (<a href="../../networking/chapters/20-consensus.html">networking chapter 20</a>). The Data Systems course will pick up from here with isolation levels.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li><code>counter += 1</code> on shared data is three steps (load, add, store). A thread switch between them can make a thread write back a stale value: a lost update.</li>
+    <li>The GIL does not make your multi-step operations atomic. It only protects the interpreter's internals.</li>
+    <li>Two threads of <em>n</em> steps have C(2n, n) interleavings: 20 for three steps, and rapidly astronomical. You can't test them all; you must reason about all of them.</li>
+    <li>Check-then-act (bank balance, "create if missing", lazy init, TOCTOU) and read-modify-write are the same bug in different clothes. The fix is to make check and act one indivisible step.</li>
+    <li>A data race is unordered conflicting memory access; a race condition is correctness depending on timing. Locking every variable can remove data races yet leave race conditions.</li>
+    <li>Races are Heisenbugs: rare, timing dependent and silent. To reproduce one, widen the gap (<code>sleep(0)</code>); to prevent one, use synchronisation, not hope.</li>
+    <li>The same pattern appears between servers and a database as a lost update; the cure is atomic operations, locks, versioning or stronger isolation.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Two threads each run <code>counter += 1</code> once on a shared counter that starts at 0. Which final values are possible?</p>
+    <ol class="q-options">
+      <li>Only 2</li>
+      <li>1 or 2</li>
+      <li>0, 1 or 2</li>
+      <li>Only 1</li>
+    </ol>
+    <div class="q-explain">If the two run one after the other the answer is 2. If both load 0 before either stores, both write 1, and one update is lost. 0 is impossible, because each thread stores at least 1. The interleaving explorer above shows 18 of 20 orders giving 1.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Why doesn't CPython's GIL make <code>counter += 1</code> safe?</p>
+    <ol class="q-options">
+      <li>The GIL only works on Linux</li>
+      <li>The GIL is released at the start of every function</li>
+      <li>Adding integers isn't done by the interpreter</li>
+      <li>The GIL makes each single bytecode uninterrupted, but a thread can lose the GIL between the load and the store bytecodes</li>
+    </ol>
+    <div class="q-explain">The operation is several bytecodes (load, add, store). The GIL doesn't promise a thread keeps running from one bytecode to the next, so the value loaded can be stale by the time it is stored.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A program locks every individual read and write of <code>balance</code>, but checks <code>balance &gt;= amount</code> in one locked block and subtracts in another. What is true?</p>
+    <ol class="q-options">
+      <li>It has no data race but still has a race condition</li>
+      <li>It has a data race but no race condition</li>
+      <li>It has neither</li>
+      <li>It has both</li>
+    </ol>
+    <div class="q-explain">No two accesses to <code>balance</code> overlap, so there's no data race. But the check and the act aren't one atomic step, so two withdrawals can both pass the check, and the result depends on timing: a race condition.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why can a test suite that passes thousands of times still hide a race condition?</p>
+    <ol class="q-options">
+      <li>Tests always run on a single core</li>
+      <li>Race conditions only occur in production code, never in tests</li>
+      <li>The bad interleaving may need a thread switch in a tiny window, so most runs never hit it</li>
+      <li>Races always raise an exception that tests catch</li>
+    </ol>
+    <div class="q-explain">The vulnerable window is tiny, depends on timing and load, and leaves no error behind. A bug that triggers once in a billion operations passes any reasonable test and still fails in production. Deliberate delays, stress tests and race detectors help; repeated passing doesn't prove safety.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Two web servers each read a row's value (10), subtract 1 and write 9. What is this, and what's the best simple fix?</p>
+    <ol class="q-options">
+      <li>A deadlock; add more servers</li>
+      <li>A lost update; do the arithmetic inside the database in one atomic statement (<code>stock = stock - 1</code>), or use a version check or stronger isolation</li>
+      <li>A TCP retransmission; increase the timeout</li>
+      <li>Not a bug, because databases never lose writes</li>
+    </ol>
+    <div class="q-explain">It's the same lost update as the in-process counter, with a network-sized gap between read and write. Moving the read-modify-write into one atomic database operation (or protecting it with a lock, a version number or serializable isolation) closes the gap.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In <code>open(path, "x")</code>, what does the <code>"x"</code> mode accomplish compared with <code>if not os.path.exists(path): open(path, "w")</code>?</p>
+    <ol class="q-options">
+      <li>It makes the file read-only</li>
+      <li>It encrypts the file</li>
+      <li>It makes "fail if the file exists, otherwise create it" a single atomic operation in the operating system, closing the check-then-act gap</li>
+      <li>It speeds up the check</li>
+    </ol>
+    <div class="q-explain">Separate check and create steps leave a gap in which another thread or process can create the file (TOCTOU). Exclusive creation lets the OS do both as one indivisible step and report an error if you lost the race.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/interleave.js"></script>
+</body>
+</html>

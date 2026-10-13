@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crash Recovery · Data Systems</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="data" data-chapter="13">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+<header class="chapter-head">
+  <h1>Crash Recovery</h1>
+  <p class="lede">A database is promised to be durable: if it said "committed", the data is there after the power cut. But it also keeps recent changes in memory for speed, and it may have written half of a transaction to disk when it died. This chapter explains the one idea that squares all of that: write the intention to a log first, and repair everything from the log on restart.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Crashes are not rare events at scale: processes get killed, machines lose power, disks fill up, and cloud hosts are replaced. The write-ahead log is why a database can tell you "committed" and mean it, and the same log then feeds replication, backups and change data capture. Once you see the log as the real source of truth, with the tables as a cache of it, a great deal of database design makes sense.</p>
+</div>
+
+<h2>Recap: written is not saved</h2>
+
+<p>In <a href="../../systems/chapters/09-durability.html">systems chapter 9</a> we saw that <code>write()</code> only hands data to the operating system's page cache. It reaches the disk later, and survives a power cut only after <code>fsync</code> returns. A database lives right on that fault line: it must acknowledge a commit only when the data is safe, but it cannot afford to <code>fsync</code> every scattered page it modified.</p>
+
+<p>There is a second problem. A database page is typically 8 or 16 KiB (<a href="06-b-trees.html">chapter 6</a>), and one transaction may change many of them: two account balances, an index entry, a counter. If the machine dies after some of those pages have reached the disk and before the rest, the database on disk is inconsistent. "Half a transfer" happened. We need <em>atomicity</em> and <em>durability</em> (the A and D of <a href="10-acid.html">ACID</a>) in the face of crashes.</p>
+
+<h2>The write-ahead log rule</h2>
+
+<p>The solution is a <span class="term">write-ahead log</span> (WAL), sometimes called the redo log or journal: a sequential, append-only file recording every change before the change is applied to the data pages. The rule has two halves:</p>
+
+<ol class="steps">
+  <li><strong>Log first.</strong> Before a modified page may be written to the data file, the log record describing the modification must already be durable on disk.</li>
+  <li><strong>Commit means the log is durable.</strong> A transaction counts as committed once its COMMIT record, and everything before it in the log, is safely on disk. The data pages are allowed to lag behind.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 250" role="img" aria-label="The commit path: change the page and append a log record in memory, then fsync the log and acknowledge the client, with data pages written to disk later but never before their log records">
+<defs><marker id="ahD13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="10" y="20" width="210" height="84" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="115.0" y="42.0" text-anchor="middle" class="t-sm t-bold">1  Change the page</text>
+<text x="115.0" y="58.0" text-anchor="middle" class="t-xs t-muted">in memory (buffer pool)</text>
+<text x="115.0" y="74.0" text-anchor="middle" class="t-xs t-muted">and append a log record</text>
+<text x="115.0" y="90.0" text-anchor="middle" class="t-xs t-muted">to the log buffer</text>
+<rect x="275" y="20" width="210" height="84" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="380.0" y="50.0" text-anchor="middle" class="t-sm t-bold">2  COMMIT: write the</text>
+<text x="380.0" y="66.0" text-anchor="middle" class="t-sm t-bold">log to disk and fsync</text>
+<text x="380.0" y="82.0" text-anchor="middle" class="t-xs t-muted">the WAL is now durable</text>
+<rect x="540" y="20" width="210" height="84" rx="8" class="fs-green s-green sw-2"/>
+<text x="645.0" y="42.0" text-anchor="middle" class="t-sm t-bold">3  Tell the client</text>
+<text x="645.0" y="58.0" text-anchor="middle" class="t-sm t-bold">“committed”</text>
+<text x="645.0" y="74.0" text-anchor="middle" class="t-xs t-muted">the data pages may still</text>
+<text x="645.0" y="90.0" text-anchor="middle" class="t-xs t-muted">be only in memory</text>
+<line x1="222" y1="62" x2="273" y2="62" class="line" marker-end="url(#ahD13a)"/>
+<line x1="487" y1="62" x2="538" y2="62" class="line" marker-end="url(#ahD13a)"/>
+<rect x="275" y="168" width="210" height="70" rx="8" class="box"/>
+<text x="380.0" y="191.0" text-anchor="middle" class="t-sm t-bold">Later: write the dirty page</text>
+<text x="380.0" y="207.0" text-anchor="middle" class="t-sm t-bold">to the data file</text>
+<text x="380.0" y="223.0" text-anchor="middle" class="t-xs t-muted">(any time, in any order)</text>
+<line x1="380" y1="106" x2="380" y2="166" class="line-dash" marker-end="url(#ahD13a)"/>
+<text x="392" y="140" class="t-xs t-faint">only after its log record is on disk</text>
+<rect x="10" y="168" width="230" height="70" rx="8" class="fs-red s-red sw-2"/>
+<text x="125.0" y="191.0" text-anchor="middle" class="t-sm t-bold tc-red">The WAL rule</text>
+<text x="125.0" y="207.0" text-anchor="middle" class="t-xs">a page may not reach the data file</text>
+<text x="125.0" y="223.0" text-anchor="middle" class="t-xs">before its log record is durable</text>
+</svg>
+<figcaption>The commit path. The expensive thing at commit is one sequential log write and fsync, not the scattered data pages.</figcaption>
+</figure>
+
+<p>Why is this faster than just writing the data pages? The log is one sequential append, which both SSDs and spinning disks do quickly. The data pages are scattered across the file; flushing all of them at every commit would be many slow random writes. With a WAL, commit costs one small sequential write and one <code>fsync</code>, and the random page writes happen later, in the background, batched. Under load, many concurrent commits share a single log <code>fsync</code>: that is the <span class="term">group commit</span> we saw in <a href="../../systems/chapters/09-durability.html">systems chapter 9</a>.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the bank's journal</p>
+  <p>A bank clerk handling a transfer does not first erase and rewrite the ledger pages. They first write a line in the day journal: "move 30 from Alice to Bob, entry #1043", and initial it. Only once that line exists do they update the ledger. If the lights go out half way, the next morning someone reads the journal and finishes (or cancels) every entry. The journal is the truth; the ledger is a convenient summary.</p>
+  <p><em>Where it breaks down:</em> a clerk can decide by judgement what a half-finished entry means. A database must use a precise algorithm, and each log entry has to be safe to apply more than once, because the crash might happen again during recovery.</p>
+</div>
+
+<h2>Redo and undo, and the buffer policy that needs both</h2>
+
+<p>Dirty pages live in the buffer pool and get written out when convenient. Two policy choices decide what recovery has to do:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>The easy choice</th><th>The fast choice</th></tr></thead>
+  <tbody>
+    <tr><td><strong>At commit time</strong></td><td><span class="term">Force</span>: write all the transaction's dirty pages to disk before committing. Then committed work is always already on disk, so nothing needs redoing. But commits are slow, with many random writes.</td><td><span class="term">No-force</span>: commit needs only the log. Committed changes may exist only in memory, so after a crash they must be <strong>redone</strong> from the log.</td></tr>
+    <tr><td><strong>When memory is short</strong></td><td><span class="term">No-steal</span>: never write a page that holds uncommitted changes. Then the disk never has uncommitted data, so nothing needs undoing. But a big transaction pins all its pages in memory.</td><td><span class="term">Steal</span>: the buffer pool may evict any dirty page, even one with uncommitted changes. Then the disk may hold uncommitted data, which must be <strong>undone</strong> after a crash.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Real databases choose <strong>steal, no-force</strong>: the fast choice on both rows. It gives the best performance and makes the recovery job twice as big. After a crash the log has to tell the database both <em>what to redo</em> (committed changes that never reached the data file) and <em>what to undo</em> (uncommitted changes that did). So log records for updates carry enough to do both: where the change was, the new value (for redo) and the old value (for undo). The rule is easy to remember: <strong>redo the winners, undo the losers.</strong></p>
+
+<p>Here it is in about thirty lines of Python. The "disk" and the log survive the crash; the cache does not. T1 commits but its pages are never flushed (no-force). T2 never commits but one of its pages is flushed early (steal).</p>
+
+<pre><code># A toy write-ahead log. The log and the data pages survive the crash; memory does not.
+log = []                                   # every append is assumed to be fsynced
+disk = {"A": 100, "B": 100, "C": 50}       # the data file (pages)
+cache = dict(disk)                         # the buffer pool (RAM)
+
+def update(txn, key, new):
+    log.append(("UPDATE", txn, key, cache[key], new))    # 1. log first: old AND new value
+    cache[key] = new                                     # 2. then change the page in memory
+
+def commit(txn):
+    log.append(("COMMIT", txn))            # durable log record = committed
+
+update("T1", "A", 70); update("T1", "B", 130); commit("T1")
+update("T2", "C", 0)                       # T2 never commits
+disk["C"] = cache["C"]                     # STEAL: T2's dirty page is evicted to disk early
+# NO-FORCE: T1's pages (A, B) were not written to the data file at commit
+print("before recovery, disk is:", disk)   # crash! `cache` is gone
+
+def recover():
+    winners = {r[1] for r in log if r[0] == "COMMIT"}
+    for r in log:                                        # REDO: repeat history, in log order
+        if r[0] == "UPDATE":
+            disk[r[2]] = r[4]
+    for r in reversed(log):                              # UNDO: roll back losers, newest first
+        if r[0] == "UPDATE" and r[1] not in winners:
+            disk[r[2]] = r[3]
+    return winners
+
+print("committed (winners):", recover())
+print("after recovery, disk is:", disk)</code></pre>
+<pre class="terminal" data-title="real output"><code>before recovery, disk is: {'A': 100, 'B': 100, 'C': 0}
+committed (winners): {'T1'}
+after recovery, disk is: {'A': 70, 'B': 130, 'C': 50}</code></pre>
+
+<div class="callout warn">
+  <p class="callout-title">Not every database undoes the same way</p>
+  <p>The redo-and-undo picture is the general case, and InnoDB (MySQL) has both a redo log and undo logs. PostgreSQL gets away with a <em>redo-only</em> WAL, because its multi-version storage (<a href="12-mvcc-locking.html">chapter 12</a>) leaves old row versions in the table: rows written by a transaction that never committed are simply invisible, so there is nothing to physically undo (they are cleaned up later by vacuum). SQLite's WAL mode never lets uncommitted changes into the main file at all. Same principle, different bookkeeping.</p>
+</div>
+
+<h2>Sequence numbers and checkpoints</h2>
+
+<p>To know what to redo, recovery must tell which log records a page has already absorbed. Every log record gets a <span class="term">log sequence number</span> (LSN), a number that grows with each record (in Postgres it is a position in the WAL byte stream). Every data page stores the LSN of the last log record that changed it, its <span class="term">page LSN</span>. During redo, for each record that touches a page:</p>
+
+<ul>
+  <li>if <code>page LSN ≥ record LSN</code>, the page already has this change (it was written to disk after the change): skip it;</li>
+  <li>if <code>page LSN &lt; record LSN</code>, the change is missing: apply it, and set the page LSN.</li>
+</ul>
+
+<p>That comparison makes redo <span class="term">idempotent</span>: applying it twice gives the same result as once, so if the machine crashes <em>during</em> recovery you can simply start recovery again. (The same idea of idempotent operations returns in distributed systems with retries.)</p>
+
+<p>Without a limit, recovery would replay the log from the dawn of time. A <span class="term">checkpoint</span> bounds it: periodically the database flushes dirty pages to the data file and writes a CHECKPOINT record saying "everything older than this is on disk". Recovery starts from the last checkpoint. (Real checkpoints are "fuzzy": they spread the page writes over a time window and record what was dirty and what was running, rather than freezing the system.)</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 252" role="img" aria-label="A log timeline with two checkpoints and a crash: without checkpoints recovery replays the whole log, with a checkpoint it replays only the part after the last one">
+<defs><marker id="ahD13b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<line x1="20" y1="90" x2="740" y2="90" class="line" marker-end="url(#ahD13b)"/>
+<text x="20" y="74" class="t-xs t-faint">log (time →)</text>
+<line x1="200" y1="60" x2="200" y2="120" class="line s-orange sw-2"/>
+<text x="200" y="50" text-anchor="middle" class="t-xs t-bold tc-orange">checkpoint 1</text>
+<line x1="440" y1="60" x2="440" y2="120" class="line s-orange sw-2"/>
+<text x="440" y="50" text-anchor="middle" class="t-xs t-bold tc-orange">checkpoint 2</text>
+<line x1="650" y1="52" x2="650" y2="128" class="line-dash s-red"/>
+<text x="650" y="44" text-anchor="middle" class="t-xs t-bold tc-red">CRASH</text>
+<line x1="20" y1="150" x2="650" y2="150" class="line s-red" marker-end="url(#ahD13b)"/>
+<text x="335" y="142" text-anchor="middle" class="t-xs tc-red">no checkpoints: replay the whole log since the server first started</text>
+<line x1="440" y1="186" x2="650" y2="186" class="line s-green" marker-end="url(#ahD13b)"/>
+<text x="545" y="178" text-anchor="middle" class="t-xs tc-green">with checkpoint 2: replay only this</text>
+<text x="380" y="222" text-anchor="middle" class="t-xs t-muted">A checkpoint writes dirty pages to the data file and records where recovery may start.</text>
+<text x="380" y="238" text-anchor="middle" class="t-xs t-muted">The more often you checkpoint, the less to replay, but the more page writes during normal running.</text>
+</svg>
+<figcaption>Checkpoints put a ceiling on recovery time. This is the trade behind the checkpoint settings of Postgres and InnoDB.</figcaption>
+</figure>
+
+<p>The knob is a trade-off. Checkpoint often and recovery is quick, but you do more page writes and spend more I/O during normal operation. Checkpoint rarely and the opposite. Postgres, for example, triggers checkpoints on a timer (five minutes by default) or when enough WAL has accumulated. Once the log before a checkpoint is no longer needed for recovery, it can be recycled, archived or, as we'll see, shipped elsewhere.</p>
+
+<h2>ARIES in one page</h2>
+
+<p>Most textbook and many real systems follow a recovery method called <span class="term">ARIES</span> (Mohan et al., IBM, 1992). It has three phases, run in this order after a crash:</p>
+
+<ol class="steps">
+  <li><strong>Analysis.</strong> Read the log from the last checkpoint to the end. Work out which transactions were running at the crash (the losers, with no COMMIT record) and which pages might have been dirty.</li>
+  <li><strong>Redo.</strong> Scan forward and re-apply every logged change, winners <em>and</em> losers, whose page LSN says it is missing. This "repeats history" and brings the database to exactly its state at the moment of the crash.</li>
+  <li><strong>Undo.</strong> Walk the losers' records backwards and reverse each one. Every undo is itself written to the log as a <span class="term">compensation log record</span> (CLR), so a crash during recovery never undoes the same change twice.</li>
+</ol>
+
+<p>The name is worth knowing and the details are not required for this course. What matters: <strong>recovery is deterministic, repeatable, and driven by the log</strong>. The stepper below walks through exactly this, on three tiny pages.</p>
+
+<div class="widget stepper" data-autoplay-ms="4800">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">A crash mid-transaction, and the recovery</h4></div>
+<svg viewBox="0 0 760 392" role="img" aria-label="A crash mid-transaction and its recovery: write-ahead log records with sequence numbers, a checkpoint, a crash, then redo of committed work and undo of uncommitted work">
+<defs><marker id="ahD13d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="20" y="20" class="t-xs t-faint t-bold">WAL ON DISK (log sequence numbers)</text>
+<g data-steps="1-" data-active="1">
+<rect x="20" y="28" width="84" height="58" rx="8" class="fs-green s-green sw-2"/>
+<text x="62.0" y="45.0" text-anchor="middle" class="t-xs t-bold">LSN 1</text>
+<text x="62.0" y="61.0" text-anchor="middle" class="t-xs">T1 update P1</text>
+<text x="62.0" y="77.0" text-anchor="middle" class="t-xs mono">A 100→70</text>
+</g>
+<g data-steps="1-" data-active="1">
+<rect x="112" y="28" width="84" height="58" rx="8" class="fs-green s-green sw-2"/>
+<text x="154.0" y="45.0" text-anchor="middle" class="t-xs t-bold">LSN 2</text>
+<text x="154.0" y="61.0" text-anchor="middle" class="t-xs">T1 update P2</text>
+<text x="154.0" y="77.0" text-anchor="middle" class="t-xs mono">B 100→130</text>
+</g>
+<g data-steps="2-" data-active="2">
+<rect x="204" y="28" width="84" height="58" rx="8" class="fs-green s-green sw-2"/>
+<text x="246.0" y="53.0" text-anchor="middle" class="t-xs t-bold">LSN 3</text>
+<text x="246.0" y="69.0" text-anchor="middle" class="t-xs">T1 COMMIT</text>
+</g>
+<g data-steps="3-" data-active="3,7">
+<rect x="296" y="28" width="84" height="58" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="338.0" y="53.0" text-anchor="middle" class="t-xs t-bold">LSN 4</text>
+<text x="338.0" y="69.0" text-anchor="middle" class="t-xs">CHECKPOINT</text>
+</g>
+<g data-steps="4-" data-active="4,5,7,8,9">
+<rect x="388" y="28" width="84" height="58" rx="8" class="fs-pink s-pink sw-2"/>
+<text x="430.0" y="45.0" text-anchor="middle" class="t-xs t-bold">LSN 5</text>
+<text x="430.0" y="61.0" text-anchor="middle" class="t-xs">T2 update P3</text>
+<text x="430.0" y="77.0" text-anchor="middle" class="t-xs mono">C 50→0</text>
+</g>
+<g data-steps="4-" data-active="4,7,8">
+<rect x="480" y="28" width="84" height="58" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="522.0" y="45.0" text-anchor="middle" class="t-xs t-bold">LSN 6</text>
+<text x="522.0" y="61.0" text-anchor="middle" class="t-xs">T3 update P1</text>
+<text x="522.0" y="77.0" text-anchor="middle" class="t-xs mono">A 70→60</text>
+</g>
+<g data-steps="4-" data-active="4,7">
+<rect x="572" y="28" width="84" height="58" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="614.0" y="53.0" text-anchor="middle" class="t-xs t-bold">LSN 7</text>
+<text x="614.0" y="69.0" text-anchor="middle" class="t-xs">T3 COMMIT</text>
+</g>
+<g data-steps="9-" data-active="9">
+<rect x="664" y="28" width="84" height="58" rx="8" class="fs-pink s-pink sw-2"/>
+<text x="706.0" y="45.0" text-anchor="middle" class="t-xs t-bold">LSN 8</text>
+<text x="706.0" y="61.0" text-anchor="middle" class="t-xs">CLR undo 5</text>
+<text x="706.0" y="77.0" text-anchor="middle" class="t-xs mono">C 0→50</text>
+</g>
+<g data-steps="6-">
+<line x1="660" y1="24" x2="660" y2="96" class="line-dash s-red"/><text x="660" y="110" text-anchor="middle" class="t-xs t-bold tc-red">CRASH</text>
+</g>
+<rect x="20" y="126" width="350" height="160" rx="8" class="fs-blue s-blue sw-1"/>
+<text x="30" y="144" class="t-xs t-bold tc-blue">BUFFER POOL (RAM)</text>
+<rect x="390" y="126" width="350" height="160" rx="8" class="box2"/>
+<text x="400" y="144" class="t-xs t-bold">DATA PAGES ON DISK</text>
+<g data-steps="1-2">
+<rect x="30" y="154" width="100" height="84" rx="8" class="box s-orange sw-2"/>
+<text x="80.0" y="176" text-anchor="middle" class="t-sm t-bold">P1</text>
+<text x="80.0" y="192" text-anchor="middle" class="t-xs">A = 70</text>
+<text x="80.0" y="208" text-anchor="middle" class="t-xs">pageLSN 1</text>
+<text x="80.0" y="224" text-anchor="middle" class="t-xs">dirty</text>
+</g>
+<g data-steps="3">
+<rect x="30" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="80.0" y="176" text-anchor="middle" class="t-sm t-bold">P1</text>
+<text x="80.0" y="192" text-anchor="middle" class="t-xs">A = 70</text>
+<text x="80.0" y="208" text-anchor="middle" class="t-xs">pageLSN 1</text>
+<text x="80.0" y="224" text-anchor="middle" class="t-xs">clean</text>
+</g>
+<g data-steps="4-5">
+<rect x="30" y="154" width="100" height="84" rx="8" class="box s-orange sw-2"/>
+<text x="80.0" y="176" text-anchor="middle" class="t-sm t-bold">P1</text>
+<text x="80.0" y="192" text-anchor="middle" class="t-xs">A = 60</text>
+<text x="80.0" y="208" text-anchor="middle" class="t-xs">pageLSN 6</text>
+<text x="80.0" y="224" text-anchor="middle" class="t-xs">dirty</text>
+</g>
+<g data-steps="1-2">
+<rect x="140" y="154" width="100" height="84" rx="8" class="box s-orange sw-2"/>
+<text x="190.0" y="176" text-anchor="middle" class="t-sm t-bold">P2</text>
+<text x="190.0" y="192" text-anchor="middle" class="t-xs">B = 130</text>
+<text x="190.0" y="208" text-anchor="middle" class="t-xs">pageLSN 2</text>
+<text x="190.0" y="224" text-anchor="middle" class="t-xs">dirty</text>
+</g>
+<g data-steps="3-5">
+<rect x="140" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="190.0" y="176" text-anchor="middle" class="t-sm t-bold">P2</text>
+<text x="190.0" y="192" text-anchor="middle" class="t-xs">B = 130</text>
+<text x="190.0" y="208" text-anchor="middle" class="t-xs">pageLSN 2</text>
+<text x="190.0" y="224" text-anchor="middle" class="t-xs">clean</text>
+</g>
+<g data-steps="4">
+<rect x="250" y="154" width="100" height="84" rx="8" class="box s-orange sw-2"/>
+<text x="300.0" y="176" text-anchor="middle" class="t-sm t-bold">P3</text>
+<text x="300.0" y="192" text-anchor="middle" class="t-xs">C = 0</text>
+<text x="300.0" y="208" text-anchor="middle" class="t-xs">pageLSN 5</text>
+<text x="300.0" y="224" text-anchor="middle" class="t-xs">dirty</text>
+</g>
+<g data-steps="5">
+<rect x="250" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="300.0" y="176" text-anchor="middle" class="t-sm t-bold">P3</text>
+<text x="300.0" y="192" text-anchor="middle" class="t-xs">evicted</text>
+<text x="300.0" y="208" text-anchor="middle" class="t-xs">(to disk)</text>
+</g>
+<g data-steps="6">
+<rect x="30" y="154" width="330" height="84" rx="8" class="line-dash s-red"/><text x="195" y="200" text-anchor="middle" class="t-sm t-bold tc-red">memory lost</text><text x="195" y="220" text-anchor="middle" class="t-xs t-muted">RAM does not survive</text>
+</g>
+<g data-steps="7-10">
+<text x="195" y="200" text-anchor="middle" class="t-sm t-muted">empty after restart</text><text x="195" y="220" text-anchor="middle" class="t-xs t-faint">recovery loads what it needs</text>
+</g>
+<g data-steps="1-2">
+<rect x="400" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="450.0" y="176" text-anchor="middle" class="t-sm t-bold">P1</text>
+<text x="450.0" y="192" text-anchor="middle" class="t-xs">A = 100</text>
+<text x="450.0" y="208" text-anchor="middle" class="t-xs">pageLSN 0</text>
+</g>
+<g data-steps="3-7">
+<rect x="400" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="450.0" y="176" text-anchor="middle" class="t-sm t-bold">P1</text>
+<text x="450.0" y="192" text-anchor="middle" class="t-xs">A = 70</text>
+<text x="450.0" y="208" text-anchor="middle" class="t-xs">pageLSN 1</text>
+</g>
+<g data-steps="8-10" data-active="8">
+<rect x="400" y="154" width="100" height="84" rx="8" class="fs-green s-green sw-2"/>
+<text x="450.0" y="176" text-anchor="middle" class="t-sm t-bold">P1</text>
+<text x="450.0" y="192" text-anchor="middle" class="t-xs">A = 60</text>
+<text x="450.0" y="208" text-anchor="middle" class="t-xs">pageLSN 6</text>
+</g>
+<g data-steps="1-2">
+<rect x="510" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="560.0" y="176" text-anchor="middle" class="t-sm t-bold">P2</text>
+<text x="560.0" y="192" text-anchor="middle" class="t-xs">B = 100</text>
+<text x="560.0" y="208" text-anchor="middle" class="t-xs">pageLSN 0</text>
+</g>
+<g data-steps="3-10">
+<rect x="510" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="560.0" y="176" text-anchor="middle" class="t-sm t-bold">P2</text>
+<text x="560.0" y="192" text-anchor="middle" class="t-xs">B = 130</text>
+<text x="560.0" y="208" text-anchor="middle" class="t-xs">pageLSN 2</text>
+</g>
+<g data-steps="1-4">
+<rect x="620" y="154" width="100" height="84" rx="8" class="box"/>
+<text x="670.0" y="176" text-anchor="middle" class="t-sm t-bold">P3</text>
+<text x="670.0" y="192" text-anchor="middle" class="t-xs">C = 50</text>
+<text x="670.0" y="208" text-anchor="middle" class="t-xs">pageLSN 0</text>
+</g>
+<g data-steps="5-8">
+<rect x="620" y="154" width="100" height="84" rx="8" class="fs-red s-red sw-2"/>
+<text x="670.0" y="176" text-anchor="middle" class="t-sm t-bold">P3</text>
+<text x="670.0" y="192" text-anchor="middle" class="t-xs">C = 0</text>
+<text x="670.0" y="208" text-anchor="middle" class="t-xs">pageLSN 5</text>
+<text x="670.0" y="224" text-anchor="middle" class="t-xs">uncommitted!</text>
+</g>
+<g data-steps="9-10" data-active="9">
+<rect x="620" y="154" width="100" height="84" rx="8" class="fs-green s-green sw-2"/>
+<text x="670.0" y="176" text-anchor="middle" class="t-sm t-bold">P3</text>
+<text x="670.0" y="192" text-anchor="middle" class="t-xs">C = 50</text>
+<text x="670.0" y="208" text-anchor="middle" class="t-xs">pageLSN 8</text>
+</g>
+<text x="20" y="310" class="t-xs t-faint t-bold">TRANSACTIONS</text>
+<g data-steps="1">
+<rect x="20" y="318" width="230" height="34" rx="8" class="fs-green s-green sw-2"/>
+<text x="135.0" y="339.0" text-anchor="middle" class="t-xs">T1: running</text>
+</g>
+<g data-steps="2-">
+<rect x="20" y="318" width="230" height="34" rx="8" class="fs-green s-green sw-2"/>
+<text x="135.0" y="339.0" text-anchor="middle" class="t-xs">T1: committed (LSN 3)</text>
+</g>
+<g data-steps="4-6">
+<rect x="265" y="318" width="230" height="34" rx="8" class="fs-pink s-pink sw-2"/>
+<text x="380.0" y="339.0" text-anchor="middle" class="t-xs">T2: running (never commits)</text>
+</g>
+<g data-steps="7-8">
+<rect x="265" y="318" width="230" height="34" rx="8" class="fs-red s-red sw-2"/>
+<text x="380.0" y="339.0" text-anchor="middle" class="t-xs">T2: no COMMIT in log: a loser</text>
+</g>
+<g data-steps="9-">
+<rect x="265" y="318" width="230" height="34" rx="8" class="fs-pink s-pink sw-2"/>
+<text x="380.0" y="339.0" text-anchor="middle" class="t-xs">T2: rolled back (undone)</text>
+</g>
+<g data-steps="4-">
+<rect x="510" y="318" width="230" height="34" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="625.0" y="339.0" text-anchor="middle" class="t-xs">T3: committed (LSN 7)</text>
+</g>
+<g data-steps="1">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">NORMAL OPERATION</text>
+</g>
+<g data-steps="2">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">NORMAL OPERATION</text>
+</g>
+<g data-steps="3">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">CHECKPOINT</text>
+</g>
+<g data-steps="4">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">NORMAL OPERATION</text>
+</g>
+<g data-steps="5">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">A DIRTY PAGE IS STOLEN</text>
+</g>
+<g data-steps="6">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-red">CRASH</text>
+</g>
+<g data-steps="7">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">RECOVERY 1: ANALYSIS</text>
+</g>
+<g data-steps="8">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">RECOVERY 2: REDO</text>
+</g>
+<g data-steps="9">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-yellow">RECOVERY 3: UNDO</text>
+</g>
+<g data-steps="10">
+<text x="380" y="378" text-anchor="middle" class="t-sm t-bold tc-green">RECOVERED</text>
+</g>
+</svg>
+  <ol class="stepper-captions">
+    <li><strong>Normal running.</strong> Transaction T1 transfers 30: it updates page P1 (A: 100 to 70) and page P2 (B: 100 to 130). Each change appends a log record with a <span class="term">log sequence number</span> (LSN 1, LSN 2) and stamps that LSN on the changed page in the buffer pool (its <em>pageLSN</em>). The pages on disk still hold the old values.</li>
+    <li><strong>T1 commits.</strong> The COMMIT record (LSN 3) is appended and the log is forced to disk. Only now is T1 told "committed". The data pages on disk are still old: the database did not force them out (<em>no-force</em>). Durability rests entirely on the log.</li>
+    <li><strong>Checkpoint.</strong> The database writes the dirty pages (P1, P2) to the data file and appends a CHECKPOINT record (LSN 4). Simplified: real checkpoints are "fuzzy" and let work continue while they run. Recovery will never need to look before this record.</li>
+    <li><strong>More work.</strong> T2 updates page P3 (C: 50 to 0), logged as LSN 5; it has not committed. T3 updates P1 again (A: 70 to 60, LSN 6) and commits (LSN 7), so the log is forced through LSN 7. P1 and P3 are dirty in memory.</li>
+    <li><strong>A page is stolen.</strong> The buffer pool needs room and evicts dirty page P3 to disk <em>before T2 has committed</em> (<em>steal</em>). This is allowed because the WAL rule holds: LSN 5 is already durable. But now the data file contains an uncommitted change (C = 0).</li>
+    <li><strong>Crash.</strong> The power fails. Everything in memory is gone, including the dirty P1 (A = 60). On disk: the log through LSN 7, and data pages that are out of step with it. P1 lacks T3's change, and P3 contains T2's.</li>
+    <li><strong>Recovery, phase 1: analysis.</strong> Read the log from the last checkpoint (LSN 4). T3 has a COMMIT record: a winner. T2 has updates but no COMMIT: a loser. T1 committed before the checkpoint, and its pages were flushed by it.</li>
+    <li><strong>Phase 2: redo.</strong> Repeat history from the checkpoint. LSN 5: P3's pageLSN is already 5, so skip it. LSN 6: P1's pageLSN is 1, less than 6, so re-apply the change: A = 60. Comparing the pageLSN to the record's LSN is what makes redo safe to repeat. (Recovery works in memory first; it is drawn on disk here for simplicity.)</li>
+    <li><strong>Phase 3: undo.</strong> Roll back the losers by walking their records backwards. T2's LSN 5 is undone: C goes back to 50. The undo is itself logged as a <span class="term">compensation log record</span> (LSN 8), so a crash during recovery does not undo it twice.</li>
+    <li><strong>Recovered.</strong> A = 60 (T1 and T3 committed), B = 130, C = 50 (T2 vanished). Every committed change survived and every uncommitted one disappeared, although the data pages and the crash left things out of step. Recovery time depended on the log since the checkpoint, not on the size of the database.</li>
+  </ol>
+</div>
+
+<h2>Commit means the log record is durable</h2>
+
+<p>Put the pieces together: when you issue <code>COMMIT</code>, the database appends a commit record to the log, calls <code>fsync</code> on the log, and only then returns success. That fsync is the cost of durability, which is why systems offer settings that trade it away: Postgres's <code>synchronous_commit = off</code> and InnoDB's <code>innodb_flush_log_at_trx_commit</code> can acknowledge before the fsync, so a crash may lose the most recent commits (a small window) but, importantly, does not corrupt the database. The default in both is the safe one. Group commit (<a href="../../systems/chapters/09-durability.html">systems ch. 9</a>) is what makes the safe setting affordable.</p>
+
+<h2>Torn pages</h2>
+
+<p>One more hazard. A database page is 8 KiB (Postgres) or 16 KiB (InnoDB by default), but disks and file systems only promise to write much smaller units atomically. A crash in the middle of a page write can leave a <span class="term">torn page</span>: half old, half new. A log record that says "change bytes 40 to 48 of this page" cannot repair a page whose other half is garbage. The two main defences:</p>
+
+<ul>
+  <li><strong>Full-page writes (Postgres).</strong> The first time a page is modified after a checkpoint, the WAL records a copy of the <em>entire</em> page, not just the change. Recovery can then rebuild a torn page from the log. This is why WAL volume spikes right after each checkpoint.</li>
+  <li><strong>Doublewrite buffer (InnoDB).</strong> Pages are first written to a special area, then to their real place. If a crash tears the real write, the intact copy in the doublewrite area is used to restore it.</li>
+</ul>
+
+<p>Both pay extra writes for safety. Checksums on pages and on log records (as in the systems chapter) let the database notice a torn or corrupt page in the first place.</p>
+
+<h2>Backups, replicas and point-in-time recovery</h2>
+
+<p>Crash recovery handles "the machine died". It does not handle "the disk is destroyed", "a bug corrupted rows", or "someone ran <code>DROP TABLE</code> on production". Those need other tools, and they are not interchangeable:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>Protects against</th><th>Does not protect against</th></tr></thead>
+  <tbody>
+    <tr><td><strong>The WAL and crash recovery</strong></td><td>Power loss, process crash</td><td>Lost disk, human error</td></tr>
+    <tr><td><strong>A replica</strong> (<a href="15-replication-practice.html">chapter 15</a>)</td><td>Loss of a machine; fast failover</td><td>Human error and bugs: <code>DROP TABLE</code> replicates, too</td></tr>
+    <tr><td><strong>A backup</strong></td><td>Lost machine, corruption, mistakes (back to the backup time)</td><td>Anything since the last backup</td></tr>
+    <tr><td><strong>Backup + WAL archive</strong></td><td>All of the above, to a chosen moment</td><td>Loss of the archive itself</td></tr>
+  </tbody>
+</table></div>
+
+<p>The last row is <span class="term">point-in-time recovery</span> (PITR). Take a periodic <em>base backup</em> (a copy of the data files), and continuously archive the WAL segments the database produces. To recover, restore the base backup and replay the archived WAL, stopping just before the mistake. Because the WAL is a complete history of changes, you can stop at any moment. It is the same mechanism as crash recovery, with the stopping point chosen by you instead of by the end of the log.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 244" role="img" aria-label="Point-in-time recovery: restore a base backup, then replay archived WAL segments up to just before a mistaken DROP TABLE">
+<defs><marker id="ahD13c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="10" y="40" width="110" height="64" rx="8" class="box"/>
+<text x="65.0" y="60.0" text-anchor="middle" class="t-sm t-bold">Base backup</text>
+<text x="65.0" y="76.0" text-anchor="middle" class="t-xs t-muted">Monday 02:00</text>
+<text x="65.0" y="92.0" text-anchor="middle" class="t-xs t-muted">(files copy)</text>
+<rect x="140" y="40" width="68" height="64" rx="8" class="fs-orange s-orange"/>
+<text x="174.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 1</text>
+<text x="174.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<rect x="214" y="40" width="68" height="64" rx="8" class="fs-orange s-orange"/>
+<text x="248.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 2</text>
+<text x="248.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<rect x="288" y="40" width="68" height="64" rx="8" class="fs-orange s-orange"/>
+<text x="322.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 3</text>
+<text x="322.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<rect x="362" y="40" width="68" height="64" rx="8" class="fs-orange s-orange"/>
+<text x="396.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 4</text>
+<text x="396.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<rect x="436" y="40" width="68" height="64" rx="8" class="fs-orange s-orange"/>
+<text x="470.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 5</text>
+<text x="470.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<rect x="510" y="40" width="68" height="64" rx="8" class="fs-red s-red sw-2"/>
+<text x="544.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 6</text>
+<text x="544.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<rect x="584" y="40" width="68" height="64" rx="8" class="box"/>
+<text x="618.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 7</text>
+<text x="618.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<rect x="658" y="40" width="68" height="64" rx="8" class="box"/>
+<text x="692.0" y="68.0" text-anchor="middle" class="t-xs t-bold">WAL seg 8</text>
+<text x="692.0" y="84.0" text-anchor="middle" class="t-xs t-muted">archived</text>
+<text x="544" y="128" text-anchor="middle" class="t-xs t-bold tc-red">14:03 DROP TABLE</text>
+<line x1="514" y1="106" x2="514" y2="140" class="line s-green sw-2"/>
+<text x="450" y="156" text-anchor="middle" class="t-xs t-bold tc-green">recovery target: 14:02</text>
+<line x1="65" y1="176" x2="514" y2="176" class="line s-green" marker-end="url(#ahD13c)"/>
+<text x="240" y="196" text-anchor="middle" class="t-xs tc-green">1. restore the base backup   2. replay archived WAL up to the target</text>
+<text x="654" y="128" text-anchor="middle" class="t-xs t-faint">never replayed</text>
+<text x="380" y="230" text-anchor="middle" class="t-xs t-muted">A base backup plus a continuous archive of WAL lets you rebuild the database as of any moment in the archive.</text>
+</svg>
+<figcaption>Point-in-time recovery. The base backup is the starting point; the WAL archive is the film strip you play forward, and you pick where to stop.</figcaption>
+</figure>
+
+<div class="callout warn">
+  <p class="callout-title">Test your restores</p>
+  <p>A backup you have never restored is a hope, not a backup. Backups fail silently: jobs that produce empty files, retention that deleted what you needed, credentials that expired, a version mismatch discovered only on the worst day. In January 2017 GitLab accidentally deleted a production database directory and found that several of its backup mechanisms were not producing usable backups. Read <a href="../cases/case-05-gitlab-2017.html">the case study</a>. Schedule a restore drill, time it, and monitor the backup job like a production service.</p>
+</div>
+
+<h2>The log is more than a recovery tool</h2>
+
+<p>Because the WAL is an ordered, durable record of every change, other systems read it as well:</p>
+
+<ul>
+  <li><strong>Replication.</strong> A Postgres replica is kept current by streaming and replaying the leader's WAL, which is the same redo process, running continuously. MySQL replicates through a separate binary log. More in <a href="15-replication-practice.html">chapter 15</a> and, for the theory, <a href="../../networking/chapters/18-replication.html">networking chapter 18</a>.</li>
+  <li><strong>Change data capture.</strong> Tools can decode the log into a stream of row-level events and feed search indexes, caches and warehouses without touching the application (<a href="19-streams-cdc.html">chapter 19</a>).</li>
+  <li><strong>The log as the database.</strong> Amazon Aurora takes the idea furthest: the database node sends only redo log records to a distributed storage service, which builds the pages itself. See <a href="../cases/case-08-aurora.html">the Aurora case</a>.</li>
+</ul>
+
+<p>The same insight, a log of changes that is the truth and everything else a derived view of it, returns in Kafka and in consensus protocols such as Raft (<a href="../../networking/chapters/20-consensus.html">networking chapter 20</a>).</p>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: kill a database mid-transaction</p>
+  <p>This script uses SQLite in WAL mode. A child process commits transaction T1, starts T2, then dies with <code>os._exit</code> (like <code>kill -9</code>: no cleanup, no flush). The parent reopens the database, which is when recovery happens. It works in a throwaway temp directory and removes it afterwards. Python 3 and its built-in <code>sqlite3</code> are all you need.</p>
+</div>
+
+<pre><code>import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+def child(path):
+    db = sqlite3.connect(path, isolation_level=None)        # we issue BEGIN/COMMIT ourselves
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")                  # fsync the log at every commit
+    db.execute("CREATE TABLE acct (name TEXT PRIMARY KEY, bal INTEGER)")
+    db.execute("INSERT INTO acct VALUES ('alice', 100), ('bob', 100)")
+
+    db.execute("BEGIN")                                    # T1: move 30 from alice to bob
+    db.execute("UPDATE acct SET bal = bal - 30 WHERE name = 'alice'")
+    db.execute("UPDATE acct SET bal = bal + 30 WHERE name = 'bob'")
+    db.execute("COMMIT")                                   # durable from here on
+
+    db.execute("BEGIN")                                    # T2: starts, never commits
+    db.execute("UPDATE acct SET bal = bal - 50 WHERE name = 'alice'")
+    print("child: T2 has run an UPDATE; now crashing with no cleanup", flush=True)
+    os._exit(1)                                            # like kill -9: nothing is flushed or closed
+
+if len(sys.argv) &gt; 2 and sys.argv[1] == "child":
+    child(sys.argv[2])
+else:
+    folder = tempfile.mkdtemp()
+    path = os.path.join(folder, "bank.db")
+    subprocess.run([sys.executable, __file__, "child", path])
+    print("files left behind:", sorted(os.listdir(folder)))
+    db = sqlite3.connect(path)                             # opening the database runs recovery
+    print("after recovery:", db.execute("SELECT * FROM acct ORDER BY name").fetchall())
+    db.close()
+    shutil.rmtree(folder)</code></pre>
+<pre class="terminal" data-title="real output"><code>child: T2 has run an UPDATE; now crashing with no cleanup
+files left behind: ['bank.db', 'bank.db-shm', 'bank.db-wal']
+after recovery: [('alice', 70), ('bob', 130)]</code></pre>
+
+<p>The three files left behind are the database, its WAL, and a shared-memory index. T1's committed transfer is there (70 and 130); T2's uncommitted debit is not. SQLite's WAL is simpler than ARIES (it never needs an undo), but the contract is the same. Experiment: change the child to stop <em>before</em> <code>COMMIT</code> on T1, and check that the transfer disappears entirely. If you have Postgres, <code>pgbench</code> in the <a href="../toolbox.html#pgbench">toolbox</a> lets you watch the effect of <code>synchronous_commit</code> on throughput.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>The WAL is the seed of distributed data. A replica that replays the leader's log reaches the same state, which is state-machine replication. Consensus (Raft, Paxos) is, at its heart, getting a group of machines to agree on one replicated log and make each entry durable on a majority before acknowledging it: the commit rule of this chapter with "fsync on disk" replaced by "durable on a quorum". Change data capture turns a database's log into a stream for the rest of the company. And disaggregated storage like Aurora moves the log to a separate fleet of machines. When you meet a new system, ask: where is its log, and who reads it?</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>The WAL rule: log the change and make it durable before the changed page may reach the data file. Commit means the commit record is durable in the log.</li>
+    <li>Steal (evict uncommitted pages) and no-force (don't flush at commit) give speed, and so require both undo of uncommitted work and redo of committed work. Redo the winners, undo the losers.</li>
+    <li>Each log record has an LSN and each page stores its page LSN; comparing them makes redo idempotent, so recovery can safely be restarted.</li>
+    <li>Checkpoints flush dirty pages and mark where recovery can start, bounding recovery time at the price of extra writes.</li>
+    <li>ARIES: analysis, redo (repeat history), undo (with compensation records). Postgres is redo-only thanks to MVCC; InnoDB has both redo and undo logs.</li>
+    <li>Torn pages are handled by full-page writes (Postgres) or the doublewrite buffer (InnoDB).</li>
+    <li>Replicas and WAL archives are not backups of your mistakes unless set up as such. PITR = base backup + archived WAL. Test restores.</li>
+    <li>The WAL also feeds replication, CDC and storage layers like Aurora's.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A database writes a modified data page to disk <em>before</em> the matching log record is durable, then crashes. Why is that a violation of the WAL rule that matters?</p>
+    <ol class="q-options">
+      <li>Log records are always larger than pages</li>
+      <li>If the transaction later turns out to be uncommitted, recovery would have no log record to undo the change with, so uncommitted data would be stuck on disk</li>
+      <li>The page would be written twice</li>
+      <li>fsync would no longer work</li>
+    </ol>
+    <div class="q-explain">Undo information lives in the log. A change on disk with no log record is a change the database cannot reverse or even know about. Log first, so the log always knows at least as much as the data file.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A transaction commits and the database acknowledges it. Which statement is true under a steal, no-force policy?</p>
+    <ol class="q-options">
+      <li>All its modified data pages are already in the data file</li>
+      <li>The commit is only durable after the next checkpoint</li>
+      <li>Its commit record (and earlier log) is durable, but its data pages may exist only in memory, so recovery may have to redo them</li>
+      <li>Recovery never needs to look at the log for it</li>
+    </ol>
+    <div class="q-explain">No-force means commit only waits for the log. The data pages are written later. After a crash, redo replays the logged changes that the data file lacks.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">During redo, a log record has LSN 120 and the target page's page LSN is 135. What does recovery do?</p>
+    <ol class="q-options">
+      <li>Skip it: the page already contains this change (and later ones)</li>
+      <li>Apply it again to be safe</li>
+      <li>Undo it</li>
+      <li>Delete the page</li>
+    </ol>
+    <div class="q-explain">A page LSN of 135 means a record at or after 120 already modified the page and the page reached disk with those changes. Skipping when <code>page LSN ≥ record LSN</code> is what makes redo idempotent.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">What is the main job of a checkpoint?</p>
+    <ol class="q-options">
+      <li>To make the database faster for readers</li>
+      <li>To compress the log</li>
+      <li>To roll back long transactions</li>
+      <li>To bound recovery time: dirty pages are flushed so recovery only has to replay the log after the checkpoint</li>
+    </ol>
+    <div class="q-explain">Without checkpoints the log would have to be replayed from the start. Checkpoints trade extra writes during normal operation for shorter recovery.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Someone runs <code>DROP TABLE orders</code> on the primary by mistake. A hot replica exists. Which one helps you get the table back?</p>
+    <ol class="q-options">
+      <li>Promote the replica: it still has the table</li>
+      <li>A base backup plus an archive of WAL, replayed to just before the drop (point-in-time recovery)</li>
+      <li>Crash recovery on the primary</li>
+      <li>Run checkpoint again</li>
+    </ol>
+    <div class="q-explain">A replica faithfully replays the DROP TABLE too, usually within moments. Replicas protect against hardware loss, not mistakes. PITR can stop the replay just before the drop.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why does Postgres write a full copy of a page into the WAL the first time it is changed after a checkpoint?</p>
+    <ol class="q-options">
+      <li>To make replicas faster</li>
+      <li>To compress the WAL</li>
+      <li>To protect against torn pages: if a page is half-written in a crash, recovery can rebuild it from the full copy in the log</li>
+      <li>Because pages are always rewritten after a checkpoint</li>
+    </ol>
+    <div class="q-explain">Disks may not write an 8 KiB page atomically. A log record that describes a small change cannot repair a page whose other half is garbage, so the log carries a complete image. InnoDB's doublewrite buffer solves the same problem differently.</div>
+  </div>
+</section>
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

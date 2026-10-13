@@ -1,0 +1,746 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your Own Event Loop · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="sys" data-lab="L5">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 5: Your Own Event Loop</h1>
+  <p class="lede">In <a href="../chapters/16-event-loops.html">chapter 16</a> you saw an event loop; in <a href="../chapters/17-async-await.html">chapter 17</a> you saw <code>async</code>/<code>await</code> sit on top of one. Now you'll build both. About 300 lines of Python, standard library only (<code>selectors</code> and <code>heapq</code>, no <code>asyncio</code>), ending with a server that handles a thousand connections on one thread and a clear picture of why one slow handler is a disaster.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Web servers, databases, browsers, Node.js, Redis, nginx and Python's own <code>asyncio</code> are all this program, wearing different clothes. Once you have written the loop yourself, <code>await</code> stops being magic: it is a generator pausing, a small object saying "wake me when this socket is readable", and a loop that keeps its promise. You will also hit, with your own hands, the rule that governs every event-driven system: <strong>never block the loop</strong>.</p>
+</div>
+
+<h2>What you'll build</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 310" role="img" aria-label="Layers of the lab: coroutines and callback servers on top of an event loop that holds a ready queue, a timer heap and a selector, which sits on the kernel's epoll or kqueue">
+    <defs><marker id="ahSL1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="10" width="340" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="190" y="34" text-anchor="middle" class="t-bold">Coroutine echo server</text>
+    <text x="190" y="53" text-anchor="middle" class="t-xs t-muted">milestone 4: straight-line code</text>
+    <rect x="400" y="10" width="340" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="570" y="34" text-anchor="middle" class="t-bold">Callback echo servers</text>
+    <text x="570" y="53" text-anchor="middle" class="t-xs t-muted">milestones 2 and 3: handlers + buffers</text>
+    <line x1="190" y1="68" x2="190" y2="96" class="line" marker-end="url(#ahSL1a)"/>
+    <line x1="570" y1="68" x2="570" y2="96" class="line" marker-end="url(#ahSL1a)"/>
+    <rect x="20" y="98" width="720" height="130" rx="14" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="122" text-anchor="middle" class="t-bold tc-blue">EventLoop: one thread, one while-loop</text>
+    <rect x="40" y="136" width="210" height="76" rx="8" class="box2"/>
+    <text x="145" y="160" text-anchor="middle" class="t-sm t-bold">ready queue</text>
+    <text x="145" y="179" text-anchor="middle" class="t-xs t-muted">call_soon, woken I/O</text>
+    <text x="145" y="195" text-anchor="middle" class="t-xs t-muted">(a FIFO deque)</text>
+    <rect x="275" y="136" width="210" height="76" rx="8" class="box2"/>
+    <text x="380" y="160" text-anchor="middle" class="t-sm t-bold">timer heap</text>
+    <text x="380" y="179" text-anchor="middle" class="t-xs t-muted">call_later, call_at</text>
+    <text x="380" y="195" text-anchor="middle" class="t-xs t-muted">(deadline, seq, fn)</text>
+    <rect x="510" y="136" width="210" height="76" rx="8" class="box2"/>
+    <text x="615" y="160" text-anchor="middle" class="t-sm t-bold">selector</text>
+    <text x="615" y="179" text-anchor="middle" class="t-xs t-muted">add_reader, add_writer</text>
+    <text x="615" y="195" text-anchor="middle" class="t-xs t-muted">(who is ready?)</text>
+    <line x1="615" y1="214" x2="615" y2="250" class="line" marker-end="url(#ahSL1a)"/>
+    <rect x="20" y="252" width="720" height="44" rx="10" class="box"/>
+    <text x="380" y="279" text-anchor="middle" class="t-sm">kernel: epoll (Linux) or kqueue (macOS), sockets, the monotonic clock</text>
+  </svg>
+  <figcaption><strong>The finished program.</strong> The loop owns three things: callbacks that are ready now, a heap of timers, and a selector watching sockets. Everything above it is just code that registers callbacks (milestones 2 and 3) or yields requests (milestone 4).</figcaption>
+</figure>
+
+<p>Five milestones, each building on the last:</p>
+<ol class="steps">
+  <li><strong>Timers:</strong> <code>call_soon</code>, <code>call_later</code> and <code>run()</code>, with a heap of deadlines on the monotonic clock.</li>
+  <li><strong>I/O readiness:</strong> <code>add_reader</code>/<code>add_writer</code> on a selector, and a callback-style echo server.</li>
+  <li><strong>Partial writes and output buffers:</strong> write interest only while there is something to write, a bounded buffer, and slow consumers cut off.</li>
+  <li><strong>Coroutines from generators:</strong> a <code>Task</code> that drives a generator, and the echo server rewritten as straight-line code.</li>
+  <li><strong>Scale and the cardinal rule:</strong> a thousand connections, the open-file limit, and a "loop lag" meter that catches a blocked loop red-handed.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>You need Python 3.8 or newer (<code>python3 --version</code>). This lab is <strong>POSIX</strong>: macOS, Linux, or Windows with WSL (run everything inside the WSL terminal). It uses <code>resource</code> limits, <code>SIGALRM</code> timeouts in the checker, and <code>epoll</code>/<code>kqueue</code> underneath. On native Windows <code>check.py</code> will tell you so and stop. The lab's files are in <code>systems/labs/code/lab05/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab05/starter.py"><code>starter.py</code></a></td><td>Your file. Class and function signatures with docstrings that spell out the steps, and <code>TODO</code>s where your code goes. A few helpers (<code>serve</code>, <code>accept</code>, <code>recv</code>, <code>send_all</code>) are already written.</td></tr>
+    <tr><td><a href="code/lab05/check.py"><code>check.py</code></a></td><td>The self-check. It starts your servers on 127.0.0.1 with random ports, connects to them like real clients, and times everything. A loop that never returns is reported as a failure, not a hang.</td></tr>
+    <tr><td><a href="code/lab05/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go at each milestone.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Seeing everything "not implemented yet" is the starting line:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd systems/labs/code/lab05</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 5 checks against starter.py
+
+  … Milestone 1: timers (call_soon, call_later, run): not implemented yet (TODO milestone 1: EventLoop.call_later)
+  … Milestone 2: I/O readiness + callback echo server: not implemented yet (TODO milestone 2: EventLoop.add_reader)
+  … Milestone 3: output buffers, write interest, slow consumers: not implemented yet (TODO milestone 3: BufferedEchoServer.__init__)
+  … Milestone 4: coroutines from generators: not implemented yet (TODO milestone 4: Task.__init__)
+  … Milestone 5: a thousand connections + loop lag: not implemented yet (TODO milestone 5: raise_fd_limit)
+
+0/5 milestones passing</span></code></pre>
+
+<div class="callout note">
+  <p class="callout-title">Conventions used by every server</p>
+  <ul>
+    <li><strong><code>127.0.0.1</code> and port 0.</strong> Servers bind the loopback address and let the OS pick a free port (<a href="../../networking/chapters/04-ip-addresses.html">networking chapter 4</a>). Each server object exposes <code>.port</code>, and <code>serve()</code> passes it to a <code>ready(port)</code> callback so <code>check.py</code> can find it.</li>
+    <li><strong>Non-blocking sockets.</strong> Every socket you hand to the loop has <code>setblocking(False)</code>, so <code>recv</code> and <code>send</code> return or raise <code>BlockingIOError</code> at once (<a href="../chapters/15-blocking-io.html">chapter 15</a>).</li>
+    <li><strong>Stopping.</strong> The checker stops a server by closing all its sockets. A loop with no timers and no watched sockets has no work left, so <code>run()</code> returns. That is exactly the definition of "done" you implement in milestone 1.</li>
+  </ul>
+</div>
+
+<h2>Milestone 1: timers</h2>
+
+<p>An event loop is, at heart, a <code>while</code> loop with a list of things to do and a clock. Start with the clock half, no sockets at all. You need three ways to say "run this later":</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Call</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>call_soon(fn, *args)</code></td><td>run on the next pass of the loop, in the order scheduled</td></tr>
+    <tr><td><code>call_later(delay, fn, *args)</code></td><td>run <code>delay</code> seconds from now</td></tr>
+    <tr><td><code>call_at(when, fn, *args)</code></td><td>run when the loop's clock reaches <code>when</code> (what <code>call_later</code> uses underneath)</td></tr>
+  </tbody>
+</table></div>
+
+<p>Ready callbacks live in a <code>collections.deque</code>: first in, first out. Timers live in a <span class="term">min-heap</span> (<code>heapq</code>), which always keeps the earliest deadline at <code>timers[0]</code>, so "what is due next?" is one look and "add a timer" is O(log n). Each heap entry is a tuple <code>(deadline, seq, fn, args)</code>. The <code>seq</code> is a counter that goes up by one for every timer. It does two jobs. Two timers due at the same instant compare equal on <code>deadline</code>, so <code>seq</code> decides: the one scheduled first runs first (FIFO). And because <code>seq</code> is unique, Python never gets as far as comparing two functions, which would raise <code>TypeError</code>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="One pass of the event loop: choose a timeout, wait in select, collect ready I/O and due timers into the ready queue, run each callback, then repeat while any work remains">
+    <defs><marker id="ahSL1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="16" width="150" height="96" rx="10" class="box2"/>
+    <text x="95" y="38" text-anchor="middle" class="t-sm t-bold">1. Pick a timeout</text>
+    <text x="95" y="58" text-anchor="middle" class="t-xs t-muted">0 if work is ready,</text>
+    <text x="95" y="73" text-anchor="middle" class="t-xs t-muted">else next deadline,</text>
+    <text x="95" y="88" text-anchor="middle" class="t-xs t-muted">else None (forever)</text>
+    <rect x="210" y="16" width="150" height="96" rx="10" class="fs-yellow s-yellow sw-2"/>
+    <text x="285" y="38" text-anchor="middle" class="t-sm t-bold">2. select(timeout)</text>
+    <text x="285" y="58" text-anchor="middle" class="t-xs t-muted">the only place the</text>
+    <text x="285" y="73" text-anchor="middle" class="t-xs t-muted">loop sleeps, at no</text>
+    <text x="285" y="88" text-anchor="middle" class="t-xs t-muted">CPU cost</text>
+    <rect x="400" y="16" width="150" height="96" rx="10" class="box2"/>
+    <text x="475" y="38" text-anchor="middle" class="t-sm t-bold">3. Collect</text>
+    <text x="475" y="58" text-anchor="middle" class="t-xs t-muted">ready sockets and</text>
+    <text x="475" y="73" text-anchor="middle" class="t-xs t-muted">due timers join the</text>
+    <text x="475" y="88" text-anchor="middle" class="t-xs t-muted">ready queue</text>
+    <rect x="590" y="16" width="150" height="96" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="665" y="38" text-anchor="middle" class="t-sm t-bold">4. Run</text>
+    <text x="665" y="58" text-anchor="middle" class="t-xs t-muted">each queued callback,</text>
+    <text x="665" y="73" text-anchor="middle" class="t-xs t-muted">one at a time, to</text>
+    <text x="665" y="88" text-anchor="middle" class="t-xs t-muted">completion</text>
+    <line x1="172" y1="64" x2="208" y2="64" class="line" marker-end="url(#ahSL1b)"/>
+    <line x1="362" y1="64" x2="398" y2="64" class="line" marker-end="url(#ahSL1b)"/>
+    <line x1="552" y1="64" x2="588" y2="64" class="line" marker-end="url(#ahSL1b)"/>
+    <path d="M665,114 V160 H95 V114" class="line" marker-end="url(#ahSL1b)"/>
+    <text x="380" y="182" text-anchor="middle" class="t-xs t-muted">repeat while there is any work: ready callbacks, timers or watched sockets</text>
+  </svg>
+  <figcaption><strong>One pass of the loop.</strong> Milestone 1 fills in steps 1, 3 (timers) and 4. Milestone 2 adds the sockets to steps 2 and 3. While a callback runs in step 4, nothing else in the program does, which is the whole story of "never block the loop".</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Why the monotonic clock?</p>
+  <p>Your wall clock (<code>time.time()</code>) is a number someone can change: NTP corrects it, an admin sets it, a leap second repeats a second, daylight saving moves it. A timer built on it can fire early, or not for an hour. <code>time.monotonic()</code> only moves forward, at the rate of real elapsed time, from an arbitrary starting point. Perfect for "wait 50 ms", useless for "what time is it". <a href="../cases/case-03-leap-second.html">Case 3</a> is what happens when software forgets this. <code>check.py</code> checks you did not: it makes the wall clock jump back 3 seconds and expects your timer to carry on regardless.</p>
+</div>
+
+<p>Callbacks should never take the loop down with them. A callback that raises must be reported (the starter's <code>report_error</code> stores it in <code>loop.errors</code> and prints the traceback) and the loop must go on with the next one. And when everything is done, <code>run()</code> should simply return: no ready callbacks, no timers, nothing registered with the selector.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>EventLoop.time</code>, <code>call_soon</code>, <code>call_at</code>, <code>call_later</code>, <code>run</code> and <code>_run_once</code> in <code>starter.py</code>. For now the selector is empty, so waiting for a timer is <code>self._selector.select(timeout)</code> on nothing, which simply sleeps until the timeout. (Why not <code>time.sleep</code>? Because in milestone 2 the same call must also wake up for sockets.) Callbacks due at the same moment must run in the order they were scheduled.</p>
+  <p class="checkpoint">run <code>python3 check.py</code>: milestone 1 should show ✔. It checks ordering (including three timers at the exact same deadline), chains of callbacks that schedule more callbacks, a callback that raises, that waiting 0.3 s costs almost no CPU, and the jumping wall clock.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Step 1 of the diagram is three branches: <code>if self._ready</code> then <code>timeout = 0</code>; <code>elif self._timers</code> then <code>timeout = max(0, self._timers[0][0] - self.time())</code>; <code>else</code> <code>None</code>.</li>
+      <li>Move due timers with a <code>while self._timers and self._timers[0][0] &lt;= now:</code> loop and <code>heapq.heappop</code>. Popping in heap order gives you (deadline, seq) order for free.</li>
+      <li>Run only <code>len(self._ready)</code> callbacks per pass, counted <em>before</em> you start. A callback that calls <code>call_soon</code> belongs to the next pass; otherwise a callback that keeps rescheduling itself starves the sockets (and the timers) forever.</li>
+      <li>Wrap each call in <code>try/except Exception as exc</code> and call <code>self.report_error(exc)</code>. Catch <code>Exception</code>, not <code>BaseException</code>, so <kbd>Ctrl</kbd>+<kbd>C</kbd> still stops the program.</li>
+      <li><code>run()</code> is one line of condition around <code>_run_once()</code>: <code>while not self._stopping and (self._ready or self._timers or self._selector.get_map())</code>. (<code>get_map()</code> is empty for now.)</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> time(self):
+    <span class="cmt"># Monotonic: never jumps backwards when NTP or an admin changes the wall clock.</span>
+    <span class="kw">return</span> time.monotonic()
+
+<span class="kw">def</span> call_soon(self, fn, *args):
+    <span class="cmt">"""Run fn(*args) on the next pass of the loop."""</span>
+    self._ready.append((fn, args))
+
+<span class="kw">def</span> call_at(self, when, fn, *args):
+    <span class="cmt">"""Run fn(*args) at absolute loop time `when` (a value of self.time())."""</span>
+    heapq.heappush(self._timers, (when, next(self._seq), fn, args))
+
+<span class="kw">def</span> call_later(self, delay, fn, *args):
+    <span class="cmt">"""Run fn(*args) after `delay` seconds."""</span>
+    self.call_at(self.time() + max(<span class="num">0.0</span>, delay), fn, *args)
+
+<span class="kw">def</span> run(self):
+    <span class="cmt">"""Run until there is no work left: no ready callbacks, timers or watched sockets."""</span>
+    self._stopping = <span class="kw">False</span>
+    <span class="kw">while</span> <span class="kw">not</span> self._stopping <span class="kw">and</span> (self._ready <span class="kw">or</span> self._timers <span class="kw">or</span> self._selector.get_map()):
+        self._run_once()
+
+<span class="kw">def</span> _run_once(self):
+    <span class="cmt"># 1. How long may we sleep in the selector?</span>
+    <span class="kw">if</span> self._ready <span class="kw">or</span> self._stopping:
+        timeout = <span class="num">0</span>                                    <span class="cmt"># work is waiting: just peek</span>
+    <span class="kw">elif</span> self._timers:
+        timeout = max(<span class="num">0.0</span>, self._timers[<span class="num">0</span>][<span class="num">0</span>] - self.time())
+    <span class="kw">else</span>:
+        timeout = <span class="kw">None</span>                                 <span class="cmt"># nothing timed: sleep until I/O</span>
+    <span class="cmt"># 2. Ask the OS which sockets are ready; queue their callbacks.</span>
+    <span class="kw">for</span> key, mask <span class="kw">in</span> self._selector.select(timeout):
+        reader, writer = key.data
+        <span class="kw">if</span> mask &amp; READ <span class="kw">and</span> reader:
+            self._ready.append(reader)
+        <span class="kw">if</span> mask &amp; WRITE <span class="kw">and</span> writer:
+            self._ready.append(writer)
+    <span class="cmt"># 3. Move due timers to the ready queue (heap order = deadline, then FIFO).</span>
+    now = self.time()
+    <span class="kw">while</span> self._timers <span class="kw">and</span> self._timers[<span class="num">0</span>][<span class="num">0</span>] &lt;= now:
+        _, _, fn, args = heapq.heappop(self._timers)
+        self._ready.append((fn, args))
+    <span class="cmt"># 4. Run exactly the callbacks that were ready when this pass began.</span>
+    <span class="kw">for</span> _ <span class="kw">in</span> range(len(self._ready)):
+        fn, args = self._ready.popleft()
+        <span class="kw">try</span>:
+            fn(*args)
+        <span class="kw">except</span> Exception <span class="kw">as</span> exc:                       <span class="cmt"># one bad callback must not kill the loop</span>
+            self.report_error(exc)</code></pre>
+    <p>The two lines about <code>key.data</code> are milestone 2; before that the selector has nothing registered and <code>select(timeout)</code> just sleeps.</p>
+  </details>
+</div>
+
+<h2>Milestone 2: I/O readiness</h2>
+
+<p>Now the loop learns to watch sockets. The selector (<code>selectors.DefaultSelector</code>: <code>epoll</code> on Linux, <code>kqueue</code> on macOS, as in <a href="../chapters/16-event-loops.html">chapter 16</a>) keeps a registry of sockets and the events you care about. You'll expose four methods that mirror what <code>asyncio</code> offers:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Method</th><th>The callback runs when...</th></tr></thead>
+  <tbody>
+    <tr><td><code>add_reader(sock, fn, *args)</code></td><td><code>sock</code> is readable: bytes waiting, a connection to accept, or the peer closed</td></tr>
+    <tr><td><code>add_writer(sock, fn, *args)</code></td><td><code>sock</code> is writable: there is room in its kernel send buffer</td></tr>
+    <tr><td><code>remove_reader(sock)</code>, <code>remove_writer(sock)</code></td><td>stop watching. Harmless if you weren't.</td></tr>
+  </tbody>
+</table></div>
+
+<p>One socket can have a reader and a writer at once, but the selector only holds <em>one</em> registration per socket, with a combined set of events. The starter gives you <code>_update(sock, reader, writer)</code>, which makes the registration match exactly the callbacks you pass (registering, modifying or unregistering as needed; the callbacks are stored in the registration's <code>data</code> field as a <code>(reader, writer)</code> pair). Your four methods just keep the <em>other</em> slot as it was and change one.</p>
+
+<p>Readiness here is <span class="term">level-triggered</span>: as long as the condition holds (bytes still unread, send buffer still has room), the selector reports it again on every pass. That is forgiving: if you read only part of the data, you'll be told again. It also has a sharp edge, which is the whole of milestone 3.</p>
+
+<p>Then use the loop. The first server is deliberately plain: a listening socket registered with <code>add_reader</code>; when it is readable, accept <em>every</em> waiting connection (until <code>BlockingIOError</code>); each connection gets its own reader that does one <code>recv</code> and one <code>send</code>. No threads, and no waiting anywhere except inside <code>select</code>.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Known flaw, on purpose</p>
+  <p><code>conn.send(data)</code> is allowed to send fewer bytes than you gave it, and on a non-blocking socket it raises <code>BlockingIOError</code> if the kernel buffer is full. The milestone 2 server ignores that, which is fine for short messages and wrong for big ones. Milestone 3 fixes it. (<a href="../chapters/15-blocking-io.html">Chapter 15</a> called this the <span class="term">partial write</span>.)</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>add_reader</code>, <code>remove_reader</code>, <code>add_writer</code>, <code>remove_writer</code>, <code>has_reader</code>, <code>has_writer</code>, then finish the I/O part of <code>_run_once</code> (step 2 and 3 of the diagram: <code>key.data</code> is the <code>(reader, writer)</code> pair; <code>mask</code> says which events fired). Then write <code>EchoServer</code>: <code>__init__</code>, <code>_on_accept</code>, <code>_on_readable</code> and <code>_drop</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows ✔ for milestone 2. It tests a reader and a writer on one socket, that removing one leaves the other, that an <em>idle</em> socket doesn't stop a timer from firing on time (the selector timeout is the next deadline!), and then an echo server with 21 clients, one of which sits idle while the others talk. Try it by hand: <code>python3 starter.py callback-echo</code>, then <code>nc 127.0.0.1 9005</code> in two terminals.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>add_reader</code>: <code>key = self._lookup(sock)</code> (None if unregistered); <code>self._update(sock, (fn, args), key.data[1] if key else None)</code>. The other three are the same idea with the slots swapped or one set to <code>None</code>.</li>
+      <li>In <code>_run_once</code>, <code>self._selector.select(timeout)</code> returns <code>(key, mask)</code> pairs. <code>mask &amp; selectors.EVENT_READ</code> tells you the reader should run. Append the stored <code>(fn, args)</code> tuple straight to <code>self._ready</code>.</li>
+      <li>A callback may run <em>after</em> its socket was dropped by an earlier callback in the same pass (both were queued before either ran). Start <code>_on_readable</code> with <code>if conn not in self.conns: return</code>.</li>
+      <li>Always <code>remove_reader</code> <em>before</em> <code>close()</code>. Closing first leaves a dead file descriptor number in the selector, and the next socket the OS hands that number to will confuse it.</li>
+      <li>If <code>accept()</code> fails with something other than <code>BlockingIOError</code> (the classic: "too many open files"), just return. You'll look at that case again in milestone 5.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> add_reader(self, sock, fn, *args):
+    key = self._lookup(sock)
+    self._update(sock, (fn, args), key.data[<span class="num">1</span>] <span class="kw">if</span> key <span class="kw">else</span> <span class="kw">None</span>)
+
+<span class="kw">def</span> remove_reader(self, sock):
+    key = self._lookup(sock)
+    <span class="kw">if</span> key:
+        self._update(sock, <span class="kw">None</span>, key.data[<span class="num">1</span>])
+
+<span class="kw">def</span> add_writer(self, sock, fn, *args):
+    key = self._lookup(sock)
+    self._update(sock, key.data[<span class="num">0</span>] <span class="kw">if</span> key <span class="kw">else</span> <span class="kw">None</span>, (fn, args))
+
+<span class="kw">def</span> remove_writer(self, sock):
+    key = self._lookup(sock)
+    <span class="kw">if</span> key:
+        self._update(sock, key.data[<span class="num">0</span>], <span class="kw">None</span>)
+
+<span class="kw">def</span> has_reader(self, sock):
+    key = self._lookup(sock)
+    <span class="kw">return</span> bool(key <span class="kw">and</span> key.data[<span class="num">0</span>])
+
+<span class="kw">def</span> has_writer(self, sock):
+    key = self._lookup(sock)
+    <span class="kw">return</span> bool(key <span class="kw">and</span> key.data[<span class="num">1</span>])</code></pre>
+    <p>And the server (the loop part of <code>_run_once</code> is in the milestone 1 solution above):</p>
+<pre><code><span class="kw">def</span> __init__(self, loop, port=<span class="num">0</span>):
+    self.loop = loop
+    self.listener = listen_socket(port)
+    self.port = self.listener.getsockname()[<span class="num">1</span>]
+    self.conns = set()
+    loop.add_reader(self.listener, self._on_accept)
+
+<span class="kw">def</span> _on_accept(self):
+    <span class="cmt"># Readable listener = at least one connection waiting. Take them all.</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        <span class="kw">try</span>:
+            conn, _ = self.listener.accept()
+        <span class="kw">except</span> (BlockingIOError, InterruptedError):
+            <span class="kw">return</span>
+        <span class="kw">except</span> OSError:                <span class="cmt"># e.g. out of file descriptors</span>
+            <span class="kw">return</span>
+        conn.setblocking(<span class="kw">False</span>)
+        self.conns.add(conn)
+        self.loop.add_reader(conn, self._on_readable, conn)
+
+<span class="kw">def</span> _on_readable(self, conn):
+    <span class="kw">if</span> conn <span class="kw">not</span> <span class="kw">in</span> self.conns:         <span class="cmt"># closed earlier in this same pass</span>
+        <span class="kw">return</span>
+    <span class="kw">try</span>:
+        data = conn.recv(<span class="num">65536</span>)
+    <span class="kw">except</span> (BlockingIOError, InterruptedError):
+        <span class="kw">return</span>
+    <span class="kw">except</span> OSError:
+        data = <span class="str">b""</span>
+    <span class="kw">if</span> <span class="kw">not</span> data:                       <span class="cmt"># b"" = the peer closed</span>
+        self._drop(conn)
+        <span class="kw">return</span>
+    <span class="kw">try</span>:
+        conn.send(data)                <span class="cmt"># may send FEWER bytes than len(data)!</span>
+    <span class="kw">except</span> OSError:
+        self._drop(conn)
+
+<span class="kw">def</span> _drop(self, conn):
+    self.loop.remove_reader(conn)
+    self.conns.discard(conn)
+    conn.close()</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 3: partial writes and output buffers</h2>
+
+<p>Reading is easy to reason about: data arrives, you take what is there. Writing is where servers get hurt. Each connection has a kernel <strong>send buffer</strong> of limited size. If the client is slow (a phone on a bad network, a bug, an attacker), the buffer fills and <code>send</code> takes only part of your data, or none. You cannot wait for room, because waiting is blocking. And you cannot throw the rest away. So the connection needs its own <strong>output buffer</strong>, a <code>bytearray</code> of bytes you owe it:</p>
+
+<ol class="steps">
+  <li>After reading, append the reply to the buffer.</li>
+  <li>Try to <code>send</code> the whole buffer; remove exactly as many bytes as were sent (<code>del buf[:sent]</code>).</li>
+  <li>If bytes remain, register <code>add_writer</code> so the loop tells you when the kernel has room. If the buffer is empty, make sure the writer is <em>not</em> registered.</li>
+</ol>
+
+<div class="callout warn">
+  <p class="callout-title">Why write interest only while there is data</p>
+  <p>A healthy socket is <em>almost always writable</em>: there is nearly always room in its send buffer. With level-triggered readiness, a writer you forgot to remove makes <code>select</code> return immediately on every pass, forever. The loop spins at 100% CPU doing nothing. The rule: register write interest when you have something to write, and remove it the moment you don't. <code>check.py</code> looks for stray writers once everything is quiet.</p>
+</div>
+
+<p>The output buffer is a queue, and <a href="../chapters/14-queues-backpressure.html">chapter 14</a> already told you what an unbounded queue is: a memory leak with extra steps. A client that sends a lot and reads slowly makes the buffer grow without limit, until the process dies and takes <em>every</em> connection with it. So the buffer needs a bound and a policy for what happens when it is exceeded. <a href="../chapters/16-event-loops.html">Chapter 16</a> showed the gentle policy (stop reading from that client while you still owe it output, so TCP flow control pushes back on it). This milestone uses the blunt one: <strong>close the slow consumer</strong>. It protects everybody else, and it is what many servers do to clients that cannot keep up. <a href="../studios/studio-01-10k-connections.html">Studio 1</a> asks you to decide which policy a real service would want.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>BufferedEchoServer</code>: <code>__init__</code> (with <code>max_buffer</code>), <code>_on_accept</code>, <code>_on_readable</code>, <code>_flush</code>, <code>_on_writable</code>, <code>_drop</code>. After appending to the buffer, if it is larger than <code>max_buffer</code>, drop the client.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows ✔ for milestone 3. The check (a) sends 1.5 MB from a client that deliberately doesn't read for 0.6 s and expects the server to be waiting for write readiness, then to return every byte intact; (b) checks that no connection stays registered for writing when idle; (c) floods the server from a client with a tiny receive buffer that never reads, while a second client keeps getting instant echoes, and expects the flooder to be disconnected.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Keep a <code>Connection</code> object per client (the starter defines one: <code>sock</code>, <code>out</code>, <code>writing</code>) and pass it to the callbacks instead of the bare socket.</li>
+      <li>In <code>_flush</code>, loop <code>while conn.out:</code> so you send as much as the kernel will take in one go, then break on <code>BlockingIOError</code>. Only <em>after</em> the loop decide whether write interest should be on or off, using <code>conn.writing</code> so you don't add or remove it needlessly.</li>
+      <li><code>del conn.out[:sent]</code> copies the rest of the buffer each time. Fine here; a ring buffer or <code>memoryview</code> would avoid it (stretch goal territory).</li>
+      <li>Check the bound <em>before</em> trying to send: otherwise a fast kernel hides the problem until it doesn't.</li>
+      <li><code>_drop</code> must be safe to call twice: <code>self.conns.pop(conn.sock, None)</code> returns <code>None</code> the second time.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> _on_readable(self, conn):
+    <span class="kw">if</span> conn.sock <span class="kw">not</span> <span class="kw">in</span> self.conns:
+        <span class="kw">return</span>
+    <span class="kw">try</span>:
+        data = conn.sock.recv(<span class="num">65536</span>)
+    <span class="kw">except</span> (BlockingIOError, InterruptedError):
+        <span class="kw">return</span>
+    <span class="kw">except</span> OSError:
+        data = <span class="str">b""</span>
+    <span class="kw">if</span> <span class="kw">not</span> data:
+        self._drop(conn)
+        <span class="kw">return</span>
+    conn.out += data
+    <span class="kw">if</span> len(conn.out) &gt; self.max_buffer:        <span class="cmt"># the client is not keeping up: cut it off</span>
+        self._drop(conn)
+        <span class="kw">return</span>
+    self._flush(conn)
+
+<span class="kw">def</span> _flush(self, conn):
+    <span class="cmt">"""Send as much as the kernel will take; ask to be told when it can take more."""</span>
+    <span class="kw">while</span> conn.out:
+        <span class="kw">try</span>:
+            sent = conn.sock.send(conn.out)
+        <span class="kw">except</span> (BlockingIOError, InterruptedError):
+            <span class="kw">break</span>                              <span class="cmt"># kernel buffer full</span>
+        <span class="kw">except</span> OSError:
+            self._drop(conn)
+            <span class="kw">return</span>
+        del conn.out[:sent]
+    <span class="kw">if</span> conn.out <span class="kw">and</span> <span class="kw">not</span> conn.writing:
+        self.loop.add_writer(conn.sock, self._on_writable, conn)
+        conn.writing = <span class="kw">True</span>
+    <span class="kw">elif</span> <span class="kw">not</span> conn.out <span class="kw">and</span> conn.writing:        <span class="cmt"># nothing left: stop waking up for nothing</span>
+        self.loop.remove_writer(conn.sock)
+        conn.writing = <span class="kw">False</span>
+
+<span class="kw">def</span> _on_writable(self, conn):
+    <span class="kw">if</span> conn.sock <span class="kw">in</span> self.conns:
+        self._flush(conn)
+
+<span class="kw">def</span> _drop(self, conn):
+    <span class="kw">if</span> self.conns.pop(conn.sock, <span class="kw">None</span>) <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span>
+    self.loop.remove_reader(conn.sock)
+    self.loop.remove_writer(conn.sock)
+    conn.sock.close()</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: coroutines from generators</h2>
+
+<p>Look at your callback server. The life of one connection (accept, then repeatedly: wait for data, read, write the reply) is smeared across four methods that communicate through objects and flags. Real protocols have dozens of states. <a href="../chapters/17-async-await.html">Chapter 17</a> showed the cure: write the connection as one function that <em>pauses</em> where it would otherwise wait. Python can already pause a function: a <span class="term">generator</span>. Every <code>yield</code> hands a value to whoever is driving it, and <code>gen.send(None)</code> resumes it right after that <code>yield</code>.</p>
+
+<p>So make the loop the driver. A coroutine is a generator that yields small <strong>request objects</strong> that say what it is waiting for:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Request</th><th>"Resume me when..."</th><th>The loop does</th></tr></thead>
+  <tbody>
+    <tr><td><code>Sleep(seconds)</code></td><td>the time has passed</td><td><code>call_later(seconds, step)</code></td></tr>
+    <tr><td><code>ReadWait(sock)</code></td><td><code>sock</code> is readable</td><td><code>add_reader(sock, wake)</code>, removed on wake</td></tr>
+    <tr><td><code>WriteWait(sock)</code></td><td><code>sock</code> is writable</td><td><code>add_writer(sock, wake)</code>, removed on wake</td></tr>
+  </tbody>
+</table></div>
+
+<p>A <code>Task</code> is the glue: it holds the generator, calls <code>send(None)</code> to run it to its next <code>yield</code>, looks at the request, and arranges for itself to be called again when the request is satisfied. While a task waits it costs no CPU and no thread; it is just an object in a heap or a selector registration. This is what <code>await</code> compiles down to, in spirit: <code>await loop.sock_recv(sock, n)</code> is "yield a request, get resumed with the answer".</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 170" role="img" aria-label="A coroutine yields a request to its Task; the Task registers interest with the loop; when the socket is ready the loop calls the Task, which resumes the coroutine with send(None)">
+    <defs><marker id="ahSL4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="24" width="160" height="110" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="100" y="50" text-anchor="middle" class="t-bold">coroutine</text>
+    <text x="100" y="72" text-anchor="middle" class="t-xs t-muted">a generator:</text>
+    <text x="100" y="88" text-anchor="middle" class="t-xs mono">yield ReadWait(s)</text>
+    <text x="100" y="108" text-anchor="middle" class="t-xs t-muted">paused here, with</text>
+    <text x="100" y="122" text-anchor="middle" class="t-xs t-muted">all its local variables</text>
+    <rect x="300" y="24" width="160" height="110" rx="10" class="box2"/>
+    <text x="380" y="50" text-anchor="middle" class="t-bold">Task</text>
+    <text x="380" y="76" text-anchor="middle" class="t-xs t-muted">_step: send(None),</text>
+    <text x="380" y="92" text-anchor="middle" class="t-xs t-muted">read the request,</text>
+    <text x="380" y="108" text-anchor="middle" class="t-xs t-muted">arrange the wake-up</text>
+    <rect x="580" y="24" width="160" height="110" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="660" y="50" text-anchor="middle" class="t-bold tc-blue">EventLoop</text>
+    <text x="660" y="76" text-anchor="middle" class="t-xs t-muted">watches sockets and</text>
+    <text x="660" y="92" text-anchor="middle" class="t-xs t-muted">timers, runs the</text>
+    <text x="660" y="108" text-anchor="middle" class="t-xs t-muted">callbacks that fire</text>
+    <line x1="182" y1="66" x2="298" y2="66" class="line" marker-end="url(#ahSL4a)"/>
+    <text x="240" y="58" text-anchor="middle" class="t-xs">yield request</text>
+    <line x1="462" y1="66" x2="578" y2="66" class="line" marker-end="url(#ahSL4a)"/>
+    <text x="520" y="58" text-anchor="middle" class="t-xs">add_reader</text>
+    <line x1="578" y1="102" x2="462" y2="102" class="line" marker-end="url(#ahSL4a)"/>
+    <text x="520" y="120" text-anchor="middle" class="t-xs">socket ready</text>
+    <line x1="298" y1="102" x2="182" y2="102" class="line" marker-end="url(#ahSL4a)"/>
+    <text x="240" y="120" text-anchor="middle" class="t-xs">send(None)</text>
+  </svg>
+  <figcaption><strong>One round trip of a coroutine.</strong> The generator keeps its place and its variables while it is paused; the Task keeps the loop honest about when to resume it. Nothing else is needed.</figcaption>
+</figure>
+
+<p>The starter already has the three request classes and the little helper coroutines <code>accept</code>, <code>recv</code> and <code>send_all</code>. Each one is a tiny generator of its own, and a coroutine calls it with <code>yield from</code> (the ancestor of <code>await</code>): <code>data = yield from recv(conn, 65536)</code> runs the helper, passes its <code>yield ReadWait(conn)</code> up to the Task, and hands back its <code>return</code> value. Notice <code>send_all</code>: it loops with <code>WriteWait</code> until every byte is sent, so a slow client makes <em>its own task</em> wait, not the loop. Compare that with milestone 3's buffer-and-close: here the task simply stops reading while it can't write, which is the gentle backpressure policy for free.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Task</code> (<code>__init__</code>, <code>_step</code>, <code>_wait_for</code>, <code>_wake</code>), then <code>CoroutineEchoServer</code> (<code>__init__</code>, <code>_accept_loop</code>, <code>_handle</code>). The whole per-connection logic in <code>_handle</code> should be about eight lines of straight-line code: no flags, no buffers.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows ✔ for milestone 4. It checks that two tasks sleeping 0.12 s and 0.04 s interleave correctly, that <code>ReadWait</code> and <code>WriteWait</code> work on a socket pair, that a task which raises doesn't stop the others, and that the coroutine server echoes 21 clients, including a 1 MB echo to a client that has stopped reading, while another client keeps being served.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>Task.__init__</code> must not run the generator itself; it only schedules the first <code>_step</code> with <code>loop.call_soon</code>. Creating a task from inside another task would otherwise run it in the middle of the creator.</li>
+      <li>The generator's <code>return value</code> arrives as <code>StopIteration.value</code>. Catch <code>StopIteration</code> <em>before</em> <code>Exception</code>.</li>
+      <li>The wake-up for <code>ReadWait</code> is one-shot: the callback is <code>self._wake</code>, with arguments <code>(loop.remove_reader, sock)</code>. If it stayed registered, the next pass would resume the task again while it is waiting for something else.</li>
+      <li>In <code>_handle</code>, put the cleanup in <code>finally</code>. A closed connection ends the loop with <code>b""</code>; a reset ends it with an <code>OSError</code>.</li>
+      <li>Stuck? Put a <code>print(request)</code> in <code>_step</code> and watch the conversation between coroutine and loop.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">class</span> Task:
+    <span class="cmt">"""Drives a generator: each `yield` is a request; resume when it is satisfied."""</span>
+
+    <span class="kw">def</span> __init__(self, loop, gen):
+        self.loop = loop
+        self.gen = gen
+        self.done = <span class="kw">False</span>
+        self.result = <span class="kw">None</span>
+        self.error = <span class="kw">None</span>
+        loop.call_soon(self._step)         <span class="cmt"># first step: run to the first yield</span>
+
+    <span class="kw">def</span> _step(self):
+        <span class="kw">if</span> self.done:
+            <span class="kw">return</span>
+        <span class="kw">try</span>:
+            request = self.gen.send(<span class="kw">None</span>)  <span class="cmt"># resume the generator</span>
+        <span class="kw">except</span> StopIteration <span class="kw">as</span> stop:      <span class="cmt"># `return value` inside the generator</span>
+            self.done, self.result = <span class="kw">True</span>, stop.value
+            <span class="kw">return</span>
+        <span class="kw">except</span> Exception <span class="kw">as</span> exc:
+            self.done, self.error = <span class="kw">True</span>, exc
+            self.loop.report_error(exc)
+            <span class="kw">return</span>
+        self._wait_for(request)
+
+    <span class="kw">def</span> _wait_for(self, request):
+        loop = self.loop
+        <span class="kw">if</span> isinstance(request, Sleep):
+            loop.call_later(request.seconds, self._step)
+        <span class="kw">elif</span> isinstance(request, ReadWait):
+            loop.add_reader(request.sock, self._wake, loop.remove_reader, request.sock)
+        <span class="kw">elif</span> isinstance(request, WriteWait):
+            loop.add_writer(request.sock, self._wake, loop.remove_writer, request.sock)
+        <span class="kw">else</span>:
+            self.done = <span class="kw">True</span>
+            self.error = TypeError(<span class="str">f"a task may only yield Sleep/ReadWait/WriteWait, not {request!r}"</span>)
+            loop.report_error(self.error)
+
+    <span class="kw">def</span> _wake(self, unregister, sock):
+        unregister(sock)                   <span class="cmt"># one-shot: we only wanted to be told once</span>
+        self._step()</code></pre>
+<pre><code><span class="kw">def</span> _accept_loop(self):
+    <span class="kw">while</span> <span class="kw">True</span>:
+        conn = <span class="kw">yield</span> <span class="kw">from</span> accept(self.listener)
+        self.conns.add(conn)
+        self.loop.create_task(self._handle(conn))
+
+<span class="kw">def</span> _handle(self, conn):
+    <span class="cmt"># Straight-line code: no state machine, no callbacks. This is async/await underneath.</span>
+    <span class="kw">try</span>:
+        <span class="kw">while</span> <span class="kw">True</span>:
+            data = <span class="kw">yield</span> <span class="kw">from</span> recv(conn, <span class="num">65536</span>)
+            <span class="kw">if</span> <span class="kw">not</span> data:
+                <span class="kw">break</span>
+            <span class="kw">yield</span> <span class="kw">from</span> send_all(conn, data)
+    <span class="kw">except</span> OSError:
+        <span class="kw">pass</span>
+    <span class="kw">finally</span>:
+        self.conns.discard(conn)
+        self.loop.remove_reader(conn)
+        self.loop.remove_writer(conn)
+        conn.close()</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: a thousand connections, and the cardinal rule</h2>
+
+<p>You now have an event loop and a server on it. Two things remain: prove it scales, and see exactly how it fails.</p>
+
+<h3>One thread, a thousand clients</h3>
+
+<p>The check opens about 1,000 connections to your coroutine server, sends a message from each, verifies every echo, and then, with <em>all of them still open</em>, does it again. A thread-per-connection server would need a thousand threads (<a href="../chapters/15-blocking-io.html">chapter 15</a> priced them); yours has one thread and a thousand small objects.
+
+The first thing to hit is not CPU or memory but the <strong>open-file limit</strong>. Each socket is a file descriptor (<a href="../chapters/08-files.html">chapter 8</a>), and each process has a limit on them: the <em>soft</em> limit is what is enforced and the <em>hard</em> limit is the ceiling a normal user may raise it to. The default soft limit varies by system (it has historically been as low as 256 on macOS shells and 1024 on many Linux ones). In this lab your test clients and your server live in <em>one</em> process, so a thousand connections need about two thousand descriptors. Past the limit, <code>accept()</code> fails with <code>EMFILE</code> ("too many open files"), and since the listener stays readable, a careless loop would retry instantly forever. (That is why the starter's <code>accept</code> helper sleeps 100 ms on that error.)</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">ulimit -n</span>        <span class="cmt"># the soft limit of this shell, in descriptors</span>
+<span class="prompt">$ </span><span class="cmd">ulimit -Hn</span>       <span class="cmt"># the hard limit</span>
+<span class="prompt">$ </span><span class="cmd">python3 -c "import resource; print(resource.getrlimit(resource.RLIMIT_NOFILE))"</span></code></pre>
+
+<h3>The cardinal rule, measured</h3>
+
+<p>Chapter 16's <span class="term">loop lag</span> is the lateness of the loop: how much later than planned does a timer run? It is a heartbeat. Schedule a ticker every 10 ms; each time it fires, compare "now" to when it <em>should</em> have fired. If nothing blocks, the lag is about a millisecond. If one callback hogs the thread for 200 ms, the ticker (and every connection's data, and every other timer) waits, and the next tick is about 200 ms late. <code>check.py</code> runs the same loop three ways and reports the worst lag: with nothing else going on, with a callback that does <code>time.sleep(0.2)</code>, and with a coroutine that does <code>yield Sleep(0.2)</code>. The same 0.2 seconds of "waiting" costs nothing in one case and everything in the other.</p>
+
+<div class="callout warn">
+  <p class="callout-title">The cardinal rule</p>
+  <p>Nothing that runs on the loop thread may block: no <code>time.sleep</code>, no blocking <code>recv</code>, no <code>requests.get</code>, no big CPU loop, no unindexed disk read. A blocked loop doesn't just slow one request, it freezes <em>all</em> of them at once, and every client sees the same latency spike. Either use the non-blocking version (a <code>Sleep</code> request), or push the blocking work to a thread or process pool (<a href="../chapters/14-queues-backpressure.html">chapter 14</a>) and have it post the result back.</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement two things in <code>starter.py</code>. <code>raise_fd_limit(wanted)</code> raises the soft <code>RLIMIT_NOFILE</code> toward <code>wanted</code> without exceeding the hard limit, and returns the soft limit it ended up with. <code>LagMonitor</code> (<code>start</code> and <code>_tick</code>) records, at every tick, how late the tick was. If the limit can't be raised high enough, <code>check.py</code> scales the number of clients down and says so; nothing to code there.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows 5/5, with notes like <code>serving all 1000 clients</code> and the three lag numbers. Typical on a laptop: idle about 1 ms, <code>time.sleep(0.2)</code> about 200 ms, <code>yield Sleep(0.2)</code> about 1 ms. The checker's thresholds are loose on purpose (blocked above 100 ms, calm below 80 ms), so your result should not flicker.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>resource.getrlimit(resource.RLIMIT_NOFILE)</code> returns <code>(soft, hard)</code>. Either may be <code>resource.RLIM_INFINITY</code>, which is a negative number on most systems: compare it with <code>==</code> before doing arithmetic.</li>
+      <li>Set the soft limit to <code>min(wanted, hard)</code>, keeping the hard limit unchanged: <code>setrlimit(RLIMIT_NOFILE, (target, hard))</code>. Never try to raise the hard limit: that needs privileges, and you shouldn't.</li>
+      <li>macOS can refuse a soft limit above its own per-process cap even when <code>hard</code> says "unlimited". If <code>setrlimit</code> raises, try a smaller target and report what you really got.</li>
+      <li>For the monitor, compute lateness as <code>now - expected</code>, then set <code>expected = now + interval</code> and schedule with <code>call_at(expected, ...)</code>. Don't schedule at <code>expected + interval</code>: after a long block you would fire a burst of "catch-up" ticks.</li>
+      <li>A ticker that reschedules itself is permanent work: <code>run()</code> never returns while it runs. That is why <code>stop()</code> exists.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> raise_fd_limit(wanted):
+    <span class="cmt">"""Try to raise the soft RLIMIT_NOFILE to `wanted`; return the soft limit we ended up with."""</span>
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    <span class="kw">if</span> soft == resource.RLIM_INFINITY <span class="kw">or</span> soft &gt;= wanted:
+        <span class="kw">return</span> sys.maxsize <span class="kw">if</span> soft == resource.RLIM_INFINITY <span class="kw">else</span> soft
+    target = wanted <span class="kw">if</span> hard == resource.RLIM_INFINITY <span class="kw">else</span> min(wanted, hard)
+    <span class="kw">while</span> target &gt; soft:
+        <span class="kw">try</span>:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            <span class="kw">break</span>
+        <span class="kw">except</span> (ValueError, OSError):      <span class="cmt"># e.g. macOS refuses values above its own cap</span>
+            target = (target + soft) // <span class="num">2</span>
+    <span class="kw">return</span> resource.getrlimit(resource.RLIMIT_NOFILE)[<span class="num">0</span>]</code></pre>
+<pre><code><span class="kw">def</span> start(self):
+    self._running = <span class="kw">True</span>
+    self._expected = self.loop.time() + self.interval
+    self.loop.call_at(self._expected, self._tick)
+
+<span class="kw">def</span> _tick(self):
+    <span class="kw">if</span> <span class="kw">not</span> self._running:
+        <span class="kw">return</span>
+    now = self.loop.time()
+    self.lags.append(max(<span class="num">0.0</span>, now - self._expected))   <span class="cmt"># how late did we fire?</span>
+    self._expected = now + self.interval
+    self.loop.call_at(self._expected, self._tick)</code></pre>
+  </details>
+</div>
+
+<h2>Look under the hood</h2>
+
+<p>Run your coroutine server and look at it from outside. In one terminal:</p>
+
+<pre class="terminal" data-title="terminal 1"><code><span class="prompt">$ </span><span class="cmd">python3 solution.py coroutine-echo</span>      <span class="cmt"># or starter.py once it works</span>
+<span class="out">listening on 127.0.0.1:9005</span></code></pre>
+
+<p>In a second terminal, open some connections (for example with several <code>nc 127.0.0.1 9005</code> windows) and look at the server process: one process, one thread, many sockets.</p>
+
+<pre class="terminal" data-title="terminal 2"><code><span class="prompt">$ </span><span class="cmd">pgrep -f "coroutine-echo"</span>                    <span class="cmt"># the server's PID</span>
+<span class="prompt">$ </span><span class="cmd">lsof -nP -p PID | grep -c TCP</span>                 <span class="cmt"># its sockets: the listener plus one per client</span>
+<span class="prompt">$ </span><span class="cmd">ps -M PID | wc -l</span>                             <span class="cmt"># macOS: one line per thread (plus a header)</span>
+<span class="prompt">$ </span><span class="cmd">ls /proc/PID/task | wc -l</span>                     <span class="cmt"># Linux: the number of threads</span></code></pre>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Block the loop on purpose.</strong> In <code>_handle</code>, add <code>time.sleep(3)</code> before the first <code>recv</code>, start the server, open two <code>nc</code> windows quickly and type in the second one. It doesn't answer until the first handler's sleep ends, because the sleep ran on the only thread. Now replace it with <code>yield Sleep(3)</code> and repeat: the second window answers instantly. Run the lag meter in the same process (<code>LagMonitor</code>) to see the number change.</li>
+    <li><strong>Hit the file-descriptor limit.</strong> In a throwaway terminal run <code>ulimit -Sn 600 -Hn 600</code> (lowering the limits needs no privileges, and lowering the hard limit cannot be undone in that shell, hence "throwaway"), then <code>python3 check.py solution</code>. <code>raise_fd_limit</code> cannot get past the hard limit of 600, so milestone 5 reports that it scaled the clients down to fit. Without your fix for descriptors running out, the server would have been the one to fail.</li>
+    <li><strong>Compare with asyncio.</strong> Python's own loop is the same machine. Here is the echo server in about ten lines of <code>asyncio</code>:
+<pre><code><span class="kw">import</span> asyncio
+
+async <span class="kw">def</span> handle(reader, writer):
+    <span class="kw">while</span> data := await reader.read(<span class="num">65536</span>):
+        writer.write(data)
+        await writer.drain()          <span class="cmt"># wait while the output buffer is too full</span>
+    writer.close()
+
+async <span class="kw">def</span> main():
+    server = await asyncio.start_server(handle, <span class="str">"127.0.0.1"</span>, <span class="num">9006</span>)
+    async <span class="kw">with</span> server:
+        await server.serve_forever()
+
+asyncio.run(main())</code></pre>
+      Which of your pieces does each line correspond to? (<code>await reader.read</code> is your <code>recv</code>; <code>drain()</code> is your <code>send_all</code> waiting on <code>WriteWait</code>; the output buffer behind <code>write</code> is milestone 3.) Then run it as <code>PYTHONASYNCIODEBUG=1 python3 script.py</code> and add a <code>time.sleep(0.5)</code> to <code>handle</code>: asyncio's debug mode logs a warning that a callback took too long, which is loop lag detection built in.</li>
+    <li><strong>Watch the syscalls (Linux).</strong> macOS has no <code>strace</code> (and <code>dtruss</code> needs system protections turned off, so skip it), but on Linux:
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">strace -f -e trace=epoll_wait,epoll_ctl python3 solution.py coroutine-echo</span></code></pre>
+      Connect with <code>nc</code> and type. You should see <code>epoll_ctl</code> calls as your loop adds, modifies and removes interest, and <code>epoll_wait</code> calls whose last argument is your timeout in milliseconds: <code>-1</code> (forever) when nothing is scheduled, <code>0</code> when callbacks are ready, and a small number while a timer is pending. That last argument is milestone 1's "pick a timeout", seen from the kernel's side. (Python rounds the timeout up to whole milliseconds. <code>strace</code> needs permission to trace your own processes; on locked-down systems it may refuse, and that's fine.)</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>One loop per core.</strong> A single loop uses one core. On Linux, <code>setsockopt(SOL_SOCKET, SO_REUSEPORT, 1)</code> lets several processes bind the same port, and the kernel spreads new connections across them. Fork N children (<code>os.fork</code>, <a href="../chapters/05-processes.html">chapter 5</a>; <code>multiprocessing</code> also works), each with its own <code>EventLoop</code>, and compare throughput with the single loop. This is the layout of nginx workers (<a href="../cases/case-04-c10k-nginx.html">case 4</a>). macOS also has <code>SO_REUSEPORT</code> but spreads connections differently, so measure rather than assume.</li>
+  <li><strong>A timer wheel.</strong> A heap costs O(log n) per timer, which hurts with millions of timeouts (one per idle connection). A <em>timer wheel</em> is a ring of buckets, one per tick; a timer goes in the bucket for its deadline, and each tick you run one bucket. Add and cancel become O(1). Implement a hashed wheel for coarse timeouts such as idle-connection kicks and compare it with the heap.</li>
+  <li><strong>Cancellable timers.</strong> Make <code>call_later</code> return a handle with <code>cancel()</code>. Heaps cannot remove from the middle cheaply; mark the entry cancelled and skip it when popped, and rebuild the heap if too many dead entries pile up.</li>
+  <li><strong>Read-stop backpressure.</strong> In the milestone 3 server, instead of closing a slow client, stop reading from it (<code>remove_reader</code>) while its buffer is above a high-water mark, and resume below a low-water mark.</li>
+  <li><strong>Idle timeouts.</strong> Close any connection that has been silent for 30 seconds, using one timer per connection or, better, one periodic sweep.</li>
+  <li><strong>Calling the outside world.</strong> Add <code>loop.run_in_thread(fn, callback)</code> that runs <code>fn</code> on a worker thread and delivers the result back to the loop thread. You'll need a way to wake <code>select</code> from another thread: a <code>socket.socketpair()</code> registered as a reader is the classic trick (the "self-pipe").</li>
+  <li><strong>Futures.</strong> Add a <code>Future</code> class and let a task <code>yield</code> one, so tasks can wait for other tasks. You have just invented <code>await task</code>.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Every node in a distributed system is a process that waits on many peers at once, and most are built around one of these loops: a Raft leader's heartbeat is a timer; its followers' election timeouts are timers; the network connections to peers are readers and writers; the RPC handlers must never block. That last part is why a <em>stop-the-world</em> pause (a long GC, a blocked loop, a slow disk) is so dangerous in a cluster: a node that misses its heartbeat looks dead to everyone else, even though it was only busy. The loop lag you measured here is the same number that, in production, decides whether a healthy node gets declared failed. And your bounded output buffer is the smallest version of what every message queue must decide: when a consumer cannot keep up, do you buffer, slow the producer down, or cut the consumer off? Part 6 of the networking course, and the Data Systems course later, meet that question again under names like <em>backpressure</em> and <em>flow control</em>.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>An event loop is a <code>while</code> loop around three things: a queue of ready callbacks, a heap of timers, and a selector. Its only sleep is <code>select(timeout)</code>, with the timeout set to the next deadline.</li>
+    <li>Timers use the monotonic clock, and a <code>(deadline, seq)</code> key makes equal deadlines run in FIFO order.</li>
+    <li>Readiness is level-triggered: register write interest only while an output buffer is non-empty, or the loop spins.</li>
+    <li>Writes can be partial, so every connection needs an output buffer, and that buffer needs a bound and a policy: stop reading, or close the slow consumer.</li>
+    <li>A coroutine is a generator that yields "wake me when..." requests; a <code>Task</code> resumes it when the loop says so. That is the machinery under <code>async</code>/<code>await</code>.</li>
+    <li>One thread can hold a thousand connections; the first wall is the file-descriptor limit, not the CPU.</li>
+    <li>Nothing on the loop thread may block. Loop lag is the number that tells you when something does.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Your timer heap stores <code>(deadline, fn, args)</code> without a sequence number. What can go wrong?</p>
+    <ol class="q-options">
+      <li>Nothing: the heap only looks at the deadline</li>
+      <li>Two timers with exactly equal deadlines make Python compare the functions, which raises <code>TypeError</code>, and equal deadlines no longer have a guaranteed order</li>
+      <li>The heap can no longer find the earliest deadline</li>
+      <li>Timers fire twice</li>
+    </ol>
+    <div class="q-explain">Tuples compare element by element. If the deadlines tie, the next elements are compared, and functions cannot be ordered. A unique, increasing <code>seq</code> in second place settles every tie, and doubles as the first-come-first-served rule for timers due at the same moment.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">An echo server leaves every connection registered with <code>add_writer</code> permanently, "just in case". What do you observe?</p>
+    <ol class="q-options">
+      <li>Replies are sent faster</li>
+      <li>Nothing, it only uses a bit more memory</li>
+      <li>The loop wakes up on every pass because sockets are almost always writable, so it burns a whole core doing nothing</li>
+      <li>The OS closes the connections</li>
+    </ol>
+    <div class="q-explain">Readiness is level-triggered: "has room in its send buffer" is true almost all the time, so <code>select</code> returns at once, over and over. Register write interest only while you have bytes to send, and remove it when the buffer empties.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">In the coroutine echo server, what does <code>data = yield from recv(conn, 65536)</code> do when no data has arrived yet?</p>
+    <ol class="q-options">
+      <li>It yields a <code>ReadWait</code> to the Task, which registers a reader and returns to the loop; the coroutine stays paused (using no thread) while other tasks and callbacks run</li>
+      <li>It blocks the thread until data arrives</li>
+      <li>It polls the socket in a tight loop</li>
+      <li>It raises <code>BlockingIOError</code> to the caller</li>
+    </ol>
+    <div class="q-explain">The coroutine pauses at the <code>yield</code>, keeping its local variables. The Task turns the request into a selector registration and returns control to the loop. When the socket becomes readable, the loop calls the Task, which resumes the coroutine right where it stopped. This is what <code>await</code> does.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Your server handles 1,000 connections normally. One handler starts calling <code>time.sleep(0.2)</code>. What happens to a client whose request arrives while it sleeps?</p>
+    <ol class="q-options">
+      <li>Nothing: the sleeping handler is just one of 1,000 tasks</li>
+      <li>It is served by a spare thread</li>
+      <li>Only clients that talk to the same handler are slowed</li>
+      <li>It waits until the sleep ends, because the one loop thread is stuck inside that call; every client sees about 0.2 s of extra latency, and loop lag jumps to about 200 ms</li>
+    </ol>
+    <div class="q-explain">There is exactly one thread, and a callback runs to completion before the loop looks at anything else. A blocking call therefore freezes all connections and all timers. Use <code>yield Sleep(0.2)</code> (or <code>await asyncio.sleep</code>), or move genuinely blocking work to a thread pool.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZooKeeper: Wait-Free Coordination &middot; Distributed Systems, Deep</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dist" data-case="C2">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>ZooKeeper: Wait-Free Coordination</h1>
+  <p class="lede">Chubby offered clients a lock service. The ZooKeeper authors, working at Yahoo!, took a different route: expose a tiny file-system-like API with no blocking calls, promise strong order, and let applications build their own locks, elections and barriers on top. This case is about that choice, about what the ordering guarantees buy, and about the sharp edge it leaves: reads that can be stale.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">The pattern in one sentence</p>
+  <p><strong>A coordination kernel offers non-blocking primitives with a precise ordering contract (linearizable writes, FIFO per client, ordered notifications), and clients build blocking recipes such as locks and barriers out of them,</strong> so one slow client can never stall the service.</p>
+</div>
+
+<h2>The cast</h2>
+
+<p>This builds on <a href="../chapters/11-coordination-services.html">chapter 11</a>, which describes ZooKeeper's data model and recipes at overview level, and on <a href="../chapters/08-consensus-smr.html">chapter 8</a> for the replicated state machine idea. This page goes into why those parts are shaped as they are. Facts are from Hunt, Konar, Junqueira and Reed, USENIX ATC 2010, unless marked as general.</p>
+
+<dl class="terms">
+  <dt>Znode</dt><dd>An in-memory data node in a hierarchical namespace (the <em>data tree</em>). Znodes are meant for coordination metadata, not bulk data, and carry version counters and timestamps so that updates can be conditional.</dd>
+  <dt>Regular, ephemeral, sequential</dt><dd>A regular znode lives until deleted. An <em>ephemeral</em> znode is also removed when the session that created it ends. A <em>sequential</em> flag appends a monotonically increasing counter to the name, never smaller than that of any other sequential child of the same parent.</dd>
+  <dt>Session</dt><dd>A client's connection state, with a timeout. A session survives moving between servers. Ephemeral znodes are tied to it.</dd>
+  <dt>Watch</dt><dd>A one-time trigger attached to a read. When the thing read changes, the server sends one notification, saying <em>that</em> something changed but not the new value, and the watch is gone.</dd>
+  <dt>Ensemble, leader, follower</dt><dd>The replicated servers that provide the service. All updates go through the leader, which broadcasts them with <em>Zab</em>, an atomic broadcast protocol, using simple majority quorums.</dd>
+  <dt>zxid</dt><dd>A transaction id that orders all state changes. Every response carries the zxid it is relative to, and reads are tagged with the last zxid their server has seen.</dd>
+</dl>
+
+<h2>Wait-free by design</h2>
+
+<p>The authors say they moved away from blocking primitives such as locks because, in a coordination service, a slow or faulty client holding something can hurt faster clients, and because the service itself gets more complicated if processing one request depends on the responses and the failure detection of other clients. The resulting API looks, in the authors' words, like "Chubby without the lock methods" and without open and close. Each call names a full path, so the server keeps no handle state.</p>
+
+<p><em>Wait-free</em> here means that an operation completes without waiting for any other client. The service supports: <code>create</code> (with flags for regular, ephemeral and sequential), <code>delete</code> and <code>setData</code> with an expected version, <code>exists</code>, <code>getData</code> and <code>getChildren</code> (each can set a watch), and <code>sync</code>. Updates take an expected version, so a client can do compare-and-set with no lock. Every call has an asynchronous form, and the client library delivers callbacks in order, so a client can keep many operations outstanding. The paper gives numbers: a new leader that must update 5,000 znodes takes about 10 seconds if each change (about 2 ms) is issued after the previous one completes, but under a second when pipelined.</p>
+
+<p>Wait-free is not the same as weakly ordered. Wait-freedom alone, the authors note, is not sufficient for coordination, so the service adds an order contract.</p>
+
+<h2>The ordering guarantees</h2>
+
+<p>There are two:</p>
+
+<ul>
+  <li><strong>Linearizable writes.</strong> All requests that update state are serialised and respect real-time precedence. The paper calls its flavour <em>A-linearizability</em> (asynchronous linearizability), because a client may have several outstanding operations rather than one, as in Herlihy and Wing's original definition.</li>
+  <li><strong>FIFO client order.</strong> All requests from one client execute in the order the client sent them.</li>
+</ul>
+
+<p>See <a href="../chapters/05-consistency-models.html">chapter 5</a> for the formal vocabulary. Note what is <em>missing</em>: reads are not linearizable. The authors observe that only writes need to be, and that the two guarantees together suffice for the primitives their applications need.</p>
+
+<p>Their illustration is the <strong>ready znode</strong>. A new leader must rewrite many configuration znodes, and workers must not use a half-updated configuration; if the leader dies partway, they must not use the partial result. A lock would help with the first requirement but not the second. Instead the leader deletes <code>ready</code>, updates the configuration znodes (all pipelined), then creates <code>ready</code>. Because of FIFO order and linearizable writes, a process that sees <code>ready</code> must also see all the new configuration. If the leader dies first, <code>ready</code> never appears and nobody uses the partial state. A reader who saw <code>ready</code> before the update began is covered by a third guarantee: a client that sets a watch is notified of a change <em>before</em> it can see the new state.</p>
+
+<h2>Reads served locally, and sync</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 312" role="img" aria-label="Space-time diagram. A read is answered by the server the client is connected to. A write is forwarded to the leader, proposed to the servers, acknowledged by a majority, committed, and the client is answered by its own server.">
+<defs>
+<marker id="ahXC1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+<marker id="ahXC1bblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker>
+<marker id="ahXC1bgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker>
+<marker id="ahXC1bred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker>
+<marker id="ahXC1borange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker>
+<marker id="ahXC1bpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker>
+<marker id="ahXC1bcyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker>
+</defs>
+<line x1="96" y1="45" x2="748" y2="45" class="line-thin"/>
+<text x="8" y="49" class="t-sm t-bold tc-green">Client</text>
+<line x1="96" y1="115" x2="748" y2="115" class="line-thin"/>
+<text x="8" y="119" class="t-sm t-bold tc-blue">Server 1</text>
+<line x1="96" y1="185" x2="748" y2="185" class="line-thin"/>
+<text x="8" y="189" class="t-sm t-bold tc-purple">Leader</text>
+<line x1="96" y1="255" x2="748" y2="255" class="line-thin"/>
+<text x="8" y="259" class="t-sm t-bold tc-blue">Server 2</text>
+<line x1="110" y1="45" x2="130" y2="115" class="line s-blue" marker-end="url(#ahXC1bblue)"/>
+<rect x="85" y="72" width="31" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="100" y="82" text-anchor="middle" class="t-xs tc-blue">read</text>
+<line x1="140" y1="115" x2="160" y2="45" class="line s-green" marker-end="url(#ahXC1bgreen)"/>
+<rect x="134" y="56" width="76" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="172" y="66" text-anchor="middle" class="t-xs tc-green">local answer</text>
+<line x1="230" y1="45" x2="250" y2="115" class="line s-blue" marker-end="url(#ahXC1bblue)"/>
+<rect x="250" y="66" width="36" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="268" y="76" text-anchor="middle" class="t-xs tc-blue">write</text>
+<line x1="262" y1="115" x2="290" y2="185" class="line s-blue" marker-end="url(#ahXC1bblue)"/>
+<rect x="216" y="146" width="48" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="240" y="156" text-anchor="middle" class="t-xs tc-blue">forward</text>
+<line x1="305" y1="185" x2="330" y2="115" class="line s-blue" marker-end="url(#ahXC1bblue)"/>
+<line x1="305" y1="185" x2="340" y2="255" class="line s-blue" marker-end="url(#ahXC1bblue)"/>
+<rect x="258" y="222" width="48" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="282" y="232" text-anchor="middle" class="t-xs tc-blue">propose</text>
+<line x1="352" y1="115" x2="375" y2="185" class="line s-green" marker-end="url(#ahXC1bgreen)"/>
+<line x1="358" y1="255" x2="385" y2="185" class="line s-green" marker-end="url(#ahXC1bgreen)"/>
+<rect x="399" y="226" width="25" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="412" y="236" text-anchor="middle" class="t-xs tc-green">ack</text>
+<line x1="400" y1="185" x2="426" y2="115" class="line s-orange" marker-end="url(#ahXC1borange)"/>
+<line x1="400" y1="185" x2="432" y2="255" class="line s-orange" marker-end="url(#ahXC1borange)"/>
+<rect x="449" y="224" width="42" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="470" y="234" text-anchor="middle" class="t-xs tc-orange">commit</text>
+<line x1="442" y1="115" x2="470" y2="45" class="line s-green" marker-end="url(#ahXC1bgreen)"/>
+<rect x="490" y="68" width="36" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="508" y="78" text-anchor="middle" class="t-xs tc-green">reply</text>
+<text x="560" y="120" text-anchor="start" class="t-xs">reply only after the change is</text>
+<text x="560" y="136" text-anchor="start" class="t-xs">delivered at the client's server</text>
+<text x="560" y="190" text-anchor="start" class="t-xs">majority of servers acknowledges</text>
+<text x="560" y="206" text-anchor="start" class="t-xs">(leader and Server 1 are enough)</text>
+  </svg>
+  <figcaption><strong>Reads local, writes global.</strong> The propose / acknowledge / commit shape is the general form of leader-based atomic broadcast; the ATC paper leaves the details of Zab to its own paper, so treat the exact message names as illustrative.</figcaption>
+</figure>
+
+
+<p>Every server holds a full in-memory copy of the data tree and answers reads from it, without disk activity or any agreement protocol. This is the central performance decision: the target workloads have read-to-write ratios from 2:1 to 100:1, and read throughput grows as servers are added. The price is stated in the paper: a read can return a stale value even though a newer update to the same znode has committed, so precedence order is not guaranteed for reads.</p>
+
+<p>The paper also describes how a client moving to a new server never goes backwards: the new server compares the client's last zxid with its own and does not re-establish the session until it has caught up. So one client sees time move forward, but two clients on two servers can see different moments.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 332" role="img" aria-label="Space-time diagram. Client A writes a configuration through the leader and then tells client B over a side channel. B reads from a server that has not yet seen the write and gets the old value. B then issues sync followed by a read and gets the new value.">
+<defs>
+<marker id="ahXC1c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+<marker id="ahXC1cblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker>
+<marker id="ahXC1cgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker>
+<marker id="ahXC1cred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker>
+<marker id="ahXC1corange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker>
+<marker id="ahXC1cpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker>
+<marker id="ahXC1ccyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker>
+</defs>
+<line x1="96" y1="45" x2="748" y2="45" class="line-thin"/>
+<text x="8" y="49" class="t-sm t-bold tc-green">Client A</text>
+<line x1="96" y1="115" x2="748" y2="115" class="line-thin"/>
+<text x="8" y="119" class="t-sm t-bold tc-purple">Leader</text>
+<line x1="96" y1="185" x2="748" y2="185" class="line-thin"/>
+<text x="8" y="189" class="t-sm t-bold tc-blue">B's server</text>
+<line x1="96" y1="255" x2="748" y2="255" class="line-thin"/>
+<text x="8" y="259" class="t-sm t-bold tc-green">Client B</text>
+<line x1="110" y1="45" x2="138" y2="115" class="line s-blue" marker-end="url(#ahXC1cblue)"/>
+<rect x="70" y="72" width="59" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="100" y="82" text-anchor="middle" class="t-xs tc-blue">write cfg</text>
+<line x1="150" y1="115" x2="178" y2="45" class="line s-green" marker-end="url(#ahXC1cgreen)"/>
+<rect x="180" y="74" width="19" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="190" y="84" text-anchor="middle" class="t-xs tc-green">ok</text>
+<line x1="150" y1="115" x2="395" y2="185" class="line-dash s-orange" marker-end="url(#ahXC1corange)"/>
+<rect x="244" y="136" width="82" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="285" y="146" text-anchor="middle" class="t-xs tc-orange">commit (slow)</text>
+<line x1="200" y1="45" x2="238" y2="255" class="line-dash s-orange" marker-end="url(#ahXC1corange)"/>
+<rect x="128" y="160" width="99" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="178" y="170" text-anchor="middle" class="t-xs tc-orange">'config changed'</text>
+<line x1="260" y1="255" x2="284" y2="185" class="line s-blue" marker-end="url(#ahXC1cblue)"/>
+<rect x="225" y="215" width="31" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="240" y="225" text-anchor="middle" class="t-xs tc-blue">read</text>
+<line x1="296" y1="185" x2="320" y2="255" class="line s-red" marker-end="url(#ahXC1cred)"/>
+<rect x="315" y="222" width="59" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="345" y="232" text-anchor="middle" class="t-xs tc-red">old value</text>
+<line x1="430" y1="255" x2="456" y2="185" class="line s-blue" marker-end="url(#ahXC1cblue)"/>
+<rect x="380" y="216" width="65" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="412" y="226" text-anchor="middle" class="t-xs tc-blue">sync, read</text>
+<line x1="468" y1="185" x2="492" y2="115" class="line s-blue" marker-end="url(#ahXC1cblue)"/>
+<rect x="505" y="138" width="31" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="520" y="148" text-anchor="middle" class="t-xs tc-blue">sync</text>
+<line x1="504" y1="115" x2="530" y2="185" class="line s-purple" marker-end="url(#ahXC1cpurple)"/>
+<line x1="542" y1="185" x2="566" y2="255" class="line s-green" marker-end="url(#ahXC1cgreen)"/>
+<rect x="590" y="222" width="59" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="620" y="232" text-anchor="middle" class="t-xs tc-green">new value</text>
+<text x="556" y="98" text-anchor="start" class="t-xs">leader orders the sync after</text>
+<text x="556" y="112" text-anchor="start" class="t-xs">all writes pending for B's server</text>
+<text x="382" y="318" text-anchor="middle" class="t-xs tc-red">B's read was ordered before the commit reached its server</text>
+  </svg>
+  <figcaption><strong>Why sync exists.</strong> Without it, B can observe a state older than something B was told about outside ZooKeeper. A <code>sync</code> placed before the read makes B's server catch up with the writes that were already pending at the leader.</figcaption>
+</figure>
+
+
+<p>The authors' second scenario is a side channel. Clients A and B share a configuration in ZooKeeper and also talk directly. A changes the configuration and tells B; B's server is a little behind, so B may not see the change. Issuing a write first would fix it, but that costs a full broadcast. <code>sync</code> is the cheaper tool: followed by a read, it makes B's server apply all pending writes before serving the read, which the paper calls a slow read. In their implementation sync is placed at the end of the request queue between the leader and the follower, so it is not broadcast. It relies on the follower being sure that the leader is still the leader, which they handle with a null transaction or with timeouts, chosen so that leaders realise they have lost leadership before followers abandon them.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "ZooKeeper is linearizable"</p>
+  <p>Writes are. Reads, by default, are not: they are served by whichever server the client is attached to. A program that needs the latest value must issue a <code>sync</code> before the read (the paper's way) or otherwise arrange it. <a href="case-04-jepsen-etcd.html">Case 4</a> is about a system, etcd, that made the opposite default: reads linearizable, with a flag for stale ones.</p>
+</div>
+
+<h2>Watches</h2>
+
+<p>Watches replace polling. They are one-time triggers, tied to the session and removed when they fire. They tell the client that data changed but not the new data. If a znode changes three times between a notification and the client's next read, there is no second or third notification: the client already knows that what it has is stale. Notifications are handled locally by the server the client is attached to, and are ordered strictly with respect to writes: the server sends and clears the notification for a write before it processes any later write or read. Session events such as connection loss are delivered to watch callbacks too, so clients know that notifications may be late.</p>
+
+<p>The paper contrasts this with Chubby. Chubby manages client caches directly and blocks an update until each caching client has invalidated, using leases to bound the delay a slow client can cause. In ZooKeeper, the authors say, watches avoid the problem altogether, because no write waits on any client.</p>
+
+<h2>Recipes</h2>
+
+<p>The paper stresses that the service knows nothing about these primitives; they are client-side code over the API. Examples it gives:</p>
+
+<ul>
+  <li><strong>Group membership.</strong> Each member creates an ephemeral child of a group znode; its disappearance signals failure. Listing the children, with a watch, shows who is alive.</li>
+  <li><strong>Configuration management.</strong> Read a configuration znode with a watch; when notified, read again, setting the watch again.</li>
+  <li><strong>Rendezvous.</strong> A znode that the master fills with its address, which workers read with a watch to wait.</li>
+  <li><strong>Simple lock.</strong> Try to create an ephemeral znode; if it exists, watch it. This works but suffers the <em>herd effect</em>: when it is deleted, every waiter wakes though only one can win, and it is exclusive-only.</li>
+  <li><strong>Lock without the herd.</strong> Create an ephemeral sequential child; if yours is the lowest you hold the lock; otherwise watch only the znode just before yours. Deleting yours (or your session dying) wakes exactly one waiter.</li>
+  <li><strong>Read/write locks and double barriers</strong> built the same way.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 230" role="img" aria-label="A znode /lock with three ephemeral sequential children. The child with the lowest number holds the lock. Each other child watches only the child just before it.">
+<defs>
+<marker id="ahXC1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+<marker id="ahXC1ablue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker>
+<marker id="ahXC1agreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker>
+<marker id="ahXC1ared" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker>
+<marker id="ahXC1aorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker>
+<marker id="ahXC1apurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker>
+<marker id="ahXC1acyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker>
+</defs>
+<rect x="300" y="14" width="160" height="36" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="380.0" y="36.0" text-anchor="middle" class="t-sm t-bold">/lock</text>
+<rect x="30" y="90" width="200" height="50" rx="8" class="fs-yellow s-yellow sw-2"/>
+<text x="130.0" y="112.0" text-anchor="middle" class="t-sm t-bold">lock-0001</text>
+<text x="130.0" y="128.0" text-anchor="middle" class="t-xs t-muted">client A: holds the lock</text>
+<rect x="280" y="90" width="200" height="50" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="380.0" y="112.0" text-anchor="middle" class="t-sm t-bold">lock-0002</text>
+<text x="380.0" y="128.0" text-anchor="middle" class="t-xs t-muted">client B: waits</text>
+<rect x="530" y="90" width="200" height="50" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="630.0" y="112.0" text-anchor="middle" class="t-sm t-bold">lock-0003</text>
+<text x="630.0" y="128.0" text-anchor="middle" class="t-xs t-muted">client C: waits</text>
+<line x1="380" y1="50" x2="130" y2="88" class="line"/>
+<line x1="380" y1="50" x2="380" y2="88" class="line"/>
+<line x1="380" y1="50" x2="630" y2="88" class="line"/>
+<line x1="278" y1="115" x2="232" y2="115" class="line s-orange" marker-end="url(#ahXC1aorange)"/>
+<rect x="237" y="94" width="36" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="255" y="104" text-anchor="middle" class="t-xs tc-orange">watch</text>
+<line x1="528" y1="115" x2="482" y2="115" class="line s-orange" marker-end="url(#ahXC1aorange)"/>
+<rect x="487" y="94" width="36" height="14" rx="3" style="fill:var(--bg-alt)"/>
+<text x="505" y="104" text-anchor="middle" class="t-xs tc-orange">watch</text>
+<text x="130" y="172" text-anchor="middle" class="t-xs tc-red">if A releases or its session dies,</text>
+<text x="130" y="188" text-anchor="middle" class="t-xs tc-red">only B's watch fires: no herd</text>
+<text x="380" y="218" text-anchor="middle" class="t-xs">if B dies instead, C's watch fires and C re-checks whether it is now lowest</text>
+  </svg>
+  <figcaption><strong>The lock recipe without a herd.</strong> Each waiter creates an ephemeral, sequential znode and watches only its predecessor. Ephemeral means the znode disappears with the client's session, so crashes release the lock; sequential means the order is fixed by the service.</figcaption>
+</figure>
+
+
+<p>The toy store below (mine, not ZooKeeper's code) counts how many waiting clients wake up for each recipe, and shows what happens when a waiter in the middle of the queue dies.</p>
+
+<pre class="terminal" data-title="lock_recipes.py"><code><span class="cmd">"""ZooKeeper-style lock recipes on a toy znode store (not ZooKeeper's code)."""
+class Store:
+    def __init__(self):
+        self.nodes, self.seq, self.watches, self.wakeups = {}, 0, {}, 0   # name -&gt; owner session
+    def create_seq(self, prefix, owner):
+        self.seq += 1
+        name = f"{prefix}{self.seq:04d}"
+        self.nodes[name] = owner
+        return name
+    def create(self, name, owner):
+        if name in self.nodes: return False
+        self.nodes[name] = owner
+        return True
+    def exists_watch(self, name, client):
+        if name in self.nodes:
+            self.watches.setdefault(name, []).append(client)
+            return True
+        return False
+    def delete(self, name):
+        del self.nodes[name]
+        woken = self.watches.pop(name, [])      # one-shot watches fire on deletion
+        self.wakeups += len(woken)
+        return woken
+    def expire_session(self, owner):            # ephemeral nodes vanish with their session
+        woken = []
+        for n in [n for n, o in self.nodes.items() if o == owner]:
+            woken += self.delete(n)
+        return woken
+
+def simple_lock(n_clients):
+    s = Store()
+    s.create("/lock", "c0")                                     # c0 holds it
+    for i in range(1, n_clients):
+        s.exists_watch("/lock", f"c{i}")                        # everyone else watches the same node
+    s.delete("/lock")
+    return s.wakeups
+
+def queue_lock(n_clients, crash_middle=False):
+    s = Store()
+    mine = [s.create_seq("/lock/n-", f"c{i}") for i in range(n_clients)]
+    for i in range(1, n_clients):
+        s.exists_watch(mine[i - 1], f"c{i}")                    # each client watches only its predecessor
+    if crash_middle:
+        s.expire_session("c3")
+        owner_after = f"c{min(i for i in range(n_clients) if mine[i] in s.nodes)}"
+        return s.wakeups, owner_after
+    s.delete(mine[0])
+    return s.wakeups, "c1"
+
+N = 20
+print(f"{N} clients waiting, holder releases")
+print("  simple lock-file recipe : watchers woken =", simple_lock(N))
+w, o = queue_lock(N)
+print("  sequential-node recipe  : watchers woken =", w, "-&gt; next holder", o)
+w, o = queue_lock(N, crash_middle=True)
+print("  waiter c3 crashes       : watchers woken =", w, "(c4 re-checks; c0 still holds) holder:", o)</span></code></pre>
+<p>Output when run:</p>
+<pre class="terminal" data-title="output"><code>20 clients waiting, holder releases
+  simple lock-file recipe : watchers woken = 19
+  sequential-node recipe  : watchers woken = 1 -&gt; next holder c1
+  waiter c3 crashes       : watchers woken = 1 (c4 re-checks; c0 still holds) holder: c0</code></pre>
+
+<div class="callout note">
+  <p class="callout-title">A lock recipe is still a lease-based lock</p>
+  <p>The ephemeral znode disappears when the <em>session times out</em>, not when the process stops. A process that is paused longer than its session timeout may wake up and still believe it holds the lock. The ZooKeeper paper does not discuss this; it is the same gap as in <a href="../chapters/04-leases-fencing.html">chapter 4</a>. Kleppmann's 2016 post, discussed in <a href="case-03-redlock.html">case 3</a>, suggests using the zxid or the znode version as a fencing token. <em>That is a general recommendation from outside this paper.</em></p>
+</div>
+
+<h2>Zab and the replicated database</h2>
+
+<p>When a server receives a write, it forwards it to the leader. The leader computes what the state <em>will be</em> once the write is applied, taking into account outstanding transactions not yet applied, and turns the request into a <em>transaction</em> that records the new state, for example a <code>setDataTXN</code> with the new data, the new version number and updated timestamps, or an <code>errorTXN</code> if a version check will fail. Transactions are idempotent. They are broadcast with Zab, and the server the client is attached to replies when it delivers the change.</p>
+
+<p>Zab uses majority quorums, so with 2f+1 servers ZooKeeper tolerates f failures. The paper says Zab gives stronger order guarantees than plain atomic broadcast: changes by a leader are delivered in order, and all changes from previous leaders are delivered to a new leader before it broadcasts its own. During normal operation delivery is in order and exactly once, but recovery may redeliver messages, which is acceptable because transactions are idempotent and still in order.</p>
+
+<p>Idempotence makes <em>fuzzy snapshots</em> possible. The server walks the tree depth-first without locking and writes what it sees. The result may not match any real instant: the paper's example has <code>/foo</code> and <code>/goo</code> both at version 1, a stream of three changes, and a snapshot that captured /foo at version 3 but /goo at version 1. Replaying the changes in order from the start of the snapshot lands on the correct final state anyway, because applying a change twice is harmless.</p>
+
+<h2>Performance and the numbers</h2>
+
+<p>The paper's benchmark ran on a cluster of 50 servers, with 35 machines simulating 250 clients, and each request a read or write of 1 KB of data. Throughput of a saturated system at the two extremes:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Servers</th><th>100% reads (ops/s)</th><th>0% reads (ops/s)</th></tr></thead>
+  <tbody>
+    <tr><td>3</td><td>87k</td><td>21k</td></tr>
+    <tr><td>5</td><td>165k</td><td>18k</td></tr>
+    <tr><td>7</td><td>257k</td><td>14k</td></tr>
+    <tr><td>9</td><td>296k</td><td>12k</td></tr>
+    <tr><td>13</td><td>460k</td><td>8k</td></tr>
+  </tbody>
+</table></div>
+
+<p>Reading the table: more servers raise read capacity and lower write capacity. It is the direct consequence of the design: reads are local, writes need the leader to talk to a majority. The paper's own measurement of a production workload (the Yahoo! Fetching Service) found the read:write ratio varying between 10:1 and 100:1 when traffic exceeded a thousand operations a second.</p>
+
+<h2>What was learned, and the trade-offs</h2>
+
+<p>This is a design and evaluation paper, not a postmortem, so the lessons are the caveats the authors themselves state:</p>
+
+<div class="cols">
+  <div class="card accent-orange"><h4>Fast reads cost precedence</h4><p>Because reads skip the agreement protocol, a read can lag the newest committed write. The remedy is explicit: <code>sync</code>, or issuing a write. The designers chose to make the common case cheap and the rare case explicit.</p></div>
+  <div class="card accent-blue"><h4>Order beats locks for some jobs</h4><p>The ready znode shows that FIFO order and linearizable writes cover cases where a lock is insufficient (a leader dying with a half-done update).</p></div>
+  <div class="card accent-green"><h4>Push blocking to the client</h4><p>Locks and barriers are client code. A bug or slowness there cannot wedge the service, and applications can pick the recipe that fits them rather than one fixed primitive.</p></div>
+  <div class="card accent-red"><h4>Watches can collapse</h4><p>A burst of changes yields one notification. That is correct for "refresh your copy" uses and wrong for "process every change" uses, so the recipes always re-read after a notification.</p></div>
+</div>
+
+<h2>The pattern to remember</h2>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the notice board, not the door lock</p>
+  <p>Chubby is a building with a doorman who hands out keys. ZooKeeper is a notice board with strict rules about the order notes appear: anyone can pin a note, notes carry numbers, and nobody has to wait for anyone else. People build their own queue-numbering, sign-up sheets and "meeting is on" signs from it.</p>
+  <p><em>Where it breaks down:</em> a real notice board shows everyone the same state at once. Each ZooKeeper server shows its own copy, which may be a moment behind.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Wait-free primitives plus two ordering guarantees (linearizable writes, FIFO client order) are enough to build locks, elections, barriers and config management on the client side.</li>
+    <li>Reads are served by any server from memory and may be stale; <code>sync</code> before a read forces freshness at the cost of a slower read.</li>
+    <li>Watches are one-shot, carry no data, and are ordered before the state change they report.</li>
+    <li>Zab turns requests into idempotent transactions, which makes recovery and fuzzy snapshots simple.</li>
+    <li>Read capacity scales with servers; write capacity does not.</li>
+  </ul>
+</div>
+
+<h2>Connect it</h2>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <ul>
+    <li><a href="../chapters/11-coordination-services.html">Chapter 11</a>: ZooKeeper and etcd side by side, and the list of things that do not belong in a coordination service.</li>
+    <li><a href="../chapters/08-consensus-smr.html">Chapter 8</a>: Zab is a replicated state machine broadcast. The leader-computes-new-state step is how nondeterministic client requests become deterministic log entries.</li>
+    <li><a href="../chapters/05-consistency-models.html">Chapter 5</a>: linearizable writes with possibly stale reads, plus per-client FIFO, is a mixed contract. Compare it with session guarantees in <a href="../chapters/06-causal-session.html">chapter 6</a>.</li>
+    <li><a href="../chapters/04-leases-fencing.html">Chapter 4</a> and <a href="case-01-chubby.html">case 1</a>: Chubby's sequencers answer the pause problem that the ZooKeeper paper leaves to the application.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why did the ZooKeeper authors avoid blocking primitives such as locks in the service's API?</p>
+    <ol class="q-options">
+      <li>Locks cannot be implemented on top of a file-system-like API</li>
+      <li>A slow or faulty client holding a blocking primitive can hurt faster clients, and the service gets more complicated</li>
+      <li>Locks are illegal in Zab</li>
+      <li>Blocking calls cannot be linearizable</li>
+    </ol>
+    <div class="q-explain">The paper gives exactly this reason. Locks can still be built by clients from ephemeral and sequential znodes.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A client calls getData with a watch, and the znode changes three times before the client reads again. How many notifications does it receive?</p>
+    <ol class="q-options">
+      <li>Three, one per change</li>
+      <li>None</li>
+      <li>One: watches are one-time triggers that say something changed, not what</li>
+      <li>One per server in the ensemble</li>
+    </ol>
+    <div class="q-explain">The watch fires once and is removed. The client re-reads and sets a new watch.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Client A writes to ZooKeeper, then tells client B by another channel. B reads and sees the old value. What does the paper offer to prevent this?</p>
+    <ol class="q-options">
+      <li>Run the read against the leader only</li>
+      <li>Use sync before the read so the server applies all pending writes</li>
+      <li>Use ephemeral znodes</li>
+      <li>Disable watches</li>
+    </ol>
+    <div class="q-explain">Reads are local and can be stale. sync followed by a read makes the server catch up first.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">In the lock recipe without a herd effect, why does each client watch only the znode immediately before its own?</p>
+    <ol class="q-options">
+      <li>Because watches can only be set on the previous sequence number</li>
+      <li>So that when the holder releases or dies, exactly one waiter is woken instead of all of them</li>
+      <li>To make the lock fair across data centres</li>
+      <li>Because ZooKeeper forbids more than one watch per znode</li>
+    </ol>
+    <div class="q-explain">Lining up the waiters and watching only the predecessor avoids waking everyone when one waiter can win. If a middle waiter dies, its successor wakes and re-checks.</div>
+  </div>
+</section>
+<h2>Sources</h2>
+<ul class="sources">
+  <li><a href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf" target="_blank" rel="noopener">P. Hunt, M. Konar, F. P. Junqueira and B. Reed, "ZooKeeper: Wait-free coordination for Internet-scale systems", USENIX ATC 2010</a>. Fetched with WebFetch (the tool returned the PDF, which its summariser could not read, so the text was extracted locally with <code>pdftotext</code> and read). All facts, example values and the throughput table are from this paper. The Zab protocol itself is described in a separate paper that I did not read; where this page shows message names it says so. The toy store is mine.</li>
+  <li><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html" target="_blank" rel="noopener">M. Kleppmann, "How to do distributed locking", 2016</a>, fetched; used only for the note that a zxid or znode version can serve as a fencing token.</li>
+</ul>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

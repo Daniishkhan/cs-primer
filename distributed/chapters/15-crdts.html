@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRDTs: Data That Merges Itself · Distributed Systems, Deep</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/crdt-play.css">
+</head>
+<body data-root="../.." data-course="dist" data-chapter="15">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>CRDTs: Data That Merges Itself</h1>
+  <p class="lede">Coordination is expensive and sometimes impossible: a phone in a tunnel, a data centre across an ocean, an editor working offline on a plane. A conflict-free replicated data type (CRDT) is a data structure designed so that replicas can accept updates independently, exchange state in any order, with duplicates and delays, and still end up identical. This chapter explains the mathematics in pictures (a join-semilattice), builds counters, registers and sets in runnable Python, shows what is hard about collaborative text, compares CRDTs with operational transformation, and ends with the unglamorous problem every real deployment hits: tombstones.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Almost every system that lets two copies of the data change without talking to each other (a leaderless database, a multi-region active-active store, an offline-first mobile app, a collaborative editor) eventually faces <em>conflicts</em>. You can pick a winner and silently drop the loser's update, push the problem to the application, or design the data so that conflicts cannot arise. CRDTs are the third option, and they are the technical core of real products. Knowing which structures merge cleanly, and which invariants they cannot protect, is what lets you design systems that stay available during partitions without corrupting data.</p>
+</div>
+
+<h2>The problem: concurrent writes with no referee</h2>
+
+<p>In <a href="../../networking/chapters/18-replication.html">Replication &amp; Consistency</a> you met leaderless and multi-leader replication, and the <a href="../../networking/cases/case-09-dynamo.html">Dynamo case study</a> showed a shopping cart that always accepts a write, even during a partition, and sorts out the consequences later. The danger is that two replicas modify the same item concurrently. When they next talk, what is the merged value? Three families of answer exist:</p>
+
+<ul>
+  <li><strong>Pick a winner</strong> (last write wins by timestamp): simple, and it silently discards one update (we will build it and break it below).</li>
+  <li><strong>Keep both and ask the application</strong> (Dynamo-style "siblings"): nothing is lost, but every application must write correct merge code, which is hard and rarely tested.</li>
+  <li><strong>Make the data type merge itself</strong>, correctly, by construction. This is the CRDT approach.</li>
+</ul>
+
+<h2>Strong eventual consistency</h2>
+
+<p>Plain <span class="term">eventual consistency</span> says: if updates stop, replicas eventually converge. That is a weak promise. It does not say how conflicts are resolved (many systems do it in an ad hoc way that can lose updates), and it allows a replica to show a value, then roll it back. In 2011 Shapiro, Preguiça, Baquero and Zawirski defined a stronger property, <span class="term">strong eventual consistency</span> (SEC), and a family of data types that provides it. A system has SEC if:</p>
+
+<ul>
+  <li><strong>Eventual delivery:</strong> an update delivered to one correct replica is eventually delivered to all of them.</li>
+  <li><strong>Convergence:</strong> any two replicas that have received the <em>same set of updates</em> are in the <em>same state</em>, whatever the order they arrived in.</li>
+  <li><strong>Termination</strong> of the operations, so every update eventually takes effect.</li>
+</ul>
+
+<p>The crucial word is <em>same set</em>. There is no consensus step, no leader, no rollback: convergence is a deterministic function of what a replica has seen. Every replica can accept reads and writes at any time, even when partitioned from all the others, which in <a href="02-impossibility.html">CAP</a> terms is an AP design that gives up linearizability but never gives up availability. Remember the limits of the promise, though: SEC guarantees that the replicas agree, not that the agreed result is what any user <em>intended</em>, and not that application-level invariants hold (more on that at the end and in <a href="16-coordination-avoidance.html">chapter 16</a>).</p>
+
+<h2>Join semilattices: the mathematics, in pictures</h2>
+
+<p>How can merging be correct no matter the order? Think about what the network does to messages: it <em>reorders</em> them, it <em>duplicates</em> them (retries, at-least-once delivery, <a href="../../networking/chapters/16-failure.html">chapter 16 of the networking course</a>), and a replica may receive them in <em>different groupings</em> (one batch of three, or three singles). The merge function has to be indifferent to all three. Mathematics has a name for such a function.</p>
+
+<p>A <span class="term">join semilattice</span> is a set of states with a partial order ≤ ("carries no more information than") and an operation called the <span class="term">join</span>, written ⊔ and also called the <em>least upper bound</em>: the join of two states is the smallest state that is above both. It satisfies three laws, which are exactly what the network demands:</p>
+
+<table>
+  <thead><tr><th>Law</th><th>Statement</th><th>The network behaviour it absorbs</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Commutative</strong></td><td>a ⊔ b = b ⊔ a</td><td>Messages arrive in a different order at different replicas.</td></tr>
+    <tr><td><strong>Associative</strong></td><td>(a ⊔ b) ⊔ c = a ⊔ (b ⊔ c)</td><td>A replica merges things one by one, another receives them pre-combined by an intermediary.</td></tr>
+    <tr><td><strong>Idempotent</strong></td><td>a ⊔ a = a</td><td>The same message is delivered twice.</td></tr>
+  </tbody>
+</table>
+
+<p>Every one of these laws is a counterexample waiting to happen if you drop it:</p>
+
+<ul>
+  <li>Merge two counters by <em>adding</em> their values: not idempotent. A duplicated message double-counts.</li>
+  <li>Merge two numbers by <em>averaging</em>: commutative, but not associative (avg(avg(1, 2), 3) is 2.25, while avg(1, avg(2, 3)) is 1.75), so the result depends on how updates were grouped.</li>
+  <li>Merge by <em>"take the left one"</em>: idempotent and associative, but not commutative, so two replicas that merge in different orders disagree.</li>
+</ul>
+
+<p>The picture below is the simplest semilattice: all subsets of {a, b, c}, ordered by inclusion, with join = union. Higher means "knows more". Replica A holds {a} and replica B holds {b}. The only state that is above both, and the lowest such, is {a, b}: that is the merge, and it is where both replicas will end up if they exchange states in either direction, twice, or in pieces.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 330" role="img" aria-label="Hasse diagram of all subsets of {a, b, c} ordered by inclusion, a join semilattice. Replica A holds {a} and replica B holds {b}, both highlighted. Their merge is the union {a, b}, the smallest state above both, highlighted in green. States only ever move upward.">
+<defs><marker id="ahX15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-blue"/></marker><marker id="ahX15b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-green"/></marker><marker id="ahX15c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-red"/></marker><marker id="ahX15d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-orange"/></marker><marker id="ahX15e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahX15f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-purple"/></marker><marker id="ahX15g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-yellow"/></marker></defs>
+<line x1="380" y1="293" x2="150" y2="242" class="line-thin"/>
+<line x1="380" y1="293" x2="380" y2="242" class="line-thin"/>
+<line x1="380" y1="293" x2="610" y2="242" class="line-thin"/>
+<line x1="150" y1="218" x2="150" y2="152" class="line-thin"/>
+<line x1="150" y1="218" x2="380" y2="152" class="line-thin"/>
+<line x1="380" y1="218" x2="150" y2="152" class="line-thin"/>
+<line x1="380" y1="218" x2="610" y2="152" class="line-thin"/>
+<line x1="610" y1="218" x2="380" y2="152" class="line-thin"/>
+<line x1="610" y1="218" x2="610" y2="152" class="line-thin"/>
+<line x1="150" y1="128" x2="380" y2="62" class="line-thin"/>
+<line x1="380" y1="128" x2="380" y2="62" class="line-thin"/>
+<line x1="610" y1="128" x2="380" y2="62" class="line-thin"/>
+<rect x="342" y="37" width="76" height="26" rx="13" class="box"/>
+<text x="380" y="54" text-anchor="middle" class="t-sm mono">{a,b,c}</text>
+<rect x="112" y="127" width="76" height="26" rx="13" class="fs-green s-green sw-2"/>
+<text x="150" y="144" text-anchor="middle" class="t-sm mono t-bold">{a,b}</text>
+<rect x="342" y="127" width="76" height="26" rx="13" class="box"/>
+<text x="380" y="144" text-anchor="middle" class="t-sm mono">{a,c}</text>
+<rect x="572" y="127" width="76" height="26" rx="13" class="box"/>
+<text x="610" y="144" text-anchor="middle" class="t-sm mono">{b,c}</text>
+<rect x="112" y="217" width="76" height="26" rx="13" class="fs-yellow s-yellow sw-2"/>
+<text x="150" y="234" text-anchor="middle" class="t-sm mono t-bold">{a}</text>
+<rect x="342" y="217" width="76" height="26" rx="13" class="fs-yellow s-yellow sw-2"/>
+<text x="380" y="234" text-anchor="middle" class="t-sm mono t-bold">{b}</text>
+<rect x="572" y="217" width="76" height="26" rx="13" class="box"/>
+<text x="610" y="234" text-anchor="middle" class="t-sm mono">{c}</text>
+<rect x="342" y="292" width="76" height="26" rx="13" class="box"/>
+<text x="380" y="309" text-anchor="middle" class="t-sm mono">{}</text>
+<text x="150" y="262" text-anchor="middle" class="t-xs tc-yellow t-bold">replica A</text>
+<text x="380" y="262" text-anchor="middle" class="t-xs tc-yellow t-bold">replica B</text>
+<text x="62" y="136" text-anchor="middle" class="t-xs tc-green t-bold">merge(A, B)</text>
+<text x="62" y="150" text-anchor="middle" class="t-xs tc-green">least upper bound</text>
+<text x="662" y="60" text-anchor="middle" class="t-xs t-muted">higher = more</text>
+<text x="662" y="74" text-anchor="middle" class="t-xs t-muted">information</text>
+<line x1="730" y1="96" x2="730" y2="28" class="line s-orange" marker-end="url(#ahX15d)"/>
+<text x="66" y="40" text-anchor="middle" class="t-xs t-muted">state can only</text>
+<text x="66" y="54" text-anchor="middle" class="t-xs t-muted">climb, never fall</text>
+</svg>
+  <figcaption>A join semilattice: subsets of {a, b, c} ordered by ⊆. Merging is moving <em>up</em> to the least upper bound (here, the union). Because states only ever climb, and the lowest common ceiling of two states is unique, every replica that sees the same updates reaches the same top.</figcaption>
+</figure>
+
+<p>The second ingredient is that every update must be <span class="term">monotonic</span> (inflationary): it moves the state upward (or leaves it) in the order. A replica never goes down, so it can never "forget" something it has merged. Together, the two ingredients give the theorem that makes state-based CRDTs work: if all replicas start at the bottom, all updates are monotonic, and merge is the join, then any two replicas that have received the same updates are in the same state, whatever the order of delivery.</p>
+
+<h2>State-based, operation-based and delta CRDTs</h2>
+
+<p>There are two classical ways to ship changes between replicas, and a hybrid.</p>
+
+<ul>
+  <li><strong>State-based (CvRDT, "convergent").</strong> Replicas periodically send their <em>entire state</em> to others, who merge it with the join. Needs almost nothing from the network: only that updates <em>eventually</em> propagate, in any order, with duplicates and loss tolerated (a lost message is harmless because a later state subsumes it). The cost is bandwidth: state can be large.</li>
+  <li><strong>Operation-based (CmRDT, "commutative").</strong> Replicas send each <em>operation</em> (for example "add milk" or "increment"). Messages are small. But now the network must deliver every operation to every replica <em>exactly once</em> and, for operations that are not commutative on their own, in causal order (<a href="../../networking/chapters/17-time.html">vector clocks</a>); a duplicate increment would be counted twice. The operations that can be concurrent must commute.</li>
+  <li><strong>Delta-state.</strong> Almeida, Shoker and Baquero's delta-state CRDTs send only the <em>delta</em>: the small part of the state that changed, expressed as a state itself and merged with the same join. You keep the robustness of state-based merging (duplicates and reordering are fine) and approach the message size of operations.</li>
+</ul>
+
+<p>Here is a state-based G-Counter (below) in space-time form. The replicas never coordinate: each increments only its own slot, ships its full vector whenever it likes, and merges the vector it receives by taking the maximum in each slot. A lost message and a duplicate message both appear, and neither changes the outcome.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 290" role="img" aria-label="Space-time diagram of three G-Counter replicas. Each increments only its own slot. Replicas send their whole state to one another over an unreliable network. A duplicate delivery changes nothing, and a lagging replica converges when it receives a later state.">
+<line x1="112" y1="60" x2="746" y2="60" class="line-thin"/>
+<rect x="4" y="46" width="96" height="28" rx="6" class="fs-blue s-blue sw-2"/>
+<text x="52.0" y="64" text-anchor="middle" class="t-sm t-bold">Replica A</text>
+<line x1="112" y1="150" x2="746" y2="150" class="line-thin"/>
+<rect x="4" y="136" width="96" height="28" rx="6" class="fs-blue s-blue sw-2"/>
+<text x="52.0" y="154" text-anchor="middle" class="t-sm t-bold">Replica B</text>
+<line x1="112" y1="240" x2="746" y2="240" class="line-thin"/>
+<rect x="4" y="226" width="96" height="28" rx="6" class="fs-blue s-blue sw-2"/>
+<text x="52.0" y="244" text-anchor="middle" class="t-sm t-bold">Replica C</text>
+<rect x="130.0" y="32" width="113.0" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="186.5" y="45" text-anchor="middle" class="t-xs">inc, inc: [2,0,0]</text>
+<circle cx="130" cy="60" r="4" class="f-orange"/>
+<rect x="130.0" y="122" width="83.3" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="171.6" y="135" text-anchor="middle" class="t-xs">inc: [0,1,0]</text>
+<circle cx="130" cy="150" r="4" class="f-orange"/>
+<rect x="130.0" y="250" width="83.3" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="171.6" y="263" text-anchor="middle" class="t-xs">inc: [0,0,1]</text>
+<circle cx="130" cy="240" r="4" class="f-orange"/>
+<line x1="270" y1="60" x2="330" y2="150" class="line s-blue" marker-end="url(#ahX15a)"/>
+<text x="294.0" y="99.0" text-anchor="end" class="t-xs tc-blue" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">[2,0,0]</text>
+<rect x="334.0" y="122" width="83.3" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="375.6" y="135" text-anchor="middle" class="t-xs">max: [2,1,0]</text>
+<circle cx="334" cy="150" r="4" class="f-orange"/>
+<line x1="440" y1="150" x2="500" y2="240" class="line s-blue" marker-end="url(#ahX15a)"/>
+<text x="464.0" y="189.0" text-anchor="end" class="t-xs tc-blue" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">[2,1,0]</text>
+<rect x="504.0" y="250" width="83.3" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="545.6" y="263" text-anchor="middle" class="t-xs">max: [2,1,1]</text>
+<circle cx="504" cy="240" r="4" class="f-orange"/>
+<line x1="600" y1="240" x2="660" y2="60" class="line s-blue" marker-end="url(#ahX15a)"/>
+<text x="624.0" y="144.0" text-anchor="end" class="t-xs tc-blue" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">[2,1,1]</text>
+<rect x="662.0" y="32" width="83.3" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="703.6" y="45" text-anchor="middle" class="t-xs">max: sum = 4</text>
+<circle cx="662" cy="60" r="4" class="f-orange"/>
+<line x1="560" y1="240" x2="646.8" y2="184.2" class="line-dash s-red"/>
+<path d="M641.8,179.2 L651.8,189.2 M651.8,179.2 L641.8,189.2" class="s-red sw-2" fill="none"/>
+<text x="672" y="264" text-anchor="middle" class="t-xs tc-red">lost: harmless, a later</text>
+<text x="672" y="278" text-anchor="middle" class="t-xs tc-red">state subsumes it</text>
+</svg>
+  <figcaption>Three G-Counter replicas. Each vector is [A's slot, B's slot, C's slot]. Merge is slot-wise maximum, so a lost state is subsumed by a later one, and receiving a state twice changes nothing. B's last value is still [2,1,0] when the diagram ends; it will converge as soon as it hears from A or C.</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: tally sheets in a shared office</p>
+  <p>Three colleagues count visitors with tally marks, each only ever adding marks in <em>their own column</em> of a sheet. Photocopy your sheet and hand it to anyone, any number of times, in any order. To get the total, a person takes each column's highest count they have seen and adds the columns. Handing over an old copy is harmless, handing the same copy twice is harmless, and nobody ever needs to ask anyone's permission to make a mark.</p>
+  <p><em>Where it breaks down:</em> every colleague who ever counts needs a column, so the sheet grows with the number of replicas. Real CRDTs have exactly this metadata cost and it is a real design constraint, especially with many short-lived clients.</p>
+</div>
+
+<h2>Worked examples, in running Python</h2>
+
+<p>All the code in this chapter uses only the standard library and is deterministic. Each class has a <code>merge</code> that mutates the receiver by joining another replica's state into it.</p>
+
+<h3>Counters: G-Counter and PN-Counter</h3>
+
+<p>Why not just keep one integer per replica and merge with <code>max</code>? Because if two replicas both increment 5 to 6 concurrently, <code>max(6, 6)</code> is 6 and an increment is lost. The fix is the tally sheet: one slot per replica, written only by its owner. A <span class="term">G-Counter</span> (grow-only) has value Σ slots and merges slot by slot with max. To allow decrements, a <span class="term">PN-Counter</span> keeps <em>two</em> G-Counters, one for increments (P) and one for decrements (N); the value is P − N. You cannot "decrement" a G-Counter, because that would move the state down the lattice.</p>
+
+<pre class="terminal" data-title="crdt_counters.py"><code>"""State-based counters. merge() is a join: commutative, associative, idempotent."""
+from __future__ import annotations
+import random
+
+
+class GCounter:
+    """Grow-only counter: one slot per replica; a replica only bumps its own slot."""
+    def __init__(self, rid: str, slots: dict[str, int] | None = None):
+        self.rid, self.slots = rid, dict(slots or {})
+
+    def inc(self, n: int = 1) -&gt; None:
+        self.slots[self.rid] = self.slots.get(self.rid, 0) + n
+
+    def value(self) -&gt; int:
+        return sum(self.slots.values())
+
+    def merge(self, other: "GCounter") -&gt; None:
+        for r, n in other.slots.items():
+            self.slots[r] = max(self.slots.get(r, 0), n)   # pointwise max
+
+    def state(self):
+        return dict(sorted(self.slots.items()))
+
+
+class PNCounter:
+    """Increase/decrease counter = two G-Counters: value = P - N."""
+    def __init__(self, rid: str):
+        self.p, self.n = GCounter(rid), GCounter(rid)
+
+    def inc(self, k: int = 1): self.p.inc(k)
+    def dec(self, k: int = 1): self.n.inc(k)
+    def value(self) -&gt; int: return self.p.value() - self.n.value()
+
+    def merge(self, other: "PNCounter") -&gt; None:
+        self.p.merge(other.p); self.n.merge(other.n)
+
+    def state(self): return (self.p.state(), self.n.state())
+
+
+if __name__ == "__main__":
+    a, b = GCounter("A"), GCounter("B")
+    a.inc(3); b.inc(2)                         # concurrent, while partitioned
+    print("before merge:", a.value(), b.value())
+    a.merge(b); b.merge(a)
+    print("after merge: ", a.value(), b.value(), a.state())
+    a.merge(b); a.merge(b)                     # duplicate delivery: harmless
+    print("merged again:", a.value(), "(idempotent)")
+
+    x, y = PNCounter("A"), PNCounter("B")
+    x.inc(10); y.dec(4); x.dec(1)
+    x.merge(y); y.merge(x)
+    print("PN-Counter:  ", x.value(), y.value(), x.state())
+
+    # Randomised check of the three laws on G-Counters.
+    rng = random.Random(1)
+
+    def rand_counter() -&gt; GCounter:
+        return GCounter("Z", {r: rng.randrange(6) for r in "ABC"})
+
+    def join(p: GCounter, q: GCounter) -&gt; GCounter:
+        out = GCounter("Z", p.slots)
+        out.merge(q)
+        return out
+
+    comm = assoc = idem = True
+    for _ in range(1000):
+        p, q, r = rand_counter(), rand_counter(), rand_counter()
+        comm &amp;= join(p, q).state() == join(q, p).state()
+        assoc &amp;= join(join(p, q), r).state() == join(p, join(q, r)).state()
+        idem &amp;= join(p, p).state() == p.state()
+    print("commutative:", comm, " associative:", assoc, " idempotent:", idem)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>before merge: 3 2
+after merge:  5 5 {'A': 3, 'B': 2}
+merged again: 5 (idempotent)
+PN-Counter:   5 5 ({'A': 10}, {'A': 1, 'B': 4})
+commutative: True  associative: True  idempotent: True</code></pre>
+
+<p>The last line is the randomised check of the three laws on 1,000 random states. It is not a proof, but it is the kind of property test you should write for any CRDT you implement.</p>
+
+<h3>Registers: last-writer-wins and multi-value</h3>
+
+<p>A <span class="term">register</span> holds one value that replicas can overwrite. The <span class="term">LWW-Register</span> tags each write with a timestamp (and the replica id as tiebreaker) and merge keeps the larger tag. It satisfies all three laws, so it converges. What it does not do is keep your data: concurrent writes are resolved by whichever has the bigger timestamp, and the loser vanishes. Worse, the timestamp is a <em>wall clock</em>: if a replica's clock is behind, its genuinely newer write can lose to an older one. (This is exactly what happens in systems that resolve conflicts by timestamp: it is documented behaviour of Cassandra's cell-level conflict resolution, for example. See <a href="07-time-revisited.html">chapter 7</a> for clocks that fix some of this: a hybrid logical clock keeps the order consistent with causality, though two truly concurrent writes still have a loser.)</p>
+
+<p>The <span class="term">MV-Register</span> ("multi-value") refuses to choose. Each write carries a version vector summarising what the writer had seen; on merge, a value is discarded only if another value's vector <em>dominates</em> it (that write had seen it). Writes that are genuinely concurrent are both kept, as "siblings", until a later write that has seen both supersedes them. That is the Dynamo-style behaviour from the case study, now with a proof of convergence.</p>
+
+<pre class="terminal" data-title="crdt_registers.py"><code>"""Registers: last-writer-wins and multi-value."""
+from __future__ import annotations
+
+
+class LWWRegister:
+    """Keeps the write with the largest (timestamp, replica id). Ties broken by id."""
+    def __init__(self, rid: str):
+        self.rid, self.stamp, self.val = rid, (0, ""), None
+
+    def set(self, val, wall_clock: int) -&gt; None:
+        self.stamp, self.val = (wall_clock, self.rid), val
+
+    def merge(self, other: "LWWRegister") -&gt; None:
+        if other.stamp &gt; self.stamp:
+            self.stamp, self.val = other.stamp, other.val
+
+
+class MVRegister:
+    """Keeps every concurrent write. Each value carries a version vector."""
+    def __init__(self, rid: str):
+        self.rid = rid
+        self.entries: list[tuple[dict[str, int], object]] = []   # (vector, value)
+
+    @staticmethod
+    def _le(a: dict, b: dict) -&gt; bool:                  # a happened-before-or-equals b
+        return all(b.get(k, 0) &gt;= v for k, v in a.items())
+
+    def set(self, val) -&gt; None:
+        vv: dict[str, int] = {}
+        for v, _ in self.entries:                       # supersede everything we have seen
+            for k, n in v.items():
+                vv[k] = max(vv.get(k, 0), n)
+        vv[self.rid] = vv.get(self.rid, 0) + 1
+        self.entries = [(vv, val)]
+
+    def merge(self, other: "MVRegister") -&gt; None:
+        pool = self.entries + other.entries
+        keep = []
+        for v, x in pool:
+            dominated = any(v != w and self._le(v, w) for w, _ in pool)
+            if not dominated and (v, x) not in keep:
+                keep.append((v, x))
+        self.entries = keep
+
+    def values(self) -&gt; list:
+        return sorted(x for _, x in self.entries)
+
+
+if __name__ == "__main__":
+    print("-- LWW with honest clocks")
+    a, b = LWWRegister("A"), LWWRegister("B")
+    a.set("draft", wall_clock=100)
+    b.set("final", wall_clock=105)            # B really wrote later
+    a.merge(b); b.merge(a)
+    print("A:", a.val, " B:", b.val)
+
+    print("-- LWW when B's clock is 60 s slow")
+    a, b = LWWRegister("A"), LWWRegister("B")
+    a.set("draft", wall_clock=100)
+    b.set("final", wall_clock=105 - 60)       # B wrote later, but its clock says 45
+    a.merge(b); b.merge(a)
+    print("A:", a.val, " B:", b.val, "  &lt;- the newer write silently lost")
+
+    print("-- MV-Register keeps concurrent writes")
+    a, b = MVRegister("A"), MVRegister("B")
+    a.set("draft"); b.set("final")
+    a.merge(b); b.merge(a)
+    print("A:", a.values(), " B:", b.values())
+    a.set("merged by hand")                    # a later write that has seen both
+    b.merge(a)
+    print("after a write that saw both:", b.values())</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>-- LWW with honest clocks
+A: final  B: final
+-- LWW when B's clock is 60 s slow
+A: draft  B: draft   &lt;- the newer write silently lost
+-- MV-Register keeps concurrent writes
+A: ['draft', 'final']  B: ['draft', 'final']
+after a write that saw both: ['merged by hand']</code></pre>
+
+<p>Look at the middle experiment. B's write really was later in real time, but B's clock was 60 seconds slow, so its timestamp (45) loses to A's (100) on <em>both</em> replicas, consistently. Convergence held; correctness did not. When a register's value matters, use an MV-Register and surface the conflict, or use a clock that respects causality and accept that concurrent writes still lose one side.</p>
+
+<h3>Sets: G-Set, 2P-Set and OR-Set</h3>
+
+<p>Sets are where the design questions get interesting, because removing an element is not monotonic.</p>
+
+<ul>
+  <li>A <span class="term">G-Set</span> only grows (join = union). Safe and trivial, but you cannot remove anything.</li>
+  <li>A <span class="term">2P-Set</span> ("two-phase") keeps an add-set and a <em>remove-set</em> (tombstones); an element is present if it is in the first and not the second. Both sets only grow, so it merges cleanly. The cost is a rule you may not like: once removed, an element can <strong>never be added again</strong>, because its tombstone is forever.</li>
+  <li>The <span class="term">OR-Set</span> ("observed-remove") fixes that. Every <em>add</em> creates a fresh unique tag, and a <em>remove</em> deletes only the tags the remover has actually <em>observed</em>. An element is present if at least one of its tags is not removed. So a concurrent add (a new tag the remover never saw) survives the remove: the semantics are <strong>add wins over a concurrent remove</strong>. Re-adding after a remove works too, because the new add has a new tag.</li>
+</ul>
+
+<pre class="terminal" data-title="crdt_sets.py"><code>"""Sets: grow-only, two-phase and observed-remove."""
+from __future__ import annotations
+import itertools
+import random
+
+
+class GSet:
+    def __init__(self): self.items: set = set()
+    def add(self, x): self.items.add(x)
+    def merge(self, o: "GSet"): self.items |= o.items
+    def value(self): return set(self.items)
+
+
+class TwoPSet:
+    """Add set + remove set (tombstones). A removed element can never come back."""
+    def __init__(self): self.added: set = set(); self.removed: set = set()
+    def add(self, x): self.added.add(x)
+    def remove(self, x):
+        if x in self.added: self.removed.add(x)
+    def merge(self, o: "TwoPSet"):
+        self.added |= o.added; self.removed |= o.removed
+    def value(self): return self.added - self.removed
+
+
+class ORSet:
+    """Every add creates a unique tag; remove deletes only the tags it has *observed*."""
+    def __init__(self, rid: str):
+        self.rid, self.n = rid, 0
+        self.adds: set[tuple] = set()      # (element, tag)
+        self.tombs: set[tuple] = set()     # tags that were observed and removed
+
+    def add(self, x):
+        self.n += 1
+        self.adds.add((x, f"{self.rid}{self.n}"))
+
+    def remove(self, x):
+        self.tombs |= {(e, t) for e, t in self.adds if e == x}   # only what I can see
+
+    def merge(self, o: "ORSet"):
+        self.adds |= o.adds; self.tombs |= o.tombs
+
+    def value(self):
+        return {e for e, t in self.adds if (e, t) not in self.tombs}
+
+    def state(self):
+        return (frozenset(self.adds), frozenset(self.tombs))
+
+
+if __name__ == "__main__":
+    print("-- 2P-Set: remove is forever")
+    s = TwoPSet(); s.add("milk"); s.remove("milk"); s.add("milk")
+    print("re-added milk present?", "milk" in s.value())
+
+    print("-- OR-Set: concurrent add and remove, add wins")
+    a, b = ORSet("A"), ORSet("B")
+    a.add("milk"); b.merge(a)                  # both replicas know about milk (tag A1)
+    b.remove("milk")                           # B removes the tag it saw
+    a.add("milk")                              # A, concurrently, adds again (tag A2)
+    a.merge(b); b.merge(a)
+    print("A:", a.value(), " B:", b.value(), " tags:", sorted(t for _, t in a.adds))
+
+    print("-- OR-Set: remove after seeing everything really removes")
+    a.remove("milk"); b.merge(a)
+    print("A:", a.value(), " B:", b.value())
+
+    # Convergence under arbitrary merge order: 3 replicas, random ops, random gossip.
+    def trial(seed: int) -&gt; bool:
+        rng = random.Random(seed)
+        reps = [ORSet(r) for r in "ABC"]
+        for _ in range(30):
+            r = rng.choice(reps)
+            x = rng.choice("xyz")
+            rng.choice([r.add, r.add, r.remove])(x)
+            if rng.random() &lt; 0.3:
+                src, dst = rng.sample(reps, 2)
+                dst.merge(src)
+        for _ in range(2):                              # final anti-entropy, random order
+            for src, dst in rng.sample(list(itertools.permutations(reps, 2)), 6):
+                dst.merge(src)
+        return len({r.state() for r in reps}) == 1
+    print("200 random runs converged:", sum(trial(s) for s in range(200)), "/ 200")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>-- 2P-Set: remove is forever
+re-added milk present? False
+-- OR-Set: concurrent add and remove, add wins
+A: {'milk'}  B: {'milk'}  tags: ['A1', 'A2']
+-- OR-Set: remove after seeing everything really removes
+A: set()  B: set()
+200 random runs converged: 200 / 200</code></pre>
+
+<p>The OR-Set demo is the one to understand. A adds milk (tag A1) and B receives it. B removes milk: it tombstones A1, the only tag it has seen. Meanwhile A, without hearing from B, adds milk again as tag A2. After merging, A2 is not tombstoned, so milk is present on both replicas. B's remove did exactly what B meant ("remove the milk I could see") and A's add did exactly what A meant. The last test runs 200 random 3-replica histories with random merge schedules and checks that all replicas end in an identical state each time.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 270" role="img" aria-label="Space-time diagram of an observed-remove set with two replicas. Replica A adds milk with tag A1 and sends it to B. B removes milk, which tombstones tag A1. Concurrently A adds milk again with a new tag A2. After they exchange state, tag A2 is not tombstoned, so milk is present on both replicas: add wins over a concurrent remove.">
+<line x1="112" y1="70" x2="746" y2="70" class="line-thin"/>
+<rect x="4" y="56" width="96" height="28" rx="6" class="fs-blue s-blue sw-2"/>
+<text x="52.0" y="74" text-anchor="middle" class="t-sm t-bold">Replica A</text>
+<line x1="112" y1="200" x2="746" y2="200" class="line-thin"/>
+<rect x="4" y="186" width="96" height="28" rx="6" class="fs-blue s-blue sw-2"/>
+<text x="52.0" y="204" text-anchor="middle" class="t-sm t-bold">Replica B</text>
+<rect x="128.0" y="42" width="107.0" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="181.5" y="55" text-anchor="middle" class="t-xs">add milk: tag A1</text>
+<circle cx="128" cy="70" r="4" class="f-orange"/>
+<line x1="250" y1="70" x2="306" y2="200" class="line s-blue" marker-end="url(#ahX15a)"/>
+<text x="272.8" y="135.5" text-anchor="end" class="t-xs tc-blue" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">{(milk,A1)}</text>
+<rect x="310.0" y="210" width="160.5" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="390.2" y="223" text-anchor="middle" class="t-xs">remove milk: tombstone A1</text>
+<circle cx="310" cy="200" r="4" class="f-orange"/>
+<rect x="330.0" y="42" width="107.0" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="383.5" y="55" text-anchor="middle" class="t-xs">add milk: tag A2</text>
+<circle cx="330" cy="70" r="4" class="f-orange"/>
+<line x1="490" y1="70" x2="550" y2="200" class="line s-blue" marker-end="url(#ahX15a)"/>
+<text x="496.8" y="100.4" text-anchor="end" class="t-xs tc-blue" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">adds A1,A2</text>
+<line x1="500" y1="200" x2="560" y2="70" class="line s-orange" marker-end="url(#ahX15d)"/>
+<text x="526.8" y="157.6" text-anchor="start" class="t-xs tc-orange" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">tombs A1</text>
+<rect x="566.0" y="42" width="113.0" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="622.5" y="55" text-anchor="middle" class="t-xs">milk present (A2)</text>
+<circle cx="566" cy="70" r="4" class="f-orange"/>
+<rect x="556.0" y="210" width="113.0" height="18" rx="4" class="fs-orange s-orange"/>
+<text x="612.5" y="223" text-anchor="middle" class="t-xs">milk present (A2)</text>
+<circle cx="556" cy="200" r="4" class="f-orange"/>
+<text x="396" y="134" text-anchor="middle" class="t-xs tc-red">concurrent: B's remove saw only A1</text>
+</svg>
+  <figcaption>The OR-Set demo as a space-time diagram. B's tombstone names a specific tag (A1); A's concurrent re-add created a different tag (A2), so it is untouched by that remove and survives the merge.</figcaption>
+</figure>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "a CRDT makes my data correct"</p>
+  <p>A CRDT guarantees <em>convergence</em>: everyone ends up with the same thing. It does not guarantee that the thing satisfies your application's rules. Two replicas can each decrement a PN-Counter holding 1 to 0 and the merged value is −1; two users can each claim the same username in an OR-Set of names and both claims survive. Uniqueness, "balance never negative" and similar invariants need some coordination (or an escrow trick), which is the subject of <a href="16-coordination-avoidance.html">chapter 16</a>. CRDTs decide <em>how to merge</em>, not <em>whether the merge is acceptable</em>.</p>
+</div>
+
+<h3>Play with it</h3>
+
+<p>The playground below has three replicas of a G-Counter, PN-Counter, LWW register or OR-set. Edits are local; nothing travels until you press a merge button. Try to make replicas diverge permanently: you cannot, once every state has been merged somewhere. Try the "B's clock is 60 s slow" scenario for the LWW register, and the "concurrent add and remove" scenario for the OR-set.</p>
+
+<div class="widget" id="crdt-play"></div>
+
+<h2>Sequence CRDTs: collaborative text</h2>
+
+<p>Text is the hard case, and the commercially important one. Represent a document as an array of characters and an edit as "insert 'x' at index 5". If Alice inserts at 5 while Bob concurrently deletes the character at index 3, Alice's index 5 now points at a different character on Bob's machine. Indexes are positions in <em>one particular version</em>; they do not mean the same thing on every replica.</p>
+
+<p>The CRDT fix is to give every character a <strong>permanent identity</strong> and to define order in terms of identities, not positions. Two families:</p>
+
+<ul>
+  <li><strong>Linked-structure approaches.</strong> RGA (Roh et al., "Replicated abstract data type") and the Yjs algorithm (YATA, Nicolaescu et al.) record, for each inserted character, <em>which character it was inserted after</em>. Concurrent insertions after the same character are put in a deterministic order (for example by a timestamp and replica id). Deletion marks a character as a <em>tombstone</em> rather than removing it, because other replicas may still refer to it.</li>
+  <li><strong>Dense-identifier approaches.</strong> Logoot (Weiss, Urso, Molli) and LSEQ give every character a position identifier from a dense, totally ordered space (think of numbers like 1.5, or 1.25: you can always find one strictly between any two). To insert between characters with identifiers 1 and 2, create one in between. Replicas sort characters by identifier, so the order is the same everywhere.</li>
+</ul>
+
+<p>Real libraries build on these ideas: <strong>Automerge</strong> (a JSON-like document CRDT, based on the work of Kleppmann and Beresford) and <strong>Yjs</strong> (YATA) are the best-known open-source examples, and both also handle maps, lists and rich-text structure, not only a string.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 290" role="img" aria-label="Diagram of a sequence CRDT. Each character has a unique identifier that never changes. Alice and Bob concurrently type words at the same position. Because every character is placed relative to identifiers, both edits survive, but a naive rule can interleave the two words, giving f b o a o r instead of foobar.">
+<text x="14" y="45" text-anchor="start" class="t-sm t-bold">Shared start</text>
+<rect x="170" y="26" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="187" y="46" text-anchor="middle" class="t-sm mono t-bold">H</text>
+<rect x="210" y="26" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="227" y="46" text-anchor="middle" class="t-sm mono t-bold">i</text>
+<rect x="250" y="26" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="267" y="46" text-anchor="middle" class="t-sm mono t-bold">_</text>
+<text x="14" y="105" text-anchor="start" class="t-sm t-bold">Alice inserts</text>
+<rect x="290" y="86" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="307" y="106" text-anchor="middle" class="t-sm mono t-bold">f</text>
+<rect x="330" y="86" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="347" y="106" text-anchor="middle" class="t-sm mono t-bold">o</text>
+<rect x="370" y="86" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="387" y="106" text-anchor="middle" class="t-sm mono t-bold">o</text>
+<text x="14" y="165" text-anchor="start" class="t-sm t-bold">Bob inserts</text>
+<rect x="290" y="146" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="307" y="166" text-anchor="middle" class="t-sm mono t-bold">b</text>
+<rect x="330" y="146" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="347" y="166" text-anchor="middle" class="t-sm mono t-bold">a</text>
+<rect x="370" y="146" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="387" y="166" text-anchor="middle" class="t-sm mono t-bold">r</text>
+<text x="320" y="70" text-anchor="middle" class="t-xs t-muted">both after the same character</text>
+<text x="14" y="235" text-anchor="start" class="t-sm t-bold">Merged: good</text>
+<rect x="170" y="216" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="187" y="236" text-anchor="middle" class="t-sm mono t-bold">H</text>
+<rect x="210" y="216" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="227" y="236" text-anchor="middle" class="t-sm mono t-bold">i</text>
+<rect x="250" y="216" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="267" y="236" text-anchor="middle" class="t-sm mono t-bold">_</text>
+<rect x="290" y="216" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="307" y="236" text-anchor="middle" class="t-sm mono t-bold">f</text>
+<rect x="330" y="216" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="347" y="236" text-anchor="middle" class="t-sm mono t-bold">o</text>
+<rect x="370" y="216" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="387" y="236" text-anchor="middle" class="t-sm mono t-bold">o</text>
+<rect x="410" y="216" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="427" y="236" text-anchor="middle" class="t-sm mono t-bold">b</text>
+<rect x="450" y="216" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="467" y="236" text-anchor="middle" class="t-sm mono t-bold">a</text>
+<rect x="490" y="216" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="507" y="236" text-anchor="middle" class="t-sm mono t-bold">r</text>
+<text x="14" y="277" text-anchor="start" class="t-sm t-bold">Merged: anomaly</text>
+<rect x="170" y="258" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="187" y="278" text-anchor="middle" class="t-sm mono t-bold">H</text>
+<rect x="210" y="258" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="227" y="278" text-anchor="middle" class="t-sm mono t-bold">i</text>
+<rect x="250" y="258" width="34" height="30" rx="5" class="fs-yellow s-yellow sw-2"/>
+<text x="267" y="278" text-anchor="middle" class="t-sm mono t-bold">_</text>
+<rect x="290" y="258" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="307" y="278" text-anchor="middle" class="t-sm mono t-bold">f</text>
+<rect x="330" y="258" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="347" y="278" text-anchor="middle" class="t-sm mono t-bold">b</text>
+<rect x="370" y="258" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="387" y="278" text-anchor="middle" class="t-sm mono t-bold">o</text>
+<rect x="410" y="258" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="427" y="278" text-anchor="middle" class="t-sm mono t-bold">a</text>
+<rect x="450" y="258" width="34" height="30" rx="5" class="fs-blue s-blue sw-2"/>
+<text x="467" y="278" text-anchor="middle" class="t-sm mono t-bold">o</text>
+<rect x="490" y="258" width="34" height="30" rx="5" class="fs-pink s-pink sw-2"/>
+<text x="507" y="278" text-anchor="middle" class="t-sm mono t-bold">r</text>
+</svg>
+  <figcaption>The interleaving anomaly. Alice and Bob concurrently type words at the same cursor position (the underscore stands for a space). The "good" result keeps each user's word together. In some algorithms, with characters inserted one at a time at the same position, the identifiers can sort so that the words weave together letter by letter.</figcaption>
+</figure>
+
+<p>That woven result, "Hi_fboaor", is the <span class="term">interleaving anomaly</span>. Convergence still holds: every replica shows the same garbled text. It is a failure of <em>intention preservation</em>, not of consistency. Kleppmann and colleagues catalogued such anomalies in published algorithms (PaPoC 2019), proposed a specification that rules the anomaly out (text typed consecutively by one user stays together), and showed how to repair a lesser variant in one algorithm. Two other practical costs are worth knowing. First, per-character metadata (identifiers, tombstones) can dwarf the text itself, so libraries use run-length compaction and compact encodings. Second, deleted characters linger as tombstones until they can be garbage-collected, which brings us to the last section.</p>
+
+<h2>OT versus CRDT</h2>
+
+<p><span class="term">Operational transformation</span> (OT), invented for collaborative editing (Ellis and Gibbs, 1989), takes the opposite approach. Operations keep their index-based form, but when a replica receives a <em>concurrent</em> operation it first <em>transforms</em> it against the operations it has already applied: if Bob deleted a character before index 5, Alice's "insert at 5" becomes "insert at 4". Google Docs is the famous OT system.</p>
+
+<p>The difference is where the difficulty lives:</p>
+
+<ul>
+  <li><strong>With a central server, OT is manageable.</strong> The server picks one total order for operations, so each client only has to transform against the server's sequence, which needs a simpler correctness condition on the transformation functions. This is why production OT systems are built around a central server.</li>
+  <li><strong>Without a central server, OT is hard.</strong> Peer-to-peer OT needs transformation functions that remain correct for any three or more concurrent operations arriving in different orders. That condition is subtle, and published decentralised algorithms were repeatedly found to have counterexamples. Many practitioners regard the complexity as a reason to avoid it.</li>
+  <li><strong>CRDTs make convergence a property of the data structure,</strong> so they work peer-to-peer and offline with no server in the middle (the server, if present, is an optimisation). The costs are per-element metadata, tombstones and, as we saw, algorithm choices that affect how user intent is preserved.</li>
+</ul>
+
+<p>The two are not mutually exclusive, and real products mix them with pragmatism. Figma's multiplayer engine, for instance, runs a central server and resolves conflicts per property with last-writer-wins; the team describes it as inspired by CRDTs rather than being one. That is a deliberate trade: with a server in the loop, they can use simpler merge rules where the data model allows. Read it in <a href="../cases/case-08-figma-multiplayer.html">Figma's Multiplayer Engine</a>, and see the design exercise in <a href="../studios/studio-02-collab-editor.html">Studio 2: Design a Collaborative Editor</a>.</p>
+
+<h2>Garbage collection of tombstones</h2>
+
+<p>Every structure above got the ability to delete by <em>remembering</em> that a deletion happened: a tombstone in a 2P-Set or OR-Set, a deleted character in a text CRDT. Without it, a replica that has not yet heard about the delete would send the element back at the next merge and resurrect it. But tombstones accumulate forever: a document that has been edited for years carries every character anyone ever deleted.</p>
+
+<p>You can remove a tombstone only when you know <strong>no replica can still send or hold the thing it refers to</strong>. The standard notion is <span class="term">causal stability</span>: a delete is stable once every replica has acknowledged it (for example when all version vectors have advanced past it). Once stable, its tombstone, and the element behind it, can be dropped. Notice the irony: <em>garbage collection needs knowledge of the whole group</em>, which is a kind of coordination, in a data type whose point was to need none. Real systems handle this in a few ways:</p>
+
+<ul>
+  <li><strong>Track membership and acknowledgements</strong> and collect when stable. Correct, but a replica that is gone for good (a lost phone) blocks collection unless it is removed from the group, which needs a membership decision.</li>
+  <li><strong>Time-based collection.</strong> Cassandra's tombstones are removed after a configurable grace period (<code>gc_grace_seconds</code>, ten days by default). This is cheap and needs no acknowledgements, but it is a bet: a replica that was offline for longer than the grace period and then returns can resurrect deleted data.</li>
+  <li><strong>Snapshots and compaction.</strong> Periodically agree (this one is coordination) on a snapshot and discard history before it; libraries such as Yjs and Automerge also compress their operation history and merge adjacent edits.</li>
+  <li><strong>Reduce metadata by design:</strong> reuse tags, use compact version vectors with dots, or choose a type where removal is naturally unneeded.</li>
+</ul>
+
+<details class="deeper">
+  <summary>Go deeper (optional): the CRDT design checklist <span class="hint">advanced</span></summary>
+  <p>When you design or choose a CRDT, ask in order: (1) <em>What are the concurrent-update semantics</em> I want ("add wins", "remove wins", "keep both")? Two CRDTs of the same type can differ. (2) <em>Is the state a semilattice, and are updates monotonic?</em> Test commutativity, associativity and idempotence with random states, as the counters listing does. (3) <em>What does the metadata cost grow with</em>: number of replicas, number of operations, number of deletions? (4) <em>How will tombstones and per-replica slots be garbage-collected</em>, and what does that require from membership? (5) <em>Which of my invariants are not covered?</em> Those need coordination or compensation.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Save the three listings as <code>crdt_counters.py</code>, <code>crdt_registers.py</code> and <code>crdt_sets.py</code> and run each with <code>python3</code>.</p>
+</div>
+
+<ol>
+  <li>Break the G-Counter: change <code>merge</code> to <code>self.slots[r] = self.slots.get(r, 0) + n</code> (add instead of max). Re-run the law check. Which law fails, and which line of the demo shows it?</li>
+  <li>Add a <code>remove</code> to <code>GSet</code> by deleting from the set. Show two replicas that remove and re-add concurrently and diverge permanently.</li>
+  <li>Make the OR-Set "remove wins": on a concurrent add, drop the new tag if any replica has tombstoned the element. What does that do to the milk example, and which behaviour would you want for a shopping cart? For a block-list?</li>
+  <li>Add a <code>delta_since(other)</code> method to the G-Counter that returns only the slots that are larger than the other replica's, and show that merging the delta gives the same result as merging the full state.</li>
+  <li>Prove convergence to yourself by hand for the PN-Counter, then run the full guided exercise in <a href="../labs/lab-06-crdts.html">Lab 6: CRDTs That Converge</a>.</li>
+</ol>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>CRDTs are the data-structure answer to the CAP trade-off: they choose availability and offer a strong consistency level that is compatible with it, strong eventual consistency (and, with care about delivery order, causal consistency, <a href="06-causal-session.html">chapter 6</a>). They are the right tool when replicas must work independently (offline clients, active-active regions: <a href="18-multi-region.html">chapter 18</a>) and the data can be shaped so that merging is meaningful. They are the wrong tool for invariants that span replicas, which is exactly the next chapter's question: which invariants can be kept without coordination, and which can't?</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Strong eventual consistency: replicas that have received the same set of updates are in the same state, with no consensus, no rollback and full availability.</li>
+    <li>The mathematics: a join semilattice. The merge (join, the least upper bound) must be commutative, associative and idempotent, and updates must be monotonic. Each law answers a network behaviour: reordering, regrouping, duplication.</li>
+    <li>State-based CRDTs ship states and need only eventual delivery; operation-based ship operations and need exactly-once, causally ordered delivery; delta-state CRDTs ship small joinable deltas.</li>
+    <li>G-Counter: one slot per replica, merge by max. PN-Counter: two G-Counters. LWW-Register converges but silently drops writes and depends on clocks; the MV-Register keeps concurrent writes; the OR-Set gives "add wins" by tagging each add and removing only observed tags; 2P-Sets can never re-add.</li>
+    <li>Collaborative text uses identities for characters, not indexes (RGA, Yjs, Logoot, Automerge). Concurrent typing can interleave in some algorithms: convergence is guaranteed, intent is not.</li>
+    <li>OT transforms index-based operations and is practical with a central server; decentralised OT is notoriously hard. CRDTs work peer-to-peer at the price of metadata.</li>
+    <li>Tombstones must be garbage-collected, which needs causal stability, a grace-period gamble, or snapshots. CRDTs do not protect invariants such as uniqueness or non-negative balances.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Which property of the merge function makes a CRDT tolerate the same message being delivered twice?</p>
+    <ol class="q-options">
+      <li>Commutativity</li>
+      <li>Idempotence</li>
+      <li>Associativity</li>
+      <li>Monotonicity of the clock</li>
+    </ol>
+    <div class="q-explain">Idempotence (a ⊔ a = a) means re-merging something already merged changes nothing. Commutativity absorbs reordering and associativity absorbs different groupings. Merging counters by adding values is a classic non-idempotent mistake: a duplicate delivery counts twice.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Replicas A and B each increment a shared counter from 5 to 6 while partitioned. If the counter is a single integer merged with <code>max</code>, what is the result, and how does the G-Counter avoid the problem?</p>
+    <ol class="q-options">
+      <li>7, because max adds the increments</li>
+      <li>6, and the G-Counter avoids it by using timestamps</li>
+      <li>5, and the G-Counter avoids it with a lock</li>
+      <li>6 (one increment is lost); the G-Counter keeps a separate slot per replica, so the merged value is the sum of each replica's own count</li>
+    </ol>
+    <div class="q-explain">Max of two equal 6s is 6, so one increment disappears. With one slot per replica (A: +1, B: +1) the merged slots are A=1, B=1 and the sum is 7. Each replica writes only its own slot, so merging slots by max never discards anyone's increments.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">In an OR-Set, replica A removes an element it can see while replica B concurrently adds the same element. After merging, what happens and why?</p>
+    <ol class="q-options">
+      <li>The element is present: B's add created a new unique tag that A's remove never observed, so it was not tombstoned</li>
+      <li>The element is absent, because removes always win</li>
+      <li>Whichever operation has the later wall-clock timestamp wins</li>
+      <li>The merge is undefined and needs a coordinator</li>
+    </ol>
+    <div class="q-explain">Remove deletes only the tags it has observed. B's concurrent add has a fresh tag, so the element survives: "add wins". The behaviour comes from the unique tags, not from timestamps. A 2P-Set, by contrast, would let the tombstone win and permanently ban the element.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why can last-writer-wins lose a genuinely newer update even though replicas always converge?</p>
+    <ol class="q-options">
+      <li>Because merge is not commutative</li>
+      <li>Because the network drops the newer write</li>
+      <li>Because ordering depends on wall-clock timestamps; a replica with a slow clock stamps its newer write with an older time, and the larger timestamp wins on every replica</li>
+      <li>Because LWW registers cannot be merged more than once</li>
+    </ol>
+    <div class="q-explain">Convergence only requires a deterministic winner, and the larger (timestamp, id) pair provides one. But "larger timestamp" is not "later in real time" when clocks are skewed, so the loser is lost on every replica. Use a register that keeps concurrent writes (MV) or a causally consistent clock where lost updates matter.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Which statement about OT and CRDTs for collaborative editing is most accurate?</p>
+    <ol class="q-options">
+      <li>OT guarantees convergence by construction without any central server; CRDTs always need one</li>
+      <li>OT transforms index-based operations and is practical when a central server orders them; CRDTs make convergence a property of the data structure, work peer to peer, and pay in per-character metadata and tombstones</li>
+      <li>CRDTs and OT both require consensus on every keystroke</li>
+      <li>OT cannot handle deletions, while CRDTs can</li>
+    </ol>
+    <div class="q-explain">A central server gives OT a single order to transform against, which keeps the transformation functions simple. Fully decentralised OT needs much stricter correctness conditions on those functions and has a history of incorrect algorithms. CRDT text structures need no server at all, but carry identifiers and tombstones for every character.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why do CRDT implementations with removal need garbage collection of tombstones, and what makes it hard?</p>
+    <ol class="q-options">
+      <li>Tombstones slow down merges; collecting them is trivial since each replica can drop them whenever it likes</li>
+      <li>Tombstones are only needed for text; sets never need them</li>
+      <li>A tombstone must be kept until every replica has seen the delete, otherwise a late merge resurrects the element; knowing that requires membership knowledge or a time-based bet</li>
+      <li>Tombstones break idempotence and must be removed after each merge</li>
+    </ol>
+    <div class="q-explain">The tombstone is what remembers the deletion. Drop it too early and a replica that still holds the old element will reintroduce it. Dropping it safely needs causal stability (all replicas have acknowledged), or a grace period such as Cassandra's <code>gc_grace_seconds</code>, with the risk that a long-offline replica resurrects data.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/crdt-play.js"></script>
+</body>
+</html>

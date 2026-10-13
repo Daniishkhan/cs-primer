@@ -1,0 +1,1118 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 2: Rate Limiters · System Design Studio</title>
+<script>try{{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}}catch(e){{}}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="design" data-lab="L2">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 2: Rate Limiters</h1>
+  <p class="lede">A rate limiter looks like a counter, and chapter 5 argued that it is really a small distributed system. In this lab you prove it. You build the token bucket and the two sliding-window algorithms on a clock you control, and you test them with properties instead of examples: exact for the log, bounded for the counter, bursts only up to capacity. Then you move the counter into a shared store, put several app nodes with network delay in front of it, and measure what the chapter only asserted: how much a local limiter over-admits as its sync interval grows, what fail-open and fail-closed really do when the store disappears, and how clock skew quietly doubles your limit.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Rate limiting is on the hot path of every request, so the cheap algorithm choices (which window, how much state) and the expensive ones (shared state, failure policy) both show up as money and outages. The usual way people learn this is by shipping a limiter that is subtly wrong: it lets a burst through at a window edge, it over-admits by 3x once it runs on more than one node, or it takes the whole API down with it when its store restarts. Every one of those can be reproduced and measured in a few seconds of <em>simulated</em> time, which is what this lab does. You will also practise the most valuable testing habit for this kind of code: stating the property ("in any window of length W, at most L admitted") and checking it on thousands of generated traces, with the seed printed when it fails, instead of hand-picking a few cases. The design decisions of <a href="../chapters/05-rate-limiter.html">chapter 5</a> (algorithm per number, atomic script call, fail-open policy, local limiters with sync) each turn into a measured number here, and the failure-handling vocabulary comes from <a href="../../architecture/chapters/17-resilience.html">resilience</a>.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Simulated time: no sleeping, no sockets, no threads</p>
+  <p>Nothing in this lab ever waits for real. A limiter takes a <em>clock object</em> and calls <code>clock.now()</code>; the tests move a <code>ManualClock</code> by hand, and the distributed experiments run on a small event loop (<code>Sim</code>) whose clock jumps from one event to the next. The network is a seeded random delay of 1 to 5 ms each way; the shared store is an object whose methods run at one instant of simulated time, so each is atomic by construction. Randomness comes only from <code>random.Random(seed)</code>, and trace times are multiples of 1/1024 s so the arithmetic is exact in floating point, which lets the tests demand exact answers at window edges. The whole check takes about three seconds. A failing property prints its seed; replay just that one with <code>python3 check.py solution 4 7</code> (milestone 4, seed 7). Python 3.8 or newer, standard library only.</p>
+</div>
+
+<h2>What you'll build</h2>
+<figure class="diagram">
+<svg viewBox="0 0 760 332" role="img" aria-label="Top: a trace of request times is fed to a limiter on a manual clock, which returns the admitted times. Bottom: several app nodes call a shared store with an atomic increment and TTL across a simulated network; experiments cover local limiters with periodic sync, a store outage and clock skew."><defs><marker id="ahGL1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs><text x="12" y="20" text-anchor="start" class="t-sm t-bold">Milestones 1 to 3: limiters on an injected clock</text><rect x="12" y="36" width="96" height="52" rx="8" class="fs-yellow s-yellow sw-2"/><text x="60.0" y="58.0" text-anchor="middle" class="t-sm t-bold">clock</text><text x="60.0" y="74.0" text-anchor="middle" class="t-xs t-muted">ManualClock</text><rect x="150" y="36" width="112" height="52" rx="8" class="fs-green s-green sw-2"/><text x="206.0" y="58.0" text-anchor="middle" class="t-sm t-bold">requests</text><text x="206.0" y="74.0" text-anchor="middle" class="t-xs t-muted">a trace of times</text><line x1="110" y1="62" x2="148" y2="62" class="line-dash sw-2" marker-end="url(#ahGL1a)"/><line x1="264" y1="62" x2="296" y2="62" class="line sw-2" marker-end="url(#ahGL1a)"/><rect x="298" y="36" width="112" height="52" rx="8" class="fs-blue s-blue sw-2"/><text x="354.0" y="58.0" text-anchor="middle" class="t-sm t-bold">limiter</text><text x="354.0" y="74.0" text-anchor="middle" class="t-xs t-muted">allow() -&gt; bool</text><line x1="412" y1="62" x2="444" y2="62" class="line sw-2" marker-end="url(#ahGL1a)"/><rect x="446" y="36" width="90" height="52" rx="8" class="fs-green s-green sw-2"/><text x="491.0" y="58.0" text-anchor="middle" class="t-sm t-bold">admitted</text><text x="491.0" y="74.0" text-anchor="middle" class="t-xs t-muted">times</text><text x="12" y="112" text-anchor="start" class="t-xs t-muted">token bucket, sliding-window log, sliding-window counter</text><text x="12" y="128" text-anchor="start" class="t-xs t-muted">property tests: never more than the limit in ANY window (exact), or at most 2x (counter)</text><line x1="12" y1="146" x2="748" y2="146" class="line-dash"/><text x="12" y="168" text-anchor="start" class="t-sm t-bold">Milestones 4 and 5: several app nodes and a shared store, in simulated time</text><rect x="12" y="184" width="100" height="32" rx="8" class="fs-blue s-blue sw-2"/><text x="62.0" y="204.0" text-anchor="middle" class="t-sm t-bold">app node 1</text><line x1="114" y1="200" x2="300" y2="232" class="line sw-2" marker-end="url(#ahGL1a)"/><rect x="12" y="224" width="100" height="32" rx="8" class="fs-blue s-blue sw-2"/><text x="62.0" y="244.0" text-anchor="middle" class="t-sm t-bold">app node 2</text><line x1="114" y1="240" x2="300" y2="240" class="line sw-2" marker-end="url(#ahGL1a)"/><rect x="12" y="264" width="100" height="32" rx="8" class="fs-blue s-blue sw-2"/><text x="62.0" y="284.0" text-anchor="middle" class="t-sm t-bold">app node 3</text><line x1="114" y1="280" x2="300" y2="232" class="line sw-2" marker-end="url(#ahGL1a)"/><text x="130" y="202" text-anchor="start" class="t-xs t-muted">INCR rl:&lt;window&gt; (atomic, TTL)</text><text x="150" y="290" text-anchor="start" class="t-xs t-muted">network delay 1 to 5 ms each way</text><rect x="302" y="206" width="120" height="64" rx="8" class="fs-cyan s-cyan sw-2"/><text x="362.0" y="228.0" text-anchor="middle" class="t-sm t-bold">shared store</text><text x="362.0" y="244.0" text-anchor="middle" class="t-xs t-muted">Redis-like</text><text x="362.0" y="258.0" text-anchor="middle" class="t-xs t-muted">INCR + TTL</text><rect x="480" y="184" width="268" height="40" rx="8" class="fs-orange s-orange sw-2"/><text x="614.0" y="200.0" text-anchor="middle" class="t-sm t-bold">local limiters + periodic sync</text><text x="614.0" y="216.0" text-anchor="middle" class="t-xs t-muted">over-admission vs the sync interval</text><rect x="480" y="232" width="268" height="40" rx="8" class="fs-red s-red sw-2"/><text x="614.0" y="248.0" text-anchor="middle" class="t-sm t-bold">store down</text><text x="614.0" y="264.0" text-anchor="middle" class="t-xs t-muted">fail open, fail closed, local fallback</text><rect x="480" y="280" width="268" height="40" rx="8" class="fs-purple s-purple sw-2"/><text x="614.0" y="296.0" text-anchor="middle" class="t-sm t-bold">clock skew</text><text x="614.0" y="312.0" text-anchor="middle" class="t-xs t-muted">who names the window?</text><line x1="424" y1="238" x2="478" y2="205" class="line-dash sw-2" marker-end="url(#ahGL1a)"/><line x1="424" y1="238" x2="478" y2="252" class="line-dash sw-2" marker-end="url(#ahGL1a)"/><line x1="424" y1="238" x2="478" y2="298" class="line-dash sw-2" marker-end="url(#ahGL1a)"/></svg>
+  <figcaption><strong>Two halves.</strong> Top: single-process limiters on a clock you move by hand, tested by properties on generated traces. Bottom: the same idea at fleet scale, with nodes, a network, a shared store, an outage and skewed clocks, all inside one process and one seed.</figcaption>
+</figure><p>Five milestones, each building on the last:</p>
+<ol class="steps">
+  <li><strong>A token bucket</strong> on an injected clock: burst up to capacity, refill at the rate, <code>retry_after</code>, and a clock that steps backwards.</li>
+  <li><strong>Sliding windows:</strong> the exact sliding-window log, and the sliding-window counter with the weighted-previous-window approximation. A fixed window is given as the baseline that fails at edges.</li>
+  <li><strong>Property tests:</strong> a sliding-window measurement helper, a trace replayer and a trace generator with an adversarial "edges" shape; then the properties themselves, run on 160 generated traces.</li>
+  <li><strong>A global limiter</strong> over a simulated shared store with an atomic increment and a TTL, several app nodes, and network delay, set against a read-then-write limiter that races.</li>
+  <li><strong>The real-world part:</strong> local limiters with periodic sync (over-admission against the sync interval), fail-open versus fail-closed versus a local fallback when the store is down, and clock skew between nodes.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are inside this guide's folder, in <code>design/labs/code/lab02/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab02/starter.py"><code>starter.py</code></a></td><td>Your file. The clocks, the simulation kit (event loop, network, store skeleton, <code>rpc</code>), the experiment harnesses and the baseline limiters are given; each function that matters has a docstring and a <code>TODO</code> for its milestone.</td></tr>
+    <tr><td><a href="code/lab02/check.py"><code>check.py</code></a></td><td>The self-check. Seeded and simulated, so it gives the same answer on every run. It uses its own trusted reference limiters and measurement code, so a bug in your helpers cannot hide a bug in your limiters.</td></tr>
+    <tr><td><a href="code/lab02/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Everything is unimplemented, and it says so cleanly:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd design/labs/code/lab02</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">  … Milestone 1: a token bucket on an injected clock: not implemented yet (TODO milestone 1: TokenBucket.tokens)
+  … Milestone 2: sliding-window log and sliding-window counter: not implemented yet (TODO milestone 2: SlidingWindowLog.allow)
+  … Milestone 3: property tests (exact, bounded, burst): not implemented yet (TODO milestone 3: max_in_window)
+  … Milestone 4: a global limiter over a shared store: not implemented yet (TODO milestone 4: Store.get)
+  … Milestone 5: local limiters + sync, failure policy, clock skew: not implemented yet (TODO milestone 5: LocalSyncNode.sync)
+
+0/5 milestones passing  (0.0 s)</span></code></pre><p>Milestone 3 does not depend on 1 and 2 for its own helpers, but its properties run your limiters, so work in order. Milestones 4 and 5 use your token bucket (the local fallback) and the given simulation kit.</p>
+
+<h2>Milestone 1: a token bucket on an injected clock</h2>
+
+<p>A <span class="term">token bucket</span> holds up to <code>capacity</code> tokens and receives <code>rate</code> new ones per second. A request spends tokens (normally one) or is rejected. Two numbers, two meanings: the <em>rate</em> is the long-run average you allow, and the <em>capacity</em> is the largest burst. That is why chapter 5 recommends it as the default for APIs: real clients are bursty, and the bucket allows exactly the burst you chose and no more.</p>
+<p>The implementation needs no timer. It is <em>lazy</em>: remember the token count and the time you last looked, and on every call add <code>rate &times; (now - last)</code> capped at <code>capacity</code>. State is two numbers per key, which is why a limiter for ten million keys fits in a gigabyte (chapter 5's estimate). The bucket never calls <code>time.time()</code>. It is handed a clock, and that one design choice is what makes every test in this lab possible: a test can say "advance 0.5 seconds" and mean it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-label="Tokens in a bucket with capacity 10 and refill 10 per second over four seconds. A steady 5 per second keeps it near full; a burst of 25 empties it in the first ten requests and the rest are rejected; after a pause it refills, and a faster stream drains it again.">
+<line x1="56" y1="252.0" x2="738" y2="252.0" class="line-thin"/>
+<text x="48" y="256.0" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="56" y1="211.6" x2="738" y2="211.6" class="line-thin"/>
+<text x="48" y="215.6" text-anchor="end" class="t-xs t-muted">2</text>
+<line x1="56" y1="171.3" x2="738" y2="171.3" class="line-thin"/>
+<text x="48" y="175.3" text-anchor="end" class="t-xs t-muted">4</text>
+<line x1="56" y1="130.9" x2="738" y2="130.9" class="line-thin"/>
+<text x="48" y="134.9" text-anchor="end" class="t-xs t-muted">6</text>
+<line x1="56" y1="90.5" x2="738" y2="90.5" class="line-thin"/>
+<text x="48" y="94.5" text-anchor="end" class="t-xs t-muted">8</text>
+<line x1="56" y1="50.2" x2="738" y2="50.2" class="line-thin"/>
+<text x="48" y="54.2" text-anchor="end" class="t-xs t-muted">10</text>
+<line x1="56.0" y1="30" x2="56.0" y2="252" class="line-thin"/>
+<text x="56.0" y="268" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="226.5" y1="30" x2="226.5" y2="252" class="line-thin"/>
+<text x="226.5" y="268" text-anchor="middle" class="t-xs t-muted">1</text>
+<line x1="397.0" y1="30" x2="397.0" y2="252" class="line-thin"/>
+<text x="397.0" y="268" text-anchor="middle" class="t-xs t-muted">2</text>
+<line x1="567.5" y1="30" x2="567.5" y2="252" class="line-thin"/>
+<text x="567.5" y="268" text-anchor="middle" class="t-xs t-muted">3</text>
+<line x1="738.0" y1="30" x2="738.0" y2="252" class="line-thin"/>
+<text x="738.0" y="268" text-anchor="middle" class="t-xs t-muted">4</text>
+<line x1="56" y1="252" x2="738" y2="252" class="line"/>
+<line x1="56" y1="30" x2="56" y2="252" class="line"/>
+<text x="397.0" y="292" text-anchor="middle" class="t-sm t-muted">time (s)</text>
+<text x="14" y="141.0" text-anchor="middle" class="t-sm t-muted" transform="rotate(-90 14 141.0)">tokens in the bucket</text>
+<polyline points="56.0,50.2 56.0,50.2 56.0,70.4 90.1,50.2 90.1,70.4 124.2,50.2 124.2,70.4 158.3,50.2 158.3,70.4 192.4,50.2 192.4,70.4 226.5,50.2 226.5,70.4 226.8,70.0 226.8,90.1 227.2,89.7 227.2,109.9 227.5,109.5 227.5,129.7 227.9,129.3 227.9,149.5 228.2,149.1 228.2,169.3 228.5,168.9 228.5,189.0 228.9,188.6 228.9,208.8 229.2,208.4 229.2,228.6 229.6,228.2 229.6,248.4 229.9,248.0 229.9,248.0 230.3,247.6 230.3,247.6 230.6,247.2 230.6,247.2 230.9,246.8 230.9,246.8 231.3,246.3 231.3,246.3 231.6,245.9 231.6,245.9 232.0,245.5 232.0,245.5 232.3,245.1 232.3,245.1 232.6,244.7 232.6,244.7 233.0,244.3 233.0,244.3 233.3,243.9 233.3,243.9 233.7,243.5 233.7,243.5 234.0,243.1 234.0,243.1 234.3,242.7 234.3,242.7 234.7,242.3 234.7,242.3 370.0,82.1 370.0,102.3 377.1,93.9 377.1,114.1 384.2,105.7 384.2,125.9 391.3,117.5 391.3,137.6 398.4,129.2 398.4,149.4 405.5,141.0 405.5,161.2 412.6,152.8 412.6,173.0 419.7,164.5 419.7,184.7 426.8,176.3 426.8,196.5 433.9,188.1 433.9,208.3 441.0,199.9 441.0,220.0 448.1,211.6 448.1,231.8 455.3,223.4 455.3,243.6 462.4,235.2 462.4,235.2 469.5,226.8 469.5,247.0 476.6,238.5 476.6,238.5 483.7,230.1 483.7,250.3 490.8,241.9 490.8,241.9 497.9,233.5 497.9,233.5 505.0,225.1 505.0,245.3 512.1,236.9 512.1,236.9 519.2,228.5 519.2,248.6 526.3,240.2 526.3,240.2 533.4,231.8 533.4,252.0 540.5,243.6 540.5,243.6 547.6,235.2 547.6,235.2 554.7,226.8 554.7,247.0 738.0,247.0" class="line s-blue sw-3" fill="none"/>
+<circle cx="56.0" cy="70.4" r="3.5" class="f-green"/>
+<circle cx="90.1" cy="70.4" r="3.5" class="f-green"/>
+<circle cx="124.2" cy="70.4" r="3.5" class="f-green"/>
+<circle cx="158.3" cy="70.4" r="3.5" class="f-green"/>
+<circle cx="192.4" cy="70.4" r="3.5" class="f-green"/>
+<circle cx="226.5" cy="70.4" r="3.5" class="f-green"/>
+<circle cx="226.8" cy="90.1" r="3.5" class="f-green"/>
+<circle cx="227.2" cy="109.9" r="3.5" class="f-green"/>
+<circle cx="227.5" cy="129.7" r="3.5" class="f-green"/>
+<circle cx="227.9" cy="149.5" r="3.5" class="f-green"/>
+<circle cx="228.2" cy="169.3" r="3.5" class="f-green"/>
+<circle cx="228.5" cy="189.0" r="3.5" class="f-green"/>
+<circle cx="228.9" cy="208.8" r="3.5" class="f-green"/>
+<circle cx="229.2" cy="228.6" r="3.5" class="f-green"/>
+<circle cx="229.6" cy="248.4" r="3.5" class="f-green"/>
+<circle cx="370.0" cy="102.3" r="3.5" class="f-green"/>
+<circle cx="377.1" cy="114.1" r="3.5" class="f-green"/>
+<circle cx="384.2" cy="125.9" r="3.5" class="f-green"/>
+<circle cx="391.3" cy="137.6" r="3.5" class="f-green"/>
+<circle cx="398.4" cy="149.4" r="3.5" class="f-green"/>
+<circle cx="405.5" cy="161.2" r="3.5" class="f-green"/>
+<circle cx="412.6" cy="173.0" r="3.5" class="f-green"/>
+<circle cx="419.7" cy="184.7" r="3.5" class="f-green"/>
+<circle cx="426.8" cy="196.5" r="3.5" class="f-green"/>
+<circle cx="433.9" cy="208.3" r="3.5" class="f-green"/>
+<circle cx="441.0" cy="220.0" r="3.5" class="f-green"/>
+<circle cx="448.1" cy="231.8" r="3.5" class="f-green"/>
+<circle cx="455.3" cy="243.6" r="3.5" class="f-green"/>
+<circle cx="469.5" cy="247.0" r="3.5" class="f-green"/>
+<circle cx="483.7" cy="250.3" r="3.5" class="f-green"/>
+<circle cx="505.0" cy="245.3" r="3.5" class="f-green"/>
+<circle cx="519.2" cy="248.6" r="3.5" class="f-green"/>
+<circle cx="533.4" cy="252.0" r="3.5" class="f-green"/>
+<circle cx="554.7" cy="247.0" r="3.5" class="f-green"/>
+<circle cx="229.9" cy="248.0" r="3.5" class="f-red"/>
+<circle cx="230.3" cy="247.6" r="3.5" class="f-red"/>
+<circle cx="230.6" cy="247.2" r="3.5" class="f-red"/>
+<circle cx="230.9" cy="246.8" r="3.5" class="f-red"/>
+<circle cx="231.3" cy="246.3" r="3.5" class="f-red"/>
+<circle cx="231.6" cy="245.9" r="3.5" class="f-red"/>
+<circle cx="232.0" cy="245.5" r="3.5" class="f-red"/>
+<circle cx="232.3" cy="245.1" r="3.5" class="f-red"/>
+<circle cx="232.6" cy="244.7" r="3.5" class="f-red"/>
+<circle cx="233.0" cy="244.3" r="3.5" class="f-red"/>
+<circle cx="233.3" cy="243.9" r="3.5" class="f-red"/>
+<circle cx="233.7" cy="243.5" r="3.5" class="f-red"/>
+<circle cx="234.0" cy="243.1" r="3.5" class="f-red"/>
+<circle cx="234.3" cy="242.7" r="3.5" class="f-red"/>
+<circle cx="234.7" cy="242.3" r="3.5" class="f-red"/>
+<circle cx="462.4" cy="235.2" r="3.5" class="f-red"/>
+<circle cx="476.6" cy="238.5" r="3.5" class="f-red"/>
+<circle cx="490.8" cy="241.9" r="3.5" class="f-red"/>
+<circle cx="497.9" cy="233.5" r="3.5" class="f-red"/>
+<circle cx="512.1" cy="236.9" r="3.5" class="f-red"/>
+<circle cx="526.3" cy="240.2" r="3.5" class="f-red"/>
+<circle cx="540.5" cy="243.6" r="3.5" class="f-red"/>
+<circle cx="547.6" cy="235.2" r="3.5" class="f-red"/>
+<line x1="56" y1="50.2" x2="738" y2="50.2" class="line-dash s-purple"/>
+<text x="60" y="44.2" text-anchor="start" class="t-xs t-bold">capacity 10</text>
+<text x="64.5" y="151.1" text-anchor="start" class="t-xs t-bold">steady 5/s: stays full</text>
+<text x="221.4" y="205.6" text-anchor="end" class="t-xs t-bold">burst of 25 in 50 ms:</text>
+<text x="221.4" y="223.7" text-anchor="end" class="t-xs t-bold">10 admitted, rest rejected</text>
+<text x="405.5" y="64.3" text-anchor="start" class="t-xs t-bold">pause: refills 10/s,</text>
+<text x="405.5" y="80.5" text-anchor="start" class="t-xs t-bold">then 24/s offered drains it</text>
+<circle cx="573.5" cy="37.0" r="4" class="f-green"/>
+<text x="584.5" y="40.0" class="t-xs">admitted</text>
+<circle cx="660.7" cy="37.0" r="4" class="f-red"/>
+<text x="671.7" y="40.0" class="t-xs">rejected</text>
+</svg>
+  <figcaption><strong>A real run of your bucket</strong> (rate 10 per second, capacity 10). Green dots are admitted requests, red dots rejected ones; the line is the token count. At a steady 5 per second it stays full. A burst of 25 drains it and then the rejections begin; after a pause it refills; a faster stream drains it again. Generated from the solution's own <code>TokenBucket</code>.</figcaption>
+</figure><p>Two details are worth getting right now because they bite later. A rejected request must spend nothing, or a client hammering a limit digs itself deeper. And a clock that steps <em>backwards</em> (an NTP correction, or a skewed node, milestone 5) must not mint tokens and must not freeze the bucket: re-anchor <code>last</code> to the new time and carry on.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Complete <code>TokenBucket</code>: <code>_refill()</code> (lazy refill, capped at capacity, tolerant of a clock that goes backwards), <code>tokens()</code>, <code>allow(cost=1.0)</code> (spend and return True, or return False and spend nothing) and <code>retry_after(cost=1.0)</code> (seconds until <code>cost</code> tokens exist, 0.0 if they do now). The constructor is given; the bucket starts full.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks by hand that a burst of 25 at one instant admits exactly the capacity (10), that <code>retry_after</code> is 0.1 s for one token and 0.5 s for five at 10/s, that half a second refills five tokens, that a thousand idle seconds still leave only 10, that a rejected request spends nothing, and that stepping the clock back 500 s mints nothing and does not freeze refilling. Then 40 random traces (poisson, bursty, edge and steady, random rate and capacity) are replayed through your bucket and a reference: every decision must match, and in every window of 0.25, 1 and 3 seconds the admitted count must be at most <code>capacity + rate &times; window</code>. A failure prints the seed, the request number and both answers.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>_refill</code>: <code>dt = now - self._last</code>; if <code>dt &gt; 0</code>, <code>self._tokens = min(self.capacity, self._tokens + dt * self.rate)</code>; then always set <code>self._last = now</code>. The unconditional assignment is what handles a backwards step.</li>
+      <li>Compare with a tiny tolerance (<code>self._tokens + 1e-9 &gt;= cost</code>), because refilling adds floating-point fractions. Do not subtract if the comparison fails.</li>
+      <li><code>retry_after</code>: after refilling, <code>missing = cost - tokens</code>; return 0 if <code>missing</code> is tiny, else <code>missing / rate</code>.</li>
+      <li>A request costing more than the capacity can never be admitted; the code needs no special case for it, but be sure it does not hang or go negative.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">class</span> TokenBucket:
+    <span class="str">"""Tokens drip in at `rate` per second up to `capacity`; each request spends `cost`.
+
+    The bucket is lazy: no timer fills it. Every call first adds rate x (time since the
+    last call), capped at capacity. It starts full.
+    """</span>
+
+    <span class="kw">def</span> __init__(self, rate, capacity, clock):
+        self.rate = float(rate)
+        self.capacity = float(capacity)
+        self.clock = clock
+        self._tokens = float(capacity)
+        self._last = clock.now()
+
+    <span class="kw">def</span> _refill(self):
+        now = self.clock.now()
+        dt = now - self._last
+        <span class="kw">if</span> dt &gt; <span class="num">0</span>:
+            self._tokens = min(self.capacity, self._tokens + dt * self.rate)
+        self._last = now            <span class="cmt"># if the clock stepped backwards we re-anchor: no refill, no freeze</span>
+
+    <span class="kw">def</span> tokens(self):
+        <span class="str">"""Tokens available right now (after refilling)."""</span>
+        self._refill()
+        <span class="kw">return</span> self._tokens
+
+    <span class="kw">def</span> allow(self, cost=<span class="num">1.0</span>):
+        <span class="str">"""Spend `cost` tokens and return True, or return False and spend nothing."""</span>
+        self._refill()
+        <span class="kw">if</span> self._tokens + EPS &gt;= cost:
+            self._tokens -= cost
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="kw">return</span> <span class="kw">False</span>
+
+    <span class="kw">def</span> retry_after(self, cost=<span class="num">1.0</span>):
+        <span class="str">"""Seconds until `cost` tokens will be available (0.0 if they are now)."""</span>
+        self._refill()
+        missing = cost - self._tokens
+        <span class="kw">return</span> <span class="num">0.0</span> <span class="kw">if</span> missing &lt;= EPS <span class="kw">else</span> missing / self.rate</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: sliding windows, exact and approximate</h2>
+
+<p>A <span class="term">fixed window</span> counts requests in aligned intervals ("this clock minute") and resets at the edge. It costs one counter, and it is wrong at the boundary: a client can send a full allowance in the last moments of one window and another in the first moments of the next, twice the limit in a fraction of a window. The baseline class is given so you can watch it fail. Chapter 5's table lists the two ways out.</p>
+<ul>
+  <li>The <strong>sliding-window log</strong> remembers the timestamp of every admitted request and admits a new one only if fewer than <code>limit</code> lie in the last <code>window</code> seconds. It is exact, and costs up to <code>limit</code> timestamps per key (chapter 5's estimate: about 850 bytes against 64, thirteen times more state). Use it for small limits where exactness matters, such as five login attempts per fifteen minutes.</li>
+  <li>The <strong>sliding-window counter</strong> keeps two counters, the current window's and the previous one's, and estimates the sliding count as <code>previous &times; (1 - fraction of the current window elapsed) + current</code>. It assumes the previous window's requests were spread evenly, which is where the error comes from. Two numbers per key; a good general limiter when "close enough" is enough.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 760 284" role="img" aria-label="Three rows of ticks for the same 40 requests around a window edge. The fixed window admits 10 before the edge and 10 right after, 20 in 0.4 seconds. The sliding log admits 10 and then none. The sliding counter admits 10 then about 1 or 2 as the weight of the previous window decays."><text x="12" y="20" text-anchor="start" class="t-sm t-bold">40 requests in 0.4 s around a window edge at t = 1.0; limit 10 per second</text><text x="12" y="74" text-anchor="start" class="t-sm t-bold">fixed window</text><line x1="150" y1="70" x2="740" y2="70" class="line-thin"/><line x1="176.8" y1="54" x2="176.8" y2="70" class="line s-green sw-3"/><line x1="190.2" y1="54" x2="190.2" y2="70" class="line s-green sw-3"/><line x1="203.6" y1="54" x2="203.6" y2="70" class="line s-green sw-3"/><line x1="217.0" y1="54" x2="217.0" y2="70" class="line s-green sw-3"/><line x1="230.5" y1="54" x2="230.5" y2="70" class="line s-green sw-3"/><line x1="243.9" y1="54" x2="243.9" y2="70" class="line s-green sw-3"/><line x1="257.3" y1="54" x2="257.3" y2="70" class="line s-green sw-3"/><line x1="270.7" y1="54" x2="270.7" y2="70" class="line s-green sw-3"/><line x1="284.1" y1="54" x2="284.1" y2="70" class="line s-green sw-3"/><line x1="297.5" y1="54" x2="297.5" y2="70" class="line s-green sw-3"/><line x1="310.9" y1="72" x2="310.9" y2="82" class="line s-red sw-1"/><line x1="324.3" y1="72" x2="324.3" y2="82" class="line s-red sw-1"/><line x1="337.7" y1="72" x2="337.7" y2="82" class="line s-red sw-1"/><line x1="351.1" y1="72" x2="351.1" y2="82" class="line s-red sw-1"/><line x1="364.5" y1="72" x2="364.5" y2="82" class="line s-red sw-1"/><line x1="378.0" y1="72" x2="378.0" y2="82" class="line s-red sw-1"/><line x1="391.4" y1="72" x2="391.4" y2="82" class="line s-red sw-1"/><line x1="404.8" y1="72" x2="404.8" y2="82" class="line s-red sw-1"/><line x1="418.2" y1="72" x2="418.2" y2="82" class="line s-red sw-1"/><line x1="431.6" y1="72" x2="431.6" y2="82" class="line s-red sw-1"/><line x1="445.0" y1="54" x2="445.0" y2="70" class="line s-green sw-3"/><line x1="458.4" y1="54" x2="458.4" y2="70" class="line s-green sw-3"/><line x1="471.8" y1="54" x2="471.8" y2="70" class="line s-green sw-3"/><line x1="485.2" y1="54" x2="485.2" y2="70" class="line s-green sw-3"/><line x1="498.6" y1="54" x2="498.6" y2="70" class="line s-green sw-3"/><line x1="512.0" y1="54" x2="512.0" y2="70" class="line s-green sw-3"/><line x1="525.5" y1="54" x2="525.5" y2="70" class="line s-green sw-3"/><line x1="538.9" y1="54" x2="538.9" y2="70" class="line s-green sw-3"/><line x1="552.3" y1="54" x2="552.3" y2="70" class="line s-green sw-3"/><line x1="565.7" y1="54" x2="565.7" y2="70" class="line s-green sw-3"/><line x1="579.1" y1="72" x2="579.1" y2="82" class="line s-red sw-1"/><line x1="592.5" y1="72" x2="592.5" y2="82" class="line s-red sw-1"/><line x1="605.9" y1="72" x2="605.9" y2="82" class="line s-red sw-1"/><line x1="619.3" y1="72" x2="619.3" y2="82" class="line s-red sw-1"/><line x1="632.7" y1="72" x2="632.7" y2="82" class="line s-red sw-1"/><line x1="646.1" y1="72" x2="646.1" y2="82" class="line s-red sw-1"/><line x1="659.5" y1="72" x2="659.5" y2="82" class="line s-red sw-1"/><line x1="673.0" y1="72" x2="673.0" y2="82" class="line s-red sw-1"/><line x1="686.4" y1="72" x2="686.4" y2="82" class="line s-red sw-1"/><line x1="699.8" y1="72" x2="699.8" y2="82" class="line s-red sw-1"/><text x="738" y="100" text-anchor="end" class="t-xs t-bold">admitted 20 of 40</text><text x="12" y="136" text-anchor="start" class="t-sm t-bold">sliding log</text><line x1="150" y1="132" x2="740" y2="132" class="line-thin"/><line x1="176.8" y1="116" x2="176.8" y2="132" class="line s-green sw-3"/><line x1="190.2" y1="116" x2="190.2" y2="132" class="line s-green sw-3"/><line x1="203.6" y1="116" x2="203.6" y2="132" class="line s-green sw-3"/><line x1="217.0" y1="116" x2="217.0" y2="132" class="line s-green sw-3"/><line x1="230.5" y1="116" x2="230.5" y2="132" class="line s-green sw-3"/><line x1="243.9" y1="116" x2="243.9" y2="132" class="line s-green sw-3"/><line x1="257.3" y1="116" x2="257.3" y2="132" class="line s-green sw-3"/><line x1="270.7" y1="116" x2="270.7" y2="132" class="line s-green sw-3"/><line x1="284.1" y1="116" x2="284.1" y2="132" class="line s-green sw-3"/><line x1="297.5" y1="116" x2="297.5" y2="132" class="line s-green sw-3"/><line x1="310.9" y1="134" x2="310.9" y2="144" class="line s-red sw-1"/><line x1="324.3" y1="134" x2="324.3" y2="144" class="line s-red sw-1"/><line x1="337.7" y1="134" x2="337.7" y2="144" class="line s-red sw-1"/><line x1="351.1" y1="134" x2="351.1" y2="144" class="line s-red sw-1"/><line x1="364.5" y1="134" x2="364.5" y2="144" class="line s-red sw-1"/><line x1="378.0" y1="134" x2="378.0" y2="144" class="line s-red sw-1"/><line x1="391.4" y1="134" x2="391.4" y2="144" class="line s-red sw-1"/><line x1="404.8" y1="134" x2="404.8" y2="144" class="line s-red sw-1"/><line x1="418.2" y1="134" x2="418.2" y2="144" class="line s-red sw-1"/><line x1="431.6" y1="134" x2="431.6" y2="144" class="line s-red sw-1"/><line x1="445.0" y1="134" x2="445.0" y2="144" class="line s-red sw-1"/><line x1="458.4" y1="134" x2="458.4" y2="144" class="line s-red sw-1"/><line x1="471.8" y1="134" x2="471.8" y2="144" class="line s-red sw-1"/><line x1="485.2" y1="134" x2="485.2" y2="144" class="line s-red sw-1"/><line x1="498.6" y1="134" x2="498.6" y2="144" class="line s-red sw-1"/><line x1="512.0" y1="134" x2="512.0" y2="144" class="line s-red sw-1"/><line x1="525.5" y1="134" x2="525.5" y2="144" class="line s-red sw-1"/><line x1="538.9" y1="134" x2="538.9" y2="144" class="line s-red sw-1"/><line x1="552.3" y1="134" x2="552.3" y2="144" class="line s-red sw-1"/><line x1="565.7" y1="134" x2="565.7" y2="144" class="line s-red sw-1"/><line x1="579.1" y1="134" x2="579.1" y2="144" class="line s-red sw-1"/><line x1="592.5" y1="134" x2="592.5" y2="144" class="line s-red sw-1"/><line x1="605.9" y1="134" x2="605.9" y2="144" class="line s-red sw-1"/><line x1="619.3" y1="134" x2="619.3" y2="144" class="line s-red sw-1"/><line x1="632.7" y1="134" x2="632.7" y2="144" class="line s-red sw-1"/><line x1="646.1" y1="134" x2="646.1" y2="144" class="line s-red sw-1"/><line x1="659.5" y1="134" x2="659.5" y2="144" class="line s-red sw-1"/><line x1="673.0" y1="134" x2="673.0" y2="144" class="line s-red sw-1"/><line x1="686.4" y1="134" x2="686.4" y2="144" class="line s-red sw-1"/><line x1="699.8" y1="134" x2="699.8" y2="144" class="line s-red sw-1"/><text x="738" y="162" text-anchor="end" class="t-xs t-bold">admitted 10 of 40</text><text x="12" y="198" text-anchor="start" class="t-sm t-bold">sliding counter</text><line x1="150" y1="194" x2="740" y2="194" class="line-thin"/><line x1="176.8" y1="178" x2="176.8" y2="194" class="line s-green sw-3"/><line x1="190.2" y1="178" x2="190.2" y2="194" class="line s-green sw-3"/><line x1="203.6" y1="178" x2="203.6" y2="194" class="line s-green sw-3"/><line x1="217.0" y1="178" x2="217.0" y2="194" class="line s-green sw-3"/><line x1="230.5" y1="178" x2="230.5" y2="194" class="line s-green sw-3"/><line x1="243.9" y1="178" x2="243.9" y2="194" class="line s-green sw-3"/><line x1="257.3" y1="178" x2="257.3" y2="194" class="line s-green sw-3"/><line x1="270.7" y1="178" x2="270.7" y2="194" class="line s-green sw-3"/><line x1="284.1" y1="178" x2="284.1" y2="194" class="line s-green sw-3"/><line x1="297.5" y1="178" x2="297.5" y2="194" class="line s-green sw-3"/><line x1="310.9" y1="196" x2="310.9" y2="206" class="line s-red sw-1"/><line x1="324.3" y1="196" x2="324.3" y2="206" class="line s-red sw-1"/><line x1="337.7" y1="196" x2="337.7" y2="206" class="line s-red sw-1"/><line x1="351.1" y1="196" x2="351.1" y2="206" class="line s-red sw-1"/><line x1="364.5" y1="196" x2="364.5" y2="206" class="line s-red sw-1"/><line x1="378.0" y1="196" x2="378.0" y2="206" class="line s-red sw-1"/><line x1="391.4" y1="196" x2="391.4" y2="206" class="line s-red sw-1"/><line x1="404.8" y1="196" x2="404.8" y2="206" class="line s-red sw-1"/><line x1="418.2" y1="196" x2="418.2" y2="206" class="line s-red sw-1"/><line x1="431.6" y1="196" x2="431.6" y2="206" class="line s-red sw-1"/><line x1="445.0" y1="196" x2="445.0" y2="206" class="line s-red sw-1"/><line x1="458.4" y1="196" x2="458.4" y2="206" class="line s-red sw-1"/><line x1="471.8" y1="196" x2="471.8" y2="206" class="line s-red sw-1"/><line x1="485.2" y1="196" x2="485.2" y2="206" class="line s-red sw-1"/><line x1="498.6" y1="196" x2="498.6" y2="206" class="line s-red sw-1"/><line x1="512.0" y1="196" x2="512.0" y2="206" class="line s-red sw-1"/><line x1="525.5" y1="196" x2="525.5" y2="206" class="line s-red sw-1"/><line x1="538.9" y1="196" x2="538.9" y2="206" class="line s-red sw-1"/><line x1="552.3" y1="196" x2="552.3" y2="206" class="line s-red sw-1"/><line x1="565.7" y1="196" x2="565.7" y2="206" class="line s-red sw-1"/><line x1="579.1" y1="178" x2="579.1" y2="194" class="line s-green sw-3"/><line x1="592.5" y1="196" x2="592.5" y2="206" class="line s-red sw-1"/><line x1="605.9" y1="196" x2="605.9" y2="206" class="line s-red sw-1"/><line x1="619.3" y1="196" x2="619.3" y2="206" class="line s-red sw-1"/><line x1="632.7" y1="196" x2="632.7" y2="206" class="line s-red sw-1"/><line x1="646.1" y1="196" x2="646.1" y2="206" class="line s-red sw-1"/><line x1="659.5" y1="196" x2="659.5" y2="206" class="line s-red sw-1"/><line x1="673.0" y1="196" x2="673.0" y2="206" class="line s-red sw-1"/><line x1="686.4" y1="196" x2="686.4" y2="206" class="line s-red sw-1"/><line x1="699.8" y1="196" x2="699.8" y2="206" class="line s-red sw-1"/><text x="738" y="224" text-anchor="end" class="t-xs t-bold">admitted 11 of 40</text><line x1="445.0" y1="32" x2="445.0" y2="236" class="line-dash s-orange"/><text x="450.0" y="40" text-anchor="start" class="t-xs t-bold">window edge</text><text x="176.81818181818184" y="252" text-anchor="middle" class="t-xs t-muted">0.8</text><text x="310.90909090909093" y="252" text-anchor="middle" class="t-xs t-muted">0.9</text><text x="445.0" y="252" text-anchor="middle" class="t-xs t-muted">1.0</text><text x="579.0909090909092" y="252" text-anchor="middle" class="t-xs t-muted">1.1</text><text x="713.1818181818181" y="252" text-anchor="middle" class="t-xs t-muted">1.2</text><text x="445.0" y="270" text-anchor="middle" class="t-sm t-muted">time (s); green = admitted, red = rejected</text></svg>
+  <figcaption><strong>The same 40 requests, three limiters.</strong> The fixed window lets 20 through in 0.4 seconds, twice its limit. The log admits 10 and then nothing until the old ones age out. The counter admits 11: after the edge it still weights the previous window's 10 by how much of it remains. Generated from the given <code>FixedWindow</code> and your two classes.</figcaption>
+</figure><div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Complete <code>SlidingWindowLog.allow()</code> (half-open window: a request at time <em>t</em> counts the admitted requests in (<em>t</em> - window, <em>t</em>]; rejected requests are not logged) and <code>SlidingWindowCounter</code>: <code>_roll(now)</code> (move to the current window; the old current becomes previous only if the new window is the very next one, otherwise previous is 0), <code>estimate()</code> and <code>allow()</code> (admit if <code>estimate + 1 &lt;= limit</code>).</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It runs a nine-request sequence through the log by hand (including a request at exactly <em>t</em> = 1.0, which must see the one at <em>t</em> = 0.0 as already expired), checks the counter's hand values (15 requests at <em>t</em> = 0 admit 10; at <em>t</em> = 1.5 the estimate is exactly 5.0 and exactly 5 of the next 15 fit; after a gap of several windows the estimate is 0), shows that the given <code>FixedWindow</code> breaks the limit at an edge while your log never does, and finally replays 30 random traces through your log and an exact reference: all decisions must match.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Log: a <code>deque</code> of admitted times. At the start of <code>allow</code>, pop from the left while <code>log[0] &lt;= now - window</code>. The test is <code>&lt;=</code>, not <code>&lt;</code>, because the interval is open on the left.</li>
+      <li>Counter: <code>idx = floor(now / window)</code>. If it differs from the stored index, set <code>prev = cur if idx == old_idx + 1 else 0</code>, then <code>cur = 0</code>. The fraction elapsed is <code>(now - idx * window) / window</code>.</li>
+      <li>Call <code>_roll(now)</code> at the top of <code>estimate()</code>, so both <code>estimate</code> and <code>allow</code> see a rolled state.</li>
+      <li>A rejected request must not increment anything. Only the admitted ones are counted.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">class</span> SlidingWindowLog:
+    <span class="str">"""Exact: remember the timestamp of every admitted request in the last `window` seconds.
+
+    A request at time t is admitted if fewer than `limit` admitted requests lie in the
+    half-open interval (t - window, t]. Rejected requests are not logged.
+    """</span>
+
+    <span class="kw">def</span> __init__(self, limit, window, clock):
+        self.limit, self.window, self.clock = limit, window, clock
+        self._log = deque()
+
+    <span class="kw">def</span> allow(self):
+        now = self.clock.now()
+        <span class="kw">while</span> self._log <span class="kw">and</span> self._log[<span class="num">0</span>] &lt;= now - self.window:
+            self._log.popleft()
+        <span class="kw">if</span> len(self._log) &lt; self.limit:
+            self._log.append(now)
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="kw">return</span> <span class="kw">False</span>
+
+<span class="kw">class</span> SlidingWindowCounter:
+    <span class="str">"""Approximate: two counters (this window, the previous one) and a weighted sum.
+
+    estimate = previous x (1 - fraction of the current window elapsed) + current.
+    A request is admitted if estimate + 1 &lt;= limit. The estimate assumes the previous
+    window's requests were spread evenly, which is where the error comes from.
+    """</span>
+
+    <span class="kw">def</span> __init__(self, limit, window, clock):
+        self.limit, self.window, self.clock = limit, window, clock
+        self._idx = math.floor(clock.now() / window)
+        self._cur, self._prev = <span class="num">0</span>, <span class="num">0</span>
+
+    <span class="kw">def</span> _roll(self, now):
+        idx = math.floor(now / self.window)
+        <span class="kw">if</span> idx != self._idx:
+            self._prev = self._cur <span class="kw">if</span> idx == self._idx + <span class="num">1</span> <span class="kw">else</span> <span class="num">0</span>
+            self._cur = <span class="num">0</span>
+            self._idx = idx
+
+    <span class="kw">def</span> estimate(self):
+        <span class="str">"""The weighted estimate of requests in the last `window` seconds."""</span>
+        now = self.clock.now()
+        self._roll(now)
+        frac = (now - self._idx * self.window) / self.window
+        <span class="kw">return</span> self._prev * (<span class="num">1.0</span> - frac) + self._cur
+
+    <span class="kw">def</span> allow(self):
+        <span class="kw">if</span> self.estimate() + <span class="num">1.0</span> &lt;= self.limit + EPS:
+            self._cur += <span class="num">1</span>
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="kw">return</span> <span class="kw">False</span></code></pre>
+  </details>
+</div>
+
+<h2>Milestone 3: property tests</h2>
+
+<p>Examples test what you thought of; <span class="term">properties</span> test what you should have thought of. Instead of "request 7 at <em>t</em> = 1.3 is rejected", state the guarantee the algorithm promises and check it on thousands of generated traces: <em>in any window of length W, at most L admitted</em>. The three guarantees of this lab differ in kind, and the difference is the lesson.</p>
+<ul>
+  <li><strong>Exact</strong> (the log): the maximum admitted in any sliding window is &le; <code>limit</code>, always, and decisions equal those of a reference implementation.</li>
+  <li><strong>Bounded error</strong> (the counter): the maximum can exceed the limit, but by a provable bound. If the previous window held <em>p</em> requests all bunched into the part that still overlaps, the true count is <em>p</em> plus the current count while the estimate is only <em>p</em>(1 &minus; <em>f</em>) plus the current count. So the true count stays below <code>limit &times; (1 + f)</code>, under twice the limit. And on smooth traffic it is close to the log: the check demands the counter admit within 15% of what the log does.</li>
+  <li><strong>Burst bounded by capacity</strong> (the bucket): after a long idle period a burst of any size admits exactly <code>capacity</code>, and in any window of length <em>w</em> the admitted count is at most <code>capacity + rate &times; w</code>.</li>
+</ul>
+<p>Generating the traces is half the work. Steady traffic never finds a bug. Poisson traffic finds a few. The cruel shapes are bursts, and bursts placed on window edges: "<code>edges</code>" sends half a second's traffic just before each whole second and half just after. The check insists that your edges trace pushes the fixed window to at least 1.6x its limit; a generator that cannot hurt the baseline cannot be trusted to test anything else.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 320" role="img" aria-label="Grouped bars of the worst admitted count in any one-second window as a multiple of the limit, for four limiters on four traffic shapes. The sliding log is exactly 1 on all four; the fixed window reaches 2 on bursty and edge traffic; the sliding counter stays at 1 on steady traffic and reaches 1.8 on bursts; the token bucket is up to 1.95 because capacity plus a second of refill is allowed.">
+<line x1="56" y1="272.0" x2="738" y2="272.0" class="line-thin"/>
+<text x="48" y="276.0" text-anchor="end" class="t-xs t-muted">0x</text>
+<line x1="56" y1="221.6" x2="738" y2="221.6" class="line-thin"/>
+<text x="48" y="225.6" text-anchor="end" class="t-xs t-muted">0.5x</text>
+<line x1="56" y1="171.2" x2="738" y2="171.2" class="line-thin"/>
+<text x="48" y="175.2" text-anchor="end" class="t-xs t-muted">1x</text>
+<line x1="56" y1="120.8" x2="738" y2="120.8" class="line-thin"/>
+<text x="48" y="124.8" text-anchor="end" class="t-xs t-muted">1.5x</text>
+<line x1="56" y1="70.3" x2="738" y2="70.3" class="line-thin"/>
+<text x="48" y="74.3" text-anchor="end" class="t-xs t-muted">2x</text>
+<text x="141.2" y="288" text-anchor="middle" class="t-xs t-muted">steady</text>
+<text x="311.8" y="288" text-anchor="middle" class="t-xs t-muted">poisson</text>
+<text x="482.2" y="288" text-anchor="middle" class="t-xs t-muted">bursty</text>
+<text x="652.8" y="288" text-anchor="middle" class="t-xs t-muted">edges</text>
+<line x1="56" y1="272" x2="738" y2="272" class="line"/>
+<line x1="56" y1="30" x2="56" y2="272" class="line"/>
+<text x="397.0" y="312" text-anchor="middle" class="t-sm t-muted">traffic shape (limit 20/s, offered 60/s, worst of 20 seeds)</text>
+<text x="14" y="151.0" text-anchor="middle" class="t-sm t-muted" transform="rotate(-90 14 151.0)">worst 1 s window / limit</text>
+<rect x="77.3" y="171.2" width="30.5" height="100.8" rx="2" class="fs-red s-red sw-1"/>
+<rect x="247.8" y="95.5" width="30.5" height="176.5" rx="2" class="fs-red s-red sw-1"/>
+<rect x="418.3" y="70.3" width="30.5" height="201.7" rx="2" class="fs-red s-red sw-1"/>
+<rect x="588.8" y="70.3" width="30.5" height="201.7" rx="2" class="fs-red s-red sw-1"/>
+<rect x="109.3" y="171.2" width="30.5" height="100.8" rx="2" class="fs-green s-green sw-1"/>
+<rect x="279.8" y="171.2" width="30.5" height="100.8" rx="2" class="fs-green s-green sw-1"/>
+<rect x="450.3" y="171.2" width="30.5" height="100.8" rx="2" class="fs-green s-green sw-1"/>
+<rect x="620.8" y="171.2" width="30.5" height="100.8" rx="2" class="fs-green s-green sw-1"/>
+<rect x="141.2" y="171.2" width="30.5" height="100.8" rx="2" class="fs-blue s-blue sw-1"/>
+<rect x="311.8" y="161.1" width="30.5" height="110.9" rx="2" class="fs-blue s-blue sw-1"/>
+<rect x="482.2" y="90.5" width="30.5" height="181.5" rx="2" class="fs-blue s-blue sw-1"/>
+<rect x="652.8" y="115.7" width="30.5" height="156.3" rx="2" class="fs-blue s-blue sw-1"/>
+<rect x="173.2" y="75.4" width="30.5" height="196.6" rx="2" class="fs-orange s-orange sw-1"/>
+<rect x="343.7" y="75.4" width="30.5" height="196.6" rx="2" class="fs-orange s-orange sw-1"/>
+<rect x="514.2" y="75.4" width="30.5" height="196.6" rx="2" class="fs-orange s-orange sw-1"/>
+<rect x="684.7" y="110.7" width="30.5" height="161.3" rx="2" class="fs-orange s-orange sw-1"/>
+<line x1="56" y1="171.2" x2="738" y2="171.2" class="line-dash s-green"/>
+<line x1="56" y1="70.3" x2="738" y2="70.3" class="line-dash s-red"/>
+<text x="734" y="65.3" text-anchor="end" class="t-xs t-bold">bound for the counter and the fixed window: 2x</text>
+<rect x="66.0" y="26.0" width="12" height="10" rx="2" class="fs-red s-red sw-1"/>
+<text x="83.0" y="34.0" class="t-xs">fixed window</text>
+<rect x="178.8" y="26.0" width="12" height="10" rx="2" class="fs-green s-green sw-1"/>
+<text x="195.8" y="34.0" class="t-xs">sliding log</text>
+<rect x="285.2" y="26.0" width="12" height="10" rx="2" class="fs-blue s-blue sw-1"/>
+<text x="302.2" y="34.0" class="t-xs">sliding counter</text>
+<rect x="417.2" y="26.0" width="12" height="10" rx="2" class="fs-orange s-orange sw-1"/>
+<text x="434.2" y="34.0" class="t-xs">token bucket</text>
+</svg>
+  <figcaption><strong>What the properties measure.</strong> The sliding log is exactly 1x on every shape. The fixed window reaches its 2x worst case on bursts and edges. The sliding counter is exact on steady traffic and drifts toward 2x as traffic gets burstier, which is the honest price of two counters; the token bucket's 1.95x is by design (capacity plus a second of refill is allowed). Computed with your <code>make_trace</code>, <code>replay</code> and <code>max_in_window</code>.</figcaption>
+</figure><div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>max_in_window(times, window)</code> (the most points of a sorted list in any half-open interval of that length: two pointers), <code>replay(limiter, clock, times)</code> (set the manual clock to each time, call <code>allow()</code>, return the admitted times) and <code>make_trace(kind, seed, duration, rate)</code> for the kinds <code>"steady"</code>, <code>"poisson"</code>, <code>"bursty"</code> and <code>"edges"</code> (times sorted, in [0, duration), multiples of 1/1024; <code>ValueError</code> for an unknown kind).</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. Your helpers are checked by hand (<code>[0.0, 0.5, 1.0]</code> in a window of 1.0 holds 2, not 3; seven simultaneous points hold 7; <code>replay</code> leaves the clock at the last time), and each trace kind must be deterministic, sorted, in range, about <code>rate &times; duration</code> long and different across seeds. Then the properties run on the check's own trusted traces and measurements, for 40 seeds &times; 4 shapes: the log never exceeds the limit and matches the reference; the counter stays under 2x the limit and, on smooth traffic, admits 85% to 115% of the log's total; the token bucket respects <code>capacity + rate &times; window</code> for windows of 0.1 s and 1 s, and a burst of three times the capacity after idling admits exactly the capacity. A failure prints the seed and the numbers.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>max_in_window</code>: keep <code>i = 0</code>; for each <code>j</code>, while <code>times[j] - times[i] &gt;= window</code> advance <code>i</code>; the best is <code>max(j - i + 1)</code>. The <code>&gt;=</code> makes the window half-open, matching the log.</li>
+      <li>Snap generated times down to the 1/1024 grid with <code>math.floor(t / q) * q</code>. Dyadic fractions add and subtract exactly in floating point, so a request at exactly the window edge is judged exactly.</li>
+      <li>"bursty": bursts start at Poisson times (4 a second on average) and each packs about <code>rate / 4</code> requests into 50 ms. "edges": for each whole second <em>k</em>, put <code>rate / 2</code> requests in the 100 ms before it and <code>rate / 2</code> in the 100 ms after.</li>
+      <li>Sort and filter the final list to [0, duration). Use <code>random.Random(seed)</code>, never the global generator.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> max_in_window(times, window):
+    <span class="str">"""The largest number of `times` (sorted) inside any half-open interval of length `window`.
+
+    Two pointers: for each right end j, move i forward while times[j] - times[i] &gt;= window.
+    """</span>
+    best, i = <span class="num">0</span>, <span class="num">0</span>
+    <span class="kw">for</span> j, t <span class="kw">in</span> enumerate(times):
+        <span class="kw">while</span> t - times[i] &gt;= window:
+            i += <span class="num">1</span>
+        best = max(best, j - i + <span class="num">1</span>)
+    <span class="kw">return</span> best
+
+<span class="kw">def</span> replay(limiter, clock, times):
+    <span class="str">"""Feed the request times to the limiter (setting the manual clock first); return admitted times."""</span>
+    out = []
+    <span class="kw">for</span> t <span class="kw">in</span> times:
+        clock.set(t)
+        <span class="kw">if</span> limiter.allow():
+            out.append(t)
+    <span class="kw">return</span> out
+
+<span class="kw">def</span> make_trace(kind, seed, duration, rate):
+    <span class="str">"""A sorted list of request times in [0, duration), on the 1/1024 s grid.
+
+    kinds:
+      "steady"  evenly spaced, `rate` per second
+      "poisson" random gaps with mean 1/rate
+      "bursty"  bursts of about rate/4 requests packed into 50 ms, 4 bursts a second on average
+      "edges"   at every whole second, half a second's traffic just before and half just after
+    """</span>
+    rng = random.Random(seed)
+    times = []
+    <span class="kw">if</span> kind == <span class="str">"steady"</span>:
+        n = int(rate * duration)
+        times = [_q(i * duration / n) <span class="kw">for</span> i <span class="kw">in</span> range(n)]
+    <span class="kw">elif</span> kind == <span class="str">"poisson"</span>:
+        t = rng.expovariate(rate)
+        <span class="kw">while</span> t &lt; duration:
+            times.append(_q(t))
+            t += rng.expovariate(rate)
+    <span class="kw">elif</span> kind == <span class="str">"bursty"</span>:
+        size = max(<span class="num">1</span>, int(rate / <span class="num">4</span>))
+        t = rng.expovariate(<span class="num">4.0</span>)
+        <span class="kw">while</span> t &lt; duration:
+            <span class="kw">for</span> _ <span class="kw">in</span> range(size):
+                times.append(_q(t + rng.uniform(<span class="num">0</span>, <span class="num">0.05</span>)))
+            t += rng.expovariate(<span class="num">4.0</span>)
+    <span class="kw">elif</span> kind == <span class="str">"edges"</span>:
+        half = max(<span class="num">1</span>, int(rate / <span class="num">2</span>))
+        <span class="kw">for</span> k <span class="kw">in</span> range(<span class="num">1</span>, int(duration)):
+            <span class="kw">for</span> _ <span class="kw">in</span> range(half):
+                times.append(_q(k - rng.uniform(<span class="num">0.001</span>, <span class="num">0.1</span>)))
+                times.append(_q(k + rng.uniform(<span class="num">0.0</span>, <span class="num">0.1</span>)))
+    <span class="kw">else</span>:
+        <span class="kw">raise</span> ValueError(<span class="str">f"unknown trace kind {kind!r}"</span>)
+    <span class="kw">return</span> sorted(t <span class="kw">for</span> t <span class="kw">in</span> times <span class="kw">if</span> <span class="num">0</span> &lt;= t &lt; duration)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: a global limiter over a shared store</h2>
+
+<p>One node's limiter protects one node. A fleet needs the count to be shared, and chapter 5's answer is a fast in-memory store and a single atomic call per request: increment the counter for the current window and return the new value. If it is at most the limit, admit. The counter's key names its window (<code>rl:&lt;window index&gt;</code>) and carries a TTL, so old windows evict themselves. This is a fixed window in the store (cheap, exact per key), so it inherits the edge effect of milestone 2; what the store buys is that every node sees the same count.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 312" role="img" aria-label="Sequence diagram. App node 1 sends INCR to the shared store, which counts 98 to 99 and replies allowed. App node 2 sends INCR, the count goes from 100 to 101 and it is denied. The key was created with a TTL of two seconds that later increments do not renew."><defs><marker id="ahGL1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs><rect x="55" y="12" width="110" height="32" rx="8" class="fs-blue s-blue sw-2"/><text x="110.0" y="32.0" text-anchor="middle" class="t-sm t-bold">app node 1</text><line x1="110" y1="46" x2="110" y2="300" class="line-dash"/><rect x="325" y="12" width="110" height="32" rx="8" class="fs-blue s-blue sw-2"/><text x="380.0" y="32.0" text-anchor="middle" class="t-sm t-bold">app node 2</text><line x1="380" y1="46" x2="380" y2="300" class="line-dash"/><rect x="595" y="12" width="110" height="32" rx="8" class="fs-cyan s-cyan sw-2"/><text x="650.0" y="32.0" text-anchor="middle" class="t-sm t-bold">shared store</text><line x1="650" y1="46" x2="650" y2="300" class="line-dash"/><line x1="110" y1="66" x2="647" y2="80" class="line sw-2" marker-end="url(#ahGL1b)"/><text x="380.0" y="63" text-anchor="middle" class="t-xs">INCR rl:7  (7.0012 s)</text><line x1="650" y1="120" x2="113" y2="134" class="line-dash sw-2" marker-end="url(#ahGL1b)"/><text x="380.0" y="117" text-anchor="middle" class="t-xs">99 &lt;= 100: allowed</text><line x1="380" y1="150" x2="647" y2="164" class="line sw-2" marker-end="url(#ahGL1b)"/><text x="515.0" y="147" text-anchor="middle" class="t-xs">INCR rl:7  (7.0031 s)</text><line x1="650" y1="204" x2="383" y2="218" class="line-dash sw-2 s-red" marker-end="url(#ahGL1b)"/><text x="515.0" y="201" text-anchor="middle" class="t-xs">101 &gt; 100: denied</text><text x="642" y="100" text-anchor="end" class="t-xs t-muted">count 98 -&gt; 99</text><text x="642" y="188" text-anchor="end" class="t-xs t-muted">count 100 -&gt; 101</text><rect x="555" y="240" width="190" height="44" rx="6" class="box2"/><text x="650" y="258" text-anchor="middle" class="t-xs">rl:7 created with a TTL of 2 s,</text><text x="650" y="274" text-anchor="middle" class="t-xs">not renewed by later INCRs</text><text x="60" y="290" text-anchor="start" class="t-xs t-muted">one round trip per decision, 2 to 10 ms</text></svg>
+  <figcaption><strong>One decision, one round trip.</strong> Each request sends one INCR; the store applies it at the instant it arrives and returns the new count. Two nodes cannot both see 100: one gets 100, the other 101. The key is created with a two-window TTL on first touch and later increments do not renew it.</figcaption>
+</figure><p>The simulation kit gives you an event loop, a network with seeded random delay, a store skeleton with outage intervals, and <code>rpc(...)</code>, which runs an operation at the store after one network delay and calls you back after a second delay, or after a timeout if the store is down. Your jobs are the store's two primitives and the limiter's request path.</p>
+<ul>
+  <li><strong>Atomic increment with a TTL.</strong> <code>Store.incr(key, ttl, by=1)</code> adds <code>by</code> and returns the new value; a missing or expired key is created with value <code>by</code> and expires <code>ttl</code> seconds from now; an existing key keeps its original expiry. <code>Store.get</code> returns 0 for missing or expired keys. Expiry is judged on the <em>store's</em> clock.</li>
+  <li><strong>The TTL is two windows, not one.</strong> It starts at the first touch (a few milliseconds into the window), so a one-window TTL can expire the key while late requests for the same window are still in flight, and the counter silently restarts from zero. The experiment below measures what that costs.</li>
+  <li><strong>Why atomicity matters.</strong> The given <code>RacyGlobalLimiter</code> reads the count with one round trip and writes <code>count + 1</code> back with another. Under network delay, several nodes read the same value before any of them writes, and they all admit.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-label="Admitted requests per one-second window for four nodes sharing a store. The atomic increment admits exactly 100 in every window; the read-then-write limiter admits about 330 because several nodes read the same count before any of them writes.">
+<line x1="56" y1="252.0" x2="738" y2="252.0" class="line-thin"/>
+<text x="48" y="256.0" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="56" y1="199.1" x2="738" y2="199.1" class="line-thin"/>
+<text x="48" y="203.1" text-anchor="end" class="t-xs t-muted">100</text>
+<line x1="56" y1="146.3" x2="738" y2="146.3" class="line-thin"/>
+<text x="48" y="150.3" text-anchor="end" class="t-xs t-muted">200</text>
+<line x1="56" y1="93.4" x2="738" y2="93.4" class="line-thin"/>
+<text x="48" y="97.4" text-anchor="end" class="t-xs t-muted">300</text>
+<line x1="56" y1="40.6" x2="738" y2="40.6" class="line-thin"/>
+<text x="48" y="44.6" text-anchor="end" class="t-xs t-muted">400</text>
+<line x1="56.0" y1="30" x2="56.0" y2="252" class="line-thin"/>
+<text x="56.0" y="268" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="235.5" y1="30" x2="235.5" y2="252" class="line-thin"/>
+<text x="235.5" y="268" text-anchor="middle" class="t-xs t-muted">5</text>
+<line x1="414.9" y1="30" x2="414.9" y2="252" class="line-thin"/>
+<text x="414.9" y="268" text-anchor="middle" class="t-xs t-muted">10</text>
+<line x1="594.4" y1="30" x2="594.4" y2="252" class="line-thin"/>
+<text x="594.4" y="268" text-anchor="middle" class="t-xs t-muted">15</text>
+<line x1="738.0" y1="30" x2="738.0" y2="252" class="line-thin"/>
+<text x="738.0" y="268" text-anchor="middle" class="t-xs t-muted">19</text>
+<line x1="56" y1="252" x2="738" y2="252" class="line"/>
+<line x1="56" y1="30" x2="56" y2="252" class="line"/>
+<text x="397.0" y="292" text-anchor="middle" class="t-sm t-muted">window (1 s each)</text>
+<text x="14" y="141.0" text-anchor="middle" class="t-sm t-muted" transform="rotate(-90 14 141.0)">requests admitted</text>
+<polyline points="56.0,199.1 91.9,199.1 127.8,199.1 163.7,199.1 199.6,199.1 235.5,199.1 271.4,199.1 307.3,199.1 343.2,199.1 379.1,199.1 414.9,199.1 450.8,199.1 486.7,199.1 522.6,199.1 558.5,199.1 594.4,199.1 630.3,199.1 666.2,199.1 702.1,199.1 738.0,199.1" class="line s-green sw-3" fill="none"/>
+<circle cx="56.0" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="91.9" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="127.8" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="163.7" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="199.6" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="235.5" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="271.4" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="307.3" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="343.2" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="379.1" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="414.9" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="450.8" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="486.7" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="522.6" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="558.5" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="594.4" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="630.3" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="666.2" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="702.1" cy="199.1" r="3.5" class="f-green"/>
+<circle cx="738.0" cy="199.1" r="3.5" class="f-green"/>
+<polyline points="56.0,79.2 91.9,74.9 127.8,74.4 163.7,73.3 199.6,80.7 235.5,67.0 271.4,59.1 307.3,71.8 343.2,55.4 379.1,85.0 414.9,63.3 450.8,64.9 486.7,93.4 522.6,70.7 558.5,60.7 594.4,72.3 630.3,72.3 666.2,55.9 702.1,52.7 738.0,69.1" class="line s-red sw-3" fill="none"/>
+<circle cx="56.0" cy="79.2" r="3.5" class="f-red"/>
+<circle cx="91.9" cy="74.9" r="3.5" class="f-red"/>
+<circle cx="127.8" cy="74.4" r="3.5" class="f-red"/>
+<circle cx="163.7" cy="73.3" r="3.5" class="f-red"/>
+<circle cx="199.6" cy="80.7" r="3.5" class="f-red"/>
+<circle cx="235.5" cy="67.0" r="3.5" class="f-red"/>
+<circle cx="271.4" cy="59.1" r="3.5" class="f-red"/>
+<circle cx="307.3" cy="71.8" r="3.5" class="f-red"/>
+<circle cx="343.2" cy="55.4" r="3.5" class="f-red"/>
+<circle cx="379.1" cy="85.0" r="3.5" class="f-red"/>
+<circle cx="414.9" cy="63.3" r="3.5" class="f-red"/>
+<circle cx="450.8" cy="64.9" r="3.5" class="f-red"/>
+<circle cx="486.7" cy="93.4" r="3.5" class="f-red"/>
+<circle cx="522.6" cy="70.7" r="3.5" class="f-red"/>
+<circle cx="558.5" cy="60.7" r="3.5" class="f-red"/>
+<circle cx="594.4" cy="72.3" r="3.5" class="f-red"/>
+<circle cx="630.3" cy="72.3" r="3.5" class="f-red"/>
+<circle cx="666.2" cy="55.9" r="3.5" class="f-red"/>
+<circle cx="702.1" cy="52.7" r="3.5" class="f-red"/>
+<circle cx="738.0" cy="69.1" r="3.5" class="f-red"/>
+<line x1="56" y1="199.1" x2="738" y2="199.1" class="line-dash s-purple"/>
+<text x="734" y="193.1" text-anchor="end" class="t-xs t-bold">limit 100</text>
+<line x1="307.3" y1="122.1" x2="323.3" y2="122.1" class="line s-green sw-3"/>
+<text x="327.3" y="125.1" class="t-xs">atomic INCR with TTL</text>
+<line x1="307.3" y1="138.1" x2="323.3" y2="138.1" class="line s-red sw-3"/>
+<text x="327.3" y="141.1" class="t-xs">read, then write back</text>
+<text x="307.3" y="167.4" text-anchor="start" class="t-xs t-muted">4 nodes, 400 requests/s offered, 1 to 5 ms each way</text>
+</svg>
+  <figcaption><strong>Atomic or not.</strong> Four nodes, 400 requests per second offered, a limit of 100. The atomic increment admits exactly 100 per window; the read-then-write limiter admits about 330, because with a few milliseconds of round trip most requests read the same stale count. Generated from your <code>Store.incr</code> and <code>GlobalLimiter</code> and the given racy one.</figcaption>
+</figure><div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>Store.get(key)</code>, <code>Store.incr(key, ttl, by=1)</code>, <code>GlobalLimiter.make_op()</code> (the function to run at the store: INCR the counter named by the window of this node's clock, with a TTL of two windows) and <code>GlobalLimiter.request(done)</code> (send it with <code>rpc</code>; on a reply, call <code>done(count &lt;= limit)</code>; on <code>None</code> call <code>self.failed(done)</code>, which milestone 5 writes).</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the store by hand (counting up from 1; <code>by=5</code>; a key created at <em>t</em> = 0 with TTL 1 is still alive at 0.9, <em>not</em> extended by an increment at 0.9, and gone at 1.0; after expiry <code>incr</code> restarts at 1 with a fresh TTL). Then for 12 seeds and 2 to 8 nodes, 400 requests per second against a limit of 100: no window may admit more than 100, and every saturated window must admit exactly 100 (windows counted by the time the request arrived, because that is when its window is chosen); each decision takes one round trip (at most 10 ms); a run with 30 requests per second rejects nothing; the same seed gives an identical run; and the given racy limiter must over-admit by at least 1.5x. A failure prints the seed, the per-window counts and a replay command.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Both store methods start by looking up the key and discarding it if <code>expires_at &lt;= sim.now</code>. A helper <code>_live(key)</code> is given for exactly this.</li>
+      <li><code>incr</code> on a live key: <code>item[0] += by</code> and return it. On a missing one: <code>self.data[key] = [by, self.sim.now + ttl]</code> and return <code>by</code>. Do not touch <code>item[1]</code> on later increments.</li>
+      <li><code>make_op</code> returns a function of the store: <code>lambda st: st.incr(key, ttl=2 * self.window)</code>. Compute <code>key</code> <em>when the request is made</em>, outside the lambda, from <code>self.clock.now()</code>. (Milestone 5 adds a second branch for <code>time_source == "store"</code>.)</li>
+      <li><code>request</code>: define <code>on_reply(count)</code>, then <code>rpc(self.sim, self.net, self.store, self.make_op(), on_reply, self.timeout)</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> get(self, key):
+    <span class="str">"""The value of `key`, or 0 if it is missing or expired."""</span>
+    item = self._live(key)
+    <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> item <span class="kw">is</span> <span class="kw">None</span> <span class="kw">else</span> item[<span class="num">0</span>]
+
+<span class="kw">def</span> incr(self, key, ttl, by=<span class="num">1</span>):
+    <span class="str">"""Atomically add `by` and return the new value.
+
+    If the key is missing or has expired it is created with value `by` and expires
+    `ttl` seconds from now; an existing key keeps its original expiry (INCR then
+    EXPIRE only when new).
+    """</span>
+    item = self._live(key)
+    <span class="kw">if</span> item <span class="kw">is</span> <span class="kw">None</span>:
+        self.data[key] = [by, self.sim.now + ttl]
+        <span class="kw">return</span> by
+    item[<span class="num">0</span>] += by
+    <span class="kw">return</span> item[<span class="num">0</span>]
+
+<span class="kw">def</span> make_op(self):
+    <span class="str">"""The operation to run at the store: INCR the counter of the current window.
+
+    The TTL is two windows, not one. It starts when the key is first touched (a few ms into the
+    window), so a one-window TTL would let the key expire while late requests for the same window
+    are still in flight, or while a node with a slow clock still uses it, and the counter would
+    silently restart from zero.
+    """</span>
+    ttl = <span class="num">2</span> * self.window
+    window = self.window
+    <span class="kw">if</span> self.time_source == <span class="str">"store"</span>:
+        <span class="kw">return</span> <span class="kw">lambda</span> st: st.incr(<span class="str">f"rl:{math.floor(st.now() / window)}"</span>, ttl=ttl)
+    key = <span class="str">f"rl:{math.floor(self.clock.now() / window)}"</span>
+    <span class="kw">return</span> <span class="kw">lambda</span> st: st.incr(key, ttl=ttl)
+
+<span class="kw">def</span> request(self, done):
+    <span class="str">"""Decide one request; call done(allowed) when the decision is made."""</span>
+    <span class="kw">def</span> on_reply(count):
+        <span class="kw">if</span> count <span class="kw">is</span> <span class="kw">None</span>:
+            self.failed(done)
+        <span class="kw">else</span>:
+            done(count &lt;= self.limit)
+    rpc(self.sim, self.net, self.store, self.make_op(), on_reply, self.timeout)</code></pre>
+  </details>
+</div>
+
+<p>When a milestone fails, the output tells you where to look. This is a real run of <code>python3 check.py solution 4 1</code> against a copy of the solution with a subtle bug (<code>count &lt; limit</code> instead of <code>count &lt;= limit</code>, an off-by-one that admits 99 instead of 100):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution 4 1   # with the off-by-one</span>
+<span class="out">  ✘ Milestone 4: a global limiter over a shared store: seed 1: with 4x overload every full window (counted by the time the request arrived, which is when its window is chosen) should admit exactly 100: [99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99] (replay: python3 check.py solution 4 1)
+
+0/1 milestones passing  (0.0 s)</span></code></pre><h2>Milestone 5: local limiters, failure, and clocks</h2>
+
+<p>A round trip per request is a latency tax and a dependency. Chapter 5 sketched the alternative: each node counts locally and <strong>syncs</strong> with the store periodically. This is where the interesting engineering is, and it comes in three experiments.</p>
+
+<h3>5a. Local limiters with periodic sync</h3>
+<p>Each <code>LocalSyncNode</code> decides with no network call, from <code>known</code> (the global count as of its last sync, including its own requests up to then) and <code>unsynced</code> (what it has admitted since). Every <code>sync_interval</code> seconds it sends its unsynced count to the store (<code>incr(key, by=unsynced)</code>) and learns the new global total. Between syncs it is blind to everyone else, so the over-admission it permits is roughly "the rate times the staleness": about <code>offered_rate &times; sync_interval</code>, capped by what each node can admit alone. Two policies:</p>
+<ul>
+  <li><strong>optimistic:</strong> admit while <code>known + unsynced &lt; limit</code>. Accurate when traffic is balanced and syncs are frequent; it over-admits badly when syncs are slow.</li>
+  <li><strong>conservative:</strong> admit while <code>unsynced &lt; (limit - known) / nodes</code>, a fair share of what is left. It cannot over-admit much, and it pays by refusing legitimate traffic when the load is uneven (a node that gets most of the traffic is limited to its share).</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 760 340" role="img" aria-label="Over-admission against the sync interval for eight nodes and 400 requests per second against a limit of 100. The optimistic limiter admits 5 percent too much at 10 milliseconds and almost 300 percent too much at 2 seconds. The conservative limiter stays within about 35 percent but, when all traffic hits one node, refuses up to 80 percent of what it should admit.">
+<rect x="60.0" y="229.6" width="678.0" height="62.4" class="fs-yellow" opacity="0.1"/>
+<line x1="60" y1="292.0" x2="738" y2="292.0" class="line-thin"/>
+<text x="52" y="296.0" text-anchor="end" class="t-xs t-muted">-100%</text>
+<line x1="60" y1="229.6" x2="738" y2="229.6" class="line-thin"/>
+<text x="52" y="233.6" text-anchor="end" class="t-xs t-muted">0%</text>
+<line x1="60" y1="167.2" x2="738" y2="167.2" class="line-thin"/>
+<text x="52" y="171.2" text-anchor="end" class="t-xs t-muted">+100%</text>
+<line x1="60" y1="104.9" x2="738" y2="104.9" class="line-thin"/>
+<text x="52" y="108.9" text-anchor="end" class="t-xs t-muted">+200%</text>
+<line x1="60" y1="42.5" x2="738" y2="42.5" class="line-thin"/>
+<text x="52" y="46.5" text-anchor="end" class="t-xs t-muted">+300%</text>
+<line x1="86.3" y1="30" x2="86.3" y2="292" class="line-thin"/>
+<text x="86.3" y="308" text-anchor="middle" class="t-xs t-muted">10 ms</text>
+<line x1="358.1" y1="30" x2="358.1" y2="292" class="line-thin"/>
+<text x="358.1" y="308" text-anchor="middle" class="t-xs t-muted">100 ms</text>
+<line x1="629.9" y1="30" x2="629.9" y2="292" class="line-thin"/>
+<text x="629.9" y="308" text-anchor="middle" class="t-xs t-muted">1 s</text>
+<line x1="60" y1="292" x2="738" y2="292" class="line"/>
+<line x1="60" y1="30" x2="60" y2="292" class="line"/>
+<text x="399.0" y="332" text-anchor="middle" class="t-sm t-muted">sync interval (the window is 1 s)</text>
+<text x="14" y="161.0" text-anchor="middle" class="t-sm t-muted" transform="rotate(-90 14 161.0)">admitted / limit - 1</text>
+<line x1="60" y1="229.6" x2="738" y2="229.6" class="line-dash s-purple"/>
+<text x="734" y="223.6" text-anchor="end" class="t-xs t-bold">the limit</text>
+<polyline points="86.3,226.3 168.1,223.9 276.3,217.2 358.1,206.7 466.2,173.6 548.0,120.5 629.9,69.5 711.7,47.7" class="line s-red sw-3" fill="none"/>
+<circle cx="86.3" cy="226.3" r="3.5" class="f-red"/>
+<circle cx="168.1" cy="223.9" r="3.5" class="f-red"/>
+<circle cx="276.3" cy="217.2" r="3.5" class="f-red"/>
+<circle cx="358.1" cy="206.7" r="3.5" class="f-red"/>
+<circle cx="466.2" cy="173.6" r="3.5" class="f-red"/>
+<circle cx="548.0" cy="120.5" r="3.5" class="f-red"/>
+<circle cx="629.9" cy="69.5" r="3.5" class="f-red"/>
+<circle cx="711.7" cy="47.7" r="3.5" class="f-red"/>
+<polyline points="86.3,231.6 168.1,230.7 276.3,227.6 358.1,222.3 466.2,210.1 548.0,207.2 629.9,206.3 711.7,214.2" class="line s-blue sw-3" fill="none"/>
+<circle cx="86.3" cy="231.6" r="3.5" class="f-blue"/>
+<circle cx="168.1" cy="230.7" r="3.5" class="f-blue"/>
+<circle cx="276.3" cy="227.6" r="3.5" class="f-blue"/>
+<circle cx="358.1" cy="222.3" r="3.5" class="f-blue"/>
+<circle cx="466.2" cy="210.1" r="3.5" class="f-blue"/>
+<circle cx="548.0" cy="207.2" r="3.5" class="f-blue"/>
+<circle cx="629.9" cy="206.3" r="3.5" class="f-blue"/>
+<circle cx="711.7" cy="214.2" r="3.5" class="f-blue"/>
+<polyline points="86.3,234.0 168.1,234.0 276.3,235.9 358.1,246.1 466.2,262.7 548.0,272.0 629.9,277.7 711.7,281.1" class="line-dash s-orange sw-3" fill="none"/>
+<circle cx="86.3" cy="234.0" r="3.5" class="f-orange"/>
+<circle cx="168.1" cy="234.0" r="3.5" class="f-orange"/>
+<circle cx="276.3" cy="235.9" r="3.5" class="f-orange"/>
+<circle cx="358.1" cy="246.1" r="3.5" class="f-orange"/>
+<circle cx="466.2" cy="262.7" r="3.5" class="f-orange"/>
+<circle cx="548.0" cy="272.0" r="3.5" class="f-orange"/>
+<circle cx="629.9" cy="277.7" r="3.5" class="f-orange"/>
+<circle cx="711.7" cy="281.1" r="3.5" class="f-orange"/>
+<line x1="92.1" y1="36.4" x2="108.1" y2="36.4" class="line s-red sw-3"/>
+<text x="112.1" y="39.4" class="t-xs">optimistic: admit while known + unsynced &lt; limit</text>
+<line x1="92.1" y1="52.4" x2="108.1" y2="52.4" class="line s-blue sw-3"/>
+<text x="112.1" y="55.4" class="t-xs">conservative: admit a 1/N share of what is left</text>
+<line x1="92.1" y1="68.4" x2="108.1" y2="68.4" class="line s-orange sw-3"/>
+<text x="112.1" y="71.4" class="t-xs">conservative, but ALL traffic lands on one node</text>
+<text x="92.1" y="284.5" text-anchor="start" class="t-xs t-bold">below the limit = legitimate traffic refused</text>
+</svg>
+  <figcaption><strong>Over-admission against the sync interval.</strong> Eight nodes, 400 requests per second offered against a limit of 100. The optimistic limiter is 5% over at 10 ms and almost 300% over once syncs are slower than a window. The conservative one stays within about 35% but, if all the traffic lands on one node (orange, dashed), it admits only a fraction of what it should: at 500 ms it refuses about two thirds of the allowance. Pick the failure you prefer. Each point is the mean of five seeds.</figcaption>
+</figure><h3>5b. The store goes down: fail open, fail closed, or fall back</h3>
+<p>When <code>rpc</code> times out, the limiter must decide without the store. Three policies, set per limiter in <code>on_error</code>. <strong>Open</strong> admits everything: the API stays up and the protection vanishes. <strong>Closed</strong> rejects everything: the protection holds and the API is down for every client. <strong>Local</strong> falls back to a token bucket sized at <code>limit / nodes</code> per node: roughly the right total, with no coordination, from your milestone 1 code. Chapter 5's rule was to choose per endpoint (open for ordinary traffic, closed for a login endpoint or an expensive operation), and to alert either way.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 310" role="img" aria-label="Admitted requests per second over twenty seconds with a store outage from 5 to 10 seconds. Fail-open admits all 400 offered per second, fail-closed admits none, and the local fallback holds the system at about the limit of 100; all three return to exactly 100 afterwards.">
+<rect x="238.4" y="30.0" width="178.4" height="232.0" class="fs-red" opacity="0.1"/>
+<line x1="60" y1="262.0" x2="738" y2="262.0" class="line-thin"/>
+<text x="52" y="266.0" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="60" y1="212.6" x2="738" y2="212.6" class="line-thin"/>
+<text x="52" y="216.6" text-anchor="end" class="t-xs t-muted">100</text>
+<line x1="60" y1="163.3" x2="738" y2="163.3" class="line-thin"/>
+<text x="52" y="167.3" text-anchor="end" class="t-xs t-muted">200</text>
+<line x1="60" y1="113.9" x2="738" y2="113.9" class="line-thin"/>
+<text x="52" y="117.9" text-anchor="end" class="t-xs t-muted">300</text>
+<line x1="60" y1="64.6" x2="738" y2="64.6" class="line-thin"/>
+<text x="52" y="68.6" text-anchor="end" class="t-xs t-muted">400</text>
+<line x1="60.0" y1="30" x2="60.0" y2="262" class="line-thin"/>
+<text x="60.0" y="278" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="238.4" y1="30" x2="238.4" y2="262" class="line-thin"/>
+<text x="238.4" y="278" text-anchor="middle" class="t-xs t-muted">5</text>
+<line x1="416.8" y1="30" x2="416.8" y2="262" class="line-thin"/>
+<text x="416.8" y="278" text-anchor="middle" class="t-xs t-muted">10</text>
+<line x1="595.3" y1="30" x2="595.3" y2="262" class="line-thin"/>
+<text x="595.3" y="278" text-anchor="middle" class="t-xs t-muted">15</text>
+<line x1="738.0" y1="30" x2="738.0" y2="262" class="line-thin"/>
+<text x="738.0" y="278" text-anchor="middle" class="t-xs t-muted">19</text>
+<line x1="60" y1="262" x2="738" y2="262" class="line"/>
+<line x1="60" y1="30" x2="60" y2="262" class="line"/>
+<text x="399.0" y="302" text-anchor="middle" class="t-sm t-muted">window (s); the store is down from 5 s to 10 s</text>
+<text x="14" y="146.0" text-anchor="middle" class="t-sm t-muted" transform="rotate(-90 14 146.0)">requests admitted per window</text>
+<polyline points="60.0,212.6 95.7,212.6 131.4,212.6 167.1,212.6 202.7,212.6 238.4,62.6 274.1,49.7 309.8,66.5 345.5,52.2 381.2,62.1 416.8,212.6 452.5,212.6 488.2,212.6 523.9,212.6 559.6,212.6 595.3,212.6 630.9,212.6 666.6,212.6 702.3,212.6 738.0,212.6" class="line s-red sw-3" fill="none"/>
+<circle cx="60.0" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="95.7" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="131.4" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="167.1" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="202.7" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="238.4" cy="62.6" r="3.5" class="f-red"/>
+<circle cx="274.1" cy="49.7" r="3.5" class="f-red"/>
+<circle cx="309.8" cy="66.5" r="3.5" class="f-red"/>
+<circle cx="345.5" cy="52.2" r="3.5" class="f-red"/>
+<circle cx="381.2" cy="62.1" r="3.5" class="f-red"/>
+<circle cx="416.8" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="452.5" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="488.2" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="523.9" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="559.6" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="595.3" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="630.9" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="666.6" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="702.3" cy="212.6" r="3.5" class="f-red"/>
+<circle cx="738.0" cy="212.6" r="3.5" class="f-red"/>
+<polyline points="60.0,212.6 95.7,212.6 131.4,212.6 167.1,212.6 202.7,212.6 238.4,262.0 274.1,262.0 309.8,262.0 345.5,262.0 381.2,261.0 416.8,212.6 452.5,212.6 488.2,212.6 523.9,212.6 559.6,212.6 595.3,212.6 630.9,212.6 666.6,212.6 702.3,212.6 738.0,212.6" class="line s-blue sw-3" fill="none"/>
+<circle cx="60.0" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="95.7" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="131.4" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="167.1" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="202.7" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="238.4" cy="262.0" r="3.5" class="f-blue"/>
+<circle cx="274.1" cy="262.0" r="3.5" class="f-blue"/>
+<circle cx="309.8" cy="262.0" r="3.5" class="f-blue"/>
+<circle cx="345.5" cy="262.0" r="3.5" class="f-blue"/>
+<circle cx="381.2" cy="261.0" r="3.5" class="f-blue"/>
+<circle cx="416.8" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="452.5" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="488.2" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="523.9" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="559.6" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="595.3" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="630.9" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="666.6" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="702.3" cy="212.6" r="3.5" class="f-blue"/>
+<circle cx="738.0" cy="212.6" r="3.5" class="f-blue"/>
+<polyline points="60.0,212.6 95.7,212.6 131.4,212.6 167.1,212.6 202.7,212.6 238.4,201.8 274.1,213.1 309.8,212.6 345.5,213.1 381.2,211.2 416.8,212.6 452.5,212.6 488.2,212.6 523.9,212.6 559.6,212.6 595.3,212.6 630.9,212.6 666.6,212.6 702.3,212.6 738.0,212.6" class="line s-green sw-3" fill="none"/>
+<circle cx="60.0" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="95.7" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="131.4" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="167.1" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="202.7" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="238.4" cy="201.8" r="3.5" class="f-green"/>
+<circle cx="274.1" cy="213.1" r="3.5" class="f-green"/>
+<circle cx="309.8" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="345.5" cy="213.1" r="3.5" class="f-green"/>
+<circle cx="381.2" cy="211.2" r="3.5" class="f-green"/>
+<circle cx="416.8" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="452.5" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="488.2" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="523.9" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="559.6" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="595.3" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="630.9" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="666.6" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="702.3" cy="212.6" r="3.5" class="f-green"/>
+<circle cx="738.0" cy="212.6" r="3.5" class="f-green"/>
+<line x1="60" y1="212.6" x2="738" y2="212.6" class="line-dash s-purple"/>
+<text x="734" y="206.6" text-anchor="end" class="t-xs t-bold">limit 100</text>
+<text x="245.6" y="42.0" text-anchor="start" class="t-xs t-bold">store down</text>
+<line x1="459.7" y1="110.9" x2="475.7" y2="110.9" class="line s-red sw-3"/>
+<text x="479.7" y="113.9" class="t-xs">fail open</text>
+<line x1="459.7" y1="126.9" x2="475.7" y2="126.9" class="line s-blue sw-3"/>
+<text x="479.7" y="129.9" class="t-xs">fail closed</text>
+<line x1="459.7" y1="142.9" x2="475.7" y2="142.9" class="line s-green sw-3"/>
+<text x="479.7" y="145.9" class="t-xs">local fallback</text>
+</svg>
+  <figcaption><strong>Five seconds without a store.</strong> Four nodes, 400 requests per second offered, a limit of 100. Fail-open admits all 400 in the red band; fail-closed admits none; the local fallback holds near the limit. After the store returns, every policy is back to exactly 100 per window, because the counters are disposable state. Note also what the figure does not show: every request in the red band waited out the 50 ms timeout.</figcaption>
+</figure><h3>5c. Clock skew between nodes</h3>
+<p>The window is named from a clock. If every node names it from its <em>own</em> clock and the clocks differ, then at the same instant node A is writing to window 7 and node B to window 8, and each window has its own full allowance. The mean rate is still the limit (one fresh counter a second), but the allowance arrives at different times on different nodes, and a sliding window can see nearly two allowances at once. The fix is to have one authority name the window: <code>time_source="store"</code> makes the store compute the window index inside the atomic operation (Redis's <code>TIME</code> command in a script), so every node agrees. Extend <code>make_op</code> with that branch. The clock theme is that of <a href="../../distributed/chapters/07-time-revisited.html">time revisited</a>: the only clock everyone can agree on is the one they all ask.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-label="The worst sliding one-second window as a multiple of the limit against the spread of the four nodes&#x27; clocks. When each node names the window from its own clock the peak climbs from 1.26 times to nearly 2 times as the spread reaches half a second; when the store names the window it stays at 1.26 times.">
+<line x1="56" y1="252.0" x2="738" y2="252.0" class="line-thin"/>
+<text x="48" y="256.0" text-anchor="end" class="t-xs t-muted">0x</text>
+<line x1="56" y1="205.8" x2="738" y2="205.8" class="line-thin"/>
+<text x="48" y="209.8" text-anchor="end" class="t-xs t-muted">0.5x</text>
+<line x1="56" y1="159.5" x2="738" y2="159.5" class="line-thin"/>
+<text x="48" y="163.5" text-anchor="end" class="t-xs t-muted">1x</text>
+<line x1="56" y1="113.2" x2="738" y2="113.2" class="line-thin"/>
+<text x="48" y="117.2" text-anchor="end" class="t-xs t-muted">1.5x</text>
+<line x1="56" y1="67.0" x2="738" y2="67.0" class="line-thin"/>
+<text x="48" y="71.0" text-anchor="end" class="t-xs t-muted">2x</text>
+<text x="141.2" y="268" text-anchor="middle" class="t-xs t-muted">0 s</text>
+<text x="311.8" y="268" text-anchor="middle" class="t-xs t-muted">0.1 s</text>
+<text x="482.2" y="268" text-anchor="middle" class="t-xs t-muted">0.25 s</text>
+<text x="652.8" y="268" text-anchor="middle" class="t-xs t-muted">0.5 s</text>
+<line x1="56" y1="252" x2="738" y2="252" class="line"/>
+<line x1="56" y1="30" x2="56" y2="252" class="line"/>
+<text x="397.0" y="292" text-anchor="middle" class="t-sm t-muted">spread of the nodes&#x27; clocks</text>
+<text x="14" y="141.0" text-anchor="middle" class="t-sm t-muted" transform="rotate(-90 14 141.0)">worst 1 s window / limit</text>
+<rect x="85.8" y="135.6" width="53.9" height="116.4" rx="2" class="fs-red s-red sw-1"/>
+<rect x="256.3" y="134.9" width="53.9" height="117.1" rx="2" class="fs-red s-red sw-1"/>
+<rect x="426.8" y="113.1" width="53.9" height="138.9" rx="2" class="fs-red s-red sw-1"/>
+<rect x="597.3" y="69.0" width="53.9" height="183.0" rx="2" class="fs-red s-red sw-1"/>
+<rect x="141.2" y="135.4" width="53.9" height="116.6" rx="2" class="fs-green s-green sw-1"/>
+<rect x="311.8" y="135.4" width="53.9" height="116.6" rx="2" class="fs-green s-green sw-1"/>
+<rect x="482.2" y="135.4" width="53.9" height="116.6" rx="2" class="fs-green s-green sw-1"/>
+<rect x="652.8" y="135.4" width="53.9" height="116.6" rx="2" class="fs-green s-green sw-1"/>
+<text x="112.8" y="131.6" text-anchor="middle" class="t-xs">1.26x</text>
+<text x="283.3" y="130.9" text-anchor="middle" class="t-xs">1.27x</text>
+<text x="453.8" y="109.1" text-anchor="middle" class="t-xs">1.50x</text>
+<text x="624.3" y="65.0" text-anchor="middle" class="t-xs">1.98x</text>
+<text x="168.2" y="131.4" text-anchor="middle" class="t-xs">1.26x</text>
+<text x="338.7" y="131.4" text-anchor="middle" class="t-xs">1.26x</text>
+<text x="509.2" y="131.4" text-anchor="middle" class="t-xs">1.26x</text>
+<text x="679.7" y="131.4" text-anchor="middle" class="t-xs">1.26x</text>
+<line x1="56" y1="159.5" x2="738" y2="159.5" class="line-dash s-purple"/>
+<rect x="66.0" y="26.0" width="12" height="10" rx="2" class="fs-red s-red sw-1"/>
+<text x="83.0" y="34.0" class="t-xs">window named by each node&#x27;s own clock</text>
+<rect x="338.8" y="26.0" width="12" height="10" rx="2" class="fs-green s-green sw-1"/>
+<text x="355.8" y="34.0" class="t-xs">window named by the store&#x27;s clock</text>
+</svg>
+  <figcaption><strong>Skew raises the peak, not the average.</strong> Four nodes whose clocks are spread over 0 to 0.5 s. When each names the window itself, the worst one-second window climbs from 1.26x the limit to nearly 2x; when the store names it, it stays at 1.26x (the 0.26 is the fixed-window edge effect, present in both). Mean admitted per window stays exactly at the limit, which is why an average on a dashboard would never show this.</figcaption>
+</figure><div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>LocalSyncNode.allow()</code> (roll to the current window first; optimistic or conservative as above; spend one unit of the budget when it admits), <code>LocalSyncNode.sync()</code> (send <code>unsynced</code> with <code>incr(by=unsynced)</code> on the key of the window you are in, with a TTL of two windows; on a reply for the <em>same</em> window set <code>known = total</code> and subtract what you sent from <code>unsynced</code>; ignore a timeout) and <code>GlobalLimiter.failed(done)</code> (open, closed, or local, by <code>self.on_error</code>). Then add the <code>time_source == "store"</code> branch to <code>make_op</code> from milestone 4. <code>start()</code> and the experiment harnesses are given.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It runs the harnesses on 5 seeds each and asserts: over-admission rises with the sync interval, stays under 15% at 10 ms and exceeds +150% at 2 s for the optimistic mode; the conservative mode never over-admits more than the optimistic one and stays under +60% even at 2 s, but refuses more than 30% of the allowance when all traffic lands on one node at 500 ms, while the optimistic mode stays within 10% of the limit on that traffic. During the 5 s outage (windows 6 to 8): fail-open admits at least 300 a window, fail-closed exactly 0, the local fallback 60 to 135; every policy is back to exactly 100 per window afterwards; and a fail-closed decision takes the full 50 ms timeout. For skew: with a 0.5 s spread, the node-clock version's worst sliding window must exceed 1.7x the limit while the store-clock version stays under 1.5x with a mean at the limit.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>allow</code>: <code>self._roll()</code> resets <code>known</code> and <code>unsynced</code> when the window index changes. Then <code>left = limit - known - unsynced</code> (optimistic) or <code>(limit - known) / nodes - unsynced</code> (conservative); admit if <code>left &gt;= 1</code>.</li>
+      <li><code>sync</code>: capture <code>idx = self.widx</code> and <code>delta = self.unsynced</code> <em>before</em> the call. In the callback, ignore <code>None</code> and ignore the reply if <code>self.widx != idx</code>. Otherwise <code>self.known = total</code> and <code>self.unsynced -= delta</code> (not <code>= 0</code>: more requests may have been admitted while the message was in flight).</li>
+      <li>If you set <code>unsynced = 0</code> instead of subtracting, you forget requests admitted during the round trip and the limiter over-admits at every interval. The check's "all traffic on one node" test catches the opposite mistake as well.</li>
+      <li><code>failed</code>: for <code>"local"</code>, <code>done(self.fallback.allow())</code>; the fallback bucket is created in the constructor from your <code>TokenBucket</code>.</li>
+      <li>For <code>time_source == "store"</code> the key must be computed <em>inside</em> the operation, from the store's <code>now()</code>, because the node does not know the store's time when it builds the message.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> make_op(self):
+    <span class="str">"""The operation to run at the store: INCR the counter of the current window.
+
+    The TTL is two windows, not one. It starts when the key is first touched (a few ms into the
+    window), so a one-window TTL would let the key expire while late requests for the same window
+    are still in flight, or while a node with a slow clock still uses it, and the counter would
+    silently restart from zero.
+    """</span>
+    ttl = <span class="num">2</span> * self.window
+    window = self.window
+    <span class="kw">if</span> self.time_source == <span class="str">"store"</span>:
+        <span class="kw">return</span> <span class="kw">lambda</span> st: st.incr(<span class="str">f"rl:{math.floor(st.now() / window)}"</span>, ttl=ttl)
+    key = <span class="str">f"rl:{math.floor(self.clock.now() / window)}"</span>
+    <span class="kw">return</span> <span class="kw">lambda</span> st: st.incr(key, ttl=ttl)
+
+<span class="kw">def</span> failed(self, done):
+    <span class="str">"""The store did not answer in time: apply the failure policy."""</span>
+    <span class="kw">if</span> self.on_error == <span class="str">"open"</span>:
+        done(<span class="kw">True</span>)
+    <span class="kw">elif</span> self.on_error == <span class="str">"closed"</span>:
+        done(<span class="kw">False</span>)
+    <span class="kw">elif</span> self.on_error == <span class="str">"local"</span>:
+        done(self.fallback.allow())
+    <span class="kw">else</span>:
+        <span class="kw">raise</span> ValueError(<span class="str">f"unknown on_error {self.on_error!r}"</span>)
+
+<span class="kw">def</span> allow(self):
+    <span class="str">"""Decide one request from local state only (no network)."""</span>
+    self._roll()
+    <span class="kw">if</span> self.mode == <span class="str">"optimistic"</span>:
+        left = self.limit - self.known - self.unsynced
+    <span class="kw">else</span>:
+        left = (self.limit - self.known) / self.nodes - self.unsynced
+    <span class="kw">if</span> left &gt;= <span class="num">1.0</span> - EPS:
+        self.unsynced += <span class="num">1</span>
+        <span class="kw">return</span> <span class="kw">True</span>
+    <span class="kw">return</span> <span class="kw">False</span>
+
+<span class="kw">def</span> sync(self):
+    <span class="str">"""Send our unsynced count to the store and learn the global count."""</span>
+    self._roll()
+    idx, delta = self.widx, self.unsynced
+    key = <span class="str">f"rl:{idx}"</span>
+    ttl = <span class="num">2</span> * self.window
+
+    <span class="kw">def</span> on_reply(total):
+        <span class="kw">if</span> total <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> self.widx != idx:
+            <span class="kw">return</span>              <span class="cmt"># store down, or the window has moved on: keep what we have</span>
+        self.known = total
+        self.unsynced -= delta
+
+    rpc(self.sim, self.net, self.store, <span class="kw">lambda</span> st: st.incr(key, ttl=ttl, by=delta), on_reply, self.timeout)</code></pre>
+  </details>
+</div>
+
+<h2>Run it all</h2>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution</span>
+<span class="out">  ✔ Milestone 1: a token bucket on an injected clock
+      burst = capacity, refill = rate, retry_after, clock stepping back; matched a reference bucket on 40 random traces
+  ✔ Milestone 2: sliding-window log and sliding-window counter
+      log matched an exact reference on 30 random traces; counter estimate and weighting match the hand values
+  ✔ Milestone 3: property tests (exact, bounded, burst)
+      160 (seed, trace) runs.  worst admitted in any 1 s window / limit:  log 1.00x (exact),  counter 1.80x (bound &lt; 2x),  fixed window on the &#x27;edges&#x27; trace 2.00x
+      on smooth traffic the counter admits 96% of what the exact log admits
+  ✔ Milestone 4: a global limiter over a shared store
+      atomic INCR + TTL: exactly 100 admitted in every saturated window, for 2 to 8 nodes, 12 seeds, 1 round trip per decision
+      the given read-then-write limiter admits 3.4x the limit under the same delays
+  ✔ Milestone 5: local limiters + sync, failure policy, clock skew
+      8 nodes, 400 req/s offered against a limit of 100/s (over-admission = admitted / limit - 1, mean over 5 seeds):
+        sync every   optimistic   conservative   conservative, all traffic on one node
+            10 ms         +5%           -3%              -7%
+           100 ms        +37%          +12%             -26%
+           500 ms       +175%          +36%             -68%
+          2000 ms       +292%          +25%             -82%
+      store down for 5 s, 400 req/s offered, limit 100/s: admitted per second during the outage: fail-open 405, fail-closed 0, local fallback 100
+      clock skew across 4 nodes (spread of node clocks), 400 req/s, limit 100/s:  mean over-admission / worst 1 s sliding-window peak
+        skew 0.00 s   window named by node clock   +0% / 1.26x    named by the store   +0% / 1.26x
+        skew 0.25 s   window named by node clock   +0% / 1.50x    named by the store   +0% / 1.26x
+        skew 0.50 s   window named by node clock   +0% / 1.98x    named by the store   +0% / 1.26x
+
+5/5 milestones passing  (3.1 s)</span></code></pre><h2>Look under the hood</h2>
+
+<ul>
+  <li><strong>The numbers are the chapter's, measured.</strong> Chapter 5 estimated that a local limiter with sync can be off by about <code>offered rate &times; T</code>; the table above is that estimate against a simulator, and it shows where the rule of thumb breaks: at long intervals the error saturates (each node can admit at most its own allowance alone, so at most about N times the limit), and with few nodes it is much smaller than with many.</li>
+  <li><strong>"Exact" is a strong word.</strong> The log is exact in the sense that no window ever exceeds the limit. It is not fair (a client that sent early may be locked out longer than a smooth client) and not free (state per key proportional to the limit). Approximate algorithms are an engineering trade, not a defect, as long as you know the bound.</li>
+  <li><strong>Atomicity is a property of the operation, not of the store.</strong> The store here is perfectly consistent; the racy limiter is still wrong, because it composes two atomic operations into a non-atomic one. This is why the chapter says "one script call" and why a read-modify-write across a network always needs a conditional write or a server-side script.</li>
+  <li><strong>Timeouts decide the failure policy for you.</strong> A 50 ms timeout against a 10 ms round trip means a slow store (not just a dead one) triggers the failure policy. Experiment 4 below measures it.</li>
+</ul>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: five experiments</p>
+  <ol>
+    <li><strong>The edge cases of your own traffic.</strong> Which limiter is safe against which shape? Save as <code>exp_bursty.py</code> next to <code>solution.py</code> (use <code>starter</code> once yours passes):
+<pre><code><span class="kw">from</span> solution <span class="kw">import</span> *
+
+L, RATE = <span class="num">20</span>, <span class="num">60</span>
+algos = {<span class="str">"fixed window"</span>: <span class="kw">lambda</span> c: FixedWindow(L, <span class="num">1.0</span>, c), <span class="str">"sliding log"</span>: <span class="kw">lambda</span> c: SlidingWindowLog(L, <span class="num">1.0</span>, c),
+         <span class="str">"sliding counter"</span>: <span class="kw">lambda</span> c: SlidingWindowCounter(L, <span class="num">1.0</span>, c), <span class="str">"token bucket"</span>: <span class="kw">lambda</span> c: TokenBucket(L, L, c)}
+print(<span class="str">f"worst admitted in any 1 s window / limit (limit {L}/s, offered {RATE}/s, 20 s, worst of 20 seeds)"</span>)
+print(<span class="str">f"{'':&lt;18}"</span> + <span class="str">""</span>.join(<span class="str">f"{k:&gt;10}"</span> <span class="kw">for</span> k <span class="kw">in</span> (<span class="str">"steady"</span>, <span class="str">"poisson"</span>, <span class="str">"bursty"</span>, <span class="str">"edges"</span>)))
+<span class="kw">for</span> name, mk <span class="kw">in</span> algos.items():
+    row = []
+    <span class="kw">for</span> kind <span class="kw">in</span> (<span class="str">"steady"</span>, <span class="str">"poisson"</span>, <span class="str">"bursty"</span>, <span class="str">"edges"</span>):
+        worst = <span class="num">0.0</span>
+        <span class="kw">for</span> seed <span class="kw">in</span> range(<span class="num">1</span>, <span class="num">21</span>):
+            c = ManualClock()
+            adm = replay(mk(c), c, make_trace(kind, seed, <span class="num">20.0</span>, RATE))
+            worst = max(worst, max_in_window(adm, <span class="num">1.0</span>) / L)
+        row.append(worst)
+    print(<span class="str">f"{name:&lt;18}"</span> + <span class="str">""</span>.join(<span class="str">f"{x:&gt;9.2f}x"</span> <span class="kw">for</span> x <span class="kw">in</span> row))</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_bursty.py</span>
+<span class="out">worst admitted in any 1 s window / limit (limit 20/s, offered 60/s, 20 s, worst of 20 seeds)
+                      steady   poisson    bursty     edges
+fixed window           1.00x     1.75x     2.00x     2.00x
+sliding log            1.00x     1.00x     1.00x     1.00x
+sliding counter        1.00x     1.10x     1.80x     1.55x
+token bucket           1.95x     1.95x     1.95x     1.60x</span></code></pre>
+      The log's row is all ones. The fixed window and the counter diverge on bursts, the token bucket is allowed up to capacity plus a second of refill (almost 2x here) <em>by design</em>. If your downstream cannot tolerate that, shrink the capacity relative to the rate, not the window.</li>
+    <li><strong>How much delay does the race need?</strong>
+<pre><code><span class="kw">from</span> solution <span class="kw">import</span> *
+
+D, LIMIT = <span class="num">20.0</span>, <span class="num">100</span>
+print(<span class="str">"(timeout raised to 1 s so nothing fails open)"</span>)
+print(<span class="str">"one-way delay   atomic INCR   read-then-write   (admitted per second / limit, mean of 3 seeds)"</span>)
+<span class="kw">for</span> lo, hi <span class="kw">in</span> ((<span class="num">0.0001</span>, <span class="num">0.0002</span>), (<span class="num">0.001</span>, <span class="num">0.002</span>), (<span class="num">0.002</span>, <span class="num">0.008</span>), (<span class="num">0.010</span>, <span class="num">0.030</span>)):
+    row = []
+    <span class="kw">for</span> kind <span class="kw">in</span> (<span class="str">"atomic"</span>, <span class="str">"racy"</span>):
+        v = [window_counts(admitted_times(run_global(s, limiter=kind, delay=(lo, hi), duration=D, timeout=<span class="num">1.0</span>), by=<span class="str">"arrive"</span>), <span class="num">1.0</span>, D)[<span class="num">1</span>:-<span class="num">1</span>] <span class="kw">for</span> s <span class="kw">in</span> (<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>)]
+        row.append(sum(sum(x) / len(x) <span class="kw">for</span> x <span class="kw">in</span> v) / <span class="num">3</span> / LIMIT)
+    print(<span class="str">f"{lo * 1000:5.1f}-{hi * 1000:4.1f} ms     {row[0]:8.2f}x     {row[1]:12.2f}x"</span>)</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_race.py</span>
+<span class="out">(timeout raised to 1 s so nothing fails open)
+one-way delay   atomic INCR   read-then-write   (admitted per second / limit, mean of 3 seeds)
+  0.1- 0.2 ms         1.00x             1.12x
+  1.0- 2.0 ms         1.00x             2.22x
+  2.0- 8.0 ms         1.00x             4.03x
+ 10.0-30.0 ms         1.00x             4.03x</span></code></pre>
+      Even at 0.1 ms the read-then-write version leaks 12%, and by a few milliseconds it admits everything offered. The atomic version does not move at all: delay changes <em>when</em> a decision arrives, never what the count is.</li>
+    <li><strong>The TTL trap.</strong> A one-window TTL looks natural. Patch it in and add skew:
+<pre><code><span class="kw">import</span> math
+<span class="kw">import</span> solution
+<span class="kw">from</span> solution <span class="kw">import</span> *
+
+<span class="kw">def</span> make_op_one_window_ttl(self):
+    key = <span class="str">f"rl:{math.floor(self.clock.now() / self.window)}"</span>
+    <span class="kw">return</span> <span class="kw">lambda</span> st: st.incr(key, ttl=self.window)          <span class="cmt"># the tempting, wrong TTL</span>
+
+D = <span class="num">20.0</span>
+print(<span class="str">"clock spread   TTL = 2 windows        TTL = 1 window         (mean admitted / limit - 1; worst 1 s peak / limit)"</span>)
+good = GlobalLimiter.make_op
+<span class="kw">for</span> sk <span class="kw">in</span> (<span class="num">0.0</span>, <span class="num">0.25</span>, <span class="num">0.5</span>):
+    row = []
+    <span class="kw">for</span> op <span class="kw">in</span> (good, make_op_one_window_ttl):
+        GlobalLimiter.make_op = op
+        t = [admitted_times(run_global(s, nodes=<span class="num">4</span>, rate=<span class="num">400.0</span>, skews=[<span class="num">0</span>, sk / <span class="num">3</span>, <span class="num">2</span> * sk / <span class="num">3</span>, sk])) <span class="kw">for</span> s <span class="kw">in</span> (<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>)]
+        row.append((sum(over_admission(x, <span class="num">100</span>, <span class="num">1.0</span>, D) <span class="kw">for</span> x <span class="kw">in</span> t) / <span class="num">3</span>, sum(peak_over_limit(x, <span class="num">100</span>, <span class="num">1.0</span>) <span class="kw">for</span> x <span class="kw">in</span> t) / <span class="num">3</span>))
+    GlobalLimiter.make_op = good
+    print(<span class="str">f"{sk:&gt;7.2f} s     {row[0][0]:&gt;+7.0%}  peak {row[0][1]:.2f}x      {row[1][0]:&gt;+7.0%}  peak {row[1][1]:.2f}x"</span>)</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_ttl.py</span>
+<span class="out">clock spread   TTL = 2 windows        TTL = 1 window         (mean admitted / limit - 1; worst 1 s peak / limit)
+   0.00 s         +0%  peak 1.27x          +0%  peak 1.27x
+   0.25 s         +0%  peak 1.50x         +46%  peak 1.77x
+   0.50 s         -0%  peak 1.96x         +95%  peak 2.39x</span></code></pre>
+      With a TTL of one window the key dies partway through the window for slower nodes, the counter restarts from zero and the <em>average</em> goes up too (+95% at 0.5 s of spread). With two windows only the peak rises. The lesson generalises: a TTL that starts at first touch is shorter than the window it is meant to cover.</li>
+    <li><strong>What the timeout costs.</strong>
+<pre><code><span class="kw">from</span> solution <span class="kw">import</span> *
+
+print(<span class="str">"timeout   mode      slowest decision during the outage   admitted per second in the outage"</span>)
+<span class="kw">for</span> timeout <span class="kw">in</span> (<span class="num">0.01</span>, <span class="num">0.05</span>, <span class="num">0.25</span>):
+    <span class="kw">for</span> mode <span class="kw">in</span> (<span class="str">"open"</span>, <span class="str">"closed"</span>, <span class="str">"local"</span>):
+        log = run_global(<span class="num">1</span>, nodes=<span class="num">4</span>, rate=<span class="num">400.0</span>, on_error=mode, outage=(<span class="num">5.0</span>, <span class="num">10.0</span>), timeout=timeout)
+        during = [d <span class="kw">for</span> d <span class="kw">in</span> log <span class="kw">if</span> <span class="num">5.2</span> &lt;= d.t_arrive &lt; <span class="num">9.8</span>]
+        lat = max(d.t_decide - d.t_arrive <span class="kw">for</span> d <span class="kw">in</span> during)
+        adm = sum(d.allowed <span class="kw">for</span> d <span class="kw">in</span> during) / <span class="num">4.6</span>
+        print(<span class="str">f"{timeout * 1000:&gt;5.0f} ms  {mode:&lt;8}  {lat * 1000:&gt;14.0f} ms                  {adm:&gt;12.0f}"</span>)</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_timeout.py</span>
+<span class="out">timeout   mode      slowest decision during the outage   admitted per second in the outage
+   10 ms  open                  10 ms                           409
+   10 ms  closed                10 ms                             0
+   10 ms  local                 10 ms                           100
+   50 ms  open                  50 ms                           409
+   50 ms  closed                50 ms                             0
+   50 ms  local                 50 ms                           100
+  250 ms  open                 250 ms                           409
+  250 ms  closed               250 ms                             0
+  250 ms  local                250 ms                           100</span></code></pre>
+      The admitted rate is the policy; the latency is the timeout, paid by <em>every</em> request while the store is down. That is why serious limiters add a circuit breaker (<a href="../../architecture/chapters/17-resilience.html">resilience</a>): after a few timeouts, stop asking and apply the failure policy at once.</li>
+    <li><strong>Nodes against the sync interval.</strong>
+<pre><code><span class="kw">from</span> solution <span class="kw">import</span> *
+
+D = <span class="num">20.0</span>
+print(<span class="str">"over-admission (mean of 3 seeds) for 400 req/s against a limit of 100/s"</span>)
+print(<span class="str">"nodes   sync 20 ms   sync 100 ms   sync 500 ms"</span>)
+<span class="kw">for</span> n <span class="kw">in</span> (<span class="num">2</span>, <span class="num">8</span>, <span class="num">32</span>):
+    row = []
+    <span class="kw">for</span> T <span class="kw">in</span> (<span class="num">0.02</span>, <span class="num">0.1</span>, <span class="num">0.5</span>):
+        v = [over_admission(admitted_times(run_local(s, nodes=n, sync_interval=T)), <span class="num">100</span>, <span class="num">1.0</span>, D) <span class="kw">for</span> s <span class="kw">in</span> (<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>)]
+        row.append(sum(v) / <span class="num">3</span>)
+    print(<span class="str">f"{n:&gt;5}   "</span> + <span class="str">"   "</span>.join(<span class="str">f"{x:&gt;+9.0%} "</span> <span class="kw">for</span> x <span class="kw">in</span> row))</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_nodes.py</span>
+<span class="out">over-admission (mean of 3 seeds) for 400 req/s against a limit of 100/s
+nodes   sync 20 ms   sync 100 ms   sync 500 ms
+    2         +5%         +22%         +78% 
+    8         +9%         +37%        +175% 
+   32        +10%         +41%        +196%</span></code></pre>
+      More nodes means more unseen traffic between syncs, but the effect saturates: 32 nodes are only slightly worse than 8, because the offered load, not the node count, bounds what is admitted blind. With 2 nodes and 20 ms syncs you are within 5%.</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>A sliding-window counter in the store.</strong> Make the global limiter use the weighted two-counter estimate: one round trip, two keys (a script that reads the previous window's counter and increments the current one). Measure the sliding peak against the fixed-window global limiter's 1.26x.</li>
+  <li><strong>Leaky bucket as a queue.</strong> Add the fourth algorithm of chapter 5: admit into a bounded queue and measure the queueing delay; compare its admitted set with the token bucket's.</li>
+  <li><strong>A circuit breaker.</strong> After <em>k</em> consecutive timeouts, stop calling the store for a cool-off period and apply the failure policy immediately. Re-run experiment 4 and compare the latency during the outage.</li>
+  <li><strong>Hot keys.</strong> Send 90% of the traffic to one key. The store shard that owns it becomes the bottleneck; implement a local pre-aggregation that batches increments (sync, in effect) for keys above a rate.</li>
+  <li><strong>Lossy sync.</strong> Let the network drop and duplicate sync messages. A duplicate <code>incr</code> double-counts; make sync idempotent with a per-node sequence number and show that the over-admission returns to its previous level.</li>
+  <li><strong>Per-tenant fairness.</strong> Give tenants different limits and nodes uneven shares. Does the conservative mode's refusal under skew get worse or better with many tenants?</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Every question in milestone 5 is a standard distributed-systems question in small. Sync intervals are the <em>staleness</em> of a replicated counter, and over-admission is the price of reading stale state, the same trade that <a href="../../distributed/chapters/05-consistency-models.html">consistency models</a> classify. The atomic increment is a tiny instance of the coordination that <a href="../../distributed/chapters/16-coordination-avoidance.html">coordination avoidance</a> asks whether you can skip; a local limiter with sync is a deliberately non-coordinated counter whose error you bound instead of preventing. Fail-open versus fail-closed is the availability-versus-safety choice of the CAP discussion, made per endpoint. And clock skew is why <a href="../../distributed/chapters/07-time-revisited.html">time revisited</a> warns against reading "now" on more than one machine and treating the values as comparable.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>A token bucket is two numbers and a lazy refill; its guarantees are a burst of at most <code>capacity</code> and, in any window of length <em>w</em>, at most <code>capacity + rate &times; w</code>. It takes its clock as an argument, which is what makes it testable.</li>
+    <li>The sliding-window log is exact and expensive in state; the sliding-window counter is two numbers with an error bounded below 2x that is near zero on smooth traffic and large on bursts; the fixed window is cheap and doubles the limit at an edge.</li>
+    <li>State a property and check it on generated traces with seeds printed on failure. Adversarial generators (bursts on window edges) matter more than volume.</li>
+    <li>A shared limiter needs an atomic operation, not atomic reads and writes: one INCR with a TTL of at least two windows. Composing a read and a write loses updates the moment there is network delay.</li>
+    <li>Local limiters with periodic sync over-admit roughly in proportion to rate times staleness; the conservative variant bounds the overshoot and pays in refused legitimate traffic under skewed load. Pick which error you can live with.</li>
+    <li>When the store is down, fail-open keeps the API and loses the protection, fail-closed keeps the protection and loses the API, and a local fallback is a bounded compromise. Every one costs a timeout per request unless you add a breaker.</li>
+    <li>Clock skew between nodes does not change the average admitted rate but can nearly double the peak; have one authority name the window.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A fixed-window limiter allows 100 requests per minute. What is the most a client can get admitted in any 60-second span?</p>
+    <ol class="q-options">
+      <li>100, by definition of the limit</li>
+      <li>Up to 200: 100 at the end of one window and 100 at the start of the next</li>
+      <li>Up to 150, because the window is half-weighted</li>
+      <li>Unlimited, because the counter resets</li>
+    </ol>
+    <div class="q-explain">The window is aligned to the clock, not to the client. A burst in the last instant of window k and another in the first instant of window k+1 are both within their own limits yet only a moment apart. That is the edge effect the log, the counter and the token bucket exist to remove or bound.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A sliding-window counter with limit 100 sees 100 requests early in window k. Halfway through window k+1 (fraction 0.5), how many more requests will it admit, assuming none so far in k+1?</p>
+    <ol class="q-options">
+      <li>0: the previous window was full</li>
+      <li>About 50: the previous window is weighted by the part that still overlaps, so 100 x 0.5 + current <= 100</li>
+      <li>100: each window is independent</li>
+      <li>About 150</li>
+    </ol>
+    <div class="q-explain">The estimate is previous x (1 - fraction) + current = 100 x 0.5 + current. It admits while the estimate plus one is at most 100, so about 50 more. If the old requests were bunched late in window k, the true sliding count is higher than the estimate, which is the source of the (bounded, under 2x) error.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Two app nodes each read the shared counter (value 99), see it is under the limit of 100, admit, and write back 100. What went wrong and what is the fix?</p>
+    <ol class="q-options">
+      <li>Nothing: the limit is 100 and the counter says 100</li>
+      <li>The store is inconsistent; use a stronger store</li>
+      <li>A read-then-write is not atomic, so both admitted at 99; use one atomic increment (or a server-side script) and test the returned value</li>
+      <li>The clocks are skewed; use NTP</li>
+    </ol>
+    <div class="q-explain">Each operation was atomic but their composition was not. Two admissions took the count to 101 requests but the stored value to 100. An atomic INCR returns 100 to one caller and 101 to the other, so exactly one is admitted.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A limiter's store goes down for ten minutes. The endpoint is a login form. Which policy fits, and what must you add either way?</p>
+    <ol class="q-options">
+      <li>Fail open, because availability matters most</li>
+      <li>Fail closed for this endpoint (credential stuffing is the threat), a local fallback limit for ordinary endpoints, and alerting plus a circuit breaker so requests are not each delayed by the timeout</li>
+      <li>Fail open for everything, and log it</li>
+      <li>Disable the limiter permanently</li>
+    </ol>
+    <div class="q-explain">The right policy depends on the endpoint: open fails towards availability, closed towards protection, and a login form is exactly where being unprotected is worse than being briefly unavailable. Whichever you choose, every request waits out the timeout while the store is down, so a breaker and an alert are part of the design.</div>
+  </div>
+</section>
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

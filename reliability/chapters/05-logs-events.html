@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logs &amp; Structured Events · Reliability &amp; Operations</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="ops" data-chapter="05">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Logs &amp; Structured Events</h1>
+  <p class="lede">Metrics tell you that something is wrong; logs are where you find out what happened to one particular request. This chapter follows the log from a <code>printf</code> that a human reads to a wide, structured event that a machine can slice by any field, and covers the practical machinery around it: levels, request IDs, sampling, retention tiers, privacy, and the pipeline that carries the data. The goal is the capability Charity Majors and colleagues call observability: asking questions you did not think of in advance.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapter 4 ended with a deliberate limitation: metrics are pre-aggregated, so they cannot answer "what happened to the checkout of user u-42 at 14:03?" or "which customers are seeing the slow path?". Those questions are asked in every serious incident. Whether you can answer them in two minutes or two hours depends almost entirely on how your software wrote its logs months earlier. Logging decisions are cheap to make well at design time and very expensive to fix during an outage, and logging at scale is also one of the largest line items on a monitoring bill.</p>
+</div>
+
+<h2>From text lines to structured events</h2>
+
+<p>The oldest logging style is a line of free text written for a person to read:</p>
+
+<pre class="terminal" data-title="an unstructured log line"><code>2026-10-13 14:03:22,481 ERROR PaymentService - Charge failed for user 4417 order 99120 amount=900 (declined: limit)</code></pre>
+
+<p>It is pleasant to read and unpleasant to query. To count failures per reason you must write a regular expression that matches this exact phrasing, and the day a developer rewords the message the dashboard silently breaks. Every question needs its own parser, and different services use different formats.</p>
+
+<p>A <span class="term">structured log</span> writes the same facts as named fields, usually one JSON object per line (JSON Lines):</p>
+
+<pre class="terminal" data-title="a structured log line"><code>{"ts":"2026-10-13T14:03:22.481Z","level":"ERROR","msg":"charge failed","service":"payments","user_id":"u-4417","order_id":"o-99120","amount":900,"reason":"limit","request_id":"req-b2"}</code></pre>
+
+<p>Now "count failures by <code>reason</code>" is a group-by over a field. Adding a new field does not break existing queries. The rule of thumb: <strong>the message is a constant string; the variable parts are fields.</strong> Constant messages can be counted, grouped and deduplicated; interpolated ones cannot. Note that fields like <code>user_id</code> and <code>order_id</code> would be forbidden as metric labels (chapter 4's cardinality explosion) but are exactly right here: logs are stored as individual events, so high cardinality is what they are <em>for</em>.</p>
+
+<p><a href="../../architecture/chapters/08-cross-cutting.html">Architecture chapter 8</a> introduced logging as a cross-cutting concern and named the two obvious disciplines (do not log secrets, make output machine-readable). Here we go further: what to put in each event, how events from many services are tied together, and how to afford keeping them.</p>
+
+<h2>Log levels, and how they are misused</h2>
+
+<p>A <span class="term">log level</span> is a severity tag, typically DEBUG, INFO, WARN, ERROR (some libraries add TRACE and FATAL). The intended meaning:</p>
+
+<table>
+  <thead><tr><th>Level</th><th>Intended use</th><th>Typical misuse</th></tr></thead>
+  <tbody>
+    <tr><td>DEBUG</td><td>Detail useful when diagnosing; off in production by default</td><td>Left on in production "just in case"; a hot loop logs a line per item and doubles the bill</td></tr>
+    <tr><td>INFO</td><td>Normal, notable events: started, config loaded, job finished</td><td>Used for per-request chatter; drowns everything else</td></tr>
+    <tr><td>WARN</td><td>Something unexpected that the program handled, and that might matter if it keeps happening</td><td>The dumping ground for "not sure"; so noisy that nobody reads it</td></tr>
+    <tr><td>ERROR</td><td>An operation failed and a human may need to act</td><td>Logged for every expected condition: user not found, validation failed, a retry that later succeeded</td></tr>
+  </tbody>
+</table>
+
+<p>The most damaging misuse is <strong>ERROR for things that are not errors in the sense that matters</strong>. If a user typing a wrong password logs an ERROR, then the ERROR count measures how many people mistype passwords, and nobody can use it to find real faults. The same applies in the other direction: a failed payment logged only at INFO is invisible. A useful test: "if this line appeared 1,000 times a minute, would I want to be woken up?" If yes, it is an ERROR candidate; if it is routine, it is not. Two further habits help. Log a failure <strong>once, where it is handled</strong>, with its context, rather than at every layer it passes through (otherwise one failure produces six lines, and counts are inflated). And do not alert on raw log-line counts as your main signal: alert on symptoms measured by metrics (chapter 7), and use logs to investigate.</p>
+
+<h2>Correlation IDs: tying lines to requests</h2>
+
+<p>On a busy server, thousands of requests interleave their log lines. A line saying "charge failed" is useless unless you can find the other lines from the <em>same request</em>. The fix is a <span class="term">request ID</span> (or <span class="term">correlation ID</span>): a unique identifier generated at the edge (or accepted from the caller), attached to every log line the request produces, and <strong>passed along on every outgoing call</strong> (for HTTP, a header such as <code>X-Request-ID</code>, or the trace context header from chapter 6). Search for the ID and you get the whole story across every service, in order. This is the poor person's distributed trace, and it is often enough to find a bug.</p>
+
+<p>The implementation problem is how to get the ID into lines written deep inside the code without passing it through every function signature. Languages offer <em>ambient context</em>: thread-locals, Go's <code>context.Context</code>, and in Python the <code>contextvars</code> module, which also works correctly with async code (each task sees its own value). A logger reads the context on every call and merges it into the event. The next program is a runnable sketch that also redacts an email address and drops DEBUG lines:</p>
+
+<pre class="terminal" data-title="logs.py (runnable, standard library only)"><code>import contextvars, json, itertools, re
+
+_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("log_ctx", default={})
+_clock = itertools.count(1000)          # simulated time, ms
+LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+MIN_LEVEL = "INFO"
+SINK: list[str] = []
+SECRET = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b")
+
+def bind(**fields):
+    """Add fields to the current context; returns a token to undo it."""
+    return _ctx.set({**_ctx.get(), **fields})
+
+def log(level: str, msg: str, **fields):
+    if LEVELS[level] &lt; LEVELS[MIN_LEVEL]:
+        return
+    rec = {"ts": next(_clock), "level": level, "msg": msg, **_ctx.get(), **fields}
+    for k, v in rec.items():                       # crude redaction
+        if isinstance(v, str):
+            rec[k] = SECRET.sub("[email]", v)
+    SINK.append(json.dumps(rec, sort_keys=False))
+
+def handle(request_id: str, user: str, amount: int):
+    token = bind(request_id=request_id, user_id=user)
+    try:
+        log("INFO", "request start", route="/checkout")
+        charge(amount)
+        log("DEBUG", "this line is dropped at INFO")
+    finally:
+        _ctx.reset(token)
+
+def charge(amount: int):
+    bind(payment_provider="acme-pay")              # added deep in the stack
+    if amount &gt; 500:
+        log("ERROR", "charge declined for ann@example.com", amount=amount, code="limit")
+    else:
+        log("INFO", "charge ok", amount=amount)
+
+handle("req-a1", "u-17", 120)
+handle("req-b2", "u-42", 900)
+for line in SINK:
+    print(line)
+
+# Wide event: ONE record per request, built up as the request runs.
+print("\n--- canonical line ---")
+event = {}
+def wide(request_id, user, amount):
+    ev = {"request_id": request_id, "user_id": user, "route": "/checkout", "amount": amount}
+    ev["db_calls"] = 3; ev["cache_hit"] = False
+    ev["status"] = 402 if amount &gt; 500 else 200
+    ev["duration_ms"] = 31 if amount &lt;= 500 else 87
+    print(json.dumps(ev))
+wide("req-a1", "u-17", 120); wide("req-b2", "u-42", 900)</code></pre>
+
+<pre class="terminal" data-title="terminal"><code>{"ts": 1000, "level": "INFO", "msg": "request start", "request_id": "req-a1", "user_id": "u-17", "route": "/checkout"}
+{"ts": 1001, "level": "INFO", "msg": "charge ok", "request_id": "req-a1", "user_id": "u-17", "payment_provider": "acme-pay", "amount": 120}
+{"ts": 1002, "level": "INFO", "msg": "request start", "request_id": "req-b2", "user_id": "u-42", "route": "/checkout"}
+{"ts": 1003, "level": "ERROR", "msg": "charge declined for [email]", "request_id": "req-b2", "user_id": "u-42", "payment_provider": "acme-pay", "amount": 900, "code": "limit"}
+
+--- canonical line ---
+{"request_id": "req-a1", "user_id": "u-17", "route": "/checkout", "amount": 120, "db_calls": 3, "cache_hit": false, "status": 200, "duration_ms": 31}
+{"request_id": "req-b2", "user_id": "u-42", "route": "/checkout", "amount": 900, "db_calls": 3, "cache_hit": false, "status": 402, "duration_ms": 87}</code></pre>
+
+<p>Look at three things in the output. First, <code>request_id</code> and <code>user_id</code> were bound once in <code>handle()</code> and appeared in every line, including the one written inside <code>charge()</code>, without being passed as arguments. Second, <code>payment_provider</code> was added deep in the call stack and still appears, then vanishes when the request's context is reset, so it cannot leak into the next request. Third, the second block shows a different style, a <em>wide event</em>, which is the next idea.</p>
+
+<h2>Wide events and canonical log lines</h2>
+
+<p>Traditional logging emits many small lines per request ("request start", "cache miss", "charge ok", "request end"). To answer a question you stitch the lines back together. A <span class="term">wide event</span> inverts this: the code collects everything interesting about a request into <em>one</em> structured record with dozens or hundreds of fields, and emits it once, at the end. Engineers at Stripe have written about a version of this under the name "canonical log lines", one line per request carrying the key facts, kept in addition to the normal logs so that it can be queried with ordinary tools. The idea is the same under any name.</p>
+
+<p>A good wide event for a web request contains, among others:</p>
+<ul>
+  <li><strong>Identity of the request:</strong> request ID, trace ID, route template, HTTP method, status, duration.</li>
+  <li><strong>Who and what:</strong> user or tenant ID, account plan, feature flags that were on, client version, region, host, build/commit.</li>
+  <li><strong>What it cost and did:</strong> number of database queries and their total time, cache hit or miss, bytes in and out, retries performed, which dependency was slow.</li>
+  <li><strong>Outcome:</strong> error type and message if any, and whether it was handled or user-visible.</li>
+</ul>
+
+<p>Because every field is on the same record, you can slice by any combination without joins: "show p99 duration for <code>plan=enterprise</code> and <code>client_version=4.2</code> and <code>db_calls &gt; 20</code>". That is the heart of what Majors, Fong-Jones and Miranda (<em>Observability Engineering</em>, 2022) mean by <strong>observability</strong>: you can ask <em>new</em> questions of a running system, ones you did not predict when you wrote the code, without shipping new code to answer them. A dashboard of pre-computed metrics answers only the questions someone anticipated; rich events with high-cardinality fields let you discover the unknown unknowns ("it only fails for tenant 8812 on the Android client in region eu-west when the feature flag is on"). Note that this is a claim about a <em>capability</em>, not a product category, and it is partly a sales pitch as well as a real idea: you can get most of the benefit with careful structured logging and a store that can query it.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the patient chart</p>
+  <p>Vital-sign monitors (metrics) tell the ward a patient is deteriorating. The chart (a wide event) holds the history, medications, allergies and the last test results on one page, so a doctor can ask "which patients on this drug with these symptoms got worse?" The scrawled sticky notes (unstructured lines) technically contain the same facts but not in a form anyone can query.</p>
+  <p><em>Where it breaks down:</em> a hospital chart is written once with care by a professional; software must produce thousands of charts a second automatically, and the cost of writing and keeping them is the next topic.</p>
+</div>
+
+<h2>Three signals: projections of the same events</h2>
+
+<p>It helps to see logs, metrics and traces not as three separate systems but as three <em>projections</em> of the same underlying stream of events. Everything that happens in a service is an event with a timestamp and attributes.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="A stream of events in the centre-left feeds three projections. Metrics: aggregate events into numbers over time, cheap, low cardinality, loses individual events. Logs: store each event as written, high detail, expensive per event. Traces: link the events of one request into a tree, shows causality across services.">
+    <defs><marker id="ahR05a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="10" y="80" width="170" height="110" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="95" y="112" text-anchor="middle" class="t-sm t-bold">Events</text>
+    <text x="95" y="132" text-anchor="middle" class="t-xs t-muted">timestamp + attributes</text>
+    <text x="95" y="150" text-anchor="middle" class="t-xs t-muted">"checkout by u-17,</text>
+    <text x="95" y="165" text-anchor="middle" class="t-xs t-muted">status 200, 31 ms"</text>
+    <line x1="180" y1="115" x2="300" y2="50" class="line s-cyan" marker-end="url(#ahR05a)"/>
+    <line x1="180" y1="135" x2="300" y2="135" class="line s-cyan" marker-end="url(#ahR05a)"/>
+    <line x1="180" y1="155" x2="300" y2="220" class="line s-cyan" marker-end="url(#ahR05a)"/>
+    <rect x="304" y="14" width="440" height="72" rx="10" class="fs-cyan s-cyan sw-2"/>
+    <text x="320" y="38" class="t-sm t-bold">Metrics: aggregate</text>
+    <text x="320" y="56" class="t-xs t-muted">count and bucket events into numbers per label set.</text>
+    <text x="320" y="72" class="t-xs t-muted">Cheap, long retention, fast alerts. Individual events are gone.</text>
+    <rect x="304" y="99" width="440" height="72" rx="10" class="fs-cyan s-cyan sw-2"/>
+    <text x="320" y="123" class="t-sm t-bold">Logs: store each event</text>
+    <text x="320" y="141" class="t-xs t-muted">keep the record, query by any field, high detail.</text>
+    <text x="320" y="157" class="t-xs t-muted">Cost grows with volume, so keep fewer, sample, expire early.</text>
+    <rect x="304" y="184" width="440" height="72" rx="10" class="fs-cyan s-cyan sw-2"/>
+    <text x="320" y="208" class="t-sm t-bold">Traces: link the events of one request</text>
+    <text x="320" y="226" class="t-xs t-muted">parent/child spans with timing show causality across services.</text>
+    <text x="320" y="242" class="t-xs t-muted">Answers "where did the time go?" Usually sampled.</text>
+  </svg>
+  <figcaption>Same events, three views. Choose by the question: "is it broken?" (metrics), "what happened to this one?" (logs), "where did the time go across services?" (traces).</figcaption>
+</figure>
+
+<p>The three also feed each other. A metric alert tells you <em>when</em>; you open the wide events for that window and group by fields to see <em>who and what</em>; you open one trace to see <em>where</em>. Chapter 6 shows the glue, <em>exemplars</em>, that jump from a point on a metric chart directly to a trace.</p>
+
+<h2>Volume, sampling and cost</h2>
+
+<p>A service handling 5,000 requests per second that writes a 1 KB wide event per request produces 5 MB/s, about 430 GB a day, from one service. Multiply by hundreds of services plus the chatty lines. Log storage and indexing are routinely among the biggest observability costs, and the bill grows linearly with traffic, while the value of the 500,000th identical "GET /health 200" is nil. So you decide what to keep.</p>
+
+<ul>
+  <li><strong>Drop the noise at the source.</strong> Health checks, successful static-asset requests, and DEBUG lines in production usually earn no place.</li>
+  <li><strong>Head sampling.</strong> Decide at the <em>start</em> of a request whether to record it, e.g. keep 1 in 100 at random (or deterministically by hashing the request ID, so every service in the call makes the same decision). Simple and cheap, but it is made before you know whether the request will be interesting, so it throws away 99% of the errors too.</li>
+  <li><strong>Tail sampling</strong> (or "decide after the fact"). Buffer the request's events, and at the end decide: keep all errors and slow requests, keep a small share of the fast successes. It keeps what you will want to look at, at the price of holding events in memory until the request finishes. Chapter 6 revisits this for traces.</li>
+  <li><strong>Dynamic sampling.</strong> Vary the rate by what the event is: 100% for errors, 1-in-1000 for the most common success path, 1-in-10 for a rare route; keep the rate on the event (<code>sample_rate=100</code>) so that counts can be reconstructed by weighting each kept event by its rate. Without recording the rate, sampled logs silently lie about volumes.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "sample the logs and the metrics will be wrong too"</p>
+  <p>Metrics are computed from <em>unsampled</em> counters in the process, so sampling the stored events does not change request counts or error rates. The reverse mistake is real: computing a rate by counting <em>sampled</em> log lines without weighting. Keep the pre-aggregated metrics unsampled, and sample the expensive per-event detail.</p>
+</div>
+
+<h2>Retention tiers</h2>
+
+<p>Most queries are about the last few hours. Few are about last month, and almost none about last year, except for audits. Retention is therefore tiered by access pattern and cost:</p>
+
+<table>
+  <thead><tr><th>Tier</th><th>Typical age</th><th>Storage</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>Hot</td><td>hours to days</td><td>Indexed on fast disks or memory</td><td>Live debugging, incident response; sub-second queries</td></tr>
+    <tr><td>Warm</td><td>days to weeks</td><td>Cheaper indexed storage</td><td>Recent post-incident investigation</td></tr>
+    <tr><td>Cold / archive</td><td>months to years</td><td>Compressed files in object storage, queried by scanning</td><td>Audits, compliance, rare deep investigations; slow and cheap</td></tr>
+  </tbody>
+</table>
+
+<p>Exact durations are a policy decision driven by cost, compliance and how long it takes your organisation to notice problems; there is no standard. One practical lesson: <strong>some incidents are only understood weeks later</strong> (a slow data corruption, a security investigation), so the answer to "keep nothing but a week" is rarely a good one for the events that matter. Keep a long-lived but small sample or a long-lived aggregate, and the full-fidelity data for a short window.</p>
+
+<h2>PII in logs, and redaction</h2>
+
+<p><span class="term">PII</span> (personally identifiable information) is anything that identifies a person: names, emails, phone numbers, addresses, IP addresses in many jurisdictions, government IDs, and obviously passwords, tokens and card numbers. Logs are a classic leak path. A developer logs the whole request body for debugging, and now every customer's password and card number sits, indexed and searchable by hundreds of engineers, with a retention policy longer than the database's. Logs are also replicated and archived, so deleting one user's data on request is hard.</p>
+
+<ul>
+  <li><strong>Do not log secrets or full bodies.</strong> Prefer an allow-list of fields to log over a deny-list of fields to hide: new fields then default to private.</li>
+  <li><strong>Redact at the source</strong> (as <code>logs.py</code> does with a crude regular expression), not only in the pipeline; once the raw value leaves the process you depend on every downstream stage.</li>
+  <li><strong>Use stable pseudonyms</strong> (<code>user_id</code>, not email) so that events remain joinable without exposing identity. Hash with a secret salt if you must log an identifier you do not want in the clear.</li>
+  <li><strong>Treat access as a control:</strong> restrict who can query sensitive indices, and audit it.</li>
+</ul>
+
+<p>Regular expressions catch obvious patterns only. The reliable defence is design: fields are named, typed and reviewed, which is another argument for structure over free text.</p>
+
+<h2>The log pipeline</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="Pipeline of five stages left to right: application writes structured events to stdout; an agent on each host tails and enriches them; a durable buffer such as a message queue absorbs bursts; a processing stage parses, redacts and samples; storage tiers hold hot, warm and cold data. A dashed back-pressure note points at the buffer.">
+    <defs><marker id="ahR05b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="8" y="50" width="120" height="70" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="68" y="78" text-anchor="middle" class="t-sm t-bold">Application</text>
+    <text x="68" y="96" text-anchor="middle" class="t-xs t-muted">JSON events to</text>
+    <text x="68" y="110" text-anchor="middle" class="t-xs t-muted">stdout</text>
+    <line x1="128" y1="85" x2="152" y2="85" class="line s-cyan" marker-end="url(#ahR05b)"/>
+    <rect x="154" y="50" width="120" height="70" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="214" y="78" text-anchor="middle" class="t-sm t-bold">Agent</text>
+    <text x="214" y="96" text-anchor="middle" class="t-xs t-muted">tail files, add</text>
+    <text x="214" y="110" text-anchor="middle" class="t-xs t-muted">host and pod tags</text>
+    <line x1="274" y1="85" x2="298" y2="85" class="line s-cyan" marker-end="url(#ahR05b)"/>
+    <rect x="300" y="50" width="120" height="70" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="360" y="78" text-anchor="middle" class="t-sm t-bold">Buffer</text>
+    <text x="360" y="96" text-anchor="middle" class="t-xs t-muted">durable queue</text>
+    <text x="360" y="110" text-anchor="middle" class="t-xs t-muted">absorbs bursts</text>
+    <line x1="420" y1="85" x2="444" y2="85" class="line s-cyan" marker-end="url(#ahR05b)"/>
+    <rect x="446" y="50" width="130" height="70" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="511" y="78" text-anchor="middle" class="t-sm t-bold">Process</text>
+    <text x="511" y="96" text-anchor="middle" class="t-xs t-muted">parse, redact,</text>
+    <text x="511" y="110" text-anchor="middle" class="t-xs t-muted">sample, route</text>
+    <line x1="576" y1="85" x2="600" y2="85" class="line s-cyan" marker-end="url(#ahR05b)"/>
+    <rect x="602" y="22" width="150" height="34" rx="6" class="fs-red s-red sw-2" style="fill-opacity:.5"/>
+    <text x="677" y="43" text-anchor="middle" class="t-xs t-bold">hot: indexed, days</text>
+    <rect x="602" y="64" width="150" height="34" rx="6" class="fs-yellow s-yellow sw-2" style="fill-opacity:.5"/>
+    <text x="677" y="85" text-anchor="middle" class="t-xs t-bold">warm: weeks</text>
+    <rect x="602" y="106" width="150" height="34" rx="6" class="fs-blue s-blue sw-2" style="fill-opacity:.5"/>
+    <text x="677" y="127" text-anchor="middle" class="t-xs t-bold">cold: object store</text>
+    <text x="360" y="150" text-anchor="middle" class="t-xs tc-orange">if the store is slow, the buffer fills first</text>
+        <text x="380" y="195" text-anchor="middle" class="t-xs t-muted">the application must never block on logging; if the agent is down, drop or spool locally</text>
+  </svg>
+  <figcaption>Agent, buffer, processing, store. Each hand-off decouples a failure: a slow search cluster should not slow your checkout.</figcaption>
+</figure>
+
+<p>Logs flow through a pipeline for the same reason requests flow through queues in <a href="../../systems/chapters/14-queues-backpressure.html">systems chapter 14</a>: stages run at different speeds and fail independently. The application writes to stdout or a local file (cheap, local, nearly unfailing); an <strong>agent</strong> on each host reads, tags (host, pod, region) and forwards; a <strong>durable buffer</strong> (a message queue such as Kafka) absorbs bursts such as the flood of error lines during an incident, which is exactly when volume spikes; a <strong>processing stage</strong> parses, redacts, samples and routes to tiers; and the <strong>store</strong> indexes. Two design rules follow from the queueing chapters. The application must never block on logging, so when the pipeline backs up the right behaviour is to drop (ideally the least valuable lines first) rather than to stall requests. And you must monitor the pipeline itself: a logging system that has silently stopped is indistinguishable from a quiet service, and you discover it in the incident.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Per-host logs have no single global order: clocks drift (<a href="../../networking/chapters/17-time.html">networking chapter 17</a>), so timestamps from two machines cannot be compared exactly, and a request ID is the only reliable way to group causally related events. Chapter 6 formalises this with trace and span IDs and parent-child links, which is closer to the logical clocks you met in the distributed course than to wall-clock time. The buffer-and-replay structure of the pipeline is also the log abstraction you saw in <a href="../../data/chapters/19-streams-cdc.html">data chapter 19</a>.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>You need Python 3 and, for the shell items, <code>jq</code> (macOS: <code>brew install jq</code>; Linux: your package manager). Nothing here needs sudo.</p>
+</div>
+
+<ol>
+  <li>Run <code>logs.py &gt; events.jsonl</code> (remove the wide-event part first, or keep it in a second file). Then <code>jq -c 'select(.level=="ERROR")' events.jsonl</code> and <code>jq -s 'group_by(.request_id) | map({id: .[0].request_id, lines: length})' events.jsonl</code>.</li>
+  <li>Change <code>MIN_LEVEL</code> to <code>"DEBUG"</code> and measure how many more lines you get. Multiply by your imagined traffic.</li>
+  <li>Add an <code>@sampled(rate)</code> wrapper that keeps an event with probability <code>1/rate</code> unless the level is ERROR, and records <code>sample_rate</code> in the event. Check that summing <code>sample_rate</code> over kept INFO lines estimates the true count.</li>
+  <li>Extend the redaction to mask 13-to-16-digit sequences. Then write a log line that defeats your regular expression, and explain why allow-listing fields is better.</li>
+</ol>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Structured logs (named fields, constant message) are queryable; free-text lines need a parser per question.</li>
+    <li>Levels are a contract: ERROR means someone may need to act. Do not log expected conditions as errors, and log each failure once where it is handled.</li>
+    <li>Attach a request ID to every line and propagate it on every call; use ambient context (contextvars, thread-locals) so deep code gets it for free.</li>
+    <li>Wide events (one rich record per request, as in canonical log lines) enable asking new questions by slicing on any field, the core of observability in the Majors et al. sense.</li>
+    <li>Logs, metrics and traces are projections of the same events: aggregate, store, or link. Pick by the question.</li>
+    <li>Control cost with source filtering, head, tail and dynamic sampling (recording the sample rate), and tiered retention.</li>
+    <li>Treat logs as a privacy risk: allow-list fields, redact at the source, use pseudonymous IDs. The pipeline (agent, buffer, process, store) should never block the application and must itself be monitored.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why is <code>log("charge failed for user 4417")</code> worse than <code>log("charge failed", user_id="u-4417")</code>?</p>
+    <ol class="q-options">
+      <li>The second is shorter on disk</li>
+      <li>The first bakes a variable into the message, so identical events have different messages and cannot be grouped or counted without a regular expression</li>
+      <li>The first cannot contain digits</li>
+      <li>The second is automatically redacted</li>
+    </ol>
+    <div class="q-explain">A constant message plus named fields lets a query group by message and filter by user. Interpolating the ID makes every line unique text. Size, redaction and digits are not the issue.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A service logs ERROR whenever a user's login attempt has a wrong password. What is the most serious consequence?</p>
+    <ol class="q-options">
+      <li>Logs get slightly larger</li>
+      <li>Passwords are leaked</li>
+      <li>Login attempts slow down</li>
+      <li>The ERROR count no longer indicates real faults, so it cannot support alerts or investigation, and genuine failures hide in the noise</li>
+    </ol>
+    <div class="q-explain">The size is minor and nothing here says the password is logged. The damage is semantic: a level only helps if it means something consistent. Use INFO or a metric for expected user mistakes, and keep ERROR for failures a person may need to act on.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">With head sampling at 1 in 100, which problem should you expect?</p>
+    <ol class="q-options">
+      <li>About 99% of rare error requests are discarded before anyone knows they were errors</li>
+      <li>Request counts on dashboards become 100 times too small, because metrics are also sampled</li>
+      <li>Request IDs stop being unique</li>
+      <li>The decision cannot be consistent across services</li>
+    </ol>
+    <div class="q-explain">Head sampling decides before the outcome is known, so it discards errors at the same rate as everything else. Metrics are computed from unsampled counters and are unaffected. Hashing the request ID makes the decision consistent across services. Tail or dynamic sampling keeps the interesting requests.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">You keep a sampled log with a different sampling rate per event type. What must you store on each kept event to estimate true volumes?</p>
+    <ol class="q-options">
+      <li>The hostname</li>
+      <li>A checksum</li>
+      <li>The sample rate, so each kept event can be weighted by that rate when counting</li>
+      <li>Nothing; the counts are correct as they are</li>
+    </ol>
+    <div class="q-explain">An event kept at 1 in 1000 stands for 1,000 real events. Without the rate recorded, counts over a mixture of rates are biased toward the types you sampled less aggressively.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">What is the main reason to put a durable buffer between log agents and the log store?</p>
+    <ol class="q-options">
+      <li>To make logs sort correctly by timestamp</li>
+      <li>To absorb bursts (such as the flood during an incident) and decouple a slow or failing store from the producers</li>
+      <li>To encrypt the logs</li>
+      <li>To remove the need for retention policies</li>
+    </ol>
+    <div class="q-explain">Volume spikes exactly when things go wrong, and the store may be the component that is struggling. A buffer lets stages run at different speeds without back-pressure reaching your application. It does nothing for ordering, encryption or retention.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

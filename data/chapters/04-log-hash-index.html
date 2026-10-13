@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Simplest Database: a Log · Data Systems</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/log-store.css">
+</head>
+<body data-root="../.." data-course="data" data-chapter="04">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>The Simplest Database: a Log</h1>
+  <p class="lede">Two lines of shell script are a working database. Make them survive crashes, find keys instantly, reclaim space and handle deletes, and you have a real storage engine whose ideas appear in nearly every system in the rest of this course. We build it step by step, and then we find exactly where it stops working.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Every storage engine answers the same two questions: <em>where do I put new data?</em> and <em>how do I find it again?</em> The log answers the first in the cheapest possible way (put it at the end) and then spends the whole chapter on the second. Once you see why it works and where it breaks, B-trees, LSM trees, write-ahead logs, Kafka and replication stop being separate topics: they are all variations on this one idea.</p>
+</div>
+
+<h2>A database in two lines</h2>
+
+<p>A <span class="term">database</span>, at its core, does two things: you hand it data and it remembers it, and later you ask for the data back. Here is the smallest thing that qualifies, a pair of bash functions:</p>
+
+<pre><code><span class="cmt">#!/bin/bash</span>
+db_set() { echo "$1,$2" &gt;&gt; database; }
+db_get() { grep "^$1," database | sed -e "s/^$1,//" | tail -n 1; }</code></pre>
+
+<p><code>db_set key value</code> appends one line, <code>key,value</code>, to a file called <code>database</code>. <code>db_get key</code> finds every line starting with that key, strips the key off, and keeps only the last one. Let's use it, and then do something unkind to it:</p>
+
+<pre><code>source ./db.sh
+db_set user:1 Ada
+db_set user:2 Grace
+db_set user:1 "Ada Lovelace"
+echo "get user:1 -&gt; $(db_get user:1)"
+echo "get user:2 -&gt; $(db_get user:2)"
+echo "get user:3 -&gt; '$(db_get user:3)'"
+echo "--- the file:"
+cat database
+echo "--- 200,000 more records:"
+awk 'BEGIN { for (i = 0; i &lt; 200000; i++) print "key" i ",value" i }' &gt;&gt; database
+wc -lc database
+TIMEFORMAT="get key5      took %3R s"; time db_get key5 &gt; /dev/null
+TIMEFORMAT="get key199999 took %3R s"; time db_get key199999 &gt; /dev/null</code></pre>
+
+<pre class="terminal" data-title="terminal (bash; your timings will differ)"><code><span class="prompt">$ </span><span class="cmd">bash try4.sh</span>
+<span class="out">get user:1 -&gt; Ada Lovelace
+get user:2 -&gt; Grace
+get user:3 -&gt; ''
+--- the file:
+user:1,Ada
+user:2,Grace
+user:1,Ada Lovelace
+--- 200,000 more records:
+  200003 4177824 database
+get key5      took 0.034 s
+get key199999 took 0.039 s</span></code></pre>
+
+<p>(Save the two functions as <code>db.sh</code> and the script above as <code>try4.sh</code> in an empty directory. It writes a file called <code>database</code> there, so don't run it anywhere you care about. On Windows use WSL or Git Bash.) Notice what happened to <code>user:1</code>. We wrote it twice and the file now holds <em>both</em> lines. We never went back and changed the first one; we appended a newer one, and <code>tail -n 1</code> makes the newest win. That is an <span class="term">append-only log</span>: a file you only ever add to at the end, never edit in the middle. The data is the history, and the current value of a key is simply its most recent entry.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the returns cart</p>
+  <p>In our library, returned books go onto a cart at the desk in the order they arrive. Nobody walks to the right shelf for each one; you just drop it on the end of the cart. That is why returning is so quick. Finding a particular book, though, means digging through the cart from the beginning. The log is the cart.</p>
+  <p><em>Where it breaks down:</em> a library cart is eventually emptied onto the shelves, and the books on it are still physical books. Our log keeps old versions around, so it also needs a way to throw away copies that have been superseded. We'll get to that.</p>
+</div>
+
+<h2>Why writes are fast, and reads are slow</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 175" role="img" aria-label="A file of eight records. A short arrow shows db_set adding at the end of the file. A long arrow underneath shows db_get reading every record from the start, with the last record for key k1 being the answer.">
+    <defs>
+      <marker id="ah04a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="686" y="22" text-anchor="middle" class="t-sm t-bold">db_set appends here</text>
+    <line x1="686" y1="30" x2="686" y2="61" class="line s-orange sw-3" marker-end="url(#ah04a)"/>
+
+    <rect x="30" y="64" width="80" height="40" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="70" y="89" text-anchor="middle" class="t-sm mono">k1,a</text>
+    <rect x="118" y="64" width="80" height="40" rx="6" class="box"/>
+    <text x="158" y="89" text-anchor="middle" class="t-sm mono">k2,b</text>
+    <rect x="206" y="64" width="80" height="40" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="246" y="89" text-anchor="middle" class="t-sm mono">k1,c</text>
+    <rect x="294" y="64" width="80" height="40" rx="6" class="box"/>
+    <text x="334" y="89" text-anchor="middle" class="t-sm mono">k3,d</text>
+    <rect x="382" y="64" width="80" height="40" rx="6" class="box"/>
+    <text x="422" y="89" text-anchor="middle" class="t-sm mono">k2,e</text>
+    <rect x="470" y="64" width="80" height="40" rx="6" class="box"/>
+    <text x="510" y="89" text-anchor="middle" class="t-sm mono">k4,f</text>
+    <rect x="558" y="64" width="80" height="40" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="598" y="89" text-anchor="middle" class="t-sm mono">k1,g</text>
+    <rect x="646" y="64" width="80" height="40" rx="6" class="box"/>
+    <text x="686" y="89" text-anchor="middle" class="t-sm mono">k5,h</text>
+
+    <text x="598" y="122" text-anchor="middle" class="t-xs t-muted">last match wins</text>
+    <line x1="30" y1="138" x2="732" y2="138" class="line s-blue sw-3" marker-end="url(#ah04a)"/>
+    <text x="30" y="162" class="t-sm t-muted">db_get reads from the start to the end, so its cost grows with the file: O(n)</text>
+  </svg>
+  <figcaption>The two-line database. A write touches only the end of the file. A read has to look at everything, because the answer for k1 could be anywhere and only the last match counts.</figcaption>
+</figure>
+
+<p><strong>Writes.</strong> <code>db_set</code> adds bytes to the end of a file. That is about the cheapest operation a disk can do, for a reason from <a href="../../systems/chapters/02-memory-hierarchy.html">systems chapter 2</a>: storage hardware loves sequential access. On a spinning disk, moving the head to a new place (a <span class="term">seek</span>) costs milliseconds, while appending continues from where the head already is. On an SSD there is no head, but large sequential writes are still friendlier to the flash and let the operating system merge many small writes into one big one. An update-in-place database must find the right spot in the file first; an append-only log never has to.</p>
+
+<p><strong>Reads.</strong> <code>db_get</code> scans the entire file, every time. I measured the function above on a file of about 200,000 lines (4.2 MB): a lookup took roughly 35 ms, whether the key was near the start or the end, because the scan always reads to the end to be sure no later match exists. That is fine for a toy. But the cost is proportional to the file size, which is what <span class="term">O(n)</span> means. At that same rate, a 100 GB log would take on the order of a quarter of an hour <em>per lookup</em>. Reads like this can't serve a website.</p>
+
+<div class="callout warn">
+  <p class="callout-title">"Written" is still not "saved"</p>
+  <p>This toy never calls <code>fsync</code>. As you learned in <a href="../../systems/chapters/09-durability.html">systems chapter 9</a>, <code>echo ... >> database</code> hands the bytes to the operating system's page cache, and they can vanish in a power cut. A real log-based engine has to decide when to <code>fsync</code>, which we cover below. The log makes durability <em>easy to reason about</em> (there is exactly one place new data goes), but it does not make it free.</p>
+</div>
+
+<p>So the log is a wonderful way to <em>write</em> and a terrible way to <em>read</em>. The whole history of storage engines is a series of answers to: how can we keep the fast writes and also get fast reads? The first answer is almost embarrassingly simple.</p>
+
+<h2>Adding an index: the hash table in RAM</h2>
+
+<p>An <span class="term">index</span> is an extra data structure, kept alongside the data, whose only job is to make lookups fast. (Chapter 7 is devoted to them.) The simplest one for a log is a hash table: <strong>for each key, remember where its newest record starts in the file.</strong> Keep that table in memory.</p>
+
+<p>Now the two operations look like this:</p>
+
+<ol class="steps">
+  <li><strong>Write <code>set(key, value)</code>:</strong> append the record to the end of the file, note the <span class="term">byte offset</span> where it started (how many bytes into the file), and set <code>index[key] = offset</code>. Still one sequential append, plus one in-memory update.</li>
+  <li><strong>Read <code>get(key)</code>:</strong> look up the offset in the hash table (a RAM access, nanoseconds to well under a microsecond), <code>seek</code> to that offset in the file, and read one record. One disk read, no scanning.</li>
+</ol>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 190" role="img" aria-label="A hash index in memory with four keys, each pointing to a segment and record number. Two segment files on disk are shown as rows of records. An arrow follows the key user:1 from the index to the newest user:1 record in segment 2; the older user:1 record in segment 1 is faded as garbage.">
+    <defs>
+      <marker id="ah04b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="20" width="215" height="160" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="128" y="40" text-anchor="middle" class="t-sm t-bold">Hash index (RAM)</text>
+    <rect x="30" y="52" width="195" height="24" rx="5" class="fs-yellow s-yellow sw-2"/>
+    <text x="40" y="68" class="t-sm mono">user:1 → seg-2 #0</text>
+    <rect x="30" y="78" width="195" height="24" rx="5" class="box"/>
+    <text x="40" y="94" class="t-sm mono">user:2 → seg-2 #1</text>
+    <rect x="30" y="104" width="195" height="24" rx="5" class="box"/>
+    <text x="40" y="120" class="t-sm mono">user:3 → seg-1 #2</text>
+    <rect x="30" y="130" width="195" height="24" rx="5" class="box"/>
+    <text x="40" y="146" class="t-sm mono">user:4 → seg-1 #3</text>
+    <text x="128" y="172" text-anchor="middle" class="t-xs t-muted">key → (segment, record)</text>
+
+    <rect x="270" y="20" width="480" height="70" rx="10" class="box"/>
+    <text x="282" y="37" class="t-xs t-bold">seg-1 · sealed (never modified)</text>
+    <rect x="278" y="46" width="113" height="34" rx="6" class="box"/>
+    <text x="334" y="67" text-anchor="middle" class="t-xs mono t-faint">#0 user:1=v1</text>
+    <rect x="395" y="46" width="113" height="34" rx="6" class="box"/>
+    <text x="451" y="67" text-anchor="middle" class="t-xs mono t-faint">#1 user:2=v1</text>
+    <rect x="512" y="46" width="113" height="34" rx="6" class="fs-orange s-orange"/>
+    <text x="568" y="67" text-anchor="middle" class="t-xs mono">#2 user:3=v1</text>
+    <rect x="629" y="46" width="113" height="34" rx="6" class="fs-orange s-orange"/>
+    <text x="685" y="67" text-anchor="middle" class="t-xs mono">#3 user:4=v1</text>
+
+    <rect x="270" y="110" width="480" height="70" rx="10" class="box"/>
+    <text x="282" y="127" class="t-xs t-bold">seg-2 · active (appends go here)</text>
+    <rect x="278" y="136" width="113" height="34" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="334" y="157" text-anchor="middle" class="t-xs mono">#0 user:1=v2</text>
+    <rect x="395" y="136" width="113" height="34" rx="6" class="fs-orange s-orange"/>
+    <text x="451" y="157" text-anchor="middle" class="t-xs mono">#1 user:2=v2</text>
+    <rect x="512" y="136" width="113" height="34" rx="6" class="line-dash"/>
+    <text x="568" y="157" text-anchor="middle" class="t-xs t-faint">next append</text>
+
+    <path d="M227 64 H252 V153 H276" class="line s-yellow sw-3" marker-end="url(#ah04b)"/>
+  </svg>
+  <figcaption>get(user:1): the index (purple, in RAM) names the segment and record, and one seek reaches it (yellow). The faded user:1 and user:2 records in seg-1 are garbage now: the index points at newer versions.</figcaption>
+</figure>
+
+<p>This design is called <span class="term">Bitcask</span>, after the storage engine originally written for the Riak database (the design is described in a short paper, "Bitcask: A Log-Structured Hash Table for Fast Key/Value Data"). Its index is traditionally called a <em>keydir</em>. Its promise is attractive: <strong>every write is one sequential append and every read is at most one disk seek</strong>, no matter how big the data is.</p>
+
+<h3>What a record looks like on disk</h3>
+
+<p>To seek into a file we need to read a record back without knowing its length in advance, so each record carries a small header. Here is the layout used by the code in this chapter (Bitcask's own records also carry a timestamp, which we skip):</p>
+
+<div class="fields">
+  <div class="field">crc32<small>4 bytes · checksum of everything after it</small></div>
+  <div class="field">key length<small>4 bytes</small></div>
+  <div class="field">value length<small>4 bytes · −1 means tombstone</small></div>
+  <div class="field" style="--w:2">key<small>key length bytes</small></div>
+  <div class="field" style="--w:2">value<small>value length bytes</small></div>
+</div>
+
+<p>The offset in the index points at the first byte of the header. The header tells us exactly how many more bytes to read. The checksum and the "−1" will earn their keep in a minute.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the card catalogue</p>
+  <p>The library's catalogue does not hold any books. It holds <em>cards</em>: for each title, which shelf and which position. Looking up a book takes one flip through the cards and one walk to the shelf. The hash index is the catalogue, the log segments are the shelves of books, and the values (which may be big) never need to be in memory, only the cards.</p>
+  <p><em>Where it breaks down:</em> a paper catalogue survives a power cut. Our index lives in RAM, so after a crash someone has to rewrite every card from scratch. That is the recovery problem below.</p>
+</div>
+
+<h3>Why every key must fit in RAM</h3>
+
+<p>The index holds one entry per <em>live key</em>: the key itself plus a pointer (segment, offset, size). The <em>values</em> stay on disk. Suppose you track view counts for 100 million videos with 16-byte keys. Even with a few tens of bytes of overhead per entry, the index is on the order of 4 to 5 GB. That is a back-of-envelope figure, not a measurement, but it shows the shape: RAM use grows with the <em>number of keys</em>, not with the amount of data. A store with 100 million keys and 1 KB values holds around 100 GB on disk and needs only a few GB of RAM, which is a good deal. A store with 10 billion tiny keys does not fit on any single machine's memory.</p>
+
+<p>So Bitcask suits workloads with <strong>a modest number of keys that are updated very often</strong>: counters, session data, a "latest status" per device. The video-view example is the classic one: millions of increments, but each increment overwrites the same key.</p>
+
+<h2>Segments: the log can't grow forever</h2>
+
+<p>In our example workload, each video's counter is overwritten constantly. After a billion updates the log holds a billion records, but only 100 million of them (the newest per key) are still "live". The rest are garbage that wastes disk. We can't edit the file to remove them, because editing in place is exactly what we gave up. So we use a trick: break the log into pieces.</p>
+
+<p>A <span class="term">segment</span> is one file of the log. We append to a single <em>active</em> segment. When it reaches a size limit, we <strong>seal</strong> it (close it and never write to it again) and start a new active segment. Sealed segments are <span class="term">immutable</span>: once written, not one byte changes. The index now stores a (segment, offset) pair instead of just an offset, exactly as in the diagram above.</p>
+
+<p>Immutability is a recurring gift. We'll use it for compaction, for concurrency and, in later chapters, for backups and replication.</p>
+
+<h3>Compaction and merging</h3>
+
+<p><span class="term">Compaction</span> is the process of throwing away garbage. In the simplest version: read some sealed segments, copy into a <em>new</em> segment only the records that are still live (the ones the index points to), then switch the index to the new locations and delete the old files. Because sealed segments are never changed, we can do all of this in the background while reads and writes carry on. The related word <span class="term">merging</span> means combining several small segments into one bigger one; in practice the same pass does both.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 255" role="img" aria-label="Three sealed segments seg-1, seg-2 and seg-3 hold records a1 b1 c1, a2 c2 d1 and b2 a3 and a tombstone for c. Arrows lead from them to a new compacted segment seg-5 containing only a3 and b2. The active segment seg-4 holding d2 is left untouched.">
+    <defs>
+      <marker id="ah04c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="26" width="185" height="80" rx="10" class="box"/>
+    <text x="30" y="44" class="t-xs t-bold">seg-1 · sealed</text>
+    <rect x="30" y="56" width="52" height="30" rx="5" class="box"/><text x="56" y="76" text-anchor="middle" class="t-sm mono t-faint">a1</text>
+    <rect x="88" y="56" width="52" height="30" rx="5" class="box"/><text x="114" y="76" text-anchor="middle" class="t-sm mono t-faint">b1</text>
+    <rect x="146" y="56" width="52" height="30" rx="5" class="box"/><text x="172" y="76" text-anchor="middle" class="t-sm mono t-faint">c1</text>
+
+    <rect x="215" y="26" width="185" height="80" rx="10" class="box"/>
+    <text x="225" y="44" class="t-xs t-bold">seg-2 · sealed</text>
+    <rect x="225" y="56" width="52" height="30" rx="5" class="box"/><text x="251" y="76" text-anchor="middle" class="t-sm mono t-faint">a2</text>
+    <rect x="283" y="56" width="52" height="30" rx="5" class="box"/><text x="309" y="76" text-anchor="middle" class="t-sm mono t-faint">c2</text>
+    <rect x="341" y="56" width="52" height="30" rx="5" class="box"/><text x="367" y="76" text-anchor="middle" class="t-sm mono t-faint">d1</text>
+
+    <rect x="410" y="26" width="185" height="80" rx="10" class="box"/>
+    <text x="420" y="44" class="t-xs t-bold">seg-3 · sealed</text>
+    <rect x="420" y="56" width="52" height="30" rx="5" class="fs-orange s-orange"/><text x="446" y="76" text-anchor="middle" class="t-sm mono">b2</text>
+    <rect x="478" y="56" width="52" height="30" rx="5" class="fs-orange s-orange"/><text x="504" y="76" text-anchor="middle" class="t-sm mono">a3</text>
+    <rect x="536" y="56" width="52" height="30" rx="5" class="fs-red s-red"/><text x="562" y="76" text-anchor="middle" class="t-sm mono">c✕</text>
+
+    <rect x="605" y="26" width="135" height="80" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="615" y="44" class="t-xs t-bold">seg-4 · active</text>
+    <rect x="615" y="56" width="52" height="30" rx="5" class="fs-orange s-orange"/><text x="641" y="76" text-anchor="middle" class="t-sm mono">d2</text>
+    <text x="672" y="124" text-anchor="middle" class="t-xs t-muted">active: not touched</text>
+
+    <line x1="112" y1="108" x2="190" y2="167" class="line s-orange sw-2" marker-end="url(#ah04c)"/>
+    <line x1="307" y1="108" x2="307" y2="167" class="line s-orange sw-2" marker-end="url(#ah04c)"/>
+    <line x1="502" y1="108" x2="425" y2="167" class="line s-orange sw-2" marker-end="url(#ah04c)"/>
+
+    <rect x="150" y="170" width="320" height="72" rx="10" class="fs-orange s-orange sw-2"/>
+    <text x="162" y="188" class="t-xs t-bold">seg-5 · compacted (new file)</text>
+    <rect x="162" y="198" width="52" height="30" rx="5" class="box"/><text x="188" y="218" text-anchor="middle" class="t-sm mono">a3</text>
+    <rect x="220" y="198" width="52" height="30" rx="5" class="box"/><text x="246" y="218" text-anchor="middle" class="t-sm mono">b2</text>
+
+    <text x="490" y="196" class="t-sm">1. copy only the live records</text>
+    <text x="490" y="216" class="t-sm">2. point the index at seg-5</text>
+    <text x="490" y="236" class="t-sm">3. delete seg-1, 2, 3 (oldest first)</text>
+  </svg>
+  <figcaption>Compaction. Faded records are stale versions, the red c✕ is a tombstone, orange records are live. Only a3 and b2 survive into the new segment. The old d1 is dropped too, because the active segment holds a newer d2. The active segment is not touched.</figcaption>
+</figure>
+
+<p>Two details matter for correctness:</p>
+<ul>
+  <li><strong>Liveness comes from the index.</strong> A record is live exactly when the index points at it. Everything else is garbage. (This is also how the widget below decides what to fade.)</li>
+  <li><strong>Crash safety.</strong> Write the new segment under a temporary name, <code>fsync</code> it, then rename it into place (the pattern from <a href="../../systems/chapters/09-durability.html">systems chapter 9</a>), and only then delete the old files. If the machine dies halfway, the old segments are all still there and you simply redo the compaction.</li>
+</ul>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: copying the current balances</p>
+  <p>Imagine a notebook where you write every change to your account balance on a new line. After a year it is full of old entries. To save paper you start a fresh notebook and copy over only the <em>current</em> balance for each account, then recycle the old notebook. Same information you still need, far fewer pages.</p>
+  <p><em>Where it breaks down:</em> an accountant would never throw away the history. A Bitcask-style store deliberately does, which is why you wouldn't use it for an audit trail.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Compaction is not free</p>
+  <p>Compaction reads and rewrites live data, so it uses disk bandwidth and needs enough spare space to hold the new segments while the old ones still exist. Data that is rewritten many times over its life costs more I/O than the user ever asked for. That ratio is called <span class="term">write amplification</span>, and it returns in a big way in <a href="05-lsm-trees.html">the next chapter</a>.</p>
+</div>
+
+<h2>Deleting: you can't, so you write a tombstone</h2>
+
+<p>How do you delete a key from a file you can only append to? You can't remove the old record. Instead you append a special record that means "this key is deleted", called a <span class="term">tombstone</span>. In our format that is a record whose value length is −1. The index removes the key, so reads miss immediately.</p>
+
+<p>Why is the tombstone needed at all, if the index already forgot the key? Because the index is not the truth; the log is. After a crash, the index is rebuilt by replaying the log from the start. Replaying the old <code>set</code> without the tombstone would resurrect the key. The tombstone is what makes the delete durable.</p>
+
+<div class="callout warn">
+  <p class="callout-title">When can a tombstone be dropped?</p>
+  <p>Only when no <em>older</em> record for that key can still be replayed. A compaction that merges all the older segments can safely drop it, which is why the diagram above drops <code>c✕</code> (every older <code>c</code> was in the segments being merged). And when you delete the old segments afterwards, delete them <strong>oldest first</strong>. If a crash interrupted the clean-up after the tombstone's segment was removed but while an older segment holding the old value remained, the key would come back to life. This "zombie" problem recurs in every log-structured system, including LSM trees.</p>
+</div>
+
+<h2>Crash recovery</h2>
+
+<p>There are three different things that can go wrong, and they have three different answers.</p>
+
+<h3>1. The index is gone</h3>
+
+<p>The index lives in RAM. When the process restarts, it must be rebuilt. The simplest method works because the log is the truth: <strong>scan every segment from oldest to newest, and for each record set <code>index[key]</code> to its location (or remove the key for a tombstone).</strong> Newer records overwrite older ones, so at the end the index is exactly right. It costs a full read of the data, which on a 100 GB store can mean minutes of downtime.</p>
+
+<p>To speed that up, Bitcask writes <span class="term">hint files</span> next to its data files: for each segment, a compact list of (key, offset, size) <em>without the values</em>. Reading the hints rebuilds the index while skipping most of the bytes. Another common approach is to periodically snapshot the whole index to disk and replay only the log written since. Either way, the idea is the same: a cache of derived data, thrown away and recomputed from the log whenever needed.</p>
+
+<h3>2. The last record is torn</h3>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 160" role="img" aria-label="A log with five complete records, a sixth record that is only partly written, and empty space after it. A recovery arrow scans the first five records and stops at the sixth, where the checksum fails and the file is truncated.">
+    <defs>
+      <marker id="ah04d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="590" y="36" text-anchor="middle" class="t-xs t-muted">power cut during this append</text>
+    <rect x="20" y="52" width="100" height="40" rx="6" class="fs-orange s-orange"/><text x="70" y="77" text-anchor="middle" class="t-sm">rec 1 ✓</text>
+    <rect x="128" y="52" width="100" height="40" rx="6" class="fs-orange s-orange"/><text x="178" y="77" text-anchor="middle" class="t-sm">rec 2 ✓</text>
+    <rect x="236" y="52" width="100" height="40" rx="6" class="fs-orange s-orange"/><text x="286" y="77" text-anchor="middle" class="t-sm">rec 3 ✓</text>
+    <rect x="344" y="52" width="100" height="40" rx="6" class="fs-orange s-orange"/><text x="394" y="77" text-anchor="middle" class="t-sm">rec 4 ✓</text>
+    <rect x="452" y="52" width="100" height="40" rx="6" class="fs-orange s-orange"/><text x="502" y="77" text-anchor="middle" class="t-sm">rec 5 ✓</text>
+    <rect x="560" y="52" width="60" height="40" rx="6" class="fs-red s-red sw-2"/><text x="590" y="77" text-anchor="middle" class="t-sm">rec 6</text>
+    <rect x="626" y="52" width="114" height="40" rx="6" class="line-dash"/><text x="683" y="77" text-anchor="middle" class="t-xs t-faint">never written</text>
+
+    <line x1="20" y1="120" x2="552" y2="120" class="line s-blue sw-3" marker-end="url(#ah04d)"/>
+    <text x="566" y="124" class="t-sm tc-red">bad checksum: truncate</text>
+    <text x="20" y="146" class="t-sm t-muted">Recovery reads oldest to newest, checks every checksum, and re-adds each key to a fresh index.</text>
+  </svg>
+  <figcaption>A torn tail. The last append was only partly on disk when the power failed. Its checksum cannot match, so recovery stops there and cuts the file back to the last good record.</figcaption>
+</figure>
+
+<p>If the machine died in the middle of an append, the file may end with half a record: a header promising 100 bytes of value, followed by 37. If recovery trusted the header it would read garbage, or run off the end of the file. This is the <span class="term">torn write</span> from <a href="../../systems/chapters/09-durability.html">systems chapter 9</a>, and the cure is the same one: a <span class="term">checksum</span> (here a CRC32) stored in every record and verified on recovery. A partial or damaged record almost certainly fails the check. Recovery then <em>truncates the file at that record</em> and carries on. Nothing is lost that was ever acknowledged, provided the store only told the client "OK" after the record was fully written (and <code>fsync</code>ed, if you want it to survive a power cut).</p>
+
+<p>The <a href="../../systems/labs/lab-02-crash-safe-log.html">crash-safe log lab in the Systems course</a> builds exactly this record format and recovery loop. Lab 1 of this course (linked below) extends it with an index and compaction.</p>
+
+<h3>3. Corruption in the middle</h3>
+
+<p>A bad checksum on the <em>last</em> record is an expected consequence of a crash. A bad checksum in the <em>middle</em> of the log, with valid records after it, is not: it means the disk itself returned wrong bytes (bit rot, a failing drive). Truncating there would throw away good data. A careful engine reports it loudly and, if the data is replicated, repairs from another copy. Verifying the checksum on reads, not just during recovery, catches such damage early.</p>
+
+<h3>How often to fsync</h3>
+
+<p><code>fsync</code> after every record is safest and slowest: each write waits milliseconds for the disk. Many log-based stores let you choose: sync every write, sync every N milliseconds (a crash can lose the last few acknowledged writes), or leave it to the operating system. Another way to cut the cost without weakening the promise is <em>group commit</em>, where one <code>fsync</code> covers many concurrent writers' records (also in systems chapter 9). This is the same trade-off as everywhere else in this course: durability costs latency.</p>
+
+<h2>Try it: drive a log store</h2>
+
+<p>The widget below is a Bitcask in miniature. Each rectangle in the left pane is a record in a segment; the table on the right is the in-memory hash index. Things to try:</p>
+<ul>
+  <li>Click <strong>Load a demo log</strong>, then <strong>Get</strong> <code>user:1</code>. You'll see the index lookup first, then the single seek. Then get <code>user:3</code>, which was deleted: it misses in the index without touching the disk.</li>
+  <li>Overwrite a key and watch its old record fade. Fill a segment and watch it seal. Delete a key and see the tombstone appear <em>without</em> the old value disappearing.</li>
+  <li>Press <strong>Compact</strong>. The sealed segments shrink to just their live records, and the garbage percentage drops. Notice the active segment is left alone.</li>
+  <li>Press <strong>Crash &amp; recover</strong>. The index is wiped, and the log is replayed record by record. Watch the counters. Then tick "The crash hits mid-append" and try again to see a torn record get cut off.</li>
+</ul>
+
+<div class="widget" id="log-store"><p class="widget-help">The log store needs JavaScript.</p></div>
+
+<h2>One writer, many readers</h2>
+
+<p>How does a log-structured store handle many clients at once? Better than you might expect, because of immutability.</p>
+
+<ul>
+  <li><strong>Writes go to one place.</strong> Only the end of the active segment is ever written, and by a single writer thread (or process). With only one writer there are no two appends to interleave and no locks around file contents. Writers queue up and the log gives them a clean order. (A simple lock file prevents a second process from opening the store for writing.)</li>
+  <li><strong>Readers need no locks on the data.</strong> A sealed segment never changes, so any number of readers can read it simultaneously. The active segment only grows at the end; a reader that has an index entry pointing at a complete record sees a complete, unchanging record.</li>
+  <li><strong>The index is the shared mutable thing.</strong> It must be updated atomically (a lock, or a concurrent hash table), so that a reader never sees a half-updated entry. This is the only real synchronisation, and it is a tiny, in-memory critical section (see <a href="../../systems/chapters/12-locks.html">systems chapter 12</a> on locks).</li>
+  <li><strong>Readers and compaction.</strong> A reader may have just fetched an old location when compaction deletes that segment. On Linux and macOS, a file that is deleted while someone still has it open stays readable until the last reader closes it (<a href="../../systems/chapters/08-files.html">systems chapter 8</a>), or the reader can simply retry with a fresh index lookup.</li>
+</ul>
+
+<p>The summary is worth remembering: <strong>immutable data can be shared freely</strong>. Almost all the concurrency difficulty in databases comes from data that changes in place. The log avoids it by never changing anything it has written. (Chapter 12 returns to this idea in the form of multi-version concurrency control.)</p>
+
+<h2>Where the log runs out</h2>
+
+<p>The Bitcask design is lovely, and it has two hard limits.</p>
+
+<p><strong>1. The keys must fit in RAM.</strong> A large number of keys breaks it, no matter how small the values. Could we keep the hash table on disk instead? A hash table spread over disk turns every lookup and update into a random disk access, and handling collisions and resizing there is painful. The easy speed came from RAM.</p>
+
+<p><strong>2. Range queries are hard.</strong> A hash function deliberately scatters keys, so <code>user:1001</code> and <code>user:1002</code> end up in unrelated places. A query like "give me every key from <code>user:1000</code> to <code>user:2000</code>" must examine every key in the index (or sort them all), and then do a separate random seek to each record, because those records are scattered across the log in write order. Questions like "all orders from last Tuesday", or "the next ten items after this one", are central to databases, and a hash index can't help.</p>
+
+<p>Both limits point at the same fix, which is the subject of <a href="05-lsm-trees.html">chapter 5</a>: <em>keep the data sorted by key</em>. Sorted files can be searched with a small <strong>sparse</strong> index (so keys no longer need to be in RAM), range queries become sequential reads, and, remarkably, we can still keep the fast, append-style writes. The log idea survives; the hash table goes.</p>
+
+<h2>The log is everywhere</h2>
+
+<p>This chapter's structure is not an academic exercise. The append-only log is the most reused idea in data systems.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 295" role="img" aria-label="The append-only log at the centre, connected to six places it is reused: Bitcask in this chapter, LSM trees in chapter 5, the write-ahead log of B-trees in chapters 6 and 13, replication in chapter 15, Kafka and change data capture in chapter 19, and the Raft log in networking chapter 20.">
+    <rect x="300" y="115" width="160" height="70" rx="12" class="fs-orange s-orange sw-3"/>
+    <text x="380" y="144" text-anchor="middle" class="t-sm t-bold">The log</text>
+    <text x="380" y="162" text-anchor="middle" class="t-xs t-muted">append-only, ordered</text>
+
+    <line x1="230" y1="57" x2="300" y2="130" class="line-thin"/>
+    <line x1="230" y1="150" x2="300" y2="150" class="line-thin"/>
+    <line x1="230" y1="243" x2="300" y2="170" class="line-thin"/>
+    <line x1="460" y1="130" x2="530" y2="57" class="line-thin"/>
+    <line x1="460" y1="150" x2="530" y2="150" class="line-thin"/>
+    <line x1="460" y1="170" x2="530" y2="243" class="line-thin"/>
+
+    <rect x="20" y="30" width="210" height="54" rx="10" class="box"/>
+    <text x="125" y="53" text-anchor="middle" class="t-sm t-bold">Bitcask (this chapter)</text>
+    <text x="125" y="71" text-anchor="middle" class="t-xs t-muted">the log is the database</text>
+    <rect x="20" y="123" width="210" height="54" rx="10" class="box"/>
+    <text x="125" y="146" text-anchor="middle" class="t-sm t-bold">LSM trees (chapter 5)</text>
+    <text x="125" y="164" text-anchor="middle" class="t-xs t-muted">a WAL, then sorted runs</text>
+    <rect x="20" y="216" width="210" height="54" rx="10" class="box"/>
+    <text x="125" y="239" text-anchor="middle" class="t-sm t-bold">B-tree WAL (chapters 6, 13)</text>
+    <text x="125" y="257" text-anchor="middle" class="t-xs t-muted">log first, pages later</text>
+
+    <rect x="530" y="30" width="210" height="54" rx="10" class="box"/>
+    <text x="635" y="53" text-anchor="middle" class="t-sm t-bold">Replication (chapter 15)</text>
+    <text x="635" y="71" text-anchor="middle" class="t-xs t-muted">followers replay the log</text>
+    <rect x="530" y="123" width="210" height="54" rx="10" class="box"/>
+    <text x="635" y="146" text-anchor="middle" class="t-sm t-bold">Kafka &amp; CDC (chapter 19)</text>
+    <text x="635" y="164" text-anchor="middle" class="t-xs t-muted">consumers read at an offset</text>
+    <rect x="530" y="216" width="210" height="54" rx="10" class="box"/>
+    <text x="635" y="239" text-anchor="middle" class="t-sm t-bold">Raft log (networking 20)</text>
+    <text x="635" y="257" text-anchor="middle" class="t-xs t-muted">agree on the order of entries</text>
+  </svg>
+  <figcaption>One structure, many roles. Wherever a system needs a durable, ordered record of what happened, it is some form of append-only log.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Write-ahead logs.</strong> B-tree databases update pages in place, but before touching a page they append a description of the change to a log, so a crash can be repaired by replaying it (<a href="13-crash-recovery.html">chapter 13</a>). It is today's torn-tail and replay machinery with a different job.</li>
+  <li><strong>LSM trees.</strong> The next chapter's storage engine writes to a log for durability and then turns the data into sorted, immutable files.</li>
+  <li><strong>Replication.</strong> A follower stays in sync by applying the leader's log in order (<a href="15-replication-practice.html">chapter 15</a>).</li>
+  <li><strong>Streams.</strong> Kafka's core abstraction is a partitioned, append-only log that many consumers read at their own pace, each remembering an <em>offset</em> (<a href="19-streams-cdc.html">chapter 19</a>).</li>
+  <li><strong>Consensus and ordering.</strong> Raft makes machines agree on the content and order of a log (<a href="../../networking/chapters/20-consensus.html">networking chapter 20</a>), and <a href="../../networking/cases/case-10-ordering-at-scale.html">networking case 10</a> shows a global-scale system built around it.</li>
+</ul>
+
+<p>Notice the pattern in everything above: the log is the <em>source of truth</em>, and structures like hash indexes, sorted tables, caches and search indexes are <em>derived</em> from it, rebuildable at any time. Keeping that distinction clear is one of the most useful habits in data-system design.</p>
+
+<h2>Build and break it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: the log database in Python</p>
+  <p>The bash version proves the idea. This Python version, <code>minicask.py</code>, has everything from this chapter in about 100 lines: segments, an index, tombstones, compaction, a CRC32 per record, and a recovery scan that cuts off a torn tail. Save it, run it, then break it. It needs only Python 3 and no installs. (Python's <code>zlib.crc32</code> and <code>struct</code> do the byte-level work.)</p>
+</div>
+
+<details class="deeper">
+  <summary>Go deeper: the full source of minicask.py <span class="hint">optional, ~100 lines</span></summary>
+<pre><code>import os, struct, zlib
+
+HEADER = struct.Struct("&gt;IIi")      <span class="cmt"># crc32, key length, value length (-1 = tombstone)</span>
+MAX_SEGMENT = 64                    <span class="cmt"># bytes; tiny so rollover is easy to see</span>
+
+class MiniCask:
+    def __init__(self, directory):
+        self.dir = directory
+        os.makedirs(directory, exist_ok=True)
+        self.index = {}             <span class="cmt"># key -&gt; (segment number, offset of record, record length)</span>
+        self.segments = sorted(int(n[4:10]) for n in os.listdir(directory) if n.startswith("seg-"))
+        for seg in self.segments:   <span class="cmt"># crash recovery = replay the log, oldest segment first</span>
+            self._scan(seg)
+        if not self.segments:
+            self.segments = [1]
+        self.active = open(self._path(self.segments[-1]), "ab")
+
+    def _path(self, seg):
+        return os.path.join(self.dir, "seg-%06d.log" % seg)
+
+    def _scan(self, seg):
+        with open(self._path(seg), "rb") as f:
+            data = f.read()
+        pos = 0
+        while pos + HEADER.size &lt;= len(data):
+            crc, klen, vlen = HEADER.unpack_from(data, pos)
+            end = pos + HEADER.size + klen + max(vlen, 0)
+            body = data[pos + 4:end]
+            if end &gt; len(data) or zlib.crc32(body) != crc:
+                print("  torn record in segment", seg, "at offset", pos, "- ignoring the rest")
+                with open(self._path(seg), "r+b") as f:
+                    f.truncate(pos)             <span class="cmt"># drop the damaged tail</span>
+                return
+            key = data[pos + HEADER.size:pos + HEADER.size + klen].decode()
+            if vlen &lt; 0:
+                self.index.pop(key, None)       <span class="cmt"># tombstone: forget the key</span>
+            else:
+                self.index[key] = (seg, pos, end - pos)
+            pos = end
+        if pos != len(data):                    <span class="cmt"># a partial header at the very end</span>
+            with open(self._path(seg), "r+b") as f:
+                f.truncate(pos)
+
+    def _append(self, key, value):
+        k = key.encode()
+        v = b"" if value is None else value.encode()
+        vlen = -1 if value is None else len(v)
+        body = struct.pack("&gt;Ii", len(k), vlen) + k + v
+        rec = struct.pack("&gt;I", zlib.crc32(body)) + body
+        if self.active.tell() + len(rec) &gt; MAX_SEGMENT and self.active.tell() &gt; 0:
+            self.active.close()                 <span class="cmt"># roll over: the old segment is now immutable</span>
+            self.segments.append(self.segments[-1] + 1)
+            self.active = open(self._path(self.segments[-1]), "ab")
+        offset = self.active.tell()
+        self.active.write(rec)
+        self.active.flush()
+        os.fsync(self.active.fileno())
+        return self.segments[-1], offset, len(rec)
+
+    def set(self, key, value):
+        self.index[key] = self._append(key, value)
+
+    def delete(self, key):
+        if key in self.index:
+            self._append(key, None)
+            del self.index[key]
+
+    def get(self, key):
+        loc = self.index.get(key)
+        if loc is None:
+            return None
+        seg, offset, length = loc
+        with open(self._path(seg), "rb") as f:
+            f.seek(offset)                      <span class="cmt"># one seek...</span>
+            rec = f.read(length)                <span class="cmt"># ...one read</span>
+        crc, klen, vlen = HEADER.unpack_from(rec)
+        assert zlib.crc32(rec[4:]) == crc, "corrupt record"
+        return rec[HEADER.size + klen:].decode()
+
+    def compact(self):
+        """Rewrite every live key into fresh segments, then delete the old ones."""
+        old = list(self.segments)
+        live = {k: self.get(k) for k in self.index}
+        self.active.close()
+        first_new = old[-1] + 1
+        self.segments = [first_new]
+        self.active = open(self._path(first_new), "ab")
+        self.index = {}
+        for k, v in live.items():
+            self.set(k, v)
+        for seg in old:
+            os.remove(self._path(seg))
+        self.segments = [s for s in self.segments if s &gt;= first_new]</code></pre>
+  <p>Two simplifications to know about: <code>MAX_SEGMENT</code> is 64 bytes so rollover is easy to see (real segments are far larger), and <code>compact()</code> merges <em>everything</em>, including the active segment, which keeps the code short. A real engine leaves the active segment alone, as the widget does.</p>
+</details>
+
+<p>Now a script that uses it, with a deliberate crash. Save this as <code>demo1.py</code> next to <code>minicask.py</code>:</p>
+
+<pre><code>import os, shutil
+from minicask import MiniCask
+
+shutil.rmtree("demo_db", ignore_errors=True)
+db = MiniCask("demo_db")
+for i in range(1, 6):
+    db.set("user:%d" % i, "name-%d" % i)
+db.set("user:1", "Ada Lovelace")             <span class="cmt"># overwrite</span>
+db.delete("user:2")                          <span class="cmt"># tombstone</span>
+print("segments on disk :", sorted(os.listdir("demo_db")))
+print("index            :", {k: v[:2] for k, v in db.index.items()})
+print("get user:1       :", db.get("user:1"))
+print("get user:2       :", db.get("user:2"))
+size = lambda: sum(os.path.getsize("demo_db/" + n) for n in os.listdir("demo_db"))
+print("bytes on disk    :", size())
+
+print("\n-- compact")
+db.compact()
+print("segments on disk :", sorted(os.listdir("demo_db")))
+print("index            :", {k: v[:2] for k, v in db.index.items()})
+print("bytes on disk    :", size())
+
+print("\n-- crash: throw away the in-memory index, restart")
+db.active.close()
+db2 = MiniCask("demo_db")
+print("rebuilt index    :", {k: v[:2] for k, v in db2.index.items()})
+print("get user:1       :", db2.get("user:1"))
+
+print("\n-- torn write: chop 5 bytes off the last segment, restart")
+last = "demo_db/" + sorted(os.listdir("demo_db"))[-1]
+with open(last, "r+b") as f:
+    f.truncate(os.path.getsize(last) - 5)
+db3 = MiniCask("demo_db")
+print("rebuilt index    :", sorted(db3.index))
+shutil.rmtree("demo_db")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 demo1.py</span>
+<span class="out">segments on disk : ['seg-000001.log', 'seg-000002.log', 'seg-000003.log', 'seg-000004.log']
+index            : {'user:1': (3, 24), 'user:3': (2, 0), 'user:4': (2, 24), 'user:5': (3, 0)}
+get user:1       : Ada Lovelace
+get user:2       : None
+bytes on disk    : 168
+
+-- compact
+segments on disk : ['seg-000005.log', 'seg-000006.log']
+index            : {'user:1': (5, 0), 'user:3': (5, 30), 'user:4': (6, 0), 'user:5': (6, 24)}
+bytes on disk    : 102
+
+-- crash: throw away the in-memory index, restart
+rebuilt index    : {'user:1': (5, 0), 'user:3': (5, 30), 'user:4': (6, 0), 'user:5': (6, 24)}
+get user:1       : Ada Lovelace
+
+-- torn write: chop 5 bytes off the last segment, restart
+  torn record in segment 6 at offset 24 - ignoring the rest
+rebuilt index    : ['user:1', 'user:3', 'user:4']</span></code></pre>
+
+<p>Read the output slowly. Five users and four segments (one per couple of records, since segments are tiny), with <code>user:1</code> overwritten and <code>user:2</code> deleted. After compaction 168 bytes became 102, and the index points into brand-new segments. The "crash" throws the index away, and the rebuilt index is identical. Chopping 5 bytes off the final segment makes the last record fail its checksum; recovery keeps the three good keys and drops <code>user:5</code>. (Nothing here is random, so your output should match exactly.)</p>
+
+<p>Things to try:</p>
+<ul>
+  <li>Replace the 5-byte chop with flipping one byte in the <em>middle</em> of the first segment. What does recovery do? What <em>should</em> it do (see "Corruption in the middle")?</li>
+  <li>Comment out the tombstone replay (<code>self.index.pop(...)</code>) and restart: the deleted key comes back.</li>
+  <li>In <code>compact()</code>, delete the old segments newest-first instead of oldest-first, and think through what a crash between two deletions could do.</li>
+</ul>
+
+<p>When you want to build the full version, with proper compaction of sealed segments only, hint files and a benchmark, go to <a href="../labs/lab-01-bitcask.html">Lab 1: A Log-Structured Key-Value Store</a>.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>A log is the natural unit of replication. If every change to a database is an entry at a known position in an append-only log, then keeping a second copy up to date is just "send me everything after position 4,127 and apply it in order". Followers replaying a leader's log is how many replicated databases work (<a href="15-replication-practice.html">chapter 15</a>, and <a href="../../networking/chapters/18-replication.html">networking chapter 18</a> for the theory). The position in the log, the <em>offset</em>, is also how a consumer remembers where it was, which is the whole idea behind Kafka and change data capture in <a href="19-streams-cdc.html">chapter 19</a>. And because sealed segments are immutable, copying them to a backup or another machine is safe while the store keeps running. Agreeing on the order of a replicated log across machines that can fail is exactly what Raft (<a href="../../networking/chapters/20-consensus.html">networking chapter 20</a>) is for.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>An append-only log gives very fast writes: every write goes to the end of one file, a sequential access. The newest record for a key wins.</li>
+    <li>Without an index, reads scan the whole log: O(n). A hash index in RAM mapping each key to its newest record's (segment, offset) makes a read one lookup and one seek (the Bitcask design).</li>
+    <li>RAM use grows with the number of <em>keys</em>, not the size of the values, so all keys must fit in memory.</li>
+    <li>Segments bound file size. Sealed segments are immutable; compaction copies only live records (those the index points at) into new segments, then deletes the old ones. It costs extra I/O: write amplification.</li>
+    <li>Deletes are tombstone records. A tombstone must outlive every older record of its key, so recovery never resurrects the value.</li>
+    <li>After a crash, rebuild the index by replaying the log oldest to newest (hint files or snapshots make this faster). A checksum per record detects a torn tail, which is truncated; a bad checksum mid-log is real corruption.</li>
+    <li>Immutability makes concurrency easy: one writer appends, readers read sealed files freely, and only the in-memory index needs synchronising.</li>
+    <li>Limits: keys must fit in RAM, and range queries are hard. Both are fixed by sorting the data (chapter 5). The log itself recurs in WALs, replication, Kafka and Raft.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why is appending to a log file so cheap compared with updating a record in place?</p>
+    <ol class="q-options">
+      <li>Appended data is compressed automatically</li>
+      <li>It is sequential: the write goes to the end of the file with no search for the right spot, which suits disks and lets the OS batch writes</li>
+      <li>Appended writes skip the operating system's page cache</li>
+      <li>Appends never need <code>fsync</code> to be durable</li>
+    </ol>
+    <div class="q-explain">Sequential access avoids seeks and batches well. The other options are false: appends go through the page cache like any write, and they still need <code>fsync</code> to survive a power cut.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In a Bitcask-style store, what does the in-memory hash index contain?</p>
+    <ol class="q-options">
+      <li>Every key with its complete history of values</li>
+      <li>A copy of all the values, for fast reads</li>
+      <li>For each live key, the location (segment and offset) of its newest record on disk</li>
+      <li>Only the keys that were recently read</li>
+    </ol>
+    <div class="q-explain">The index holds keys and pointers only. Values stay on disk, which is why RAM use scales with the number of keys and not with the data size.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A store deletes a key by appending a tombstone, rather than erasing the old record. Why?</p>
+    <ol class="q-options">
+      <li>Segments are append-only and old ones are immutable, and recovery replays the log, so without a tombstone a restart would bring the deleted value back</li>
+      <li>Tombstones make deletes faster than updates for hardware reasons</li>
+      <li>Erasing is forbidden by the operating system</li>
+      <li>So that the key can be reused immediately at the same offset</li>
+    </ol>
+    <div class="q-explain">The log, not the index, is the truth. Replaying an old <code>set</code> with no later tombstone would recreate the key. The space is reclaimed later, by compaction.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">After a power cut, the last record in the active segment is half-written. How does recovery handle it?</p>
+    <ol class="q-options">
+      <li>It trusts the length in the header and reads past the end of the file</li>
+      <li>It deletes the entire segment</li>
+      <li>It restores the record from the index</li>
+      <li>The record fails its checksum, so recovery truncates the file at that record and keeps everything before it</li>
+    </ol>
+    <div class="q-explain">The checksum detects the torn write. Everything before it was complete, so it stays. The index is not a backup: it is rebuilt from the log, not the other way round.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why is "one writer, many readers" relatively easy for a log-structured store?</p>
+    <ol class="q-options">
+      <li>Because the index is stored on disk, where the OS makes it thread-safe</li>
+      <li>Sealed segments are immutable and the active one is only appended to, so readers need no locks on data files; only the small in-memory index needs synchronising</li>
+      <li>Because readers always read stale data</li>
+      <li>Because the writer holds a lock on every file for the whole time it runs</li>
+    </ol>
+    <div class="q-explain">Immutable data can be shared freely. The complications of in-place updates (readers seeing half-changed pages) simply do not arise.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A product needs the query "all users whose id is between 1000 and 2000", over a billion keys. What is the main problem with a hash-indexed log?</p>
+    <ol class="q-options">
+      <li>The log is too slow to write</li>
+      <li>Tombstones prevent range queries</li>
+      <li>A hash index scatters adjacent keys, so a range query must visit every key; and a billion keys may not fit in RAM anyway</li>
+      <li>Compaction deletes ranges</li>
+    </ol>
+    <div class="q-explain">Hashing destroys ordering, and the key count is the index's memory cost. Sorted files (chapter 5) fix both: keys that are neighbours in value are neighbours on disk, and a sparse index needs only a few entries per file.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/log-store.js"></script>
+</body>
+</html>

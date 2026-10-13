@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design a Distributed Job Scheduler · System Design Studio</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="design" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design a Distributed Job Scheduler</h1>
+  <p class="lede">Delayed and recurring jobs, leases, retries, priorities and at-least-once execution. "Run this later" sounds like a timer; at scale it is a durable store, a due-time index, a lease protocol and a fairness policy, and the interesting bugs live where those meet.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Almost every product ends up with a scheduler: send the reminder in 24 hours, retry the webhook, expire the hold, rebuild the report every night. It is a small system whose correctness story is subtle. A job must not be lost when a machine dies, must not run in two places as though it were alone, and a stampede of "midnight" jobs must not take down the thing that serves customers. It is also the cleanest place to apply <a href="../../distributed/chapters/04-leases-fencing.html">leases and fencing</a>, <a href="../../distributed/chapters/17-logs-exactly-once.html">at-least-once with idempotent effects</a> and <a href="../../distributed/chapters/11-coordination-services.html">leader election</a> to one concrete problem.</p>
+</div>
+
+<h2>The problem</h2>
+<p><em>"Design a service that lets teams run work at a later time or on a schedule. They submit a job, say when it should run, and the system runs it reliably. Some jobs recur. It has to survive machines dying."</em></p>
+<p>"Reliably" hides the whole design. Does it mean "never lose a job", "never run a job twice", or "run it within a second of its time"? You cannot have the second without paying for it, and the third conflicts with the second under failures. We pin these down below using the <a href="01-framework.html">framework</a>.</p>
+
+<h2>Clarify requirements</h2>
+<table>
+  <thead><tr><th>Question</th><th>Assumed answer</th></tr></thead>
+  <tbody>
+    <tr><td>Kinds of job?</td><td>Three: <strong>one-off</strong> (run as soon as possible), <strong>delayed</strong> (run at a given time, minutes to months ahead) and <strong>recurring</strong> (cron expressions, with a time zone).</td></tr>
+    <tr><td>Who runs the work?</td><td>Our fleet of workers calls the tenant's handler (an HTTP endpoint or a registered function). The scheduler decides <em>when and where</em>; the handler owns <em>what</em>.</td></tr>
+    <tr><td>Scale?</td><td>About 500M executions per day across 20,000 tenants (teams or customers), a few thousand cron entries per busy tenant, handlers that take about 2 s on average and rarely more than a few minutes.</td></tr>
+    <tr><td>Timing accuracy?</td><td>A job starts within about 1 s of its due time at p99 when the system is healthy, and we expose the lag as a metric. Not hard real time.</td></tr>
+    <tr><td>Delivery semantics?</td><td><strong>At-least-once.</strong> A job may run more than once after a failure, so handlers must be idempotent. We provide a stable idempotency key per scheduled run.</td></tr>
+    <tr><td>Retries?</td><td>Configurable per job: attempts, exponential backoff, then a dead-letter state a human can inspect and redrive.</td></tr>
+    <tr><td>Priorities and tenants?</td><td>Several priority classes; one tenant must not be able to starve the others.</td></tr>
+    <tr><td>Durability?</td><td>An accepted job survives the loss of any single machine or zone. Acknowledge the submit only after it is durably stored.</td></tr>
+  </tbody>
+</table>
+<p><strong>Functional.</strong> Submit, cancel, reschedule and inspect a job; create and edit cron schedules; run handlers with retries; expose status and history; dead-letter and redrive.</p>
+<p><strong>Non-functional.</strong> No accepted job is lost; start-time lag p99 under 1 s; the control plane (submit, status) stays available when the data plane is backed up; tail behaviour at round times such as the top of the hour is bounded; fairness across tenants; every worker failure is recoverable without a human.</p>
+<p><strong>Out of scope.</strong> Multi-step workflow engines with branching and compensation (that is <a href="../../architecture/chapters/15-sagas.html">sagas</a>, built on top of a scheduler), sandboxing untrusted code (see the code-judge studio), and a fully general batch cluster scheduler. We do not promise exactly-once <em>execution</em>, because it is not achievable at the boundary with the outside world; we promise exactly-once <em>triggering</em> for cron and effectively-once effects via idempotency.</p>
+
+<h2>Estimate</h2>
+<p>The numbers to extract are the steady rate, the size of the pending set (which decides whether a database index is enough), the size of the "due soon" window (which decides what must sit in memory), the worker fleet, and the size of the top-of-the-hour herd. Method as in <a href="02-estimation.html">chapter 2</a>; every assumption is a named line you can change.</p>
+<pre class="terminal" data-title="napkin17.py"><code>&quot;&quot;&quot;Napkin maths for a job scheduler: rates, due-index size, storage, and the top-of-the-hour herd.&quot;&quot;&quot;
+SECONDS = 86_400
+tenants = 20_000                      # assumption
+jobs_per_day = 500_000_000            # assumption: 500M executions/day (one-off + delayed + cron firings)
+peak = 3                              # assumption: peak/avg for ordinary load
+avg_qps = jobs_per_day / SECONDS
+print(f&quot;executions: avg {avg_qps:,.0f}/s, ordinary peak {avg_qps*peak:,.0f}/s&quot;)
+
+# Each execution = ~4 store writes: insert, claim, heartbeat(s) folded in, complete (assume 5 incl. one heartbeat)
+writes_per_job = 5
+print(f&quot;store writes: avg {avg_qps*writes_per_job:,.0f}/s, peak {avg_qps*peak*writes_per_job:,.0f}/s&quot;)
+
+# Pending set = jobs waiting out ~1 h of delay + long-dated ones (assume 5% of each day&#x27;s jobs are due ~30 days out).
+pending = avg_qps * 3600 + 0.05 * jobs_per_day * 30
+row = 500                             # assumption: bytes per job row incl. payload pointer, indexes
+print(f&quot;pending rows ~ {pending/1e6:,.0f}M  -&gt; {pending*row/1e9:,.0f} GB of rows (+ index ~ same again)&quot;)
+
+# The hot window: only jobs due in the next minute need to be in memory.
+window = 60
+hot = avg_qps * window
+print(f&quot;jobs due in the next {window}s: ~{hot:,.0f} -&gt; a {hot*row/1e6:,.0f} MB working set per scheduler fleet&quot;)
+
+# Cron herd: 2M cron jobs share &#x27;0 * * * *&#x27; (top of the hour).
+herd = 2_000_000
+for spread in (0, 60, 300):
+    rate = herd / max(spread, 1)
+    label = &quot;no jitter (all inside ~1 s)&quot; if spread == 0 else f&quot;jitter over {spread}s&quot;
+    print(f&quot;herd of {herd:,} at :00, {label:&lt;28} -&gt; {rate:&gt;10,.0f} starts/s&quot;)
+
+# Workers: handler mean 2 s of wall time, 70% utilisation target.
+mean_s, util = 2.0, 0.7
+need = avg_qps * mean_s / util
+print(f&quot;\nworker slots needed (Little&#x27;s law, mean {mean_s}s, {util:.0%} util): avg {need:,.0f}, peak {need*peak:,.0f}&quot;)
+print(f&quot;  at 64 slots per host: {need/64:,.0f} hosts avg, {need*peak/64:,.0f} hosts peak&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>executions: avg 5,787/s, ordinary peak 17,361/s
+store writes: avg 28,935/s, peak 86,806/s
+pending rows ~ 771M  -&gt; 385 GB of rows (+ index ~ same again)
+jobs due in the next 60s: ~347,222 -&gt; a 174 MB working set per scheduler fleet
+herd of 2,000,000 at :00, no jitter (all inside ~1 s)  -&gt;  2,000,000 starts/s
+herd of 2,000,000 at :00, jitter over 60s              -&gt;     33,333 starts/s
+herd of 2,000,000 at :00, jitter over 300s             -&gt;      6,667 starts/s
+
+worker slots needed (Little&#x27;s law, mean 2.0s, 70% util): avg 16,534, peak 49,603
+  at 64 slots per host: 258 hosts avg, 775 hosts peak</code></pre>
+<p>Reading the output. About 5,800 executions per second on average and 17,000 at an ordinary peak is a modest rate by the standards of other chapters; the store has to take roughly 29,000 writes per second on average (insert, claim, a heartbeat, complete), which is within reach of a sharded SQL or wide-column store but not of one primary, so <strong>the job table is partitioned</strong>. The pending set is the surprise: most pending rows are long-dated ones (my assumption: 5% of jobs are due about a month out), around 770 million rows or a few hundred gigabytes. That is a perfectly fine <em>disk</em> workload and an awkward <em>memory</em> workload, which is exactly why only the next minute or so of due jobs, about 350,000 rows or under 200 MB, should live in the in-memory index. The worker arithmetic is Little's law (concurrency = rate &times; time in system): 16,500 busy slots on average, so a few hundred hosts, and about 775 at the peak. And the last block is the one to remember: two million cron jobs sharing <code>0 * * * *</code> start in the same second unless we spread them. Spread over five minutes the same work is a calm 6,700 starts per second.</p>
+
+<h2>API</h2>
+<pre class="terminal" data-title="surfaces"><code>POST /v1/jobs                              Idempotency-Key: 3f9a…
+  { "tenant": "acme", "queue": "emails", "priority": "normal",
+    "run_at": "2025-03-01T09:00:00Z",        -- or "delay_s": 3600; omit = now
+    "payload": { … }, "max_attempts": 5,
+    "backoff": { "base_s": 2, "cap_s": 600 }, "timeout_s": 120 }
+  -&gt; 201 { "job_id": "j_01HX…", "state": "scheduled" }
+
+DELETE /v1/jobs/{job_id}                    -&gt; 202 (cancel if not yet running)
+GET    /v1/jobs/{job_id}                    -&gt; { state, attempts, next_run_at, last_error }
+
+PUT /v1/crons/{cron_id}
+  { "tenant": "acme", "schedule": "0 9 * * MON-FRI", "tz": "Europe/London",
+    "job_template": { … }, "misfire": "fire_once" | "skip" | "fire_all" }
+
+-- Worker protocol (internal):
+POST /internal/claim     { worker, queues[], max }  -&gt; [ { job_id, fence, lease_until, payload, run_key } ]
+POST /internal/heartbeat { job_id, fence }          -&gt; 200 | 409 (fenced out)
+POST /internal/complete  { job_id, fence, result }  -&gt; 200 | 409
+POST /internal/fail      { job_id, fence, error }   -&gt; 200 | 409</code></pre>
+<ul>
+  <li><strong>Submit is idempotent</strong>, via an idempotency key, for the usual reason: a client that times out must be able to retry without creating two jobs (<a href="../../architecture/chapters/09-api-design.html">API design</a>).</li>
+  <li><strong>The claim returns a fence.</strong> A strictly increasing number per job, bumped on every claim. Every later call from the worker carries it, and the store rejects calls with an old fence. This is the whole defence against a worker that was paused and wakes up after its lease was reassigned.</li>
+  <li><strong><code>run_key</code> is stable across retries.</strong> It is derived from the job (or, for cron, from the cron id and the scheduled fire time), so a handler can use it as the idempotency key for its own side effects.</li>
+  <li><strong>Misfire policy is explicit</strong> on crons, because "what happens if the scheduler was down at 09:00" has three defensible answers (Deep dive 4).</li>
+</ul>
+
+<h2>Data model</h2>
+<ul>
+  <li><strong>Jobs table</strong> (the durable source of truth), partitioned by <code>job_id</code> hash: <code>job_id, tenant, queue, priority, due_at, state, attempts, fence, lease_until, owner, run_key, payload_ref</code>. States: <code>scheduled → ready → running → done</code>, with <code>running → scheduled</code> (retry, with a new <code>due_at</code>) and <code>running → dead</code>. A secondary index on <code>(partition, state, due_at)</code> serves the due scan. Large payloads go to <a href="08-object-storage.html">object storage</a> and the row keeps a reference.</li>
+  <li><strong>Cron table</strong>: <code>cron_id, tenant, expr, tz, template, misfire, last_fire_time</code>. Tiny compared with jobs (tens of thousands of rows).</li>
+  <li><strong>Run history</strong>: append-only, <code>job_id, attempt, worker, started, ended, outcome</code>, in a cheaper store with a retention period. Kept apart so the hot table stays small.</li>
+  <li><strong>Which store?</strong> The jobs table needs conditional updates ("claim if still queued"), a range index on due time and cheap horizontal partitioning. A partitioned SQL database or a wide-column store with lightweight transactions fits (<a href="../../data/chapters/16-sharding.html">sharding</a>). A pure message queue does not, as Deep dive 1 explains. A coordination service such as ZooKeeper or etcd is for the handful of leases and leader keys, not for hundreds of millions of rows.</li>
+</ul>
+
+<h2>High-level design</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Architecture of a job scheduler. Clients submit jobs through a submit API into a partitioned job store. A cron leader, holding a lease in a coordination service, inserts the next run of each cron. A partition scheduler scans the store for due jobs into an in-memory due index and releases them to ready queues by priority and tenant. Workers claim jobs with a lease and fence, send heartbeats and completions back to the store, and call external handlers. Jobs that exhaust their attempts go to dead letter.">
+<defs><marker id="ahG17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="30" width="90" height="44" rx="8" class="fs-green s-green sw-2"/><text x="55" y="57" text-anchor="middle" class="t-sm t-bold">Clients</text></g>
+<g><rect x="130" y="30" width="100" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="180" y="57" text-anchor="middle" class="t-sm t-bold">Submit API</text></g>
+<g><rect x="270" y="30" width="150" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="345" y="49" text-anchor="middle" class="t-sm t-bold">Job store</text><text x="345" y="65" text-anchor="middle" class="t-xs t-muted">partitioned by job_id</text></g>
+<g><rect x="580" y="30" width="170" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="665" y="49" text-anchor="middle" class="t-sm t-bold">Cron leader</text><text x="665" y="65" text-anchor="middle" class="t-xs t-muted">one per cron table</text></g>
+<g><rect x="600" y="130" width="150" height="44" rx="8" class="box2"/><text x="675" y="149" text-anchor="middle" class="t-sm t-bold">Coordination</text><text x="675" y="165" text-anchor="middle" class="t-xs t-muted">leader lease</text></g>
+<g><rect x="270" y="130" width="150" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="345" y="149" text-anchor="middle" class="t-sm t-bold">Partition scheduler</text><text x="345" y="165" text-anchor="middle" class="t-xs t-muted">in-memory due index</text></g>
+<g><rect x="270" y="230" width="150" height="44" rx="8" class="fs-orange s-orange sw-2"/><text x="345" y="249" text-anchor="middle" class="t-sm t-bold">Ready queues</text><text x="345" y="265" text-anchor="middle" class="t-xs t-muted">priority x tenant</text></g>
+<g><rect x="500" y="230" width="120" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="560" y="249" text-anchor="middle" class="t-sm t-bold">Workers</text><text x="560" y="265" text-anchor="middle" class="t-xs t-muted">lease + fence</text></g>
+<g><rect x="650" y="230" width="100" height="44" rx="8" class="box2"/><text x="700" y="249" text-anchor="middle" class="t-sm t-bold">Handlers</text><text x="700" y="265" text-anchor="middle" class="t-xs t-muted">tenant code</text></g>
+<g><rect x="60" y="230" width="150" height="44" rx="8" class="fs-orange s-red sw-2"/><text x="135" y="249" text-anchor="middle" class="t-sm t-bold">Dead letter</text><text x="135" y="265" text-anchor="middle" class="t-xs t-muted">after N attempts</text></g>
+<line x1="100" y1="52" x2="130" y2="52" class="line" marker-end="url(#ahG17a)"/>
+<line x1="230" y1="52" x2="270" y2="52" class="line" marker-end="url(#ahG17a)"/>
+<line x1="580" y1="52" x2="420" y2="52" class="line" marker-end="url(#ahG17a)"/>
+<text x="436" y="44" text-anchor="start" class="t-xs t-faint">insert next run</text>
+<line x1="675" y1="130" x2="675" y2="74" class="line" marker-end="url(#ahG17a)"/>
+<text x="685" y="106" text-anchor="start" class="t-xs t-faint">lease</text>
+<line x1="345" y1="74" x2="345" y2="130" class="line" marker-end="url(#ahG17a)"/>
+<text x="355" y="106" text-anchor="start" class="t-xs t-faint">scan due</text>
+<line x1="345" y1="174" x2="345" y2="230" class="line" marker-end="url(#ahG17a)"/>
+<text x="355" y="206" text-anchor="start" class="t-xs t-faint">release</text>
+<line x1="420" y1="252" x2="500" y2="252" class="line" marker-end="url(#ahG17a)"/>
+<text x="425" y="244" text-anchor="start" class="t-xs t-faint">claim</text>
+<line x1="620" y1="252" x2="650" y2="252" class="line" marker-end="url(#ahG17a)"/>
+<line x1="520" y1="230" x2="420" y2="68" class="line-dash" marker-end="url(#ahG17a)"/>
+<text x="482" y="150" text-anchor="start" class="t-xs t-faint">heartbeat, complete</text>
+<line x1="270" y1="252" x2="210" y2="252" class="line-dash" marker-end="url(#ahG17a)"/>
+<text x="10" y="150" text-anchor="start" class="t-xs tc-red">watch: lag = now - due of the</text>
+<text x="10" y="166" text-anchor="start" class="t-xs tc-red">oldest unclaimed job</text>
+<text x="10" y="318" text-anchor="start" class="t-xs t-muted">Lease and fence live in the job row: claim bumps the fence, every worker call carries it.</text>
+  </svg>
+  <figcaption>The job store is the single source of truth. Everything else (due index, ready queues) is derived from it and can be rebuilt. Blue is stateless services, purple the store, orange queues, the grey box an external coordination service. The red text is the metric that tells you the scheduler is behind.</figcaption>
+</figure>
+<p>The central choice: <strong>the database is the truth and every queue is a cache of it.</strong> If the due index or a ready queue is lost, the scheduler rebuilds it by scanning rows with <code>state in (scheduled, ready, running)</code>. That makes recovery boring, and it is why we do not treat a message broker as the system of record: a broker that loses messages loses jobs, while a derived queue that loses messages only costs a rescan. The life of one job:</p>
+<div class="widget stepper" data-autoplay-ms="5000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One job, from submit to done</h4></div>
+  <svg viewBox="0 0 760 250" role="img" aria-label="A job's life: the API writes it to the store, the scheduler loads it into the due index and releases it when due, a worker claims it with a lease and fence, heartbeats, and completes; if the worker dies the lease expires and the job is claimed again with a higher fence.">
+<defs><marker id="ahG17b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g data-active="1"><rect x="10" y="50" width="90" height="56" rx="8" class="fs-blue s-blue sw-2"/><text x="55" y="83" text-anchor="middle" class="t-sm t-bold">API</text></g>
+<g data-active="1,6"><rect x="150" y="50" width="120" height="56" rx="8" class="fs-purple s-purple sw-2"/><text x="210" y="83" text-anchor="middle" class="t-sm t-bold">Job store</text></g>
+<g data-active="2,3"><rect x="320" y="50" width="120" height="56" rx="8" class="fs-blue s-blue sw-2"/><text x="380" y="75" text-anchor="middle" class="t-sm t-bold">Scheduler</text><text x="380" y="92" text-anchor="middle" class="t-xs t-muted">due index</text></g>
+<g data-active="3,4"><rect x="490" y="50" width="100" height="56" rx="8" class="fs-orange s-orange sw-2"/><text x="540" y="83" text-anchor="middle" class="t-sm t-bold">Ready</text></g>
+<g data-active="4,5,6,7"><rect x="630" y="50" width="120" height="56" rx="8" class="fs-blue s-blue sw-2"/><text x="690" y="83" text-anchor="middle" class="t-sm t-bold">Worker</text></g>
+<line x1="100" y1="78" x2="150" y2="78" class="line" marker-end="url(#ahG17b)" data-steps="1"/>
+<line x1="270" y1="68" x2="320" y2="68" class="line" marker-end="url(#ahG17b)" data-steps="2"/>
+<line x1="440" y1="78" x2="490" y2="78" class="line" marker-end="url(#ahG17b)" data-steps="3"/>
+<line x1="590" y1="78" x2="630" y2="78" class="line" marker-end="url(#ahG17b)" data-steps="4"/>
+<path d="M690,106 L690,170 L210,170 L210,106" fill="none" class="line-dash" marker-end="url(#ahG17b)" data-steps="5-6"/>
+<text x="450" y="162" text-anchor="middle" class="t-xs t-faint" data-steps="5">heartbeat(fence=1): extend lease</text>
+<text x="450" y="162" text-anchor="middle" class="t-xs t-faint" data-steps="6">complete(fence=1): state = done</text>
+<text x="210" y="130" text-anchor="middle" class="t-xs t-bold" data-steps="1">scheduled</text>
+<text x="210" y="130" text-anchor="middle" class="t-xs t-bold" data-steps="2-3">scheduled -&gt; ready</text>
+<text x="210" y="130" text-anchor="middle" class="t-xs t-bold" data-steps="4-5">running, fence=1</text>
+<text x="210" y="130" text-anchor="middle" class="t-xs t-bold" data-steps="6">done</text>
+<text x="210" y="130" text-anchor="middle" class="t-xs tc-red t-bold" data-steps="7">lease expired -&gt; running, fence=2</text>
+<text x="690" y="130" text-anchor="middle" class="t-xs tc-red t-bold" data-steps="7">crashed</text>
+<text x="450" y="216" text-anchor="middle" class="t-xs tc-red" data-steps="7">another worker claims it; a late write with fence=1 is rejected</text>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Submit.</strong> The API validates, stores the row with <code>due_at</code> and state <code>scheduled</code>, and only then acknowledges. Durability is decided here.</li>
+    <li><strong>Load.</strong> The partition scheduler that owns this slice of the table keeps an in-memory index of jobs due within the next minute or so, refilled by a range scan on <code>(partition, state, due_at)</code>. Jobs due next month are not in memory at all.</li>
+    <li><strong>Release.</strong> When the clock reaches <code>due_at</code> the scheduler moves the id into the ready queue for its priority and tenant (Deep dive 4). Releasing is idempotent; the row, not the queue, says what is real.</li>
+    <li><strong>Claim.</strong> A worker takes an item and does a conditional update in the store: set <code>running</code>, <code>owner</code>, <code>lease_until = now + L</code>, and <code>fence = fence + 1</code>, only if the job is still claimable. The returned fence is the worker's proof of ownership.</li>
+    <li><strong>Heartbeat.</strong> While the handler runs, the worker extends the lease every L/3 seconds, carrying its fence. A long job survives; a dead worker stops heartbeating.</li>
+    <li><strong>Complete.</strong> The worker reports success with its fence; the store accepts it only if the fence still matches. State becomes <code>done</code> (or <code>scheduled</code> with a new due time on failure).</li>
+    <li><strong>The crash path.</strong> If the worker dies, heartbeats stop, the lease expires, and the job becomes claimable again with a higher fence. If the old worker was merely slow and wakes up, its calls carry fence 1 and are rejected.</li>
+  </ol>
+</div>
+
+<h2>Deep dive 1: the durable store versus a queue, and the due-time index</h2>
+<p>A scheduler is not "a queue with a delay". Queues are optimised for <em>order of arrival</em>; a scheduler needs <em>order of due time</em>, and due times are inserted wildly out of order (one job in a minute, the next in a month). Cancelling or rescheduling a job in the middle is also ordinary here, which most brokers do not support well. Hence a store of record plus an index on due time, with queues only as the last hop.</p>
+<table>
+  <thead><tr><th>Approach</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+  <tbody>
+    <tr><td>Broker with per-message delay</td><td>Publish with a delay; the broker holds the message</td><td>Very simple; scales with the broker</td><td>Delay caps are common; cancel and reschedule are hard; you cannot list or query pending jobs; the broker is now your database</td></tr>
+    <tr><td>Database table, poll with an index on <code>due_at</code></td><td><code>SELECT ... WHERE state='scheduled' AND due_at &lt;= now ORDER BY due_at LIMIT n</code></td><td>Durable, queryable, cancellable, conditional updates for claims; easy to reason about</td><td>Polling load; contention on the head of the index if many pollers hit the same range; hot-spot at "now"</td></tr>
+    <tr><td>Sorted set in a key-value store (due time as score)</td><td>Range query for scores up to now</td><td>Fast; low latency</td><td>Memory-bound; durability and failover semantics must be designed; two writes (store and index) to keep consistent</td></tr>
+    <tr><td><strong>Store of record plus a partitioned in-memory timing wheel or buckets</strong></td><td>Scan only the next minute from the DB into a wheel; fire from memory</td><td>DB handles the long tail on disk; memory handles only the hot window; rebuildable</td><td>More moving parts; wheel and DB must agree after restarts (solved by treating the DB as truth)</td></tr>
+  </tbody>
+</table>
+<p><strong>Recommendation:</strong> the last row, because the estimate told us the pending set is hundreds of millions of rows but the hot window is a few hundred thousand. You get the durability of a database without having every poller hammer the head of a global index.</p>
+<h3>The timing wheel and bucketed due times</h3>
+<p>A <span class="term">timing wheel</span> (Varghese and Lauck, 1987) is a circular array of slots, one per tick. A timer due <em>d</em> ticks from now goes into slot <code>(now + d) mod W</code> with a <em>rounds</em> counter <code>d div W</code>; each tick, the wheel advances one slot, decrements the rounds of everything in it and fires what reaches zero. Insert is O(1) and each tick touches only one slot (the hashed-wheel variant with a rounds counter, in the paper's terms), compared with O(log n) per insert for a heap. At scheduler scale the same idea appears as <strong>time buckets</strong> in the database: <code>bucket = floor(due_at / 60 s)</code> is stored in the row, indexed, and the scheduler scans whole buckets one minute ahead.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 170" role="img" aria-label="Tiered due-time index: the far future lives only in the database ordered by due bucket; the next hour is scanned bucket by bucket; the next minute is loaded into a per-second timing wheel in memory; due jobs flow into the ready queue.">
+<defs><marker id="ahG17c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="30" width="200" height="70" rx="8" class="fs-purple s-purple sw-2"/><text x="110" y="56" text-anchor="middle" class="t-sm t-bold">Database only</text><text x="110" y="74" text-anchor="middle" class="t-xs t-muted">due more than an hour away</text><text x="110" y="90" text-anchor="middle" class="t-xs t-muted">index: (partition, due_at)</text></g>
+<g><rect x="250" y="30" width="170" height="70" rx="8" class="fs-purple s-purple sw-2"/><text x="335" y="56" text-anchor="middle" class="t-sm t-bold">Minute buckets</text><text x="335" y="74" text-anchor="middle" class="t-xs t-muted">next hour, scanned one</text><text x="335" y="90" text-anchor="middle" class="t-xs t-muted">bucket at a time</text></g>
+<g><rect x="460" y="30" width="150" height="70" rx="8" class="fs-cyan s-cyan sw-2"/><text x="535" y="56" text-anchor="middle" class="t-sm t-bold">Timing wheel</text><text x="535" y="74" text-anchor="middle" class="t-xs t-muted">next 60 s, one slot</text><text x="535" y="90" text-anchor="middle" class="t-xs t-muted">per second, in memory</text></g>
+<g><rect x="650" y="30" width="100" height="70" rx="8" class="fs-orange s-orange sw-2"/><text x="700" y="70" text-anchor="middle" class="t-sm t-bold">Ready</text></g>
+<line x1="210" y1="65" x2="250" y2="65" class="line" marker-end="url(#ahG17c)"/>
+<line x1="420" y1="65" x2="460" y2="65" class="line" marker-end="url(#ahG17c)"/>
+<line x1="610" y1="65" x2="650" y2="65" class="line" marker-end="url(#ahG17c)"/>
+<text x="110" y="128" text-anchor="middle" class="t-xs t-muted">hundreds of millions</text>
+<text x="335" y="128" text-anchor="middle" class="t-xs t-muted">tens of millions</text>
+<text x="535" y="128" text-anchor="middle" class="t-xs t-muted">hundreds of thousands</text>
+<text x="700" y="128" text-anchor="middle" class="t-xs t-muted">thousands</text>
+<text x="10" y="156" text-anchor="start" class="t-xs t-muted">Rows move rightwards as time passes. Each tier is rebuilt from the database after a restart.</text>
+  </svg>
+  <figcaption>Hierarchy by time horizon. Precision and memory cost both rise toward the right, so only the near future pays for them.</figcaption>
+</figure>
+<p>This is a toy single-level wheel with eight slots, so you can see rounds in action, followed by the hash that partitions jobs across schedulers. Real implementations use larger wheels or several stacked ones (seconds, minutes, hours), and the single level is already enough to see why insert and fire are cheap.</p>
+<pre class="terminal" data-title="wheel17.py"><code>&quot;&quot;&quot;A single-level timing wheel (bucketed due-time index) with a rounds counter, plus hash partitioning.&quot;&quot;&quot;
+from collections import defaultdict
+import zlib
+
+TICK = 1          # seconds per bucket
+WHEEL = 8         # slots in the wheel (tiny, for the demo)
+
+class Wheel:
+    &quot;&quot;&quot;Slots hold job ids; a job farther than WHEEL ticks away keeps a &#x27;rounds&#x27; counter.&quot;&quot;&quot;
+    def __init__(self): self.slots = [[] for _ in range(WHEEL)]; self.now = 0
+    def add(self, job, due):
+        delay = max(0, due - self.now)
+        slot, rounds = (self.now + delay) % WHEEL, delay // WHEEL
+        self.slots[slot].append([job, rounds])
+    def tick(self):
+        self.now += 1
+        slot = self.slots[self.now % WHEEL]; fire, keep = [], []
+        for item in slot:
+            if item[1] == 0: fire.append(item[0])
+            else: item[1] -= 1; keep.append(item)
+        self.slots[self.now % WHEEL] = keep
+        return fire
+
+w = Wheel()
+for name, due in [(&quot;a&quot;, 2), (&quot;b&quot;, 2), (&quot;c&quot;, 5), (&quot;d&quot;, 11), (&quot;e&quot;, 20)]:
+    w.add(name, due)
+for t in range(1, 22):
+    fired = w.tick()
+    if fired: print(f&quot;t={t:&gt;2}  fire {fired}&quot;)
+
+# Partitioning: hash(job_id) picks a partition; each partition owns its own wheel / index range.
+P = 4
+counts = defaultdict(int)
+for i in range(10_000): counts[zlib.crc32(f&quot;job-{i}&quot;.encode()) % P] += 1
+print(&quot;\njobs per partition (crc32 mod 4):&quot;, dict(sorted(counts.items())))</code></pre>
+<pre class="terminal" data-title="output"><code>t= 2  fire [&#x27;a&#x27;, &#x27;b&#x27;]
+t= 5  fire [&#x27;c&#x27;]
+t=11  fire [&#x27;d&#x27;]
+t=20  fire [&#x27;e&#x27;]
+
+jobs per partition (crc32 mod 4): {0: 2500, 1: 2500, 2: 2500, 3: 2500}</code></pre>
+<p>Jobs <code>a</code> and <code>b</code> share a slot and fire together; <code>d</code>, due at 11 with a wheel of 8, waits one extra round and fires at exactly 11; <code>e</code>, due at 20, waits two. Partitioning the job table by a hash of the id (as in <a href="../../networking/chapters/19-partitioning.html">partitioning</a>) gives each scheduler instance a disjoint slice, so no two instances scan the same rows and the due index of each is small. A partition's owner is itself assigned by a lease (the next section) or by the coordination service, and when it dies another instance takes the slice and rebuilds its wheel from the table. Because the table is the truth, the rebuild is a range scan.</p>
+
+<h2>Deep dive 2: claiming work with leases, heartbeats and fencing</h2>
+<p>Every worker will crash or stall at some point: a process killed by the orchestrator, a long garbage-collection pause, a network partition that leaves it healthy but unreachable. The scheduler cannot tell "dead" from "slow" (<a href="../../distributed/chapters/03-failure-detection.html">failure detection</a>), so it uses time. A <span class="term">lease</span> says "this job is yours until time T unless you renew". If no renewal arrives by T, the scheduler may give the job to someone else. The full protocol, and the proof that a lease alone is unsafe, are in <a href="../../distributed/chapters/04-leases-fencing.html">leases and fencing tokens</a>; here is how it lands in a scheduler.</p>
+<ul>
+  <li><strong>Claim is a conditional update.</strong> In SQL: <code>UPDATE jobs SET state='running', owner=:w, lease_until=now()+:L, fence=fence+1, attempts=attempts+1 WHERE job_id=:id AND (state IN ('scheduled','ready') OR (state='running' AND lease_until &lt;= now()))</code>. One row, one atomic step. If zero rows change, someone else won.</li>
+  <li><strong>Pick the lease length from the handler, not from taste.</strong> Short leases (tens of seconds) give fast recovery but need steady heartbeats; long leases tolerate a slow network but delay recovery. Renew at roughly a third of the lease so one missed heartbeat is harmless. Jobs with a long expected runtime ask for a longer initial lease.</li>
+  <li><strong>Time source.</strong> The lease expiry is judged by the store's clock, not the worker's. The worker only needs a roughly correct <em>duration</em>, not agreement on absolute time (<a href="../../distributed/chapters/07-time-revisited.html">time revisited</a>).</li>
+  <li><strong>Fencing closes the gap.</strong> A worker that stalls past its lease still believes it owns the job. When it wakes it will try to write, and its write must be refused. Every state change carries the fence and the store checks it, so the stale worker is rejected. The diagram shows the exact interleaving.</li>
+</ul>
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Space-time diagram. Worker A claims the job with fence 1 and then pauses. The lease expires. Worker B claims it with fence 2 and completes. Worker A wakes up and tries to complete with fence 1; the store rejects it.">
+<defs><marker id="ahG17d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="64" text-anchor="start" class="t-sm t-bold">Worker A</text>
+<text x="10" y="134" text-anchor="start" class="t-sm t-bold">Worker B</text>
+<text x="10" y="204" text-anchor="start" class="t-sm t-bold">Job store</text>
+<line x1="90" y1="60" x2="750" y2="60" class="line-thin"/>
+<line x1="90" y1="130" x2="750" y2="130" class="line-thin"/>
+<line x1="90" y1="200" x2="750" y2="200" class="line-thin"/>
+<line x1="130" y1="60" x2="160" y2="200" class="line" marker-end="url(#ahG17d)"/>
+<text x="136" y="104" text-anchor="start" class="t-xs t-faint">claim</text>
+<line x1="170" y1="200" x2="195" y2="60" class="line-dash" marker-end="url(#ahG17d)"/>
+<text x="204" y="96" text-anchor="start" class="t-xs t-faint">fence=1</text>
+<rect x="210" y="52" width="250" height="16" rx="4" class="fs-red s-red sw-2"/>
+<text x="335" y="46" text-anchor="middle" class="t-xs tc-red">A pauses (GC, partition, VM stall)</text>
+<rect x="195" y="192" width="170" height="16" rx="4" class="fs-orange s-orange sw-2"/>
+<text x="280" y="226" text-anchor="middle" class="t-xs t-muted">lease of A valid</text>
+<line x1="365" y1="214" x2="365" y2="190" class="line-thin"/>
+<text x="365" y="244" text-anchor="middle" class="t-xs tc-red">lease expires</text>
+<line x1="390" y1="130" x2="410" y2="200" class="line" marker-end="url(#ahG17d)"/>
+<text x="352" y="150" text-anchor="end" class="t-xs t-faint">B claims</text>
+<line x1="420" y1="200" x2="440" y2="130" class="line-dash" marker-end="url(#ahG17d)"/>
+<text x="446" y="150" text-anchor="start" class="t-xs t-faint">fence=2</text>
+<line x1="500" y1="130" x2="520" y2="200" class="line" marker-end="url(#ahG17d)"/>
+<text x="478" y="176" text-anchor="end" class="t-xs t-faint">complete(2)</text>
+<text x="548" y="226" text-anchor="start" class="t-xs t-muted">done</text>
+<line x1="560" y1="60" x2="590" y2="200" class="line-dash s-red" marker-end="url(#ahG17d)"/>
+<text x="578" y="104" text-anchor="start" class="t-xs tc-red">complete(1)</text>
+<text x="640" y="170" text-anchor="start" class="t-xs tc-red t-bold">409: fenced out</text>
+  </svg>
+  <figcaption>Without the fence check, A's late completion (or, worse, A's late side effect) would overwrite B's result. The store, which holds the fence, is the arbiter. The lease gives liveness (someone takes over); the fence gives safety (the old owner cannot interfere).</figcaption>
+</figure>
+<p>Here is the same protocol as a deterministic simulation: a store with atomic claim, heartbeat, complete and fail, the stall above, a job that always fails, and an idempotent handler.</p>
+<pre class="terminal" data-title="sched17.py"><code>&quot;&quot;&quot;Tiny deterministic durable scheduler: leases, heartbeats, fencing tokens, backoff with jitter, dead letter.&quot;&quot;&quot;
+import random
+
+class Store:
+    &quot;&quot;&quot;Stands in for the durable job table. Every method is one atomic conditional update.&quot;&quot;&quot;
+    def __init__(self): self.jobs = {}
+    def add(self, jid, due, max_attempts=4):
+        self.jobs[jid] = dict(state=&quot;queued&quot;, due=due, attempts=0, fence=0, lease_until=0, owner=None, max=max_attempts)
+    def claim(self, now, worker, lease=10):
+        &quot;&quot;&quot;UPDATE ... WHERE state=&#x27;queued&#x27; AND due&lt;=now (or lease expired) ORDER BY due LIMIT 1.&quot;&quot;&quot;
+        cands = [(j[&quot;due&quot;], k) for k, j in self.jobs.items()
+                 if (j[&quot;state&quot;] == &quot;queued&quot; and j[&quot;due&quot;] &lt;= now) or (j[&quot;state&quot;] == &quot;running&quot; and j[&quot;lease_until&quot;] &lt;= now)]
+        if not cands: return None
+        _, k = min(cands); j = self.jobs[k]
+        j.update(state=&quot;running&quot;, owner=worker, lease_until=now + lease, fence=j[&quot;fence&quot;] + 1, attempts=j[&quot;attempts&quot;] + 1)
+        return k, j[&quot;fence&quot;]
+    def heartbeat(self, k, fence, now, lease=10):
+        j = self.jobs[k]
+        if j[&quot;fence&quot;] != fence: return False          # someone else owns it now
+        j[&quot;lease_until&quot;] = now + lease; return True
+    def complete(self, k, fence, now):
+        j = self.jobs[k]
+        if j[&quot;fence&quot;] != fence or j[&quot;state&quot;] != &quot;running&quot;: return False   # fenced out
+        j[&quot;state&quot;] = &quot;done&quot;; return True
+    def fail(self, k, fence, now, rng):
+        j = self.jobs[k]
+        if j[&quot;fence&quot;] != fence: return &quot;fenced&quot;
+        if j[&quot;attempts&quot;] &gt;= j[&quot;max&quot;]: j[&quot;state&quot;] = &quot;dead&quot;; return &quot;dead-letter&quot;
+        backoff = min(60, 2 ** j[&quot;attempts&quot;])
+        j.update(state=&quot;queued&quot;, due=now + rng.uniform(0, backoff))   # full jitter
+        return f&quot;retry in {j[&#x27;due&#x27;]-now:.1f}s (cap {backoff}s)&quot;
+
+side_effects = []                     # the &#x27;outside world&#x27;: what handlers actually did
+def handler(k, fence, key): side_effects.append((k, fence, key))   # idempotent target keyed by (job, key)
+
+rng = random.Random(7); s = Store(); s.add(&quot;j1&quot;, due=0); s.add(&quot;j2&quot;, due=0, max_attempts=2)
+print(&quot;-- j1: worker A claims, stalls (GC pause), lease expires, B takes over, A wakes up&quot;)
+k, fa = s.claim(0, &quot;A&quot;); print(f&quot;t=0   A claims {k} fence={fa}&quot;)
+k, fb = s.claim(11, &quot;B&quot;); print(f&quot;t=11  lease expired -&gt; B claims {k} fence={fb}&quot;)
+print(f&quot;t=12  B completes: {s.complete(k, fb, 12)}&quot;)
+print(f&quot;t=13  A wakes and tries to complete with fence={fa}: {s.complete(&#x27;j1&#x27;, fa, 13)}  (rejected)&quot;)
+print(&quot;-- j2: always fails, max 2 attempts&quot;)
+t = 0
+while True:
+    got = s.claim(t, &quot;C&quot;)
+    if not got: t += 1; continue
+    k, f = got; outcome = s.fail(k, f, t, rng)
+    print(f&quot;t={t:&lt;3} attempt {s.jobs[k][&#x27;attempts&#x27;]} failed -&gt; {outcome}&quot;)
+    if outcome == &quot;dead-letter&quot;: break
+print(&quot;final states:&quot;, {k: j[&quot;state&quot;] for k, j in s.jobs.items()})
+
+print(&quot;\n-- idempotent handler: at-least-once delivery, effect applied once&quot;)
+done = set(); log = []
+def pay(job, key):
+    if key in done: log.append(f&quot;{job}: duplicate {key}, skipped&quot;); return
+    done.add(key); log.append(f&quot;{job}: charged once under {key}&quot;)
+pay(&quot;j1&quot;, &quot;inv-42&quot;); pay(&quot;j1&quot;, &quot;inv-42&quot;)     # a retry after a crash between effect and ack
+print(&quot;\n&quot;.join(log))</code></pre>
+<pre class="terminal" data-title="output"><code>-- j1: worker A claims, stalls (GC pause), lease expires, B takes over, A wakes up
+t=0   A claims j1 fence=1
+t=11  lease expired -&gt; B claims j1 fence=2
+t=12  B completes: True
+t=13  A wakes and tries to complete with fence=1: False  (rejected)
+-- j2: always fails, max 2 attempts
+t=0   attempt 1 failed -&gt; retry in 0.6s (cap 2s)
+t=1   attempt 2 failed -&gt; dead-letter
+final states: {&#x27;j1&#x27;: &#x27;done&#x27;, &#x27;j2&#x27;: &#x27;dead&#x27;}
+
+-- idempotent handler: at-least-once delivery, effect applied once
+j1: charged once under inv-42
+j1: duplicate inv-42, skipped</code></pre>
+<p>Notice what the fence protects and what it does not. It stops A from marking the job done or changing its state. It cannot stop A from <em>already having sent the email</em> before it was fenced, because the outside world does not check our fence. That is why the last block exists: <strong>delivery is at-least-once, so effects must be idempotent.</strong></p>
+<h3>At-least-once plus idempotent handlers</h3>
+<p>Between "the handler did its effect" and "the worker told the store" there is always a window where a crash makes the job run again. Exactly-once execution would need the effect and the acknowledgement to be one atomic step across two systems, which in general you do not have (<a href="../../networking/chapters/16-failure.html">failure and retries</a>; the broader treatment is <a href="../../distributed/chapters/17-logs-exactly-once.html">logs and exactly-once</a>). So the contract is: the scheduler delivers <em>at least once</em>, passes a stable <code>run_key</code>, and the handler makes its effect idempotent with it. Typical ways: a unique-key insert or an upsert keyed by <code>run_key</code>; passing <code>run_key</code> as the idempotency key to a payment or email provider; a conditional write ("set status = sent where status = pending"). If a handler's effect cannot be made idempotent, the honest alternative is <em>at-most-once</em>: record "started" first and never retry, accepting that a crash loses the job. That is a product decision to expose, not hide.</p>
+
+<h2>Deep dive 3: retries, backoff and dead-letter</h2>
+<p>A failed job should usually be retried, but retries are also how a small outage becomes a large one: every failing job comes back at once. The rules that keep it sane follow <a href="../../architecture/chapters/17-resilience.html">resilience</a> and <a href="../../reliability/chapters/11-overload.html">overload</a> practice.</p>
+<ul>
+  <li><strong>Exponential backoff with full jitter.</strong> After attempt <em>n</em>, wait a random time between 0 and <code>min(cap, base &times; 2<sup>n</sup>)</code>. Without the randomness all failures from one outage retry in lockstep. The simulation above uses exactly this ("retry in 0.6s (cap 2s)"). Try the <a href="../../architecture/chapters/17-resilience.html">backoff</a> experiment if you want to see the synchronisation.</li>
+  <li><strong>Classify failures.</strong> A handler returns "retryable" (timeout, 503), "permanent" (400, validation) or "retry after T" (429 with a header). Permanent errors skip retries and go straight to dead-letter; retrying a malformed payload five times is pure waste.</li>
+  <li><strong>Bound attempts and total age.</strong> After <code>max_attempts</code>, or when a job is older than its deadline, move it to <code>dead</code>. The dead-letter state is just a row state plus an alert, with a UI to inspect and <em>redrive</em> (reset attempts, set due now) after the bug is fixed.</li>
+  <li><strong>Retries are lower priority than new work</strong> when the system is saturated, or a retry storm starves fresh jobs. A per-tenant retry budget, such as "retries may use at most 20% of this tenant's concurrency", gives the same protection as a retry budget in a client.</li>
+  <li><strong>Poison jobs.</strong> A job that crashes the worker (out of memory, segfault) never reports a failure; the lease just expires, over and over. Counting claims (<code>attempts</code> rises on every claim, not every reported failure) lets the dead-letter rule catch it.</li>
+</ul>
+
+<h2>Deep dive 4: priorities, fairness across tenants, and cron</h2>
+<h3>Priorities and tenants</h3>
+<p>Two different problems share one queue. <strong>Priority</strong> says some jobs matter more (a password-reset email beats a weekly digest). <strong>Fairness</strong> says one tenant's flood must not delay another tenant's trickle. Strict priority queues alone make low priority wait forever and do nothing about a single tenant filling the top class. The usual shape is a two-level scheme:</p>
+<table>
+  <thead><tr><th>Scheme</th><th>How</th><th>Good for</th><th>Risk</th></tr></thead>
+  <tbody>
+    <tr><td>One FIFO queue</td><td>Order of due time</td><td>Simplicity</td><td>A tenant that enqueues 100,000 jobs makes everyone wait behind it</td></tr>
+    <tr><td>Strict priority classes</td><td>Always serve the highest non-empty class</td><td>Urgent work</td><td>Starvation of low classes; no isolation inside a class</td></tr>
+    <tr><td>Weighted classes plus per-tenant round robin</td><td>Pick a class by weight (say 60/30/10), then rotate through tenants inside it</td><td>Priority <em>and</em> fairness; low classes still progress</td><td>Needs per-tenant queues or virtual queues; weights are policy to tune</td></tr>
+    <tr><td>Per-tenant concurrency caps</td><td>Each tenant may hold at most <em>c</em> running slots</td><td>Hard isolation of capacity; also protects tenants' own downstreams</td><td>Wastes capacity if caps sum to less than the fleet unless borrowing is allowed</td></tr>
+  </tbody>
+</table>
+<p><strong>Recommendation:</strong> weighted classes with per-tenant round robin, plus per-tenant concurrency caps with the ability to borrow idle capacity. Isolation of noisy tenants is the same idea developed in <a href="../../security/chapters/15-multi-tenancy.html">multi-tenancy and isolation</a>, which also covers the security side (one tenant's handler URL must not become a path into another's data). In the scheduler, tenant identity is a first-class field of every row and every queue key, not something derived later.</p>
+<pre class="terminal" data-title="fair17.py"><code>&quot;&quot;&quot;Fairness: one tenant floods 2,000 jobs. FIFO vs per-tenant round robin with 10 execution slots per tick.&quot;&quot;&quot;
+from collections import deque
+SLOTS = 10
+def arrivals():
+    # tick 0: tenant A dumps 2000 jobs; B and C each submit 20 right after
+    return [(&quot;A&quot;, i) for i in range(2000)] + [(&quot;B&quot;, i) for i in range(20)] + [(&quot;C&quot;, i) for i in range(20)]
+
+def fifo():
+    q = deque(arrivals()); t = 0; done = {}
+    while q:
+        t += 1
+        for _ in range(min(SLOTS, len(q))):
+            tenant, i = q.popleft(); done[tenant] = t
+    return done
+
+def round_robin():
+    queues = {}
+    for tenant, i in arrivals(): queues.setdefault(tenant, deque()).append(i)
+    t = 0; done = {}
+    while any(queues.values()):
+        t += 1; budget = SLOTS
+        while budget and any(queues.values()):
+            for tenant, q in queues.items():
+                if q and budget: q.popleft(); budget -= 1; done[tenant] = t
+    return done
+
+print(&quot;tick at which each tenant&#x27;s last job finished (10 slots per tick)&quot;)
+print(&quot;  FIFO       :&quot;, fifo())
+print(&quot;  round robin:&quot;, round_robin())</code></pre>
+<pre class="terminal" data-title="output"><code>tick at which each tenant&#x27;s last job finished (10 slots per tick)
+  FIFO       : {&#x27;A&#x27;: 200, &#x27;B&#x27;: 202, &#x27;C&#x27;: 204}
+  round robin: {&#x27;A&#x27;: 204, &#x27;B&#x27;: 7, &#x27;C&#x27;: 7}</code></pre>
+<p>Under FIFO the two small tenants wait behind a 2,000-job flood and finish at ticks 202 and 204. With a per-tenant rotation they finish at tick 7, and the flooder's total completion time barely changes (204 against 200), because the fleet was busy either way. That is the essence of fairness: it reorders, it does not create capacity.</p>
+<h3>Exactly-once cron triggering</h3>
+<p>A cron entry must fire once per scheduled time. Two failures break that: <strong>no one fires it</strong> (the single scheduler is down) and <strong>two fire it</strong> (two schedulers both think they are in charge). The standard answer combines two mechanisms with different jobs.</p>
+<ol>
+  <li><strong>Leader election for efficiency.</strong> One instance at a time holds a lease in the <a href="../../distributed/chapters/11-coordination-services.html">coordination service</a> and runs the cron loop (or one leader per range of cron ids). Failover happens when the lease expires. This keeps the work from being done N times in the common case.</li>
+  <li><strong>A deterministic unique key for correctness.</strong> The leader does not "launch" a run; it inserts a job row whose key is <code>(cron_id, scheduled_fire_time)</code>. A second insert of the same key fails. So even if a paused old leader wakes up and tries to fire the same minute, or the fencing check in the coordination layer is imperfect, the database refuses the duplicate.</li>
+</ol>
+<p>The lesson generalises: use consensus or leases to get <em>liveness and efficiency</em>, and idempotent writes to get <em>safety</em>. Do not rely on the lease alone for safety, for the reason in the fencing chapter.</p>
+<pre class="terminal" data-title="cron17.py"><code>&quot;&quot;&quot;Exactly-once cron triggering: leader election for efficiency, a unique (cron_id, fire_time) key for correctness.&quot;&quot;&quot;
+from datetime import datetime, timedelta
+
+jobs = {}                                   # the job table; the primary key is (cron_id, fire_time)
+def enqueue(cron_id, fire_time, leader):
+    key = (cron_id, fire_time.isoformat())
+    if key in jobs: return f&quot;{leader}: insert {key[1]} -&gt; duplicate, ignored&quot;
+    jobs[key] = dict(state=&quot;queued&quot;, by=leader); return f&quot;{leader}: insert {key[1]} -&gt; created&quot;
+
+def next_fire(after):                       # &#x27;*/15 * * * *&#x27;
+    base = after.replace(second=0, microsecond=0)
+    return base + timedelta(minutes=15 - base.minute % 15)
+
+t = datetime(2025, 1, 1, 9, 7)
+fire = next_fire(t); print(&quot;next fire after 09:07 is&quot;, fire.time())
+print(enqueue(&quot;report&quot;, fire, &quot;leader-1&quot;))
+print(enqueue(&quot;report&quot;, fire, &quot;leader-2&quot;), &quot;  &lt;- stale leader, same time-derived key&quot;)
+
+print(&quot;\ncatch-up after the scheduler was down from 09:00 to 10:40 (job fires every 15 min):&quot;)
+last, now = datetime(2025, 1, 1, 9, 0), datetime(2025, 1, 1, 10, 40)
+missed = []
+f = next_fire(last)
+while f &lt;= now: missed.append(f); f = next_fire(f)
+print(&quot;  missed fire times:&quot;, [m.strftime(&quot;%H:%M&quot;) for m in missed])
+print(&quot;  policy skip     : run nothing, wait for&quot;, f.strftime(&quot;%H:%M&quot;))
+print(&quot;  policy fire-once: run once for&quot;, missed[-1].strftime(&quot;%H:%M&quot;))
+print(&quot;  policy fire-all : run&quot;, len(missed), &quot;times, oldest first&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>next fire after 09:07 is 09:15:00
+leader-1: insert 2025-01-01T09:15:00 -&gt; created
+leader-2: insert 2025-01-01T09:15:00 -&gt; duplicate, ignored   &lt;- stale leader, same time-derived key
+
+catch-up after the scheduler was down from 09:00 to 10:40 (job fires every 15 min):
+  missed fire times: [&#x27;09:15&#x27;, &#x27;09:30&#x27;, &#x27;09:45&#x27;, &#x27;10:00&#x27;, &#x27;10:15&#x27;, &#x27;10:30&#x27;]
+  policy skip     : run nothing, wait for 10:45
+  policy fire-once: run once for 10:30
+  policy fire-all : run 6 times, oldest first</code></pre>
+<p>The second half of the output is the <strong>misfire policy</strong> you promised in the API. After downtime of an hour and forty minutes, a 15-minute job has six missed fire times. A metrics rollup probably wants <em>fire once</em> (do the latest, the aggregates cover the gap); a billing job may want <em>fire all</em>, oldest first; a "send today's digest" job wants <em>skip</em>. Make it a field, document the default, and write the missed times into the run history.</p>
+<p>Two further cron details deserve a sentence each. <strong>Time zones and daylight saving</strong>: store the zone with the schedule and compute the next fire time in that zone, deciding explicitly what a 02:30 job does on the day clocks skip it and on the day 01:30 happens twice. And <strong>compute the next fire time when the previous one is created</strong>, not by a separate clock tick, so the chain of keys is a pure function of the expression and the last time.</p>
+
+<h2>Deep dive 5: the top of the hour</h2>
+<p>People pick round numbers. If two million entries say <code>0 * * * *</code>, then at 09:00:00 the scheduler wants to start two million jobs in the same second: the estimate printed 2,000,000 starts per second against a normal 5,800. Everything downstream is hit at once: the claim path in the store, the worker fleet, and the tenants' own handlers, which are the real victims (a webhook receiver that normally sees 10 calls a second gets 10,000). Mitigations, from cheapest to most structural:</p>
+<ul>
+  <li><strong>Jitter the start.</strong> Offset each run by a per-job random delay in a window the tenant accepts (30 seconds to 5 minutes for most background work; none for jobs that really need the minute). Derive the offset from a hash of the cron id, so it is stable across restarts, and the job's <code>run_key</code> still uses the nominal time.</li>
+  <li><strong>Spread at creation time.</strong> When a tenant creates a schedule with no preference, pick the minute for them ("hourly" becomes <code>17 * * * *</code>). Defaults shape fleet behaviour far more than documentation does.</li>
+  <li><strong>Rate-limit the release.</strong> The ready-queue release step has a global and a per-tenant rate, so a herd is smoothed into a ramp and lag shows up honestly as lag (<a href="05-rate-limiter.html">rate limiter</a>).</li>
+  <li><strong>Pre-scale.</strong> Known peaks (the start of every hour) can scale the worker fleet ahead of time, but only after you have flattened them; scaling for a spike you could have spread is the expensive route.</li>
+</ul>
+<pre class="terminal" data-title="herd17.py"><code>&quot;&quot;&quot;Cron herd: 200,000 jobs scheduled &#x27;0 * * * *&#x27;. Compare peak starts per second with and without jitter.&quot;&quot;&quot;
+import random, zlib
+N = 200_000
+def peak(starts): 
+    from collections import Counter
+    c = Counter(int(t) for t in starts); return max(c.values()), len(c)
+rng = random.Random(1)
+print(f&quot;no jitter       peak {peak([0.0]*N)[0]:&gt;8,} starts/s over {peak([0.0]*N)[1]} second(s)&quot;)
+for window in (30, 300):
+    p, n = peak([rng.uniform(0, window) for _ in range(N)])
+    print(f&quot;random jitter {window:&gt;3}s peak {p:&gt;8,} starts/s over {n} seconds&quot;)
+# deterministic per-job jitter: hash of the job id, so a retry or a restart picks the same offset
+p, n = peak([zlib.crc32(f&quot;job-{i}&quot;.encode()) % 300 for i in range(N)])
+print(f&quot;hash jitter   300s peak {p:&gt;8,} starts/s over {n} seconds (stable across restarts)&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>no jitter       peak  200,000 starts/s over 1 second(s)
+random jitter  30s peak    6,886 starts/s over 30 seconds
+random jitter 300s peak      742 starts/s over 300 seconds
+hash jitter   300s peak      747 starts/s over 300 seconds (stable across restarts)</code></pre>
+<p>With 200,000 entries, no jitter is 200,000 starts in one second. A random 30-second window brings the peak to about 6,900 per second, and a 5-minute window to about 740. Deriving the offset from a hash of the id (the last line) gives the same smoothing, with the property that the offset does not change when a job is retried or the scheduler restarts. Peak-to-average drops by two orders of magnitude for a trivial change.</p>
+
+<h2>Failure modes &amp; operations</h2>
+<table>
+  <thead><tr><th>What breaks</th><th>Blast radius</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>A worker dies mid-job</td><td>That job, until its lease expires</td><td>Lease and heartbeat; the job is re-claimed with a higher fence; handlers are idempotent</td></tr>
+    <tr><td>A worker stalls and returns after losing the lease</td><td>One job could be applied twice</td><td>Fence checked on every store write; idempotent effects for everything outside the store</td></tr>
+    <tr><td>A partition scheduler dies</td><td>Jobs in its slice are not released until another instance takes over</td><td>Partition ownership by lease; the new owner rebuilds the wheel by scan; alert on lag per partition</td></tr>
+    <tr><td>Store partition or zone unavailable</td><td>Submits and claims for that slice fail</td><td>Replication across zones; submit retries with the idempotency key; other partitions are unaffected (<a href="../../reliability/chapters/15-blast-radius.html">blast radius</a>)</td></tr>
+    <tr><td>Ready queue lost</td><td>Nothing permanently</td><td>Rescan from the store; the claim is the arbiter, so duplicates in the queue are harmless</td></tr>
+    <tr><td>Cron leader pauses or two leaders overlap</td><td>Possible double fire</td><td>Unique key on <code>(cron_id, fire_time)</code>; leader lease with fencing in the coordination layer</td></tr>
+    <tr><td>Retry storm after a downstream outage</td><td>Whole fleet saturated; healthy tenants slowed</td><td>Jittered backoff, per-tenant retry budgets and concurrency caps, circuit breaking per destination</td></tr>
+    <tr><td>One tenant floods the queue</td><td>Everyone's latency</td><td>Per-tenant rotation and caps; admission control at submit (return 429 beyond a quota)</td></tr>
+    <tr><td>Clock skew between scheduler hosts</td><td>Jobs fire slightly early or late</td><td>Decide "due" by the store's clock when it matters; keep NTP healthy and alert on skew</td></tr>
+  </tbody>
+</table>
+<h3>Observing lag</h3>
+<p>The most important single metric is <strong>scheduling lag</strong>: <code>now &minus; due_at</code> for the oldest job still waiting, per partition and per priority class. It rises before anything else breaks, whatever the cause (starved workers, a slow store, a herd). Next: <strong>start delay</strong> (claimed_at &minus; due_at) as a distribution, <strong>queue depth by class and tenant</strong>, <strong>lease expirations per minute</strong> (a sudden rise means workers are dying or too slow to heartbeat), <strong>retry and dead-letter rates</strong>, and <strong>duplicate-suppression counts</strong> (the cron unique key firing, handler idempotency hits), which should be nonzero but small. Percentiles come from histograms (<a href="../../reliability/chapters/04-metrics.html">metrics</a>), not averages.</p>
+<p><strong>SLOs.</strong> 99% of jobs start within 1 s of due time (excluding jittered ones, which are measured from the jittered time); no accepted job is lost (verified by a periodic reconciliation of accepted versus terminal counts); submit availability 99.95%. <strong>Alert</strong> on lag burn rate and on a nonzero count of jobs that are <code>running</code> with an expired lease for longer than a threshold (<a href="../../reliability/chapters/07-alerting-oncall.html">burn-rate alerting</a>). <strong>Roll out</strong> scheduler changes one partition at a time, with the old and new release able to read the same rows, and run a chaos check that kills a worker mid-job and verifies exactly one effect.</p>
+
+<h2>Trade-offs &amp; alternatives</h2>
+<ul>
+  <li><strong>At-least-once versus at-most-once.</strong> We chose at-least-once because losing a job is usually worse than running it twice, and pushed the cost to handlers. For non-idempotent effects the alternative is at-most-once with "started" recorded first.</li>
+  <li><strong>Database polling versus a broker.</strong> A database gives cancel, reschedule and inspection; a broker gives raw throughput. Many systems use both: the store of record decides, a broker moves ready ids to workers.</li>
+  <li><strong>Push versus pull to workers.</strong> We chose workers pulling with claims, which gives natural backpressure and no registry of worker addresses. Push is lower latency but needs health tracking and can overload a slow worker.</li>
+  <li><strong>Short versus long leases.</strong> Short means quick recovery and more heartbeat traffic; long means slow recovery and fewer writes. A per-job lease tied to expected runtime avoids a global compromise.</li>
+  <li><strong>If we needed sub-millisecond precision</strong>, this is the wrong tool: you would run the timers in-process, accept loss on restart and not promise durability. <strong>If jobs were workflows</strong> with dependencies, add a workflow layer that stores state transitions as events and uses the scheduler only for timers (<a href="../../architecture/chapters/15-sagas.html">sagas</a>).</li>
+  <li><strong>Where it breaks down.</strong> Very large fan-in schedules (millions of timers per tenant), jobs whose runtime far exceeds any sensible lease, and effects with no idempotency story. Each needs a limit or a different product, not a bigger cluster.</li>
+</ul>
+
+<h2>What a strong answer adds</h2>
+<ul>
+  <li>Separates <em>when to run</em> (the scheduler) from <em>what to run</em> (the handler), and states the delivery guarantee up front: at-least-once, with idempotency keys.</li>
+  <li>Uses the estimate to split the pending set (disk, hundreds of millions) from the hot window (memory, hundreds of thousands), and designs a tiered due index around that.</li>
+  <li>Explains why a lease needs a fencing token, and draws the pause-then-wake interleaving.</li>
+  <li>Treats the database as the truth and every queue as a rebuildable cache.</li>
+  <li>Gets cron right: leader election for efficiency, a deterministic unique key for correctness, and an explicit misfire policy and time-zone story.</li>
+  <li>Anticipates the top-of-the-hour herd with numbers and proposes jitter derived from a hash.</li>
+  <li>Combines priority classes with per-tenant fairness and caps, and says that fairness reorders but does not add capacity.</li>
+  <li>Names scheduling lag as the headline SLI and lists the supporting metrics.</li>
+</ul>
+
+<h2>Follow-up questions</h2>
+<details class="deeper">
+  <summary>How would you support cancelling a job that is already running?</summary>
+  <p>Cancellation is a state change, not a kill. Mark the row <code>cancel_requested</code>; the worker learns about it on its next heartbeat response (the store returns a flag) and the handler must cooperate (check a context and stop). If the handler does not respond within a grace period, the worker's lease is allowed to lapse and the fence prevents any later completion from being accepted. Be honest in the API: cancellation is best effort once a job has started.</p>
+</details>
+<details class="deeper">
+  <summary>How do you handle a job that takes six hours?</summary>
+  <p>Do not make a six-hour lease. Keep the lease short and heartbeat steadily, so a crash is noticed within a minute. Better, make the job resumable: the handler checkpoints progress (an offset, a cursor) in the job row or its own store, so a re-claim continues instead of restarting. If it cannot be checkpointed, split it into shorter chained jobs.</p>
+</details>
+<details class="deeper">
+  <summary>Why not just use cron on one machine?</summary>
+  <p>It is a single point of failure, it loses runs while down, it has no retry or backoff, no per-tenant fairness and no visibility. It is a fine answer for one small team's maintenance task. The distributed design earns its complexity when there are many tenants, strict reliability needs and a fleet of workers; say that, rather than treating complexity as a virtue.</p>
+</details>
+<details class="deeper">
+  <summary>Two workers claim the same job at the same instant. What happens?</summary>
+  <p>The claim is a single conditional update on the row, executed atomically by the store for that partition, so one wins and the other sees zero rows changed. In a replicated store the claim goes through the partition's leader or uses a compare-and-set, never a read-then-write across replicas. The loser simply picks another job.</p>
+</details>
+<details class="deeper">
+  <summary>How do you scale to ten times the load?</summary>
+  <p>Add partitions (resharding the job table by hash, ideally with consistent hashing so only a fraction moves), add scheduler instances so each owns fewer partitions, and add workers. The things that do not scale linearly are hot tenants and the cron leader; shard crons by id range, and cap or isolate the tenants whose volume is a large share of the total.</p>
+</details>
+<details class="deeper">
+  <summary>How would you test that no job is lost or duplicated under failures?</summary>
+  <p>Write an invariant checker (every accepted job reaches exactly one terminal state; every effect key appears once) and run the scheduler under a deterministic simulation or a chaos harness that kills workers and schedulers, pauses processes beyond their lease and partitions the store (<a href="../../distributed/chapters/19-testing.html">testing distributed systems</a>). <a href="../labs/lab-06-job-scheduler.html">Lab 6</a> builds a small version and tests it with crashes.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In <code>sched17.py</code> change the stall so worker A wakes at <code>t=9</code>, before the lease expires, and predict the output. Then set A's lease to 3 s and B's claim time to 5, and ask whether anything breaks if A heartbeats at t=2. Finally, change <code>SLOTS</code> in <code>fair17.py</code> to 5 and check that round robin still finishes the small tenants at roughly twice the tick. Build the full version in <a href="../labs/lab-06-job-scheduler.html">Lab 6</a>.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>The scheduler is a compact tour of coordination patterns. A lease is a time-bounded lock; a fence is the monotonic token that makes an expired lock harmless; leader election is a lease on a name; and the unique cron key is an idempotent write that makes the whole arrangement safe even when the lease fails. See <a href="../../distributed/chapters/04-leases-fencing.html">leases and fencing</a>, <a href="../../distributed/chapters/11-coordination-services.html">coordination services</a> and <a href="../../distributed/chapters/17-logs-exactly-once.html">logs and exactly-once</a>. The ready queues are the pattern in <a href="../../systems/chapters/14-queues-backpressure.html">queues and backpressure</a>, scaled out.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A scheduler is a durable store plus a due-time index; queues are derived caches of the store. Only the next minute or so of jobs needs to live in memory, in a timing wheel or time buckets, partitioned by job id.</li>
+    <li>Workers claim with a conditional update that sets a lease and bumps a fence; heartbeats extend the lease; every later call carries the fence so a stalled worker is rejected.</li>
+    <li>Delivery is at-least-once. Hand handlers a stable run key and make effects idempotent; exactly-once <em>execution</em> is not on offer, exactly-once <em>triggering</em> and effectively-once effects are.</li>
+    <li>Retry with exponential backoff and full jitter, classify errors, bound attempts, count claims to catch poison jobs, and dead-letter with a redrive path.</li>
+    <li>Combine priority classes with per-tenant rotation and concurrency caps. Fairness reorders work; it does not create capacity.</li>
+    <li>Cron uses leader election for efficiency and a unique <code>(cron_id, fire_time)</code> key for correctness, plus an explicit misfire policy and time zones.</li>
+    <li>Round-number schedules create herds; jitter derived from a hash of the id cuts the peak by orders of magnitude. The headline metric is scheduling lag.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why is a message broker with delayed delivery usually not enough as the system of record for a scheduler?</p>
+    <ol class="q-options">
+      <li>Brokers cannot deliver messages at all</li>
+      <li>Scheduling needs ordering by due time, cancel and reschedule, and the ability to query pending jobs, which brokers are poor at, and losing the broker would lose the jobs</li>
+      <li>Brokers are always slower than databases</li>
+      <li>Brokers cannot be replicated</li>
+    </ol>
+    <div class="q-explain">Queues optimise arrival order. A scheduler needs a durable, queryable record with a due-time index, with queues as derived caches that can be rebuilt by rescanning it.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Worker A holds a job with fence 1, stalls, and its lease expires. Worker B claims the job with fence 2 and completes it. A then wakes and calls complete(fence=1). What should happen, and what can it not prevent?</p>
+    <ol class="q-options">
+      <li>The store accepts it, because the first claimant owns the job</li>
+      <li>The store accepts it and ignores B's result</li>
+      <li>The store rejects it, and that also stops any side effect A already performed</li>
+      <li>The store rejects it, but a side effect A performed before being fenced is outside the store's control, so handlers must be idempotent</li>
+    </ol>
+    <div class="q-explain">The fence protects the job's state. Effects in other systems are not checked against our fence, so safety there comes from idempotency keys.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Two cron leaders briefly overlap and both try to fire the 09:15 run of the same schedule. What prevents a double run even if the lease check fails?</p>
+    <ol class="q-options">
+      <li>A unique key on (cron_id, scheduled fire time) so the second insert is rejected</li>
+      <li>A longer lease</li>
+      <li>A faster clock</li>
+      <li>Nothing; this cannot be prevented</li>
+    </ol>
+    <div class="q-explain">Leader election gives efficiency; the deterministic key gives correctness. Both leaders compute the same key for the same fire time, and the database accepts one insert.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Two million jobs are scheduled for 0 * * * *. Which change reduces the peak start rate most for the least effort?</p>
+    <ol class="q-options">
+      <li>Doubling the worker fleet</li>
+      <li>Retrying failures faster</li>
+      <li>Adding a per-job jitter offset (for example derived from a hash of the id) over a few minutes</li>
+      <li>Switching to a bigger database instance</li>
+    </ol>
+    <div class="q-explain">Adding workers helps the symptom while the herd still hits the store and tenants' handlers. Jitter spreads the demand itself: over 300 seconds, 2M becomes about 6,700 starts per second.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">In the fairness simulation, FIFO finishes a small tenant at tick 202 and round robin at tick 7, while the flooding tenant finishes at 200 versus 204. What does this show?</p>
+    <ol class="q-options">
+      <li>Round robin is faster overall</li>
+      <li>Fairness reorders work and protects small tenants at a small cost to the flooder; it does not create capacity</li>
+      <li>FIFO is fairer</li>
+      <li>The fleet has too few workers</li>
+    </ol>
+    <div class="q-explain">Total work is unchanged; only the order differs. The flooder was going to take about 200 ticks regardless.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ten Thousand Connections: nginx &amp; C10k · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="sys" data-case="C4">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Ten Thousand Connections: nginx &amp; C10k</h1>
+  <p class="lede">Around the turn of the millennium, a question started going round among web server authors: can one machine serve ten thousand clients at once? Dan Kegel gave the question a name, "the C10k problem", and wrote down the strategies for answering it. nginx, created by Igor Sysoev and released in 2004, was designed around one of them. This case studies the idea behind it.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">The pattern in one sentence</p>
+  <p><strong>Event-driven servers:</strong> instead of dedicating a process or thread to every connection (and paying for it while it mostly waits), let a few threads each watch thousands of connections and do work only on the ones that are ready.</p>
+</div>
+
+<h2>The cast</h2>
+
+<p>This case builds on <a href="../chapters/15-blocking-io.html">chapter 15</a> (blocking vs non-blocking I/O) and <a href="../chapters/16-event-loops.html">chapter 16</a> (event loops). Its practical twin is <a href="../studios/studio-01-10k-connections.html">Studio 1</a>, where you design a server for 10,000 connections yourself.</p>
+
+<dl class="terms">
+  <dt>The C10k problem</dt><dd>Kegel's name for handling ten thousand simultaneous clients on one server. His page argues that "hardware is no longer the bottleneck" (his words) and sets out how to configure operating systems and write code to support thousands of clients.</dd>
+  <dt>nginx</dt><dd>A web server and proxy created by Igor Sysoev, publicly released in 2004. Andrew Alexeev's chapter in <em>The Architecture of Open Source Applications</em> says nginx targets high concurrency, high performance and low memory use, and was designed to meet the C10k goal.</dd>
+  <dt>Master process</dt><dd>Runs as root. Reads and validates configuration, creates and binds sockets, starts and maintains the workers, and handles reconfiguration and binary upgrades.</dd>
+  <dt>Worker processes</dt><dd>Run as an unprivileged user. They handle client connections, proxying, filtering and most of the real work. Each is a single-threaded event loop built on OS mechanisms such as epoll or kqueue.</dd>
+  <dt>Helper processes</dt><dd>A cache loader (fills in cache metadata at startup, then exits) and a cache manager (expires and invalidates entries).</dd>
+</dl>
+
+<h2>The problem: a connection that mostly waits</h2>
+
+<p>The straightforward way to write a server, covered in chapters 10 and 15, is to give each connection its own process or thread. The code is simple: read the request, do the work, write the reply, and let blocking calls pause only that connection. The AOSA chapter lists the costs. Each connection needs its own runtime environment, including heap and stack memory and an execution context. Creating and switching between these takes CPU time, and too much switching can cause thrashing. Its example: 1,000 clients at about 1 MB each use about 1 GB, and Apache commonly uses more than 1 MB per connection. Slow clients make it worse: a worker stays tied up while, say, a 100 KB response trickles out to a client at 10 KB/s.</p>
+
+<p>Kegel's page frames the economics the other way round. A machine with a 1 GHz CPU, 2 GB of RAM and a 1 Gbit/s network card, which he says costs $1,200 or so, spread over 20,000 clients leaves roughly 50 kHz of CPU, 100 KB of memory and 50 kbit/s of bandwidth per client. He argues that is plenty to send four kilobytes per client once a second, so the hardware could do it. The software structure was what blocked the way.</p>
+
+<h2>Step through: two ways to hold three connections</h2>
+
+<div class="widget stepper" data-autoplay-ms="3800">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One execution context per connection vs an event loop</h4></div>
+  <svg viewBox="0 0 760 320" role="img" aria-label="Left: three clients each served by their own process or thread. Right: the same three clients served by one worker running an event loop.">
+    <defs>
+      <marker id="ahSC4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <!-- panel headers -->
+    <text x="190" y="26" text-anchor="middle" class="t-sm t-bold">A process or thread per connection</text>
+    <text x="570" y="26" text-anchor="middle" class="t-sm t-bold">Event loop in one worker</text>
+    <line x1="380" y1="14" x2="380" y2="280" class="line-thin"/>
+
+    <!-- left: three execution contexts -->
+    <rect x="20" y="50" width="190" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="115" y="74" text-anchor="middle" class="t-sm t-bold">process / thread 1</text>
+    <text x="115" y="92" text-anchor="middle" class="t-xs t-muted">own stack + memory</text>
+    <rect x="20" y="130" width="190" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <g data-steps="1,3-"><text x="115" y="154" text-anchor="middle" class="t-sm t-bold">process / thread 2</text>
+    <text x="115" y="172" text-anchor="middle" class="t-xs t-muted">own stack + memory</text></g>
+    <rect x="20" y="210" width="190" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="115" y="234" text-anchor="middle" class="t-sm t-bold">process / thread 3</text>
+    <text x="115" y="252" text-anchor="middle" class="t-xs t-muted">own stack + memory</text>
+    <!-- left clients -->
+    <rect x="270" y="58" width="90" height="40" rx="8" class="box"/>
+    <text x="315" y="83" text-anchor="middle" class="t-sm">client 1</text>
+    <rect x="270" y="138" width="90" height="40" rx="8" class="box"/>
+    <text x="315" y="163" text-anchor="middle" class="t-sm">client 2</text>
+    <rect x="270" y="218" width="90" height="40" rx="8" class="box"/>
+    <text x="315" y="243" text-anchor="middle" class="t-sm">client 3</text>
+    <line x1="268" y1="78" x2="212" y2="78" class="line" marker-end="url(#ahSC4a)"/>
+    <line x1="268" y1="158" x2="212" y2="158" class="line" marker-end="url(#ahSC4a)"/>
+    <line x1="268" y1="238" x2="212" y2="238" class="line" marker-end="url(#ahSC4a)"/>
+
+    <!-- right: one worker -->
+    <rect x="400" y="40" width="190" height="236" rx="12" class="fs-blue s-blue sw-2"/>
+    <text x="495" y="62" text-anchor="middle" class="t-sm t-bold">worker (one thread)</text>
+    <rect x="415" y="76" width="160" height="50" rx="8" class="box"/>
+    <text x="495" y="106" text-anchor="middle" class="t-sm">conn 1: small state</text>
+    <rect x="415" y="140" width="160" height="50" rx="8" class="box"/>
+    <g data-steps="1,3-"><text x="495" y="170" text-anchor="middle" class="t-sm">conn 2: small state</text></g>
+    <rect x="415" y="204" width="160" height="50" rx="8" class="box"/>
+    <text x="495" y="234" text-anchor="middle" class="t-sm">conn 3: small state</text>
+    <!-- right clients -->
+    <rect x="650" y="58" width="90" height="40" rx="8" class="box"/>
+    <text x="695" y="83" text-anchor="middle" class="t-sm">client 1</text>
+    <rect x="650" y="138" width="90" height="40" rx="8" class="box"/>
+    <text x="695" y="163" text-anchor="middle" class="t-sm">client 2</text>
+    <rect x="650" y="218" width="90" height="40" rx="8" class="box"/>
+    <text x="695" y="243" text-anchor="middle" class="t-sm">client 3</text>
+    <line x1="648" y1="78" x2="592" y2="78" class="line" marker-end="url(#ahSC4a)"/>
+    <line x1="648" y1="158" x2="592" y2="158" class="line" marker-end="url(#ahSC4a)"/>
+    <line x1="648" y1="238" x2="592" y2="238" class="line" marker-end="url(#ahSC4a)"/>
+
+    <!-- step 2: slow client -->
+    <g data-steps="2" data-active="2">
+      <rect x="20" y="130" width="190" height="56" rx="10" class="fs-red s-red sw-2"/>
+      <text x="115" y="154" text-anchor="middle" class="t-sm t-bold tc-red">thread 2 is stuck</text>
+      <text x="115" y="172" text-anchor="middle" class="t-xs tc-red">waiting on a slow client</text>
+      <rect x="415" y="140" width="160" height="50" rx="8" class="fs-yellow s-yellow sw-2"/>
+      <text x="495" y="162" text-anchor="middle" class="t-sm t-bold">conn 2: parked</text>
+      <text x="495" y="180" text-anchor="middle" class="t-xs">loop serves 1 and 3</text>
+    </g>
+    <!-- step 3: scale -->
+    <g data-steps="3" data-active="3">
+      <text x="190" y="300" text-anchor="middle" class="t-sm t-bold tc-red">x 1,000 = ~1 GB at ~1 MB each</text>
+      <text x="570" y="300" text-anchor="middle" class="t-sm t-bold tc-green">x 10,000 = same thread, more state</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Three clients connect.</strong> On the left each gets a dedicated process or thread, with its own stack and memory. On the right one worker holds a small per-connection record for each client and a loop decides what to do next.</li>
+    <li><strong>One client is slow.</strong> On the left, the thread assigned to client 2 sits blocked waiting for it while holding all its memory. On the right the loop has registered interest in client 2's socket with epoll or kqueue (chapter 16) and moves on. When the socket becomes ready, the worker picks up where it left off.</li>
+    <li><strong>Now scale it up.</strong> The left side costs memory and switching for every connection, including idle ones: the AOSA chapter's example is 1,000 clients at 1 MB each, about 1 GB. The right side grows by one small state record per connection. (The figures in this diagram come from the AOSA example, not a measurement.)</li>
+  </ol>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">About Apache</p>
+  <p>The AOSA chapter says Apache was built to spawn a copy of itself per connection, that its breadth of features and third-party modules cost extra CPU and memory per connection, and that Apache 2.4 added new multi-processing modules whose standing against event-driven servers it was too early to judge. This page does not describe Apache's modes in more detail than that. Modern Apache has other options, so treat the left side of the diagram as the classic design, not a verdict on any current product.</p>
+</div>
+
+<h2>Kegel's menu of strategies</h2>
+
+<p>Kegel's page organises the options along three dimensions: how I/O is issued, how client code is controlled, and where the server code runs. It then names five popular combinations:</p>
+
+<ol>
+  <li><strong>Many clients per thread, non-blocking I/O, level-triggered readiness</strong> with <code>select()</code>, <code>poll()</code>, Solaris <code>/dev/poll</code> or BSD <code>kqueue</code>: the traditional approach.</li>
+  <li><strong>The same, edge-triggered:</strong> <code>kqueue</code>, Linux 2.6's <code>epoll</code> and others. The page warns that missed events can leave connections stuck, so it is less forgiving.</li>
+  <li><strong>Asynchronous I/O with completion notification:</strong> POSIX <code>aio_</code> calls, Windows IOCP. At the time of writing, Linux AIO lacked socket support.</li>
+  <li><strong>One thread per client:</strong> simple, but each thread's stack costs memory and operating systems struggle with very many threads.</li>
+  <li><strong>Server code inside the kernel</strong> (khttpd, TUX). Kegel reports that the linux-kernel list's consensus seemed to be that the kernel should instead gain minimal hooks that help all servers.</li>
+</ol>
+
+<p>He also lists practical details that still hold up: readiness notification is only a hint, so sockets must be non-blocking; disk reads can block even on non-blocking descriptors; <code>select()</code> is capped at <code>FD_SETSIZE</code> and <code>poll()</code> slows down at a few thousand descriptors; <code>sendfile()</code> avoids copying; and operating-system limits, such as open file descriptors, must be raised.</p>
+
+<h2>How nginx applies it</h2>
+
+<p>The AOSA chapter describes nginx as having a "modular, event-driven, asynchronous, single-threaded, non-blocking architecture". Connections are handled in a run-loop inside a small number of single-threaded worker processes, using epoll, kqueue or event ports. The chapter's stated key principle is "to be as non-blocking as possible", and it names the main remaining blocking risk as insufficient disk I/O performance, mitigated by options such as <code>sendfile</code> and AIO.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="A master process starts and monitors three worker processes. All workers accept connections from a shared listening socket.">
+    <defs>
+      <marker id="ahSC4b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="270" y="14" width="220" height="56" rx="10" class="box2"/>
+    <text x="380" y="38" text-anchor="middle" class="t-sm t-bold">master (root)</text>
+    <text x="380" y="56" text-anchor="middle" class="t-xs t-muted">config, sockets, workers</text>
+
+    <rect x="40" y="130" width="200" height="60" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="140" y="154" text-anchor="middle" class="t-sm t-bold">worker 1</text>
+    <text x="140" y="172" text-anchor="middle" class="t-xs">event loop, unprivileged</text>
+    <rect x="280" y="130" width="200" height="60" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="154" text-anchor="middle" class="t-sm t-bold">worker 2</text>
+    <text x="380" y="172" text-anchor="middle" class="t-xs">event loop, unprivileged</text>
+    <rect x="520" y="130" width="200" height="60" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="620" y="154" text-anchor="middle" class="t-sm t-bold">worker 3</text>
+    <text x="620" y="172" text-anchor="middle" class="t-xs">event loop, unprivileged</text>
+
+    <line x1="330" y1="72" x2="170" y2="128" class="line-dash" marker-end="url(#ahSC4b)"/>
+    <line x1="380" y1="72" x2="380" y2="128" class="line-dash" marker-end="url(#ahSC4b)"/>
+    <line x1="430" y1="72" x2="590" y2="128" class="line-dash" marker-end="url(#ahSC4b)"/>
+    <text x="250" y="90" text-anchor="end" class="t-xs t-muted">starts and restarts</text>
+
+    <rect x="40" y="224" width="680" height="32" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="380" y="245" text-anchor="middle" class="t-sm">shared listening socket; the OS kernel spreads new connections</text>
+    <line x1="140" y1="222" x2="140" y2="192" class="line" marker-end="url(#ahSC4b)"/>
+    <line x1="380" y1="222" x2="380" y2="192" class="line" marker-end="url(#ahSC4b)"/>
+    <line x1="620" y1="222" x2="620" y2="192" class="line" marker-end="url(#ahSC4b)"/>
+  </svg>
+  <figcaption>nginx's process model as described in the AOSA chapter. Helper processes for the cache are left out.</figcaption>
+</figure>
+
+<p>Workers accept new connections from a shared listening socket. The chapter says nginx does no custom connection distribution; the OS kernel handles that. On the number of workers, the chapter advises matching the CPU core count for CPU-intensive loads (TCP/IP handling, SSL, compression), and roughly one and a half to two times the core count for loads bound by disk I/O, and says administrators should test for their workload.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "event-driven means faster per request"</p>
+  <p>Event loops do not make any one request faster. What they save is the cost of <em>holding</em> many mostly-idle connections: memory and context switches. For a handful of busy connections a thread per connection is perfectly fine. The advantage shows when there are very many connections and most are waiting.</p>
+</div>
+
+<h2>Trade-offs and lessons</h2>
+
+<div class="cols">
+  <div class="card accent-green"><h4>Lower cost per idle connection</h4><p>A small state record replaces a whole stack. This is why the design suits proxies, static files, and long-lived connections.</p></div>
+  <div class="card accent-red"><h4>Never block the loop</h4><p>One blocking call in a worker stalls all its connections. This is Kegel's note about disk reads blocking even on non-blocking descriptors, and AOSA's disk I/O concern. Chapter 17 returns to this rule for async code.</p></div>
+  <div class="card accent-orange"><h4>Harder to write</h4><p><em>General industry pattern:</em> code is split into callbacks or state machines instead of straight-line "read, work, write". The AOSA chapter describes per-connection processing as a sequence of phases and asynchronous steps until the request completes.</p></div>
+  <div class="card accent-blue"><h4>Use all the cores</h4><p>One event loop uses one core, so nginx runs several workers (about one per core for CPU-bound work). AOSA says nginx's processes primarily use shared memory to communicate, and that the cache keys and metadata live in shared memory segments the workers can access.</p></div>
+</div>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">One thread, a hundred sockets</p>
+  <p>This uses <code>socketpair()</code>, which creates connected sockets inside your own process, so no ports are opened. The <code>selectors</code> module picks the best mechanism available.</p>
+</div>
+
+<pre class="terminal" data-title="python3"><code><span class="cmd">import selectors, socket
+
+sel = selectors.DefaultSelector()
+pairs = [socket.socketpair() for _ in range(100)]
+for a, b in pairs:
+    sel.register(a, selectors.EVENT_READ)    # watch 100 "connections"
+
+pairs[42][1].send(b"hi")                     # only one becomes ready
+for key, _ in sel.select(timeout=1):
+    print("ready:", key.fileobj.recv(10))
+
+print(type(sel).__name__)   # KqueueSelector on macOS, EpollSelector on Linux</span></code></pre>
+
+<p>Now look at the limits that Kegel told you to raise, and, if nginx happens to be running on your machine, its process layout:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">ulimit -n</span>                       <span class="cmt"># max open file descriptors for this shell (often 256 on macOS, 1024 on Linux)</span>
+<span class="prompt">$ </span><span class="cmd">sysctl kern.maxfilesperproc</span>      <span class="cmt"># macOS per-process descriptor limit</span>
+<span class="prompt">$ </span><span class="cmd">cat /proc/sys/fs/file-max</span>        <span class="cmt"># Linux system-wide limit</span>
+<span class="prompt">$ </span><span class="cmd">ps aux | grep '[n]ginx'</span>          <span class="cmt"># empty if nginx isn't running; otherwise one master and several workers</span></code></pre>
+
+<p>Each socket uses a file descriptor (<a href="../chapters/08-files.html">chapter 8</a>), so the descriptor limit is a hard ceiling on how many connections one process can hold. Studio 1 asks you to work out how far you can get before the limits and memory run out.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>General industry pattern, not from these sources: the same idea shows up one level up. Load balancers and gateways that hold millions of mostly-idle client connections (networking case study 5) are event-driven for the same reason. Event-driven servers also expose a new failure mode: with a few threads handling everything, a slow dependency makes work queue up inside the process, so you need timeouts and backpressure (chapter 14) rather than relying on the thread count to limit damage.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>C10k is Dan Kegel's name for the challenge of serving ten thousand simultaneous clients. His argument was that hardware was no longer the bottleneck; the software structure was.</li>
+    <li>One process or thread per connection pays memory and switching costs for every connection, including idle and slow ones.</li>
+    <li>nginx runs a master process plus a few single-threaded, non-blocking worker processes, each handling many connections through epoll or kqueue.</li>
+    <li>The cost: never block the loop, and code becomes callbacks or state machines.</li>
+    <li>File descriptor limits and memory per connection are the practical ceilings (Studio 1).</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why does a thread-per-connection server struggle at ten thousand mostly-idle connections?</p>
+    <ol class="q-options">
+      <li>Threads are slower at reading data</li>
+      <li>The network card can only handle 1,000 sockets</li>
+      <li>Each connection holds its own stack and context, and switching among them costs CPU time even when most are waiting</li>
+      <li>Operating systems forbid more than 1,000 threads</li>
+    </ol>
+    <div class="q-explain">The AOSA chapter lists per-connection memory (heap, stack and execution context) and CPU time spent creating and switching them. Kegel's page also notes that each thread's stack consumes memory and operating systems struggle with very many threads.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">What does a worker process in nginx do?</p>
+    <ol class="q-options">
+      <li>Runs a single-threaded event loop that handles many connections using non-blocking I/O</li>
+      <li>Starts one thread per client</li>
+      <li>Reads the configuration and binds privileged sockets</li>
+      <li>Handles only static files</li>
+    </ol>
+    <div class="q-explain">Reading configuration and binding sockets is the master's job. Workers run unprivileged and do the actual connection handling, proxying and filtering.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">What is the biggest danger when writing code in an event-loop worker?</p>
+    <ol class="q-options">
+      <li>Running out of threads</li>
+      <li>Using too little memory</li>
+      <li>Having too many CPU cores</li>
+      <li>A blocking call stalls every connection that worker is handling</li>
+    </ol>
+    <div class="q-explain">One thread serves many connections, so whatever blocks it blocks them all. Both Kegel (disk reads) and the AOSA chapter (disk I/O) flag this.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">How many worker processes does the AOSA chapter suggest for a CPU-intensive nginx load?</p>
+    <ol class="q-options">
+      <li>Exactly one</li>
+      <li>About the number of CPU cores</li>
+      <li>One per client</li>
+      <li>Ten thousand</li>
+    </ol>
+    <div class="q-explain">For CPU-intensive loads (TCP/IP handling, SSL, compression) match the core count; for disk-bound loads, roughly one and a half to two times the cores. The chapter adds that administrators should test their own workload.</div>
+  </div>
+</section>
+
+<h2>Sources</h2>
+<ul class="sources">
+  <li>Dan Kegel, <a href="http://www.kegel.com/c10k.html" target="_blank" rel="noopener">"The C10K problem"</a> (copyright 1999-2018, last updated 2014).</li>
+  <li>Andrew Alexeev, <a href="https://aosabook.org/en/v2/nginx.html" target="_blank" rel="noopener">"nginx"</a>, chapter in <em>The Architecture of Open Source Applications, Volume II</em> (aosabook.org).</li>
+</ul>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

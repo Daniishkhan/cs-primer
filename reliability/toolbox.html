@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Toolbox · Reliability &amp; Operations</title>
+<meta name="description" content="Hands-on tools with ten-minute guided exercises for Reliability and Operations: Prometheus, Grafana, OpenTelemetry and Jaeger, k6, wrk2 and vegeta, kind and kubectl, stress-ng and tc netem, Toxiproxy and Chaos Mesh, and runbook templates.">
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/css/theme.css">
+<link rel="stylesheet" href="../assets/css/main.css">
+</head>
+<body data-root=".." data-course="ops" data-page="toolbox">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Toolbox</h1>
+  <p class="lede">Reliability is learned by watching systems under load and in trouble. These tools let you measure a service, trace a request, push on it at a fixed rate, break it in a controlled way, and write down what happened. Each card has install notes and a ten-minute exercise tied to a chapter, and the exercises share one tiny service so you only write it once.</p>
+</header>
+
+<div class="callout tool">
+  <p class="callout-title">How to use this page</p>
+  <p>Jump to a tool when a chapter mentions it. Commands target macOS or Linux (Windows under WSL). I checked command forms against the tools' public documentation (kind, k6, Prometheus, Jaeger, vegeta, wrk2, Toxiproxy and Chaos Mesh) and I ran the Python exporter's code paths in-process, but I did <strong>not</strong> start servers, containers or clusters while writing this page. Every output block is therefore labelled <em>illustrative</em>: the shape is right, the numbers on your machine will differ. Versions move, so if a flag has changed, trust <code>--help</code> over this page.</p>
+  <p><strong>The shared target.</strong> The first card includes <code>app.py</code>, a standard-library Python service with a <code>/checkout</code> route that sleeps for a random time and sometimes returns a 500, and a <code>/metrics</code> route in the Prometheus text format. The load, Grafana, chaos and stress cards use it as the thing under test. Save it once in a folder such as <code>~/ops-lab/</code>.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>Load generators, CPU and memory stress, network delay and fault injection are all legitimate tools and all can look like an attack or cause an outage. Run them only against processes and machines <strong>you own</strong>, on <code>127.0.0.1</code> or on your own VM. Never point them at a production system, a shared environment, a third-party service or a network you do not control without written permission and a way to stop. Every exercise below is local and ends with a cleanup step.</p>
+</div>
+
+<h2>See what the system is doing</h2>
+<p>Measurement before action: collect metrics, draw them, and follow a request across processes.</p>
+<section class="tool-card" id="prometheus">
+<h3>Prometheus &amp; PromQL</h3>
+<p class="tool-meta"><strong>Needs:</strong> Python 3.8+ for the exporter; Prometheus 2.x or 3.x · <strong>macOS:</strong> <code>brew install prometheus</code> · <strong>Linux:</strong> download the tarball for your platform from <code>prometheus.io/download</code> and unpack it (it contains <code>prometheus</code> and <code>promtool</code>) · <strong>Chapters:</strong> <a href="chapters/04-metrics.html">4</a>, <a href="chapters/07-alerting-oncall.html">7</a>, <a href="chapters/02-slos-error-budgets.html">2</a></p>
+<p>Prometheus scrapes (<em>pulls</em>) a text page of metrics from each target at an interval, stores the samples in a time-series database, and answers queries in PromQL. It is the common starting point for the metrics of <a href="chapters/04-metrics.html">chapter 4</a> and the burn-rate rules of <a href="chapters/07-alerting-oncall.html">chapter 7</a>. The exercise has three parts: a target, a scrape and the three queries you will use all the time (<code>rate</code>, a ratio of rates, and <code>histogram_quantile</code>).</p>
+<h4>10-minute guided exercise</h4>
+<p><strong>1. The target.</strong> Save this as <code>app.py</code>. It is the whole exporter: a counter, a histogram with explicit buckets and a lock around the shared state. (I ran its counting and rendering code in-process; I did not start the server, so the output below is illustrative.)</p>
+<pre class="terminal" data-title="app.py"><code>#!/usr/bin/env python3
+&quot;&quot;&quot;A tiny service that exports Prometheus metrics, using only the standard library.&quot;&quot;&quot;
+import contextlib, os, random, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+lock = threading.Lock()
+requests = {}                          # (route, code) -&gt; count
+bucket_counts = [0] * len(BUCKETS)     # per-bucket (non-cumulative) counts
+total_count, total_sum = 0, 0.0
+MEAN_MS = float(os.environ.get(&quot;SERVICE_MS&quot;, &quot;20&quot;))
+ERROR_RATE = float(os.environ.get(&quot;ERROR_RATE&quot;, &quot;0.02&quot;))
+# SERIAL=1 lets one request work at a time, so capacity is about 1000 / SERVICE_MS per second.
+WORK_LOCK = threading.Lock() if os.environ.get(&quot;SERIAL&quot;) else contextlib.nullcontext()
+
+def work():
+    &quot;&quot;&quot;Simulate one request. Returns the HTTP status code.&quot;&quot;&quot;
+    with WORK_LOCK:
+        start = time.perf_counter()
+        time.sleep(random.lognormvariate(0, 0.5) * MEAN_MS / 1000 / 1.13)  # mean is about MEAN_MS
+        code = 500 if random.random() &lt; ERROR_RATE else 200
+        elapsed = time.perf_counter() - start
+    observe(&quot;/checkout&quot;, str(code), elapsed)
+    return code
+
+def observe(route, code, seconds):
+    global total_count, total_sum
+    with lock:
+        requests[(route, code)] = requests.get((route, code), 0) + 1
+        total_count += 1
+        total_sum += seconds
+        for i, bound in enumerate(BUCKETS):
+            if seconds &lt;= bound:
+                bucket_counts[i] += 1
+                break
+
+def render():
+    lines = [&quot;# HELP app_requests_total Requests handled.&quot;,
+             &quot;# TYPE app_requests_total counter&quot;]
+    with lock:
+        for (route, code), n in sorted(requests.items()):
+            lines.append(f&#x27;app_requests_total{{route=&quot;{route}&quot;,code=&quot;{code}&quot;}} {n}&#x27;)
+        lines += [&quot;# HELP app_request_duration_seconds Request latency.&quot;,
+                  &quot;# TYPE app_request_duration_seconds histogram&quot;]
+        running = 0
+        for bound, n in zip(BUCKETS, bucket_counts):
+            running += n
+            lines.append(f&#x27;app_request_duration_seconds_bucket{{le=&quot;{bound}&quot;}} {running}&#x27;)
+        lines.append(f&#x27;app_request_duration_seconds_bucket{{le=&quot;+Inf&quot;}} {total_count}&#x27;)
+        lines.append(f&quot;app_request_duration_seconds_sum {total_sum}&quot;)
+        lines.append(f&quot;app_request_duration_seconds_count {total_count}&quot;)
+    return &quot;\n&quot;.join(lines) + &quot;\n&quot;
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == &quot;/metrics&quot;:
+            body = render().encode()
+            self.send_response(200)
+            self.send_header(&quot;Content-Type&quot;, &quot;text/plain; version=0.0.4&quot;)
+        else:
+            code = work()
+            body = b&quot;ok\n&quot;
+            self.send_response(code)
+            self.send_header(&quot;Content-Type&quot;, &quot;text/plain&quot;)
+        self.send_header(&quot;Content-Length&quot;, str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):      # keep the terminal quiet
+        pass
+
+if __name__ == &quot;__main__&quot;:
+    port = int(os.environ.get(&quot;PORT&quot;, &quot;8000&quot;))
+    print(f&quot;serving on :{port}; metrics at /metrics&quot;)
+    ThreadingHTTPServer((&quot;127.0.0.1&quot;, port), Handler).serve_forever()</code></pre>
+<p><strong>2. Run it and look at the raw metrics,</strong> the same text Prometheus will read:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 app.py</span>  <span class="cmt"># terminal 1; leave running</span>
+<span class="out">serving on :8000; metrics at /metrics</span>
+<span class="prompt">$ </span><span class="cmd">for i in $(seq 1 20); do curl -s -o /dev/null localhost:8000/checkout; done</span>
+<span class="prompt">$ </span><span class="cmd">curl -s localhost:8000/metrics | head -12</span>
+<span class="out">illustrative:  app_requests_total{route=&quot;/checkout&quot;,code=&quot;200&quot;} 19</span>
+<span class="out">illustrative:  app_request_duration_seconds_bucket{le=&quot;0.025&quot;} 14</span>
+<span class="out">illustrative:  app_request_duration_seconds_bucket{le=&quot;+Inf&quot;} 20</span></code></pre>
+<p>Notice that histogram buckets are <em>cumulative</em> (each <code>le</code> counts everything at or below it) and that the last one, <code>+Inf</code>, equals the count. That is what lets histograms from many pods be summed (chapter 4).</p>
+<p><strong>3. Configure and start Prometheus.</strong> In the same folder create <code>prometheus.yml</code> and <code>rules.yml</code>:</p>
+<pre class="terminal" data-title="prometheus.yml"><code>global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+rule_files:
+  - rules.yml
+scrape_configs:
+  - job_name: app
+    static_configs:
+      - targets: [&quot;localhost:8000&quot;]</code></pre><pre class="terminal" data-title="rules.yml  (illustrative; a single window to keep it short, real pages use two as in chapter 7)"><code>groups:
+  - name: app
+    rules:
+      - record: app:error_ratio:rate1m
+        expr: sum(rate(app_requests_total{code=&quot;500&quot;}[1m])) / sum(rate(app_requests_total[1m]))
+      - alert: AppFastBurn
+        expr: app:error_ratio:rate1m &gt; (14.4 * 0.005)
+        for: 1m
+        labels: {severity: page}
+        annotations: {summary: &quot;burning the error budget at over 14.4x&quot;}</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">promtool check config prometheus.yml</span>  <span class="cmt"># validates the file and the rule file it references</span>
+<span class="out">illustrative:  SUCCESS: prometheus.yml is valid prometheus config file syntax</span>
+<span class="prompt">$ </span><span class="cmd">prometheus --config.file=prometheus.yml</span>  <span class="cmt"># terminal 2; UI at http://localhost:9090</span>
+<span class="prompt">$ </span><span class="cmd">while true; do curl -s -o /dev/null localhost:8000/checkout; sleep 0.05; done &amp;</span>  <span class="cmt"># terminal 3: about 15 requests a second</span></code></pre>
+<p><strong>4. Query it.</strong> Open <code>http://localhost:9090</code>, go to the expression browser and run these one at a time (wait a minute for a few scrapes):</p>
+<pre class="terminal" data-title="PromQL (illustrative results)"><code><span class="out">up                                              # 1 = the scrape works; the first thing to check</span>
+<span class="out">rate(app_requests_total[1m])                     # per-second rate for each route and code</span>
+<span class="out">sum by (code) (rate(app_requests_total[1m]))     # about 14.7 for 200, about 0.3 for 500</span>
+<span class="out">sum(rate(app_requests_total{code=&quot;500&quot;}[1m])) / sum(rate(app_requests_total[1m]))   # about 0.02</span>
+<span class="out">histogram_quantile(0.99, sum by (le) (rate(app_request_duration_seconds_bucket[1m])))   # about 0.05</span>
+<span class="out">sum(rate(app_request_duration_seconds_bucket{le=&quot;0.1&quot;}[5m])) / sum(rate(app_request_duration_seconds_count[5m]))   # latency SLI: share under 100 ms</span></code></pre>
+<p>Now make the alert fire. Stop the app and restart it with a high error rate; after a minute the alert appears on the <code>/alerts</code> page:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">ERROR_RATE=0.15 python3 app.py</span>  <span class="cmt"># after Ctrl-C in terminal 1; a 15% error ratio is 30x the 0.5% budget</span>
+<span class="out">illustrative:  /alerts shows AppFastBurn pending, then firing after the 1m &#x27;for&#x27; period</span></code></pre>
+<p>Finally, clean up: <code>kill %1</code> in terminal 3 and Ctrl-C in terminals 1 and 2.</p>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>Prometheus and the exporter listen on <code>localhost</code> here. If you later run Prometheus on a server, do not expose port 9090 or the <code>/metrics</code> pages to the internet; both reveal internal structure and the UI can run arbitrary queries.</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li><strong>Sum inside, quantile outside.</strong> <code>histogram_quantile(0.99, sum by (le) (rate(..._bucket[1m])))</code> adds bucket counts across series first. Computing a quantile per series and then averaging is the mistake of chapter 4.</li>
+  <li>The p99 you read is an <em>estimate</em> that is interpolated inside a bucket. Move a bucket bound or add one (edit <code>BUCKETS</code>) and see the number shift; buckets set the accuracy.</li>
+  <li>Counters only go up; the useful number is always <code>rate()</code> of it. A restart resets a counter and <code>rate()</code> handles that.</li>
+  <li><code>up == 0</code> for a target, or a scrape taking nearly the whole interval, are signals about the monitoring itself.</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>Range selectors need at least two scrapes inside: <code>[1m]</code> with a 5 s interval is fine; <code>[5s]</code> is not.</li>
+  <li>Alert state is evaluated at <code>evaluation_interval</code>; <code>for:</code> adds delay on top.</li>
+  <li>Do not add a label with unbounded values (a user id) to the exporter to "see more": it multiplies series (studio 1).</li>
+  <li>Port 8000 or 9090 busy? Change <code>PORT</code> or <code>--web.listen-address</code>.</li>
+</ul>
+</section>
+<section class="tool-card" id="grafana">
+<h3>Grafana</h3>
+<p class="tool-meta"><strong>Needs:</strong> Docker Desktop (or Docker Engine), the Prometheus and <code>app.py</code> from the previous card still running · <strong>Run:</strong> <code>docker run -d --name grafana -p 3000:3000 grafana/grafana-oss</code> · <strong>Chapters:</strong> <a href="chapters/04-metrics.html">4</a>, <a href="chapters/02-slos-error-budgets.html">2</a></p>
+<p>Grafana draws data from sources such as Prometheus. The tool is easy; the skill is deciding what a dashboard is for. The rule from <a href="studios/studio-01-observability.html">studio 1</a>: a dashboard answers <em>one question</em>, and the title is that question, with the answer visible in the first row.</p>
+<h4>10-minute guided exercise</h4>
+<p>Build a dashboard called <strong>"Is the checkout service healthy?"</strong> with four panels, driven by the exporter and Prometheus from the previous card.</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">docker run -d --name grafana -p 3000:3000 grafana/grafana-oss</span>
+<span class="prompt">$ </span><span class="cmd">open http://localhost:3000</span>  <span class="cmt"># Linux: xdg-open; log in as admin / admin and set a new password</span></code></pre>
+<ol>
+  <li><strong>Add the data source.</strong> Connections, then Data sources, then Add data source, then Prometheus. For the URL use <code>http://host.docker.internal:9090</code> (Docker Desktop on macOS and Windows resolves this name to your machine). On Linux Docker Engine, start the container with <code>--add-host=host.docker.internal:host-gateway</code> to get the same name. Click Save &amp; test.</li>
+  <li><strong>Panel 1, the headline: the latency SLI.</strong> Query <code>sum(rate(app_request_duration_seconds_bucket{le="0.1"}[5m])) / sum(rate(app_request_duration_seconds_count[5m]))</code>. Use a Stat panel, unit "Percent (0.0-1.0)", and set thresholds: red below 0.99, green above. That is an SLO of 99% under 100 ms, made visible.</li>
+  <li><strong>Panel 2, the error ratio</strong> against the budget: the ratio query from the previous card, as a time series, with a threshold line at <code>0.005</code> (the 99.5% budget) and a second at <code>0.072</code> (the 14.4× page level of studio 1).</li>
+  <li><strong>Panel 3, latency percentiles:</strong> three queries with <code>histogram_quantile</code> at 0.5, 0.95 and 0.99, as one time series panel, unit seconds. Give each a legend such as <code>p99</code>.</li>
+  <li><strong>Panel 4, traffic:</strong> <code>sum(rate(app_requests_total[1m]))</code>, so that a drop (the quiet failure) is visible.</li>
+  <li>Give every panel a one-line description of what a bad reading means (Panel settings, Description). Save the dashboard, then restart the app with <code>ERROR_RATE=0.15</code> and <code>SERVICE_MS=120</code> and watch panels 1 to 3 change within a minute.</li>
+</ol>
+<p>Clean up with <code>docker rm -f grafana</code>. (The dashboard lives inside the container unless you mount a volume; use Share, then Export, to save the JSON if you want to keep it.)</p>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>The default <code>admin/admin</code> login is for your laptop only. If you ever run Grafana on a server, change the password at once and put it behind authentication; Grafana can query every data source you give it.</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li>Order panels by the question's flow: is it bad (SLI), how bad (error ratio), where (percentiles), how much (traffic).</li>
+  <li>Thresholds drawn on the panel turn a graph into a judgement: reading a number against a target is what the SLO is for.</li>
+  <li>Variables (region, version) at the top of a dashboard are what turns one dashboard into many, as in studio 1.</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>The data source URL is resolved <em>from inside the container</em>: <code>localhost:9090</code> there is the container itself, not your machine.</li>
+  <li>A panel that says "No data" usually has a rate window shorter than two scrapes, a wrong label value (<code>le="0.1"</code> must match the exporter's text exactly) or a time range with no samples.</li>
+  <li>More panels are not better. If you cannot say what decision a panel supports, delete it.</li>
+</ul>
+</section>
+<section class="tool-card" id="otel">
+<h3>OpenTelemetry &amp; Jaeger</h3>
+<p class="tool-meta"><strong>Needs:</strong> Docker; Python 3.9+ and <code>pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http</code> (use a virtual environment) · <strong>Jaeger all-in-one:</strong> the container below · <strong>Chapters:</strong> <a href="chapters/06-tracing.html">6</a>, <a href="chapters/05-logs-events.html">5</a></p>
+<p><a href="https://opentelemetry.io">OpenTelemetry</a> (OTel) is the vendor-neutral set of APIs, SDKs and the OTLP wire protocol for traces, metrics and logs. <a href="https://www.jaegertracing.io">Jaeger</a> stores and displays traces; its quick-start image takes OTLP directly on ports 4317 (gRPC) and 4318 (HTTP). The exercise instruments two tiny "services" and shows <a href="chapters/06-tracing.html">chapter 6</a>'s central point: context propagation joins the spans, and one dropped header splits the tree.</p>
+<h4>10-minute guided exercise</h4>
+<p><strong>1. Start Jaeger</strong> with the command from its getting-started page (the version tag moves; use the tag the page shows today):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">docker run --rm --name jaeger -p 16686:16686 -p 4317:4317 -p 4318:4318 cr.jaegertracing.io/jaegertracing/jaeger:2.22.0</span>  <span class="cmt"># UI at http://localhost:16686</span></code></pre>
+<p><strong>2. Two services in one script.</strong> A gateway on port 8001 calls an orders service on port 8002; each has its own tracer with its own <code>service.name</code>, so Jaeger shows two services. The gateway injects the W3C <code>traceparent</code> header into the outgoing call, and orders extracts it. (Illustrative: I have not run this against the SDK; the API names follow the OpenTelemetry Python documentation.)</p>
+<pre class="terminal" data-title="tracing_demo.py (illustrative)"><code>import os, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from opentelemetry import propagate, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+def make_tracer(service):
+    provider = TracerProvider(resource=Resource.create({&quot;service.name&quot;: service}))
+    exporter = OTLPSpanExporter(endpoint=&quot;http://localhost:4318/v1/traces&quot;)
+    provider.add_span_processor(BatchSpanProcessor(exporter, schedule_delay_millis=1000))
+    return provider.get_tracer(service)
+
+gateway_tracer, orders_tracer = make_tracer(&quot;gateway&quot;), make_tracer(&quot;orders&quot;)
+DROP_HEADER = os.environ.get(&quot;DROP_HEADER&quot;) == &quot;1&quot;      # simulate a hop that loses context
+
+def reply(handler):
+    handler.send_response(200); handler.send_header(&quot;Content-Length&quot;, &quot;3&quot;); handler.end_headers()
+    handler.wfile.write(b&quot;ok\n&quot;)
+
+class Orders(BaseHTTPRequestHandler):
+    def do_GET(self):
+        ctx = propagate.extract(self.headers)           # read traceparent, if present
+        with orders_tracer.start_as_current_span(&quot;GET /orders&quot;, context=ctx, kind=trace.SpanKind.SERVER):
+            with orders_tracer.start_as_current_span(&quot;db.query&quot;):
+                time.sleep(0.05)
+            time.sleep(0.01)
+        reply(self)
+    def log_message(self, *a): pass
+
+class Gateway(BaseHTTPRequestHandler):
+    def do_GET(self):
+        with gateway_tracer.start_as_current_span(&quot;GET /checkout&quot;, kind=trace.SpanKind.SERVER):
+            with gateway_tracer.start_as_current_span(&quot;call orders&quot;, kind=trace.SpanKind.CLIENT):
+                headers = {}
+                if not DROP_HEADER:
+                    propagate.inject(headers)           # writes traceparent for the current span
+                urllib.request.urlopen(urllib.request.Request(&quot;http://localhost:8002/&quot;, headers=headers)).read()
+        reply(self)
+    def log_message(self, *a): pass
+
+threading.Thread(target=ThreadingHTTPServer((&quot;127.0.0.1&quot;, 8002), Orders).serve_forever, daemon=True).start()
+print(&quot;gateway on :8001, orders on :8002&quot;)
+ThreadingHTTPServer((&quot;127.0.0.1&quot;, 8001), Gateway).serve_forever()</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -m venv .venv &amp;&amp; . .venv/bin/activate &amp;&amp; pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http</span>
+<span class="prompt">$ </span><span class="cmd">python3 tracing_demo.py</span>  <span class="cmt"># terminal 2</span>
+<span class="prompt">$ </span><span class="cmd">for i in 1 2 3 4 5; do curl -s localhost:8001/ &gt;/dev/null; done</span>
+<span class="out">illustrative:  open http://localhost:16686, choose service &#x27;gateway&#x27;, Find Traces</span>
+<span class="out">illustrative:  one trace, 5 spans, 2 services: GET /checkout &gt; call orders &gt; GET /orders &gt; db.query</span></code></pre>
+<p><strong>3. Break the chain.</strong> Stop the script and restart it with <code>DROP_HEADER=1 python3 tracing_demo.py</code>. Send five requests again. Jaeger now shows <em>two</em> traces per request, one containing the gateway spans and another containing the orders spans, with different trace ids: the tree is severed. This is how a single legacy client or an async hop that forgets the context makes tracing look broken. Compare the span timings in the working version: the waterfall shows <code>db.query</code> (50 ms) dominating the critical path.</p>
+<p>Clean up with Ctrl-C and <code>docker stop jaeger</code> (the <code>--rm</code> flag removes it; traces are stored in memory and are lost).</p>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>The Jaeger quick-start has no authentication and keeps traces in memory. Use it on your laptop only; traces can contain request details and identifiers (<a href="chapters/05-logs-events.html">chapter 5</a>: PII), so never send real customer data to an exposed collector.</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li>The span tree and the <code>traceparent</code> value are the same thing seen two ways: version-traceid-parentid-flags. The trace id stays the same across hops; the parent id changes at each.</li>
+  <li>Add <code>span.set_attribute("order.id", "o-123")</code> in the orders handler and search for it in Jaeger's tags box. That is the link to the wide event of chapter 5.</li>
+  <li>Sampling is configured in the SDK (the default records everything). Production policy belongs in the collector, as chapter 6 argues.</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>Import paths and package names change between releases; check the OpenTelemetry Python docs if an import fails.</li>
+  <li>Spans are exported in batches; wait a second or two before looking. If nothing shows, check that port 4318 is mapped and the endpoint path ends in <code>/v1/traces</code>.</li>
+  <li>Do not call <code>inject</code> outside the client span, or the downstream parent will be the wrong span.</li>
+</ul>
+</section>
+
+<h2>Push on it</h2>
+<p>Load tools tell you how a service behaves at a rate; the cluster and resource tools show how the platform reacts to change and to scarcity.</p>
+<section class="tool-card" id="loadgen">
+<h3>k6, wrk2 &amp; vegeta</h3>
+<p class="tool-meta"><strong>k6:</strong> <code>brew install k6</code> or the packages on <code>grafana.com/docs/k6</code> · <strong>vegeta:</strong> <code>brew install vegeta</code> (or <code>go install github.com/tsenart/vegeta@latest</code>) · <strong>wrk2:</strong> build from source from <code>github.com/giltene/wrk2</code> with <code>make</code> (needs a C toolchain; the binary is called <code>wrk</code>) · <strong>Chapters:</strong> <a href="chapters/10-load-testing-capacity.html">10</a>, <a href="chapters/08-queueing-theory.html">8</a>, <a href="chapters/09-tail-latency.html">9</a></p>
+<p>All three can send requests at a <strong>fixed arrival rate</strong> (an open model) and measure latency from when a request was <em>supposed</em> to be sent, which is what avoids the coordinated omission of <a href="chapters/10-load-testing-capacity.html">chapter 10</a>. Pick one; the exercise is the same. The target is <code>app.py</code> from the Prometheus card, run in its capacity-limited mode.</p>
+<h4>10-minute guided exercise</h4>
+<p><strong>Setup.</strong> Start the app so that only one request is worked on at a time and each takes about 20 ms. Its capacity is then about 1 / 0.02 = <strong>50 requests per second</strong>:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">SERIAL=1 SERVICE_MS=20 python3 app.py</span>  <span class="cmt"># terminal 1</span></code></pre>
+<p><strong>Run 1: below capacity, at 30 per second.</strong> Choose one tool:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">echo &#x27;GET http://localhost:8000/checkout&#x27; | vegeta attack -rate=30/s -duration=20s | vegeta report</span>  <span class="cmt"># vegeta</span>
+<span class="prompt">$ </span><span class="cmd">wrk -t2 -c10 -d20s -R30 --latency http://localhost:8000/checkout</span>  <span class="cmt"># wrk2 (rate in total requests per second)</span>
+<span class="prompt">$ </span><span class="cmd">k6 run script.js</span>  <span class="cmt"># k6; script below</span>
+<span class="out">illustrative:  Latencies [min, mean, 50, 90, 95, 99, max]  21ms, 28ms, 25ms, 38ms, 46ms, 71ms, 110ms</span></code></pre>
+<p>For k6, save this as <code>script.js</code>. It uses the <code>constant-arrival-rate</code> executor (options as in the k6 documentation) and no <code>sleep()</code>, because the executor paces the iterations. Change <code>rate</code> between runs.</p>
+<pre class="terminal" data-title="script.js"><code>import http from &#x27;k6/http&#x27;;
+
+export const options = {
+  discardResponseBodies: true,
+  scenarios: {
+    steady: {
+      executor: &#x27;constant-arrival-rate&#x27;,
+      rate: 30,            // iterations started per timeUnit
+      timeUnit: &#x27;1s&#x27;,
+      duration: &#x27;20s&#x27;,
+      preAllocatedVUs: 20,
+      maxVUs: 200,
+    },
+  },
+};
+
+export default function () {
+  http.get(&#x27;http://localhost:8000/checkout&#x27;);
+}</code></pre>
+<p><strong>Run 2: above capacity, at 80 per second.</strong> Repeat with <code>-rate=80/s</code> (vegeta), <code>-R80</code> (wrk2) or <code>rate: 80</code> (k6):</p>
+<pre class="terminal" data-title="terminal"><code><span class="out">illustrative:  Latencies  ... 50th 3.1s, 90th 7.4s, 99th 8.9s, max 9.2s</span>
+<span class="out">illustrative:  k6: http_req_duration p(95)=8.1s ... dropped_iterations: 140 (all VUs busy)</span>
+<span class="prompt">$ </span><span class="cmd">curl -s localhost:8000/metrics | grep -E &#x27;le=&quot;(0.05|0.1|2.5)&quot;|_count&#x27;</span>  <span class="cmt"># the app&#x27;s own view</span>
+<span class="out">illustrative:  server-side buckets still show most requests under 50 ms</span></code></pre>
+<p>This is the lesson in one picture. At 80 per second against a capacity of 50 the queue grows without bound: the client-side latency keeps growing for as long as the test runs (the later requests wait longest), while the server's own histogram, which starts its clock only when work begins, still says "about 20 ms". <em>Server-side metrics do not see queueing before the handler.</em> Measure at the edge, as <a href="chapters/02-slos-error-budgets.html">chapter 2</a> says. Now do the same with a closed-loop client for contrast:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">for i in $(seq 1 200); do curl -s -o /dev/null -w &#x27;%{time_total}\n&#x27; localhost:8000/checkout; done | sort -n | tail -3</span>
+<span class="out">illustrative:  0.041  0.047  0.052     (one request at a time never queues, so it sees about 20 ms)</span></code></pre>
+<p>A loop that waits for each reply can never overload the server, so it reports a flattering p99. That is the closed-loop lie (chapter 10). Clean up with Ctrl-C.</p>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>A load generator is a denial-of-service tool pointed in a direction. Aim it only at your own service on <code>localhost</code> or on a machine you own. Check that a staging environment is yours before you load it, and never run it against production or a third party's API (the PSP in the studio is exactly the kind of dependency you must not test without an agreement). Set a duration so it always stops.</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li><strong>Open versus closed.</strong> At a rate above capacity the open tools show latency growing without limit; a fixed number of virtual users would settle at a high latency and throughput equal to capacity, and say nothing about the drops.</li>
+  <li><strong>Is the generator keeping up?</strong> In k6, <code>dropped_iterations</code> above zero means it ran out of VUs; in vegeta, the report shows achieved rate; in wrk2, look for the requests/sec line close to <code>-R</code>.</li>
+  <li>Latency percentiles beyond p99 need many samples: 20 seconds at 30 per second is 600 requests, too few to trust a p99.9.</li>
+  <li>wrk2 and vegeta print the latency distribution; k6 also reports metrics such as <code>http_req_duration</code> by percentile and can fail a run with <code>thresholds</code>.</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>wrk2's first ten seconds are calibration; use runs longer than 20 seconds.</li>
+  <li>Generating the load on the same machine as the server steals CPU from it. At small rates this is fine; at large rates it is not.</li>
+  <li>Python's <code>sleep</code> has a floor of about a millisecond, so very small <code>SERVICE_MS</code> values will not behave as written.</li>
+  <li>The macOS default limit on open files (<code>ulimit -n</code>) can cap connections at high concurrency.</li>
+</ul>
+</section>
+<section class="tool-card" id="kubectl">
+<h3>kind &amp; kubectl</h3>
+<p class="tool-meta"><strong>Needs:</strong> Docker (running), <code>kubectl</code> · <strong>kind (macOS):</strong> <code>brew install kind</code> (community package), or download the release binary for <code>darwin-arm64</code>/<code>darwin-amd64</code> from <code>kind.sigs.k8s.io</code>, <code>chmod +x</code> and move it into your <code>PATH</code> · <strong>kubectl:</strong> <code>brew install kubectl</code> · <strong>Chapters:</strong> <a href="chapters/14-orchestration.html">14</a>, <a href="chapters/12-deployments.html">12</a></p>
+<p>kind ("Kubernetes in Docker") runs a whole cluster as containers on your laptop, which is enough for deployments, probes, rollouts and failure of pods. The exercise shows the declarative loop of <a href="chapters/14-orchestration.html">chapter 14</a> and why a readiness probe is the only thing standing between a bad rollout and an outage (<a href="chapters/12-deployments.html">chapter 12</a>).</p>
+<h4>10-minute guided exercise</h4>
+<p><strong>1. Create the cluster and a deployment.</strong> Save the manifest as <code>web.yaml</code>: three nginx pods with a readiness probe, and a rolling update that never removes a ready pod before a new one is ready (<code>maxUnavailable: 0</code>). (The manifest is standard; I could not validate it against a cluster here.)</p>
+<pre class="terminal" data-title="web.yaml (illustrative)"><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: web}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27
+        ports: [{containerPort: 80}]
+        readinessProbe:
+          httpGet: {path: /, port: 80}
+          periodSeconds: 3
+        resources:
+          requests: {cpu: 50m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: {app: web}
+  ports: [{port: 80, targetPort: 80}]</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">kind create cluster --name ops</span>  <span class="cmt"># creates a one-node cluster; takes a minute</span>
+<span class="prompt">$ </span><span class="cmd">kubectl cluster-info --context kind-ops</span>  <span class="cmt"># contexts are named kind-&lt;cluster name&gt;</span>
+<span class="prompt">$ </span><span class="cmd">kubectl apply -f web.yaml</span>
+<span class="prompt">$ </span><span class="cmd">kubectl rollout status deployment/web</span>
+<span class="out">illustrative:  deployment &quot;web&quot; successfully rolled out</span>
+<span class="prompt">$ </span><span class="cmd">kubectl get pods -l app=web</span>
+<span class="out">illustrative:  web-6c9d8f7b5-4kq2z   1/1   Running   0   40s   (three of them)</span></code></pre>
+<p><strong>2. Watch reconciliation.</strong> Delete a pod and see the controller replace it, since actual state no longer matches the desired state of three:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">kubectl delete $(kubectl get pod -l app=web -o name | head -1)</span>  <span class="cmt"># delete one pod</span>
+<span class="prompt">$ </span><span class="cmd">kubectl get pods -l app=web -w</span>  <span class="cmt"># Ctrl-C when three are Ready again</span>
+<span class="out">illustrative:  a new pod appears as ContainerCreating, then Running, within seconds</span></code></pre>
+<p><strong>3. A good rollout.</strong> Change the image and watch the surge and replace sequence:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">kubectl set image deployment/web nginx=nginx:1.27-alpine</span>
+<span class="prompt">$ </span><span class="cmd">kubectl rollout status deployment/web</span>
+<span class="out">illustrative:  Waiting for deployment &quot;web&quot; rollout to finish: 1 out of 3 new replicas have been updated...</span>
+<span class="out">illustrative:  deployment &quot;web&quot; successfully rolled out</span></code></pre>
+<p><strong>4. A broken readiness probe.</strong> Point the probe at a path that does not exist, simulating a release that fails its health check:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">kubectl patch deployment web --type=json -p=&#x27;[{&quot;op&quot;:&quot;replace&quot;,&quot;path&quot;:&quot;/spec/template/spec/containers/0/readinessProbe/httpGet/path&quot;,&quot;value&quot;:&quot;/nope&quot;}]&#x27;</span>
+<span class="prompt">$ </span><span class="cmd">kubectl rollout status deployment/web --timeout=45s</span>
+<span class="out">illustrative:  Waiting for deployment &quot;web&quot; rollout to finish: 1 out of 3 new replicas have been updated...</span>
+<span class="out">illustrative:  error: timed out waiting for the condition</span>
+<span class="prompt">$ </span><span class="cmd">kubectl get pods -l app=web</span>
+<span class="out">illustrative:  3 old pods  1/1 Running;  1 new pod  0/1 Running (never Ready)</span>
+<span class="prompt">$ </span><span class="cmd">kubectl describe pod -l app=web | grep -A2 &#x27;Readiness probe failed&#x27;</span>
+<span class="out">illustrative:  Readiness probe failed: HTTP probe failed with statuscode: 404</span>
+<span class="prompt">$ </span><span class="cmd">kubectl rollout undo deployment/web</span>  <span class="cmt"># roll back to the previous revision</span>
+<span class="prompt">$ </span><span class="cmd">kubectl rollout status deployment/web</span>
+<span class="out">illustrative:  deployment &quot;web&quot; successfully rolled out</span></code></pre>
+<p>The three old pods kept serving the whole time: the readiness gate stopped the rollout, which is the safe failure and the reason chapter 12 insists a rolling update is only as safe as its probe. Try again with the probe path <code>/</code> but removed entirely (delete the <code>readinessProbe</code> block) and a bad image command: the rollout "succeeds" because nothing checks. Also try <code>kubectl rollout pause deployment/web</code> mid-rollout, the manual version of halting a wave. Clean up:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">kind delete cluster --name ops</span>
+<span class="out">illustrative:  Deleting cluster &quot;ops&quot; ...</span></code></pre>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>kind is a local cluster. Check <code>kubectl config current-context</code> before running any command that changes things: a context left pointing at a shared or production cluster is one of the classic ways to break something that is not yours. Prefer a separate kubeconfig for practice (<code>KUBECONFIG=~/.kube/ops-lab kind create cluster --name ops</code>).</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li><code>kubectl get pods -w</code> and <code>kubectl get events --sort-by=.lastTimestamp</code> show what the controllers are doing. Read them as the system's explanation of its own decisions.</li>
+  <li><code>rollout history</code> and <code>rollout undo</code> exist only because the Deployment keeps old ReplicaSets; the history length is a setting.</li>
+  <li>A pod that is Running but not Ready receives no Service traffic; that is the whole meaning of readiness (chapter 14).</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>kind nodes are containers, so images must be pullable from inside them; local images go in with <code>kind load docker-image NAME:TAG --name ops</code>, and the <code>:latest</code> tag defaults to always pulling.</li>
+  <li>Docker Desktop must have enough memory (a few GB) or pods stay Pending.</li>
+  <li>kind runs Kubernetes on one container-based node; it shows control-loop behaviour, not real multi-node scheduling, zone loss or load-balancer limits.</li>
+</ul>
+</section>
+<section class="tool-card" id="stress">
+<h3>stress-ng &amp; tc netem</h3>
+<p class="tool-meta"><strong>Needs:</strong> a Linux machine you own (a local VM or a small cloud server), root access · <strong>Ubuntu/Debian:</strong> <code>sudo apt install stress-ng iproute2 curl</code> · <strong>Chapters:</strong> <a href="chapters/11-overload.html">11</a>, <a href="chapters/19-chaos-gamedays.html">19</a>, <a href="chapters/09-tail-latency.html">9</a></p>
+<p><code>stress-ng</code> consumes CPU, memory, I/O and more in controlled amounts. <code>tc</code> with the <code>netem</code> queueing discipline adds delay, jitter, loss or reordering to a network interface. Together they let you ask the question of <a href="chapters/19-chaos-gamedays.html">chapter 19</a> on a small scale: what does my service do when the machine around it is starved? These are Linux tools; on macOS use a VM.</p>
+<h4>10-minute guided exercise</h4>
+<p>Run <code>app.py</code> and a fixed-rate load (the previous card) on the VM, and watch the latency as you apply each fault, one at a time.</p>
+<pre class="terminal" data-title="terminal (Linux VM)"><code><span class="prompt">$ </span><span class="cmd">python3 app.py</span>  <span class="cmt"># terminal 1</span>
+<span class="prompt">$ </span><span class="cmd">echo &#x27;GET http://localhost:8000/checkout&#x27; | vegeta attack -rate=40/s -duration=3m | vegeta report -every=10s</span>  <span class="cmt"># terminal 2: a fixed rate with a report every 10 seconds</span>
+<span class="out">illustrative:  baseline: 99th about 55ms, success 98%</span>
+<span class="prompt">$ </span><span class="cmd">stress-ng --cpu $(nproc) --timeout 60s --metrics-brief</span>  <span class="cmt"># terminal 3: every core busy for a minute</span>
+<span class="out">illustrative:  during stress: 99th about 400ms, mean about 90ms; the service did not change, its CPU share did</span>
+<span class="prompt">$ </span><span class="cmd">stress-ng --vm 1 --vm-bytes 75% --timeout 30s</span>  <span class="cmt"># memory pressure: 75% of RAM touched repeatedly; may trigger swapping or the OOM killer, so keep it short on a small VM</span></code></pre>
+<p>CPU starvation shows as a latency tail, not as errors, until a timeout is crossed: this is "saturation" in the USE method (<a href="chapters/04-metrics.html">chapter 4</a>) and the queueing knee of <a href="chapters/08-queueing-theory.html">chapter 8</a>. Now the network. Apply delay to the <strong>loopback</strong> interface so that your SSH session over the real interface is not affected, and always set a timer to remove it:</p>
+<pre class="terminal" data-title="terminal (Linux VM)"><code><span class="prompt">$ </span><span class="cmd">sudo tc qdisc add dev lo root netem delay 100ms 20ms; sleep 60; sudo tc qdisc del dev lo root</span>  <span class="cmt"># adds 100 ms plus or minus 20 ms to every packet on lo, then removes it after a minute</span>
+<span class="out">illustrative:  latency of each request rises by roughly 200 ms (delay applies to the request and to the reply)</span>
+<span class="prompt">$ </span><span class="cmd">tc qdisc show dev lo</span>  <span class="cmt"># shows &#x27;netem&#x27; while the fault is active; back to &#x27;noqueue&#x27; afterwards</span>
+<span class="prompt">$ </span><span class="cmd">sudo tc qdisc add dev lo root netem loss 5%; sleep 30; sudo tc qdisc del dev lo root</span>  <span class="cmt"># 5% packet loss for 30 seconds</span>
+<span class="out">illustrative:  some requests take 1 s or more: TCP retransmits after a timeout</span></code></pre>
+<p>Compare what you see with a retry-less client and with one that has a timeout and a retry. Packet loss often looks like latency (retransmission) rather than failure. Clean-up check: <code>tc qdisc show dev lo</code> must not list <code>netem</code>, and <code>pgrep stress-ng</code> must print nothing.</p>
+<div class="callout vm">
+  <p class="callout-title">On a Linux VM</p>
+  <p>The point of a VM here is safety: if stress-ng takes the machine down, you reboot a throwaway. Use a VM with at least 2 vCPUs and a few GB of memory. See the <a href="../lab-machine.html">lab machine page</a> for a local Linux VM or a small rented server (set a billing alert first, and delete it when you are done).</p>
+</div>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>Never run <code>tc netem</code> on the interface that carries your SSH session without a timer that removes it in the same command, or you can lock yourself out. Never run stress tools on a shared or production host, and never on a cloud account whose acceptable-use policy you have not read.</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li>Resource faults degrade the <em>tail</em> first: p99 moves long before the mean or the error rate does.</li>
+  <li><code>netem</code> delay is added per packet in one direction; a request-response pair on the same interface pays it twice.</li>
+  <li>Write down the steady state, then the hypothesis, then inject, as in chapter 19. The commands are the easy part.</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>Applying netem to <code>eth0</code> instead of <code>lo</code> slows your own login. Always pair add with a delayed delete.</li>
+  <li><code>stress-ng --vm-bytes 75%</code> can invoke the OOM killer on a small VM and kill your service instead of just slowing it, which is itself a finding.</li>
+  <li>Containers share the host kernel; faults on <code>lo</code> inside a container's own network namespace do not affect other containers.</li>
+  <li>A cloud VM may be throttled by burst credits, which can mimic a stress result. Note the instance type.</li>
+</ul>
+</section>
+
+<h2>Break it on purpose</h2>
+<p>Fault injection with a blast radius you chose, followed by the written word you need when something breaks for real.</p>
+<section class="tool-card" id="chaos">
+<h3>Chaos tools: Toxiproxy &amp; Chaos Mesh</h3>
+<p class="tool-meta"><strong>Toxiproxy (macOS):</strong> <code>brew tap shopify/shopify &amp;&amp; brew install toxiproxy</code> · <strong>Linux:</strong> a release package or build from source (<code>github.com/Shopify/toxiproxy</code>) · <strong>Chaos Mesh:</strong> needs a Kubernetes cluster (the kind cluster of the previous card) and Helm · <strong>Chapters:</strong> <a href="chapters/19-chaos-gamedays.html">19</a></p>
+<p><strong>Toxiproxy</strong> is a TCP proxy that sits between a client and a dependency and applies "toxics" (latency, a closed connection, a bandwidth limit, a timeout) on demand through an HTTP API on port 8474. It is the simplest way to rehearse a slow dependency such as the payment provider in the studios. <strong>Chaos Mesh</strong> is a Kubernetes-native tool that injects faults (pod kills, pod failure, network delay, stress, I/O faults) described as custom resources, with selectors that limit the blast radius and durations that end the fault by themselves. Both implement <a href="chapters/19-chaos-gamedays.html">chapter 19</a>'s experiment: a steady state, a hypothesis, a fault, an abort condition.</p>
+<h4>10-minute guided exercise</h4>
+<p><strong>A. Toxiproxy against the app.</strong> Put a proxy in front of <code>app.py</code> and slow it down without touching the app. Hypothesis: "with 500 ms of added latency, a client with a 300 ms timeout fails, and one with a 2 s timeout succeeds but slowly." Abort condition: you press Ctrl-C.</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 app.py</span>  <span class="cmt"># terminal 1: the dependency on :8000</span>
+<span class="prompt">$ </span><span class="cmd">toxiproxy-server</span>  <span class="cmt"># terminal 2: the control API on :8474</span>
+<span class="prompt">$ </span><span class="cmd">toxiproxy-cli create -l localhost:8001 -u localhost:8000 web</span>  <span class="cmt"># terminal 3: clients now talk to :8001</span>
+<span class="out">illustrative:  Created new proxy web</span>
+<span class="prompt">$ </span><span class="cmd">curl -s -o /dev/null -w &#x27;%{time_total}\n&#x27; localhost:8001/checkout</span>
+<span class="out">illustrative:  0.022     (steady state: about 20 ms through the proxy)</span>
+<span class="prompt">$ </span><span class="cmd">toxiproxy-cli toxic add -t latency -a latency=500 -a jitter=100 web</span>
+<span class="out">illustrative:  Added downstream latency toxic &#x27;latency_downstream&#x27; on proxy &#x27;web&#x27;</span>
+<span class="prompt">$ </span><span class="cmd">curl -s -m 0.3 -o /dev/null -w &#x27;%{http_code} %{time_total}\n&#x27; localhost:8001/checkout</span>  <span class="cmt"># a client with a 300 ms timeout</span>
+<span class="out">illustrative:  000 0.300     (timed out: the hypothesis holds)</span>
+<span class="prompt">$ </span><span class="cmd">curl -s -m 2 -o /dev/null -w &#x27;%{http_code} %{time_total}\n&#x27; localhost:8001/checkout</span>
+<span class="out">illustrative:  200 0.55</span>
+<span class="prompt">$ </span><span class="cmd">toxiproxy-cli toxic remove -n latency_downstream web</span>  <span class="cmt"># the fault is removed; confirm the steady state returns</span>
+<span class="prompt">$ </span><span class="cmd">toxiproxy-cli toxic add -t timeout -a timeout=0 web</span>  <span class="cmt"># a connection that accepts bytes and never answers; try with and without a client timeout</span>
+<span class="prompt">$ </span><span class="cmd">toxiproxy-cli toxic remove -n timeout_downstream web</span>
+<span class="prompt">$ </span><span class="cmd">toxiproxy-cli list</span></code></pre>
+<p>Now point the Prometheus scrape or a load generator at port 8001, and watch what a slow dependency does to your own latency histogram, to the queue of in-flight requests and to the retry count if you add one. The takeaway is always the same: a missing timeout turns a slow dependency into your outage.</p>
+<p><strong>B. Chaos Mesh on kind (about ten minutes of install and run).</strong> The commands follow the Chaos Mesh docs; the container-runtime values for kind are the part to confirm on the install page for your version, so treat them as illustrative:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">kind create cluster --name chaos &amp;&amp; kubectl apply -f web.yaml</span>  <span class="cmt"># the three-pod web deployment from the kind card</span>
+<span class="prompt">$ </span><span class="cmd">helm repo add chaos-mesh https://charts.chaos-mesh.org</span>
+<span class="prompt">$ </span><span class="cmd">kubectl create ns chaos-mesh</span>
+<span class="prompt">$ </span><span class="cmd">helm install chaos-mesh chaos-mesh/chaos-mesh -n chaos-mesh --set chaosDaemon.runtime=containerd --set chaosDaemon.socketPath=/run/containerd/containerd.sock</span>  <span class="cmt"># kind uses containerd; confirm the values on the docs page</span>
+<span class="prompt">$ </span><span class="cmd">kubectl get pods -n chaos-mesh -l app.kubernetes.io/instance=chaos-mesh</span>  <span class="cmt"># wait until controller-manager, daemon and dashboard are Running</span></code></pre><pre class="terminal" data-title="podkill.yaml (from the Chaos Mesh PodChaos examples; adjust the namespace)"><code>apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kill-one-web-pod
+  namespace: default
+spec:
+  action: pod-kill
+  mode: one                 # one randomly chosen pod from the selection
+  selector:
+    namespaces: [default]
+    labelSelectors:
+      app: web</code></pre><pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">kubectl get pods -l app=web -w</span>  <span class="cmt"># terminal 1</span>
+<span class="prompt">$ </span><span class="cmd">kubectl apply -f podkill.yaml</span>  <span class="cmt"># terminal 2</span>
+<span class="out">illustrative:  one web pod goes Terminating and the Deployment starts a replacement within seconds</span>
+<span class="prompt">$ </span><span class="cmd">kubectl delete -f podkill.yaml</span>
+<span class="prompt">$ </span><span class="cmd">kind delete cluster --name chaos</span></code></pre>
+<p>Hypothesis for the Kubernetes version: "killing one of three pods causes no failed requests through the Service." Test it by running a fixed-rate client (the load card, with <code>kubectl port-forward svc/web 8080:80</code>) while you apply the chaos. If errors appear, you have found a gap such as a missing readiness probe, too few replicas or no graceful shutdown.</p>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>Fault injection belongs to systems you own and to a blast radius you have chosen. Use label selectors and namespaces so a Chaos Mesh experiment can only touch what you meant it to, give every experiment a duration where the fault type supports one, and keep a manual stop (<code>kubectl delete -f</code>) ready. Do not run these in a shared cluster without the owners' agreement, and never first in production.</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li>The Toxiproxy exercise is just a hypothesis written as a test. Writing down the expected behaviour <em>before</em> injecting is what makes it an experiment (chapter 19).</li>
+  <li>A <code>timeout</code> toxic with no client timeout hangs the client. This is the most common real finding.</li>
+  <li>Chaos Mesh separates the <em>what</em> (action), the <em>who</em> (selector and mode) and the <em>how long</em> (duration), which is exactly the checklist of blast radius, abort and expiry.</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>Toxiproxy proxies TCP only; it does not inspect HTTP. Apps must be pointed at the proxy's port.</li>
+  <li>Toxiproxy toxics default to the downstream direction (server to client); use <code>--upstream</code> style options (see <code>toxiproxy-cli toxic add --help</code>) to affect the other direction.</li>
+  <li>Chaos Mesh needs the right container runtime settings, or the daemon cannot reach containers. A failure to inject network faults on kind is usually this.</li>
+  <li>A passing experiment proves one fault was survived one time. Keep experiments and re-run them after changes.</li>
+</ul>
+</section>
+<section class="tool-card" id="runbook">
+<h3>Runbooks &amp; incident templates</h3>
+<p class="tool-meta"><strong>Needs:</strong> a text editor and a place the whole team can find the results (a repository folder or wiki) · <strong>Chapters:</strong> <a href="chapters/16-incident-response.html">16</a>, <a href="chapters/17-postmortems.html">17</a>, <a href="chapters/07-alerting-oncall.html">7</a></p>
+<p>The cheapest reliability tools are plain text. These templates are starting points to copy, edit and keep under version control. They are generic (not any company's), and each is a shape to be fitted to your system and your team. The principle behind all four: <em>they lead with the action, not the history.</em></p>
+<h4>10-minute guided exercise</h4>
+<p><strong>Exercise (ten minutes).</strong> Take the alert from the Prometheus card, <code>AppFastBurn</code>. Copy the runbook template below into a file, and fill it in for that alert, using only what you know from your own exporter. Then give it to a friend and ask them to follow it without your help. Every question they ask is a missing line. Then copy the incident-channel opener and the status update, and write the first one for a pretend incident about your toy service. Finish by writing the postmortem summary and contributing factors for the toy outage you caused with <code>ERROR_RATE=0.15</code>.</p>
+<p><strong>1. Runbook for one alert</strong> (<a href="chapters/07-alerting-oncall.html">chapter 7</a>):</p>
+<pre class="terminal" data-title="runbook-template.md"><code># ALERT NAME: &lt;AppFastBurn&gt;
+Owner: &lt;team / rota&gt;        Last reviewed: &lt;date&gt;        Severity: &lt;page | ticket&gt;
+
+## What it means (one sentence, in user terms)
+&lt;Customers are failing to complete orders at a rate that would use up the monthly budget in about 2 days.&gt;
+
+## Check first (2 minutes)
+1. Dashboard: &lt;link&gt;. Is the problem real (error ratio and traffic both visible)?
+2. Scope: one region? one version? one dependency? (use the dashboard variables)
+3. What changed in the last hour? &lt;deploys link&gt;  &lt;flags link&gt;  &lt;config link&gt;
+
+## Mitigate (in this order; stop when impact ends)
+1. Recent deploy and errors started at the same time -&gt; roll back: &lt;command or link&gt;
+2. One region or zone bad -&gt; drain it: &lt;command or link&gt;
+3. Dependency failing (&lt;PSP&gt;) -&gt; enable fallback flag: &lt;flag name&gt; / &lt;link&gt;
+4. Overloaded -&gt; shed non-essential load: &lt;flag name&gt;, then add capacity: &lt;command&gt;
+5. None of these -&gt; declare an incident (see incident channel template) and page &lt;secondary&gt;
+
+## Diagnose (only after impact is reduced)
+&lt;Query / log search / trace search links; known causes and how they look.&gt;
+
+## Save evidence before changing things
+Screenshot dashboard, copy 5 failing trace ids, note the time and deploy versions.
+
+## Escalate
+Secondary: &lt;rota&gt;   Service owner: &lt;rota&gt;   Vendor contact (PSP): &lt;contact&gt;   Manager: &lt;contact&gt;
+
+## Known false positives / history
+&lt;Date, what happened, link to postmortem.&gt;</code></pre>
+<p><strong>2. Incident-channel opener and status update</strong> (<a href="chapters/16-incident-response.html">chapter 16</a>):</p>
+<pre class="terminal" data-title="incident-channel-template.txt"><code>CHANNEL NAME: #inc-&lt;date&gt;-&lt;short-description&gt;
+PINNED MESSAGE (copy, fill in, pin):
+
+INCIDENT: &lt;one-line description in user terms&gt;
+Declared: &lt;time&gt;   Severity: &lt;1|2|3&gt;   (provisional; reassess at each update)
+Incident commander (IC): &lt;name&gt;     Ops lead: &lt;name&gt;     Comms lead: &lt;name&gt;     Scribe: &lt;name&gt;
+Dashboard: &lt;link&gt;     Status page: &lt;link&gt;     Runbook: &lt;link&gt;     Notes doc: &lt;link&gt;
+Rules: IC decides. Ops lead and others act and report briefly. Discuss ideas, but no changes
+to production without saying so in this channel first. Keep chatter to the side thread.
+Next status update due: &lt;time&gt;  (every 30 minutes)
+
+STATUS UPDATE (external or internal; plain language, no blame, no guesses):
+&lt;time&gt; UPDATE - &lt;service&gt;
+Impact: &lt;who is affected, how, since when&gt;
+What we are doing: &lt;actions in progress&gt;
+Next update: &lt;time&gt;, or sooner if anything changes.
+
+HANDOFF (when the IC changes):
+State now / what happened (one line) / mitigations in place and how to undo each /
+in flight (owner) / decisions pending / roles / clocks (what is due when) / watch-outs.
+Say in the channel: &quot;&lt;name&gt; is now IC.&quot; and wait for acknowledgement.
+
+END OF INCIDENT:
+Criteria met: impact gone for &lt;30 min&gt; at normal load; mitigations undone or owned; harm repaired;
+evidence saved. Resolution notice sent. Postmortem owner: &lt;name&gt;, review date: &lt;date&gt;.</code></pre>
+<p><strong>3. Postmortem skeleton</strong> (<a href="chapters/17-postmortems.html">chapter 17</a>; a filled-in fictional example is at the end of <a href="studios/studio-03-incident.html">studio 3</a>):</p>
+<pre class="terminal" data-title="postmortem-template.md"><code># &lt;Title: what happened, where, when&gt;
+Status: &lt;draft | reviewed | final&gt;    Owner: &lt;name&gt;    Review meeting: &lt;date&gt;
+(Blameless: describe what people knew and why their actions made sense. No &quot;should have&quot;.)
+
+## Summary (3 sentences: what happened, how long, how it ended)
+
+## Impact
+Who was affected, how many, for how long. Error-budget used: &lt;x% of the 30-day budget&gt;. Money / data effects.
+
+## Timeline (facts from logs, chat, deploy tools; times in one timezone)
+&lt;time&gt;  &lt;event&gt;  (source)
+
+## Contributing factors (several; no single &quot;root cause&quot;)
+1. &lt;Condition that made the failure possible, and why it was normal at the time.&gt;
+2. ...
+
+## Detection and response
+How we found out; time to detect; time to mitigate; what slowed us down.
+
+## What went well
+
+## Where we got lucky
+
+## Action items (each: type detect/mitigate/prevent, owner role, due date, tracking link)
+P1  &lt;action&gt;  &lt;owner&gt;  &lt;due&gt;  &lt;link&gt;
+
+## Open questions for the review
+
+## Appendix: graphs, queries, links</code></pre>
+<p>Keep templates and filled-in examples in the repository next to the code, review runbooks whenever the alert changes and after every incident that used one, and delete any template section nobody fills in.</p>
+<div class="callout warn">
+  <p class="callout-title">Only on your own machines</p>
+  <p>Incident records often hold customer details, internal hostnames and security-relevant facts. Keep them in your own team's private space, redact personal data, and do not paste real incident text into public tools. Everything on this page is generic or fictional.</p>
+</div>
+
+<p><strong>What to look for</strong></p>
+<ul>
+  <li>A good runbook step is a command or a link, not an explanation. Move the explanation to a "background" section.</li>
+  <li>The status update template forces the three things readers want: impact, action, next update time.</li>
+  <li>The postmortem template has "where we got lucky" because luck is a hidden defence that did not exist by design (chapter 17).</li>
+</ul>
+<p><strong>Common pitfalls</strong></p>
+<ul>
+  <li>Runbooks rot. An owner and a review date are the minimum, and the alert should link to the runbook directly.</li>
+  <li>Writing the postmortem as a list of who did what, in blameful language, ends the inquiry; ask "how did the system let this happen?".</li>
+  <li>Action items without an owner and a date are wishes. Track them like any other work.</li>
+</ul>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../assets/js/catalog.js"></script>
+<script src="../assets/js/main.js"></script>
+</body>
+</html>

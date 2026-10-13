@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reliable Delivery over UDP · Networking from Zero</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="net" data-lab="L2">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 2: Reliable Delivery over UDP</h1>
+  <p class="lede">UDP sends your datagram and forgets it. TCP promises that every byte arrives, once, in order. In this lab you'll build that promise yourself: packet numbers, acknowledgements, timeouts, and finally a sliding window, all on top of plain UDP, across a "network" that loses, duplicates and reorders packets on purpose. About 150 lines of Python, standard library only.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>In chapter 8 you read that TCP "numbers the bytes, acknowledges what it got, and resends on a timer". Reading is one thing; watching your own sender stall for a full round trip after every single packet, and then watching a window make the same transfer several times faster, is what makes the design click. The same ideas (acknowledge, time out, retry, de-duplicate) reappear at every level of a distributed system, from message queues to payment APIs.</p>
+</div>
+
+<h2>What you'll build</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="A sender and a receiver connected through a lossy channel that drops, delays, duplicates and reorders datagrams; DATA goes right and ACKs come back left">
+    <defs>
+      <marker id="ahL2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="50" width="170" height="150" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="105" y="80" text-anchor="middle" class="t-bold tc-purple">Sender</text>
+    <text x="105" y="108" text-anchor="middle" class="t-sm">numbers each chunk</text>
+    <text x="105" y="128" text-anchor="middle" class="t-sm">keeps a timer</text>
+    <text x="105" y="148" text-anchor="middle" class="t-sm">resends if no ACK</text>
+    <text x="105" y="180" text-anchor="middle" class="t-xs t-muted mono">gbn_send()</text>
+    <rect x="570" y="50" width="170" height="150" rx="12" class="fs-green s-green sw-2"/>
+    <text x="655" y="80" text-anchor="middle" class="t-bold tc-green">Receiver</text>
+    <text x="655" y="108" text-anchor="middle" class="t-sm">checks the checksum</text>
+    <text x="655" y="128" text-anchor="middle" class="t-sm">delivers in order</text>
+    <text x="655" y="148" text-anchor="middle" class="t-sm">drops duplicates</text>
+    <text x="655" y="180" text-anchor="middle" class="t-xs t-muted mono">receive()</text>
+    <rect x="260" y="50" width="240" height="150" rx="12" class="fs-orange s-orange sw-2"/>
+    <text x="380" y="78" text-anchor="middle" class="t-bold tc-orange">LossyChannel</text>
+    <text x="380" y="108" text-anchor="middle" class="t-sm">drops 10% of datagrams</text>
+    <text x="380" y="128" text-anchor="middle" class="t-sm">delays (the RTT you choose)</text>
+    <text x="380" y="148" text-anchor="middle" class="t-sm">duplicates, reorders, corrupts</text>
+    <text x="380" y="180" text-anchor="middle" class="t-xs t-muted">seeded: same dice every run</text>
+    <g class="line">
+      <line x1="190" y1="95" x2="258" y2="95" marker-end="url(#ahL2a)"/>
+      <line x1="500" y1="95" x2="568" y2="95" marker-end="url(#ahL2a)"/>
+      <line x1="568" y1="165" x2="502" y2="165" marker-end="url(#ahL2a)"/>
+      <line x1="258" y1="165" x2="192" y2="165" marker-end="url(#ahL2a)"/>
+    </g>
+    <text x="224" y="86" text-anchor="middle" class="t-xs t-faint">DATA</text>
+    <text x="534" y="86" text-anchor="middle" class="t-xs t-faint">DATA</text>
+    <text x="534" y="186" text-anchor="middle" class="t-xs t-faint">ACK</text>
+    <text x="224" y="186" text-anchor="middle" class="t-xs t-faint">ACK</text>
+    <text x="380" y="232" text-anchor="middle" class="t-sm t-muted">all on 127.0.0.1: real UDP sockets, an artificially bad network</text>
+  </svg>
+  <figcaption><strong>The test rig.</strong> Both directions go through a <code>LossyChannel</code>, so data <em>and</em> acknowledgements can be lost, and your code has to cope with both.</figcaption>
+</figure>
+
+<p>Five milestones, each building on the last:</p>
+<ol class="steps">
+  <li><strong>A packet format:</strong> pack a type, a sequence number and a checksum in front of the payload with <code>struct</code>, and discard anything damaged.</li>
+  <li><strong>Stop-and-wait:</strong> send one packet, wait for its ACK, resend on timeout. The receiver delivers in order and ignores duplicates.</li>
+  <li><strong>Measure it:</strong> see that stop-and-wait delivers one packet per round trip, no matter how fast the link is.</li>
+  <li><strong>A sliding window:</strong> Go-Back-N with cumulative ACKs and a single timer. Same lossy channel, several times faster.</li>
+  <li><strong>Adaptive timeout (optional):</strong> measure the RTT and set the timer the way real TCP does (RFC 6298).</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>You need Python 3.8 or newer (<code>python3 --version</code>). The lab's files are in <code>networking/labs/code/lab02/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab02/starter.py"><code>starter.py</code></a></td><td>Your file. <code>LossyChannel</code> and the experiment helpers are fully written; the functions you implement have docstrings with step-by-step hints.</td></tr>
+    <tr><td><a href="code/lab02/check.py"><code>check.py</code></a></td><td>The self-check. It runs real transfers through the lossy channel and tells you which milestones pass. A full run takes roughly 15 seconds.</td></tr>
+    <tr><td><a href="code/lab02/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you've had a real go at each milestone.</td></tr>
+  </tbody>
+</table></div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd networking/labs/code/lab02</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 2 checks against starter.py
+
+  … Milestone 1: packet format and checksum: not implemented yet (TODO milestone 1: make_packet)
+  … Milestone 2: stop-and-wait over a lossy channel: not implemented yet (TODO milestone 2: receive)
+  … Milestone 3: throughput vs RTT, bandwidth-delay product: not implemented yet (TODO milestone 3: measure_throughput)
+  … Milestone 4: sliding window (Go-Back-N) beats stop-and-wait: not implemented yet (TODO milestone 2: receive)
+  … Milestone 5 (optional): adaptive timeout from measured RTT: not implemented yet (TODO milestone 5: RttEstimator.update)
+
+0/5 milestones passing</span></code></pre>
+
+<h3>Meet the lossy channel</h3>
+
+<p>Loopback never drops anything, so we need to fake a bad network. <code>LossyChannel</code> in <code>starter.py</code> wraps a UDP socket and has the same <code>sendto</code> / <code>recvfrom</code> / <code>settimeout</code> methods you used in lab 1. Every datagram you <em>send</em> through it rolls some dice first:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Setting</th><th>What it does</th><th>Real-world cause</th></tr></thead>
+  <tbody>
+    <tr><td><code>loss</code></td><td>silently drop the datagram</td><td>a router's queue overflowed</td></tr>
+    <tr><td><code>delay</code>, <code>jitter</code></td><td>deliver after a fixed delay plus a random extra</td><td>distance and queues; <code>delay</code> is half the RTT</td></tr>
+    <tr><td><code>dup</code></td><td>deliver the datagram twice</td><td>a link-layer retry whose first copy actually arrived</td></tr>
+    <tr><td><code>reorder</code></td><td>hold it back so later datagrams overtake it</td><td>two paths with different delays</td></tr>
+    <tr><td><code>corrupt</code></td><td>flip the bits of one byte</td><td>noise on a link (rare; the checksum is the defence)</td></tr>
+    <tr><td><code>seed</code></td><td>seeds the random generator</td><td>not a network property: it makes a run <strong>reproducible</strong></td></tr>
+  </tbody>
+</table></div>
+
+<p>Because the dice are seeded, "10% loss" means the same datagrams are lost on every run, so a bug you find can be found again. (Exactly <em>when</em> your timers fire still depends on your computer's timing, so the retransmission counts can wobble a little.) The helper <code>run_transfer(send_fn, recv_fn, data, rtt=..., loss=..., ...)</code> wires a sender and a receiver together through two channels and returns <code>(received_bytes, packets_sent, seconds)</code>.</p>
+
+<div class="callout note">
+  <p class="callout-title">Conventions used in this lab</p>
+  <ul>
+    <li>A file is cut into <code>CHUNK = 1000</code>-byte pieces. Each piece travels in one <strong>DATA</strong> packet. A final <strong>empty</strong> DATA packet means "end of file".</li>
+    <li>Sequence numbers count <em>packets</em> (0, 1, 2, ...), not bytes as in real TCP. It keeps the arithmetic readable.</li>
+    <li>An <strong>ACK</strong> carries the <em>next</em> sequence number the receiver wants, just like TCP's acknowledgement number. <code>ACK 5</code> means "I have 0 to 4, send me 5".</li>
+  </ul>
+</div>
+
+<h2>Milestone 1: a packet format with a checksum</h2>
+
+<p>UDP hands you raw datagrams: bytes in, bytes out. To build reliability you first need your own <span class="term">header</span> (chapter 3): a few bytes in front of the payload saying what kind of packet this is and which one. Ours is nine bytes:</p>
+
+<div class="fields" style="margin-bottom:4px">
+  <div class="field" style="--w:1">type<small>1 byte</small></div>
+  <div class="field" style="--w:4">sequence number<small>4 bytes</small></div>
+  <div class="field" style="--w:4">CRC-32 checksum<small>4 bytes</small></div>
+  <div class="field" style="--w:8;background:var(--blue-soft)">payload<small>0 to 1000 bytes</small></div>
+</div>
+
+<p>Python's <code>struct</code> module turns numbers into bytes and back. The format string <code>"!BII"</code> says: <code>!</code> network byte order (big-endian: most significant byte first, the order used on the wire by IP, UDP and TCP headers), <code>B</code> one unsigned byte, <code>I</code> a four-byte unsigned integer. <code>struct.Struct("!BII")</code> is already in the starter as <code>HEADER</code>. Here is a real packet with type DATA (1), sequence 7 and payload <code>"hi"</code>:</p>
+
+<pre class="terminal" data-title="python"><code><span class="prompt">&gt;&gt;&gt; </span><span class="cmd">make_packet(DATA, 7, b"hi").hex(" ")</span>
+<span class="out"><span class="hl">01</span> <span class="hl2">00 00 00 07</span> a7 1e fa 1c 68 69</span></code></pre>
+
+<p>Read it left to right: <code>01</code> is the type, <code>00 00 00 07</code> is the sequence number 7 in four bytes, <code>a7 1e fa 1c</code> is the checksum, and <code>68 69</code> is "hi" in ASCII.</p>
+
+<h3>Why a checksum?</h3>
+
+<p>A <span class="term">checksum</span> is a short fingerprint of the data. The sender computes it and puts it in the header; the receiver recomputes it from what actually arrived. If the two differ, something changed on the way, and the receiver throws the packet away <em>as if it had been lost</em>. The retransmission machinery you're about to build then repairs it, so one mechanism handles both loss and damage. Real UDP and TCP both carry a checksum (chapter 7), a simple 16-bit sum; we use <code>zlib.crc32</code>, a stronger 32-bit cyclic redundancy check built into Python (the same family of checks Ethernet uses for its frame check sequence).</p>
+
+<div class="callout warn">
+  <p class="callout-title">A checksum catches accidents, not attackers</p>
+  <p>Anyone who can alter a packet can also recompute the CRC. A checksum detects random damage only. Protecting against a deliberate attacker takes cryptography (chapter 11). And even for accidents, nothing is perfect: a 32-bit checksum lets roughly 1 in 4 billion random corruptions slip through.</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>make_packet(ptype, seq, payload)</code> and <code>parse_packet(raw)</code> in <code>starter.py</code>. The checksum must cover the type, the sequence number <em>and</em> the payload. <code>parse_packet</code> returns <code>(ptype, seq, payload)</code>, or <code>None</code> for anything too short, of unknown type, or failing the checksum. It must never raise on garbage.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows ✔ for milestone 1. The check flips one bit in <em>every</em> byte of a packet in turn and requires that each damaged copy is rejected.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>The checksum can't include itself. Compute it over <code>struct.pack("!BI", ptype, seq) + payload</code>, then pack the header with the result.</li>
+      <li><code>zlib.crc32(...)</code> returns an unsigned 32-bit integer in Python 3, which fits <code>I</code> exactly.</li>
+      <li>In <code>parse_packet</code>, test the length <em>before</em> unpacking: <code>HEADER.unpack</code> raises <code>struct.error</code> if it gets fewer than 9 bytes.</li>
+      <li>Flipping the type byte must also be caught. Either the type is unknown, or the checksum no longer matches, and you already handle both.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> make_packet(ptype, seq, payload=<span class="str">b""</span>):
+    <span class="cmt"># The checksum covers the type, the sequence number AND the payload, so a</span>
+    <span class="cmt"># flipped bit anywhere (except in the checksum itself, which then fails to</span>
+    <span class="cmt"># match) is caught.</span>
+    covered = struct.pack(<span class="str">"!BI"</span>, ptype, seq) + payload
+    <span class="kw">return</span> HEADER.pack(ptype, seq, zlib.crc32(covered)) + payload
+
+<span class="kw">def</span> parse_packet(raw):
+    <span class="kw">if</span> len(raw) &lt; HEADER_LEN:
+        <span class="kw">return</span> <span class="kw">None</span>
+    ptype, seq, checksum = HEADER.unpack(raw[:HEADER_LEN])
+    payload = raw[HEADER_LEN:]
+    <span class="kw">if</span> ptype <span class="kw">not</span> <span class="kw">in</span> (DATA, ACK):
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">if</span> zlib.crc32(struct.pack(<span class="str">"!BI"</span>, ptype, seq) + payload) != checksum:
+        <span class="kw">return</span> <span class="kw">None</span>                           <span class="cmt"># corrupted in transit: discard</span>
+    <span class="kw">return</span> ptype, seq, payload</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: stop-and-wait</h2>
+
+<p>The simplest reliable protocol is the one you'd invent yourself (chapter 8, "Step 3"): send a packet, wait for the receiver to say "got it", and if you hear nothing, send it again.</p>
+
+<div class="cols">
+  <div class="card accent-purple"><h4>Sender, per packet</h4><p>Send <code>DATA seq</code>. Wait up to <code>timeout</code> for an <code>ACK</code> that says "I want <code>seq + 1</code> next". If the time runs out, send the same packet again. Only then move on.</p></div>
+  <div class="card accent-green"><h4>Receiver, per packet</h4><p>Check the checksum. If the sequence number is the one it expects, deliver the payload and expect the next. Whatever came in, reply <code>ACK expected</code>.</p></div>
+</div>
+
+<p>Notice how little the receiver has to do. Its entire policy is one sentence: <em>"always tell the sender what I'm waiting for"</em>. A duplicate of an old packet just gets the same answer again, and a packet from the future (not possible yet, but it will be in milestone 4) also gets the same answer. Let's follow three situations:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 400" role="img" aria-label="Three stop-and-wait scenarios: a normal exchange, a lost DATA packet that is resent after a timeout, and a lost ACK that makes the receiver see a duplicate">
+    <defs>
+      <marker id="ahL2b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="150" y="22" text-anchor="middle" class="t-bold tc-purple">Sender</text>
+    <text x="540" y="22" text-anchor="middle" class="t-bold tc-green">Receiver</text>
+    <line x1="150" y1="32" x2="150" y2="392" class="line-thin"/>
+    <line x1="540" y1="32" x2="540" y2="392" class="line-thin"/>
+    <line x1="8" y1="118" x2="740" y2="118" class="line-dash"/>
+    <line x1="8" y1="262" x2="740" y2="262" class="line-dash"/>
+
+    <text x="8" y="56" class="t-sm t-bold">1. Normal</text>
+    <g class="line">
+      <line x1="152" y1="52" x2="538" y2="66" marker-end="url(#ahL2b)"/>
+      <line x1="538" y1="80" x2="152" y2="94" marker-end="url(#ahL2b)"/>
+    </g>
+    <text x="345" y="54" text-anchor="middle" class="t-xs mono">DATA 0</text>
+    <text x="345" y="82" text-anchor="middle" class="t-xs mono">ACK 1</text>
+    <text x="560" y="72" class="t-xs t-muted">deliver chunk 0</text>
+    <text x="140" y="108" text-anchor="end" class="t-xs tc-green">next!</text>
+
+    <text x="8" y="140" class="t-sm t-bold">2. DATA lost</text>
+    <g class="line">
+      <line x1="152" y1="136" x2="330" y2="143" marker-end="url(#ahL2b)"/>
+      <line x1="152" y1="196" x2="538" y2="210" marker-end="url(#ahL2b)"/>
+      <line x1="538" y1="224" x2="152" y2="238" marker-end="url(#ahL2b)"/>
+    </g>
+    <text x="341" y="156" class="t-sm tc-red t-bold">✕</text>
+    <text x="240" y="130" text-anchor="middle" class="t-xs mono">DATA 1</text>
+    <text x="140" y="178" text-anchor="end" class="t-xs tc-orange">timeout!</text>
+    <path d="M144,148 L144,190" class="line-dash"/>
+    <text x="345" y="198" text-anchor="middle" class="t-xs mono">DATA 1 (again)</text>
+    <text x="345" y="226" text-anchor="middle" class="t-xs mono">ACK 2</text>
+    <text x="560" y="216" class="t-xs t-muted">deliver chunk 1</text>
+
+    <text x="8" y="284" class="t-sm t-bold">3. ACK lost</text>
+    <g class="line">
+      <line x1="152" y1="280" x2="538" y2="294" marker-end="url(#ahL2b)"/>
+      <line x1="538" y1="308" x2="360" y2="314" marker-end="url(#ahL2b)"/>
+      <line x1="152" y1="344" x2="538" y2="358" marker-end="url(#ahL2b)"/>
+      <line x1="538" y1="372" x2="152" y2="386" marker-end="url(#ahL2b)"/>
+    </g>
+    <text x="345" y="278" text-anchor="middle" class="t-xs mono">DATA 2</text>
+    <text x="560" y="300" class="t-xs t-muted">deliver chunk 2</text>
+    <text x="452" y="302" text-anchor="middle" class="t-xs mono">ACK 3</text>
+    <text x="351" y="326" class="t-sm tc-red t-bold">✕</text>
+    <text x="140" y="332" text-anchor="end" class="t-xs tc-orange">timeout!</text>
+    <text x="345" y="342" text-anchor="middle" class="t-xs mono">DATA 2 (again)</text>
+    <text x="560" y="364" class="t-xs tc-red t-bold">duplicate!</text>
+    <text x="560" y="380" class="t-xs t-muted">don't deliver; re-ACK</text>
+    <text x="345" y="374" text-anchor="middle" class="t-xs mono">ACK 3</text>
+  </svg>
+  <figcaption><strong>Three stop-and-wait rounds.</strong> In case 3 the data <em>did</em> arrive; only its ACK was lost. The sender cannot tell the difference between cases 2 and 3, so it resends in both, and the receiver has to recognise the second copy as a duplicate.</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: registered mail with a signature card</p>
+  <p>You post a numbered letter and wait for the signed receipt card. No card after a week? You post a copy. If the first letter had arrived and only the card went astray, the recipient now holds two identical letters numbered "7". A sensible recipient notices the number, files only one, and sends another card. <em>Where it breaks down:</em> the post office never delivers letters out of order or twice by itself, and a network can.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">A timeout is a guess, not a fact</p>
+  <p>When the timer fires you don't <em>know</em> the packet was lost. It might be slow, or only the ACK might have been lost (case 3 above). Resending is always safe here <em>because</em> the receiver de-duplicates by sequence number. Hold on to this thought: it is the foundation of retries and idempotency in chapter 16.</p>
+</div>
+
+<h3>Two traps to avoid</h3>
+<ul>
+  <li><strong>Stale ACKs.</strong> A duplicated or delayed ACK from an earlier packet can arrive while you're waiting for a newer one. Accept only an ACK number that proves your <em>current</em> packet got through (<code>&gt;= seq + 1</code>), and keep waiting for the rest of the timeout when you see a useless one rather than resending immediately.</li>
+  <li><strong>The last ACK.</strong> When the receiver sees the end-of-file packet it is done, but its final ACK might be lost, and then the sender would retransmit into the void forever. So the receiver <span class="term">lingers</span> for a short while after finishing, still re-ACKing. TCP's <code>TIME_WAIT</code> state (chapter 8) serves a similar purpose: after closing, it stays around a while in case the peer's last packet needs another answer.</li>
+</ul>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>stop_and_wait_send(chan, dest, data, timeout, chunk, max_tries)</code> and <code>receive(chan, linger, idle_timeout)</code>. The sender returns the number of DATA packets it transmitted (including retransmissions); the receiver returns the file's bytes.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows ✔ for milestone 2. It first sends 30,000 bytes over a clean link and requires exactly 31 packets (30 chunks plus the end marker), then repeats the transfer with 10% loss, 10% duplication, 10% reordering and 3% corruption and requires the file to arrive byte for byte identical.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Wait with a <em>deadline</em>: <code>deadline = time.monotonic() + timeout</code>, then in a loop <code>chan.settimeout(deadline - time.monotonic())</code> before each <code>recvfrom</code>. <code>socket.timeout</code> means "time's up, resend".</li>
+      <li>A Python <code>for ... else</code> is handy for "try up to <code>max_tries</code> times, and if every try fails, raise": the <code>else</code> block runs only if the loop never hit <code>break</code>.</li>
+      <li>The receiver replies to the <code>addr</code> that <code>recvfrom</code> returned. It never needs to be told the sender's address in advance.</li>
+      <li>After the end-of-file packet, set the socket timeout to <code>linger</code> instead of <code>idle_timeout</code>, and treat <code>socket.timeout</code> there as "all done, return the data".</li>
+      <li>Don't add an empty payload to your delivered pieces: that's the end marker, not data.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> stop_and_wait_send(chan, dest, data, timeout=<span class="num">0.05</span>, chunk=CHUNK, max_tries=<span class="num">40</span>):
+    <span class="cmt"># The last packet has an empty payload: that is our "end of file" marker.</span>
+    pieces = split_chunks(data, chunk) + [<span class="str">b""</span>]
+    sent = <span class="num">0</span>
+    <span class="kw">for</span> seq, payload <span class="kw">in</span> enumerate(pieces):
+        packet = make_packet(DATA, seq, payload)
+        <span class="kw">for</span> _ <span class="kw">in</span> range(max_tries):
+            chan.sendto(packet, dest)
+            sent += <span class="num">1</span>
+            <span class="kw">if</span> _wait_for_ack(chan, seq + <span class="num">1</span>, timeout):
+                <span class="kw">break</span>                         <span class="cmt"># acknowledged: next packet</span>
+        <span class="kw">else</span>:
+            <span class="kw">raise</span> ConnectionError(<span class="str">f"no ACK for packet {seq} after {max_tries} tries"</span>)
+    <span class="kw">return</span> sent
+
+<span class="kw">def</span> _wait_for_ack(chan, want, timeout):
+    deadline = time.monotonic() + timeout
+    <span class="kw">while</span> <span class="kw">True</span>:
+        remaining = deadline - time.monotonic()
+        <span class="kw">if</span> remaining &lt;= <span class="num">0</span>:
+            <span class="kw">return</span> <span class="kw">False</span>
+        chan.settimeout(remaining)
+        <span class="kw">try</span>:
+            raw, _ = chan.recvfrom()
+        <span class="kw">except</span> socket.timeout:
+            <span class="kw">return</span> <span class="kw">False</span>
+        pkt = parse_packet(raw)
+        <span class="kw">if</span> pkt <span class="kw">and</span> pkt[<span class="num">0</span>] == ACK <span class="kw">and</span> pkt[<span class="num">1</span>] &gt;= want:
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="cmt"># corrupted, wrong type, or an old duplicate ACK: ignore, keep waiting</span>
+
+<span class="kw">def</span> receive(chan, linger=<span class="num">0.3</span>, idle_timeout=<span class="num">5.0</span>):
+    expected = <span class="num">0</span>
+    pieces = []
+    finished = <span class="kw">False</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        <span class="cmt"># After the end-of-file packet we "linger": the final ACK may have been</span>
+        <span class="cmt"># lost, and the sender will keep retrying until it hears one.</span>
+        chan.settimeout(linger <span class="kw">if</span> finished <span class="kw">else</span> idle_timeout)
+        <span class="kw">try</span>:
+            raw, addr = chan.recvfrom()
+        <span class="kw">except</span> socket.timeout:
+            <span class="kw">if</span> finished:
+                <span class="kw">return</span> <span class="str">b""</span>.join(pieces)
+            <span class="kw">raise</span> TimeoutError(<span class="str">"sender went quiet"</span>)
+        pkt = parse_packet(raw)
+        <span class="kw">if</span> pkt <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> pkt[<span class="num">0</span>] != DATA:
+            <span class="kw">continue</span>
+        _, seq, payload = pkt
+        <span class="kw">if</span> seq == expected:                   <span class="cmt"># the one we were waiting for</span>
+            expected += <span class="num">1</span>
+            <span class="kw">if</span> payload:
+                pieces.append(payload)
+            <span class="kw">else</span>:
+                finished = <span class="kw">True</span>               <span class="cmt"># empty payload = end of file</span>
+        <span class="cmt"># seq &lt; expected: a duplicate. seq &gt; expected: out of order. Either</span>
+        <span class="cmt"># way we don't deliver it; we just repeat what we're waiting for.</span>
+        chan.sendto(make_packet(ACK, expected), addr)</code></pre>
+  </details>
+</div>
+
+<p>Try it by hand once it works. <code>python3 solution.py demo</code> (or <code>starter.py</code> once you've finished milestone 4) transfers a 200 KB file through the full bad network and prints how long it took. Edit the numbers at the top of <code>main()</code> and watch what happens as loss increases: stop-and-wait degrades gracefully but never gets fast.</p>
+
+<h2>Milestone 3: why stop-and-wait is slow</h2>
+
+<p>Your protocol is correct. Now measure it. After sending a packet, the sender does nothing at all until the ACK returns, which takes one full <span class="term">round-trip time</span> (RTT, chapter 13). So at most one packet is delivered per RTT, and:</p>
+
+<p style="text-align:center"><code>throughput ≈ packet size ÷ RTT</code></p>
+
+<p>With our 1000-byte chunks and a 20 ms RTT, that's 1000 ÷ 0.020 = 50,000 bytes per second, however fast the link underneath is. Double the RTT and you halve the throughput. The link's <em>bandwidth</em> doesn't appear in the formula at all.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 200" role="img" aria-label="Two timelines over the same time span: stop-and-wait transmits one short burst per round trip and idles in between; a sliding window keeps the pipe full">
+    <text x="20" y="62" class="t-bold t-sm">stop-and-wait</text><text x="20" y="80" class="t-xs t-muted">1 packet per RTT</text>
+<rect x="150" y="44" width="116" height="40" rx="4" class="box2"/>
+<rect x="152" y="48" width="12" height="32" rx="2" class="fs-blue s-blue"/>
+<text x="216" y="68" text-anchor="middle" class="t-xs t-faint">idle, waiting</text>
+<rect x="268" y="44" width="116" height="40" rx="4" class="box2"/>
+<rect x="270" y="48" width="12" height="32" rx="2" class="fs-blue s-blue"/>
+<text x="334" y="68" text-anchor="middle" class="t-xs t-faint">idle, waiting</text>
+<rect x="386" y="44" width="116" height="40" rx="4" class="box2"/>
+<rect x="388" y="48" width="12" height="32" rx="2" class="fs-blue s-blue"/>
+<text x="452" y="68" text-anchor="middle" class="t-xs t-faint">idle, waiting</text>
+<rect x="504" y="44" width="116" height="40" rx="4" class="box2"/>
+<rect x="506" y="48" width="12" height="32" rx="2" class="fs-blue s-blue"/>
+<text x="570" y="68" text-anchor="middle" class="t-xs t-faint">idle, waiting</text>
+<rect x="622" y="44" width="116" height="40" rx="4" class="box2"/>
+<rect x="624" y="48" width="12" height="32" rx="2" class="fs-blue s-blue"/>
+<text x="688" y="68" text-anchor="middle" class="t-xs t-faint">idle, waiting</text>
+<text x="20" y="152" class="t-bold t-sm">sliding window</text><text x="20" y="170" class="t-xs t-muted">many in flight</text>
+<rect x="150" y="134" width="590" height="40" rx="4" class="box2"/>
+<rect x="154.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="179.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="205.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="230.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="256.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="281.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="307.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="332.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="358.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="383.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="409.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="434.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="460.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="485.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="511.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="536.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="562.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="587.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="613.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="638.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="664.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="689.5" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<rect x="715.0" y="138" width="21" height="32" rx="2" class="fs-blue s-blue"/>
+<line x1="150" y1="104" x2="740" y2="104" class="line-thin"/>
+<text x="150" y="118" class="t-xs t-faint">time</text><text x="740" y="118" text-anchor="end" class="t-xs t-faint">same 5 round trips of time</text>
+  </svg>
+  <figcaption><strong>The idle pipe.</strong> Stop-and-wait uses a sliver of each round trip and sits idle for the rest. A window of unacknowledged packets keeps data flowing the whole time.</figcaption>
+</figure>
+
+<p>Real numbers make it vivid. Take a 1 Gbit/s link with a 50 ms RTT (roughly a cross-continent path) and 1500-byte packets: stop-and-wait delivers 1500 × 8 ÷ 0.05 = 240,000 bits per second, about <strong>0.024%</strong> of the link. The rest is silence.</p>
+
+<h3>How much should be in flight?</h3>
+
+<p>Chapter 13 gave the <span class="term">bandwidth-delay product</span>: <code>bandwidth × RTT</code> is how much data fits "in the pipe" at once, and therefore how much you must send before the first ACK returns if you want to keep the pipe full. A 100 Mbit/s link with a 50 ms RTT holds 100,000,000 ÷ 8 × 0.05 = 625,000 bytes. With 1000-byte packets, that's a window of about 625 packets. Chapter 8's rule, <em>throughput ≈ window ÷ RTT</em>, is the same fact seen from the other side: to go faster, raise the window.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement three small functions: <code>measure_throughput(send_fn, rtt)</code> (payload bytes per second for a clean 30 KB transfer), <code>bandwidth_delay_product(bits_per_second, rtt)</code> (in <em>bytes</em>) and <code>window_for_full_pipe(bits_per_second, rtt, packet_bytes)</code> (rounded up).</p>
+  <p class="checkpoint">milestone 3 shows ✔. The check measures RTTs of 20 ms and 40 ms and requires roughly one chunk per RTT at each, and about half the throughput at the second. Then run <code>python3 starter.py measure</code> and look at the table: the measured column should hug the ceiling column.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>run_transfer</code> already times the sender for you and returns <code>(received, packets_sent, seconds)</code>.</li>
+      <li>Bandwidth is in <strong>bits</strong> per second; the product should come out in <strong>bytes</strong>, so divide by 8.</li>
+      <li>Check yourself with chapter 13's example: 100 Mbit/s × 50 ms = 625,000 bytes.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> measure_throughput(send_fn, rtt, nbytes=<span class="num">30_000</span>):
+    data = make_test_data(nbytes)
+    <span class="cmt"># The timeout must comfortably exceed the RTT, or we would resend needlessly.</span>
+    received, _, seconds = run_transfer(send_fn, receive, data, rtt=rtt, timeout=<span class="num">3</span> * rtt)
+    <span class="kw">assert</span> received == data, <span class="str">"transfer was not intact"</span>
+    <span class="kw">return</span> nbytes / seconds
+
+<span class="kw">def</span> bandwidth_delay_product(bits_per_second, rtt):
+    <span class="kw">return</span> bits_per_second * rtt / <span class="num">8</span>
+
+<span class="kw">def</span> window_for_full_pipe(bits_per_second, rtt, packet_bytes=CHUNK):
+    <span class="kw">return</span> math.ceil(bandwidth_delay_product(bits_per_second, rtt) / packet_bytes)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: a sliding window (Go-Back-N)</h2>
+
+<p>The fix (chapter 8, "Step 5") is to keep many packets in flight. The sender may have up to <code>window</code> unacknowledged packets outstanding. Every ACK that arrives <em>slides the window forward</em>, freeing room for new packets. <span class="term">Go-Back-N</span> (GBN) is the simplest such protocol. The sender keeps two numbers:</p>
+
+<ul>
+  <li><code>base</code>: the oldest packet not yet acknowledged.</li>
+  <li><code>next_seq</code>: the next packet it has never sent.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 220" role="img" aria-label="A row of 14 numbered packets: 0 to 3 acknowledged, 4 to 7 sent but unacknowledged, 8 to 11 inside the window and free to send, 12 and 13 outside the window; base points at 4 and next_seq at 8">
+    <defs>
+      <marker id="ahL2c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="44" y="90" width="44" height="40" rx="6" class="fs-green s-green"/>
+<text x="66.0" y="115" text-anchor="middle" class="mono t-sm">0</text>
+<rect x="92" y="90" width="44" height="40" rx="6" class="fs-green s-green"/>
+<text x="114.0" y="115" text-anchor="middle" class="mono t-sm">1</text>
+<rect x="140" y="90" width="44" height="40" rx="6" class="fs-green s-green"/>
+<text x="162.0" y="115" text-anchor="middle" class="mono t-sm">2</text>
+<rect x="188" y="90" width="44" height="40" rx="6" class="fs-green s-green"/>
+<text x="210.0" y="115" text-anchor="middle" class="mono t-sm">3</text>
+<rect x="236" y="90" width="44" height="40" rx="6" class="fs-blue s-blue"/>
+<text x="258.0" y="115" text-anchor="middle" class="mono t-sm">4</text>
+<rect x="284" y="90" width="44" height="40" rx="6" class="fs-blue s-blue"/>
+<text x="306.0" y="115" text-anchor="middle" class="mono t-sm">5</text>
+<rect x="332" y="90" width="44" height="40" rx="6" class="fs-blue s-blue"/>
+<text x="354.0" y="115" text-anchor="middle" class="mono t-sm">6</text>
+<rect x="380" y="90" width="44" height="40" rx="6" class="fs-blue s-blue"/>
+<text x="402.0" y="115" text-anchor="middle" class="mono t-sm">7</text>
+<rect x="428" y="90" width="44" height="40" rx="6" class="fs-yellow s-yellow"/>
+<text x="450.0" y="115" text-anchor="middle" class="mono t-sm">8</text>
+<rect x="476" y="90" width="44" height="40" rx="6" class="fs-yellow s-yellow"/>
+<text x="498.0" y="115" text-anchor="middle" class="mono t-sm">9</text>
+<rect x="524" y="90" width="44" height="40" rx="6" class="fs-yellow s-yellow"/>
+<text x="546.0" y="115" text-anchor="middle" class="mono t-sm">10</text>
+<rect x="572" y="90" width="44" height="40" rx="6" class="fs-yellow s-yellow"/>
+<text x="594.0" y="115" text-anchor="middle" class="mono t-sm">11</text>
+<rect x="620" y="90" width="44" height="40" rx="6" class="box2"/>
+<text x="642.0" y="115" text-anchor="middle" class="mono t-sm">12</text>
+<rect x="668" y="90" width="44" height="40" rx="6" class="box2"/>
+<text x="690.0" y="115" text-anchor="middle" class="mono t-sm">13</text>
+<path d="M236,78 L236,66 L616,66 L616,78" class="line" fill="none"/>
+<text x="426.0" y="56" text-anchor="middle" class="t-sm t-bold">window = 8 packets</text>
+<line x1="258.0" y1="170" x2="258.0" y2="134" class="line" marker-end="url(#ahL2c)"/>
+<text x="258.0" y="188" text-anchor="middle" class="t-sm t-bold">base</text><text x="258.0" y="204" text-anchor="middle" class="t-xs t-muted">oldest unacked</text>
+<line x1="450.0" y1="170" x2="450.0" y2="134" class="line" marker-end="url(#ahL2c)"/>
+<text x="450.0" y="188" text-anchor="middle" class="t-sm t-bold">next_seq</text><text x="450.0" y="204" text-anchor="middle" class="t-xs t-muted">next never-sent</text>
+    <rect x="44" y="12" width="14" height="14" rx="3" class="fs-green s-green"/><text x="64" y="24" class="t-xs">acknowledged</text>
+    <rect x="164" y="12" width="14" height="14" rx="3" class="fs-blue s-blue"/><text x="184" y="24" class="t-xs">sent, waiting for ACK</text>
+    <rect x="324" y="12" width="14" height="14" rx="3" class="fs-yellow s-yellow"/><text x="344" y="24" class="t-xs">may be sent now</text>
+    <rect x="464" y="12" width="14" height="14" rx="3" class="box2"/><text x="484" y="24" class="t-xs">not yet allowed</text>
+  </svg>
+  <figcaption><strong>The window.</strong> An ACK for packet 5 means everything below 6 arrived, so <code>base</code> jumps from 4 to 6 and two more packets (12 and 13) become sendable.</figcaption>
+</figure>
+
+<p>The rules, in the order your loop performs them:</p>
+<ol class="steps">
+  <li><strong>Fill the window.</strong> While <code>next_seq &lt; base + window</code>, send <code>next_seq</code> and advance it.</li>
+  <li><strong>Wait for an ACK</strong>, but only until the single timer expires. The timer is for the <em>oldest</em> unacknowledged packet, and it restarts every time <code>base</code> moves.</li>
+  <li><strong>A cumulative ACK</strong> <code>n</code> means "I have everything below <code>n</code>". If <code>base &lt; n &lt;= next_seq</code>, set <code>base = n</code>. One ACK can retire many packets, so a lost ACK is often harmless: the next one covers it.</li>
+  <li><strong>On timeout, go back N.</strong> Resend every packet from <code>base</code> to <code>next_seq - 1</code> and restart the timer. Simple, and wasteful.</li>
+</ol>
+
+<p>Why does the sender resend everything? Because the receiver is deliberately <em>dumb</em>: it accepts only the packet it expects and discards anything that arrives early, so after a gap it holds nothing beyond it. That is why you don't need to write a new receiver: the one from milestone 2 already behaves this way. A packet from the future just earns another <code>ACK expected</code>, which tells the sender "I'm still stuck waiting for <code>expected</code>".</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a conveyor belt of parcels</p>
+  <p>Instead of handing the courier one parcel and waiting for the receipt, you load eight parcels on a belt and keep loading as receipts come back. If parcel 3 vanishes, the warehouse on the other end refuses 4 to 7 (they'd be out of order), so you reload 3 to 7 when your timer rings. <em>Where it breaks down:</em> real TCP can buffer the early parcels and ask for only the missing one (selective acknowledgements, see the stretch goals).</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>gbn_send(chan, dest, data, window, timeout, chunk, estimator, max_tries)</code>. Ignore <code>estimator</code> for now (it's milestone 5). Return the total number of DATA packets transmitted.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows ✔ for milestone 4. It sends 200 KB (200 chunks plus the end marker) through 10% loss with duplication, reordering and corruption, once with Go-Back-N and once with your stop-and-wait, checks both files arrive intact, and requires the window version to take under 62% of stop-and-wait's time. On a typical laptop it's about 2.3 times faster.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Build the whole packet list first: <code>packets = [make_packet(DATA, seq, p) for seq, p in enumerate(pieces)]</code>. Then "send packet <code>n</code>" is just <code>chan.sendto(packets[n], dest)</code>, whether it's the first time or the fifth.</li>
+      <li>Keep one variable, <code>timer_start</code>, and wait for <code>timer_start + timeout - time.monotonic()</code> seconds. A non-positive remainder means the timer already fired.</li>
+      <li>Reject ACKs outside <code>base &lt; ack &lt;= next_seq</code>: duplicates (<code>ack == base</code>) must <em>not</em> restart the timer, or a stream of duplicate ACKs would keep postponing the retransmission forever.</li>
+      <li>The loop ends when <code>base == len(packets)</code>, which includes the end-of-file packet.</li>
+      <li>Count the number of timeouts in a row without progress and raise <code>ConnectionError</code> if it exceeds <code>max_tries</code>, so a dead receiver doesn't hang you forever.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> gbn_send(chan, dest, data, window=<span class="num">32</span>, timeout=<span class="num">0.05</span>, chunk=CHUNK,
+             estimator=<span class="kw">None</span>, max_tries=<span class="num">40</span>):
+    packets = [make_packet(DATA, seq, p)
+               <span class="kw">for</span> seq, p <span class="kw">in</span> enumerate(split_chunks(data, chunk) + [<span class="str">b""</span>])]
+    total = len(packets)
+    base = next_seq = <span class="num">0</span>
+    sent = <span class="num">0</span>
+    send_time = {}                            <span class="cmt"># seq -&gt; time of first send (for RTT)</span>
+    retransmitted = set()                     <span class="cmt"># Karn: don't time resent packets</span>
+    timer_start = time.monotonic()
+    stalls = <span class="num">0</span>                                <span class="cmt"># timeouts in a row without progress</span>
+
+    <span class="kw">while</span> base &lt; total:
+        <span class="cmt"># 1. Fill the window.</span>
+        <span class="kw">while</span> next_seq &lt; total <span class="kw">and</span> next_seq &lt; base + window:
+            chan.sendto(packets[next_seq], dest)
+            sent += <span class="num">1</span>
+            send_time[next_seq] = time.monotonic()
+            <span class="kw">if</span> base == next_seq:
+                timer_start = time.monotonic()
+            next_seq += <span class="num">1</span>
+        <span class="cmt"># 2. Wait for an ACK, but no longer than the timer allows.</span>
+        rto = estimator.rto <span class="kw">if</span> estimator <span class="kw">else</span> timeout
+        remaining = timer_start + rto - time.monotonic()
+        <span class="kw">try</span>:
+            <span class="kw">if</span> remaining &lt;= <span class="num">0</span>:
+                <span class="kw">raise</span> socket.timeout
+            chan.settimeout(remaining)
+            raw, _ = chan.recvfrom()
+        <span class="kw">except</span> socket.timeout:
+            <span class="cmt"># 3. Timer fired: go back N, resend everything from base.</span>
+            stalls += <span class="num">1</span>
+            <span class="kw">if</span> stalls &gt; max_tries:
+                <span class="kw">raise</span> ConnectionError(<span class="str">f"no progress after {max_tries} timeouts"</span>)
+            <span class="kw">if</span> estimator:
+                estimator.backoff()
+            <span class="kw">for</span> seq <span class="kw">in</span> range(base, next_seq):
+                chan.sendto(packets[seq], dest)
+                sent += <span class="num">1</span>
+                retransmitted.add(seq)
+            timer_start = time.monotonic()
+            <span class="kw">continue</span>
+        pkt = parse_packet(raw)
+        <span class="kw">if</span> pkt <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> pkt[<span class="num">0</span>] != ACK:
+            <span class="kw">continue</span>
+        ack = pkt[<span class="num">1</span>]                          <span class="cmt"># cumulative: "I have everything below ack"</span>
+        <span class="kw">if</span> base &lt; ack &lt;= next_seq:
+            <span class="kw">if</span> estimator <span class="kw">and</span> (ack - <span class="num">1</span>) <span class="kw">not</span> <span class="kw">in</span> retransmitted:
+                estimator.update(time.monotonic() - send_time[ack - <span class="num">1</span>])
+            base = ack                        <span class="cmt"># slide the window</span>
+            stalls = <span class="num">0</span>
+            timer_start = time.monotonic()    <span class="cmt"># restart the single timer</span>
+    <span class="kw">return</span> sent</code></pre>
+  </details>
+</div>
+
+<h3>Read the numbers honestly</h3>
+
+<p>Run <code>python3 check.py solution</code> and look at the milestone 4 line. A typical result:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="out">✔ Milestone 4: ... (200 KB through 10% loss: stop-and-wait 4.1 s (248 pkts), go-back-n 1.8 s (<span class="hl">1386 pkts</span>), 2.3x faster)</span></code></pre>
+
+<p>Go-Back-N won, but look at the packet counts: stop-and-wait needed about 250 transmissions for 201 packets, while Go-Back-N sent <strong>over 1,300</strong>. Each lost packet makes the sender wait out the timer and then resend a whole window, mostly packets the receiver already had (or had to discard because the gap blocked them). The window trades bandwidth for time. With a bigger window or more loss the waste grows. That tension is why real TCP does not use plain Go-Back-N: it uses selective acknowledgements, fast retransmit and congestion control (chapter 8) to resend only what's missing and to avoid overloading the path.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception: "a bigger window is always better"</p>
+  <p>Try <code>window=128</code> in the demo with 10% loss. It sends even more redundant packets, and in a real network those extra packets would fill router queues and cause <em>more</em> loss. The right window is "enough to fill the pipe" (the bandwidth-delay product), not "as big as possible". Finding it automatically as conditions change is exactly the job of TCP's congestion control.</p>
+</div>
+
+<h2>Milestone 5 (optional): a timeout that adapts</h2>
+
+<p>So far the timeout was a number we typed in, tuned to our 10 ms test link. On a real path the RTT might be 2 ms or 300 ms, and it keeps changing. A fixed timer is either too short (needless resends, and a stream of duplicates that can make congestion worse) or too long (a lost packet leaves the sender idle). TCP <em>measures</em> the RTT and derives the timer from it, using the method in <a href="https://www.rfc-editor.org/rfc/rfc6298">RFC 6298</a>. Two running numbers:</p>
+
+<ul>
+  <li><code>SRTT</code>, the smoothed average RTT;</li>
+  <li><code>RTTVAR</code>, how much the RTT wobbles (a smoothed average deviation).</li>
+</ul>
+
+<p>For each new measurement <code>R</code> (the very first one just sets <code>SRTT = R</code>, <code>RTTVAR = R/2</code>):</p>
+
+<pre class="terminal" data-title="the update rule"><code><span class="out">RTTVAR = (1 - 1/4) * RTTVAR + 1/4 * |SRTT - R|      <span class="cmt"># uses the OLD SRTT</span>
+SRTT   = (1 - 1/8) * SRTT   + 1/8 * R
+RTO    = SRTT + 4 * RTTVAR</span></code></pre>
+
+<p>The timer is the average plus four times the typical wobble, so a steady link gets a tight timer and a jittery one gets slack. Two more rules from the RFC complete the picture:</p>
+<ul>
+  <li><strong>Exponential backoff.</strong> Each time the timer fires, double the RTO. If the network is congested, hammering it with retries at a fixed rate makes things worse; backing off gives it room to recover (chapter 16 and the retry-storm case study use the same idea).</li>
+  <li><strong>Karn's rule.</strong> Never take an RTT sample from a retransmitted packet. When its ACK arrives you can't tell whether it answers the original or the copy, so the "round trip" could be wildly wrong.</li>
+</ul>
+<p>(The RFC also sets a floor of one second for the RTO and has a clock-granularity term; our lab uses a configurable <code>min_rto</code> of 20 ms so tests finish quickly. Real stacks differ in these details.)</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement the <code>RttEstimator</code> class (<code>update</code> and <code>backoff</code>), then extend <code>gbn_send</code> so that, when given an <code>estimator</code>, it uses <code>estimator.rto</code> as its timer, calls <code>backoff()</code> on a timeout, and feeds in one RTT sample per ACK (obeying Karn's rule).</p>
+  <p class="checkpoint">milestone 5 shows ✔. The check first verifies the arithmetic against hand-computed numbers (a first sample of 100 ms gives an RTO of 300 ms; a second sample of 140 ms gives an RTT variance of 47.5 ms and an RTO of 295 ms), then runs a transfer over a link whose RTT is 60 ms and requires the estimator's SRTT to land near it.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Compute the new <code>rttvar</code> <em>before</em> the new <code>srtt</code>; it needs the old one.</li>
+      <li>Clamp the RTO into <code>[min_rto, max_rto]</code> with <code>min(max_rto, max(min_rto, value))</code>.</li>
+      <li>In <code>gbn_send</code>, remember when each packet was first sent (<code>send_time[seq]</code>) and keep a set of packets you retransmitted. When a new cumulative ACK <code>ack</code> arrives, sample the packet <code>ack - 1</code> only if it isn't in that set.</li>
+      <li>Replace <code>timeout</code> by <code>estimator.rto if estimator else timeout</code> wherever the timer is computed.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">class</span> RttEstimator:
+    ALPHA = <span class="num">1</span> / <span class="num">8</span>
+    BETA = <span class="num">1</span> / <span class="num">4</span>
+    K = <span class="num">4</span>
+
+    <span class="kw">def</span> __init__(self, initial_rto=<span class="num">0.2</span>, min_rto=<span class="num">0.02</span>, max_rto=<span class="num">2.0</span>):
+        self.srtt = <span class="kw">None</span>
+        self.rttvar = <span class="kw">None</span>
+        self.min_rto, self.max_rto = min_rto, max_rto
+        self.rto = initial_rto
+
+    <span class="kw">def</span> update(self, sample):
+        <span class="str">""</span><span class="str">"Feed in one RTT measurement (seconds)."</span><span class="str">""</span>
+        <span class="kw">if</span> self.srtt <span class="kw">is</span> <span class="kw">None</span>:                 <span class="cmt"># the very first sample</span>
+            self.srtt = sample
+            self.rttvar = sample / <span class="num">2</span>
+        <span class="kw">else</span>:                                 <span class="cmt"># rttvar first, using the OLD srtt</span>
+            self.rttvar = (<span class="num">1</span> - self.BETA) * self.rttvar + self.BETA * abs(self.srtt - sample)
+            self.srtt = (<span class="num">1</span> - self.ALPHA) * self.srtt + self.ALPHA * sample
+        self._set_rto(self.srtt + self.K * self.rttvar)
+
+    <span class="kw">def</span> backoff(self):
+        <span class="str">""</span><span class="str">"A timeout happened: double the RTO (exponential backoff)."</span><span class="str">""</span>
+        self._set_rto(self.rto * <span class="num">2</span>)
+
+    <span class="kw">def</span> _set_rto(self, value):
+        self.rto = min(self.max_rto, max(self.min_rto, value))</code></pre>
+    <p>The estimator hooks inside <code>gbn_send</code> are the lines mentioning <code>estimator</code>, <code>send_time</code> and <code>retransmitted</code> in the milestone 4 solution above.</p>
+  </details>
+</div>
+
+<h2>Look under the hood</h2>
+
+<p>You now have a miniature TCP. Experiments that show how it behaves:</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Turn up the loss.</strong> In <code>main()</code>'s demo, raise <code>loss</code> from 0.10 to 0.20 and 0.30 and compare the times and packet counts. With the lab's settings, at 30% loss stop-and-wait sends roughly 400 packets and Go-Back-N roughly 2,700, yet Go-Back-N still finishes in well under half the time. Why does it send so many more? (A window of 32 means one loss <em>anywhere</em> in the window triggers up to 32 resends.)</li>
+    <li><strong>Sweep the window.</strong> Run a lossless transfer of 100 KB with <code>rtt=0.04</code>, <code>timeout=0.15</code> and <code>window</code> of 1, 2, 4, 8, 16, 32 (use <code>run_transfer(gbn_send, receive, data, rtt=0.04, window=w, timeout=0.15)</code>). Throughput should roughly double each time, exactly as <em>window ÷ RTT</em> predicts (about 21, 41, 84, 163, 322 and 540 KB/s on one machine). Window 1 is stop-and-wait. Our "link" has unlimited bandwidth, so it only flattens when your computer's own speed becomes the limit; on a real link it would flatten at the bandwidth-delay product.</li>
+    <li><strong>Break the checksum on purpose.</strong> Make <code>parse_packet</code> skip the checksum comparison and run the check with <code>corrupt=0.05</code> (edit the transfer in milestone 2's check). The file arrives with flipped bytes, and nothing in your protocol notices. This is the "end-to-end argument" in miniature: someone has to verify the data, and it can't be assumed.</li>
+    <li><strong>Watch it on the wire (optional).</strong> While a transfer runs, <code>sudo tcpdump -i lo0 -n -X udp</code> (Linux: <code>-i lo</code>) shows the real UDP datagrams, and your nine header bytes right after the UDP header. It will need your password and shows both the sender and receiver sides.</li>
+  </ol>
+</div>
+
+<div class="callout vm">
+  <p class="callout-title">On a Linux VM</p>
+  <p>The lab's lossy channel <em>simulates</em> loss in your code. On a Linux VM you can make the kernel do it for real, on the loopback interface. Use your <a href="../../lab-machine.html">lab machine</a>:</p>
+<pre class="terminal" data-title="Linux VM"><code><span class="prompt">$ </span><span class="cmd">sudo tc qdisc add dev lo root netem loss 10% delay 50ms</span>  <span class="cmt"># 10% of packets dropped, 50 ms added</span>
+<span class="prompt">$ </span><span class="cmd">ping -c 5 127.0.0.1</span>  <span class="cmt"># round trips now take about 100 ms (50 ms each way)</span>
+<span class="prompt">$ </span><span class="cmd">sudo tc qdisc del dev lo root</span>  <span class="cmt"># REMOVE IT when you are done</span></code></pre>
+  <p><strong>Remove it afterwards.</strong> The rule affects <em>all</em> traffic on <code>lo</code> for the whole VM until you delete it, including every local service. Run the <code>del</code> command and check with <code>tc qdisc show dev lo</code>. Do this only on a throwaway VM, never on a machine you share. Running the lab's transfer while netem is on gives the same kind of results as the shim, with real packets.</p>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>Selective Repeat.</strong> Make the receiver buffer out-of-order packets (a dictionary from sequence number to payload) and acknowledge each one individually or with a list of ranges; make the sender keep one timer per packet and resend only what's missing. Compare the packet counts with Go-Back-N at 10% loss.</li>
+  <li><strong>Fast retransmit.</strong> When the sender sees three duplicate ACKs for the same number, resend <code>base</code> immediately instead of waiting for the timer (chapter 8, "Duplicate ACKs"). How much faster does the 10% loss transfer get?</li>
+  <li><strong>Congestion control.</strong> Replace the fixed window with one that starts at 1, doubles each round trip until a loss (slow start), then grows by 1 per round trip (additive increase) and halves on loss (multiplicative decrease). Print the window over time and you'll see TCP's sawtooth.</li>
+  <li><strong>A handshake.</strong> Add SYN and FIN packet types so the receiver knows a transfer is starting and the sender knows it has really finished, instead of relying on the lingering trick.</li>
+  <li><strong>Flow control.</strong> Have the receiver advertise how much buffer space it has in every ACK, and make the sender's window the smaller of its own window and that advertisement.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>You just implemented <strong>at-least-once delivery with de-duplication</strong>: the sender retries until it hears an acknowledgement (so the message arrives at least once) and the receiver uses sequence numbers to throw away the extra copies (so the effect happens once). That one combination is behind nearly every reliable messaging system. The same logic applies to any request that can time out: "did my payment go through?" is exactly "was it the DATA or the ACK that was lost?" The sender cannot know, so it must retry, and the server must make retries harmless with an identifier it recognises: an idempotency key is a sequence number by another name. Chapter 16 develops this fully, the retry-storm case study shows what happens when thousands of senders back off badly, and the replicated key-value store in lab 5 will have you build idempotency keys yourself.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>Reliability is built from four small ideas: <strong>sequence numbers</strong>, <strong>acknowledgements</strong>, <strong>timeouts</strong> and <strong>retransmission</strong>, plus a <strong>checksum</strong> to turn damage into loss.</li>
+    <li>A timeout is a guess. Lost data and a lost ACK look identical to the sender, so the receiver must tolerate duplicates.</li>
+    <li>Stop-and-wait delivers one packet per RTT: throughput = packet size ÷ RTT, regardless of bandwidth.</li>
+    <li>To fill a link you need a window of about <strong>bandwidth × RTT</strong> in flight (the bandwidth-delay product).</li>
+    <li>Go-Back-N with cumulative ACKs and one timer is simple and fast, but wasteful under loss; real TCP adds selective ACKs, fast retransmit and congestion control.</li>
+    <li>The retransmission timer should come from measured RTT (SRTT + 4 × RTTVAR), back off exponentially, and ignore samples from retransmitted packets (Karn's rule).</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A stop-and-wait sender uses 1500-byte packets over a 1 Gbit/s link with a 50 ms round-trip time. Roughly what throughput does it achieve?</p>
+    <ol class="q-options">
+      <li>About 125 MB/s, the full link speed</li>
+      <li>About 30 KB/s (roughly 240 kbit/s)</li>
+      <li>About 1.5 KB/s</li>
+      <li>About 600 KB/s</li>
+    </ol>
+    <div class="q-explain">One packet per RTT: 1500 bytes ÷ 0.05 s = 30,000 bytes per second. The 1 Gbit/s only sets how quickly each packet is transmitted; it doesn't appear in the formula, because the sender spends nearly all its time waiting. The fix is more packets in flight, not a faster link.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">The receiver gets DATA 5 (already delivered), because the sender's timer fired after the ACK was lost. What should it do?</p>
+    <ol class="q-options">
+      <li>Deliver it again to the application, in case the first copy was wrong</li>
+      <li>Ignore it silently</li>
+      <li>Not deliver it again, but still send an ACK saying what it expects next</li>
+      <li>Send an error and close the connection</li>
+    </ol>
+    <div class="q-explain">The payload was already delivered, so delivering it again would duplicate data. But staying silent would leave the sender retrying forever, because the ACK it needs was the one that got lost. Re-acknowledging without re-delivering is what makes retransmission safe.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A Go-Back-N sender has base = 10 and next_seq = 18 when its timer fires. Which packets does it resend?</p>
+    <ol class="q-options">
+      <li>Only packet 10</li>
+      <li>Only packet 18</li>
+      <li>Packets 10 to 17 that it thinks were lost, chosen by the receiver</li>
+      <li>Every packet from 10 to 17</li>
+    </ol>
+    <div class="q-explain">With cumulative ACKs the sender only knows that everything below 10 arrived. It has no record of which of 10 to 17 got through, so it goes back and resends them all. Selective Repeat avoids that waste by having the receiver report what it holds.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why does Karn's rule say not to sample the RTT from a retransmitted packet?</p>
+    <ol class="q-options">
+      <li>The ACK could be for the original or the copy, so the measured time may be wrong</li>
+      <li>Retransmitted packets are always slower</li>
+      <li>The checksum on a retransmitted packet is different</li>
+      <li>The receiver doesn't ACK retransmitted packets</li>
+    </ol>
+    <div class="q-explain">If you resend packet 7 and then an ACK arrives, it might be a late ACK for the first copy (making the RTT look tiny) or the ACK for the second (a normal RTT). Since you can't tell, the sample is unreliable, so TCP ignores it. This is the same ambiguity that forces every retrying client in chapter 16 to ask for idempotent operations.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

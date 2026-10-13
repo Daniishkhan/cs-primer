@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Encoding &amp; Schema Evolution · Data Systems</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="data" data-chapter="03">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Encoding &amp; Schema Evolution</h1>
+  <p class="lede">Data in a program is a web of pointers. Data on a disk or a wire is a flat string of bytes. Everything that stores or sends data has to convert between the two, and then live with the fact that the code that wrote the bytes yesterday is not the code that reads them tomorrow.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Shapes of data change: you add a field, rename one, drop one. In a system with many machines you can never update every program at the same instant, so old and new code must read each other's data for a while. Get the encoding wrong and a routine deploy corrupts records or crashes half your servers. Choosing a format (JSON, Protocol Buffers, Avro) is a long-lived decision, because stored data outlives the code that wrote it.</p>
+</div>
+
+<h2>Objects in memory, bytes on the wire</h2>
+
+<p>Inside a running program, data lives as objects, lists and dictionaries linked by memory pointers (<a href="../../systems/chapters/03-stack-heap.html">systems chapter 3</a>). Pointers only mean something inside one process. To write data to a file, store it in a database, or send it over the network (<a href="../../networking/chapters/12-apis.html">networking chapter 12</a> introduced this as serialization), we must convert it into a self-contained sequence of bytes. This conversion is called <span class="term">encoding</span> (also <em>serialisation</em> or <em>marshalling</em>); the reverse is <span class="term">decoding</span> (<em>deserialisation</em> or <em>parsing</em>). The bytes must carry enough information for another program, maybe written in another language years later, to rebuild the data. And the way integers, strings and lists end up as bytes in files is the same problem as bytes in memory (<a href="../../systems/chapters/08-files.html">systems chapter 8</a>), just with a longer lifetime.</p>
+
+<p>Every format answers the same few questions: How are numbers written? How is a string's length known? How do you tell fields apart? Is there a schema? Let's walk through the main families.</p>
+
+<h2>Language-specific formats and their dangers</h2>
+
+<p>Most languages have a built-in way to dump objects: Python's <code>pickle</code>, Java's <code>Serializable</code>, Ruby's <code>Marshal</code>. They are very convenient (one line saves almost any object) but poor for anything that lasts or crosses boundaries:</p>
+
+<ul>
+  <li><strong>Tied to one language.</strong> A pickle can only be read by Python. The moment a second service in another language needs the data, you must start over.</li>
+  <li><strong>Unsafe to read from untrusted sources.</strong> To rebuild arbitrary objects, the decoder must be able to instantiate arbitrary classes, which means attacker-chosen bytes can make it run code.</li>
+  <li><strong>Poor versioning.</strong> They rarely handle evolving class definitions gracefully, and are often slow and bulky.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Never unpickle data you do not trust</p>
+  <p>Python's own documentation warns that unpickling can execute arbitrary code. This harmless demonstration shows how: a class tells pickle "to rebuild me, call this function", and <code>pickle.loads</code> calls it.</p>
+<pre class="terminal" data-title="python3"><code>import pickle
+
+class Evil:
+    def __reduce__(self):
+        return (print, ('this ran during unpickling',))   # an attacker would pick something worse
+
+data = pickle.dumps(Evil())
+pickle.loads(data)          # prints: this ran during unpickling
+print(pickle.dumps({'a': 1}))
+
+this ran during unpickling
+b'\x80\x05\x95\n\x00\x00\x00\x00\x00\x00\x00}\x94\x8c\x01a\x94K\x01s.'</code></pre>
+  <p>Rule: use pickle only for your own data in your own process or files you wrote. For anything crossing a trust boundary, use a data-only format like JSON.</p>
+</div>
+
+<h2>Text formats: JSON and CSV</h2>
+
+<p><span class="term">JSON</span> (JavaScript Object Notation) is the lingua franca of web APIs: objects, arrays, strings, numbers, booleans and <code>null</code>, all as readable text. <span class="term">CSV</span> (comma-separated values) is rows of text split on commas. Both are readable by humans and every language can parse them, which is why they dominate. They have real limits.</p>
+
+<h3>Number precision</h3>
+
+<p>JSON has a single "number" type and does not say how big or precise it is. Many implementations, notably JavaScript, read every number as a 64-bit floating-point double, which can represent integers exactly only up to 2<sup>53</sup> (9,007,199,254,740,992). Beyond that, neighbouring integers collapse into one. A 64-bit database id such as a tweet id or a Snowflake id can therefore silently change as it passes through a JavaScript client. This is a well-known real-world problem, and the usual fix is to send big ids as strings.</p>
+
+<pre class="terminal" data-title="python3 and node"><code>$ python3 -c "import json; print(json.loads('9007199254740993')); print(float(9007199254740993)); print(0.1 + 0.2)"
+9007199254740993
+9007199254740992.0
+0.30000000000000004
+
+$ node -e 'console.log(JSON.parse("9007199254740993")); console.log(JSON.parse("{\"id\":12345678901234567890}").id)'
+9007199254740992
+12345678901234567000</code></pre>
+
+<p>Python's integers have unlimited size, so it reads the number exactly, but Node's <code>JSON.parse</code> gives back a different number from the one that was sent. Likewise <code>0.1 + 0.2</code> is not exactly <code>0.3</code> in binary floating point, so never store money as floats. Use integer cents or a decimal type.</p>
+
+<h3>Other quirks</h3>
+
+<ul>
+  <li><strong>No binary type.</strong> Raw bytes (an image, a hash) must be turned into text first, usually base64, which inflates them by about a third.</li>
+  <li><strong>No schema.</strong> Nothing says which fields must exist or what type they have. A typo like <code>"emial"</code> is valid JSON.</li>
+  <li><strong>CSV has no types at all.</strong> Everything is text. A reader must guess whether <code>007</code> is the number 7 or a code, how to handle commas and quotes inside a value, and whether the first row is a header:</li>
+</ul>
+
+<pre class="terminal" data-title="python3"><code>import csv, io
+print(list(csv.reader(io.StringIO('1,Asha,007\n'))))
+[['1', 'Asha', '007']]</code></pre>
+
+<p>Despite all that, JSON is a fine choice for public APIs and configuration where readability and universality matter more than size or strictness. The issue is when you want compactness, speed, or a firm contract between teams.</p>
+
+<h2>Binary formats with schemas</h2>
+
+<p>If both sides agree in advance on the structure, the bytes do not have to describe themselves. The result is smaller, faster to parse and type-checked. First a feel for the size difference using only the standard library: the same small record, as JSON and as a fixed binary layout made with Python's <code>struct</code> module.</p>
+
+<pre><code>import json, struct
+
+record = {"id": 42, "name": "Asha", "active": True, "score": 3.5}
+
+as_json = json.dumps(record, separators=(",", ":")).encode()
+print(as_json, len(as_json), "bytes")
+
+# fixed layout: uint32 id, uint8 name length, name bytes, uint8 active, float64 score
+name = record["name"].encode()
+packed = struct.pack(f"&lt;IB{len(name)}sBd", record["id"], len(name), name, record["active"], record["score"])
+print(packed.hex(" "), len(packed), "bytes")
+
+# decoding needs the same layout: there are no field names in the bytes
+id_, n = struct.unpack_from("&lt;IB", packed)
+name2, active, score = struct.unpack_from(f"&lt;{n}sBd", packed, 5)
+print(id_, name2.decode(), bool(active), score)</code></pre>
+
+<pre class="terminal" data-title="output"><code>b'{"id":42,"name":"Asha","active":true,"score":3.5}' 49 bytes
+2a 00 00 00 04 41 73 68 61 01 00 00 00 00 00 00 0c 40 18 bytes
+42 Asha True 3.5</code></pre>
+
+<p>49 bytes became 18, and the bytes are meaningless without the layout string <code>&lt;IB4sBd</code>. That <em>is</em> the schema: kept outside the data. (The <code>&lt;</code> means little-endian, the byte order of most CPUs; <code>I</code> is a 4-byte unsigned integer, <code>B</code> one byte, <code>d</code> an 8-byte float.)</p>
+
+<p>Real schema-based formats add what our hand-made layout lacks: a language for describing the schema, code generation for many languages, and above all <em>rules for changing the schema safely</em>. The three you will meet:</p>
+
+<h3>Protocol Buffers and field tags</h3>
+
+<p><span class="term">Protocol Buffers</span> (protobuf, from Google) uses a <code>.proto</code> schema file where every field has a name <em>and a number</em>:</p>
+
+<pre><code>message User {
+  int32  id    = 1;
+  string name  = 2;
+  string email = 3;
+}</code></pre>
+
+<p>On the wire, the field name never appears. Each field is written as a <span class="term">field tag</span> (the number, plus a small code for how to read the value), then the value. This is a tag-length-value (TLV) scheme. To make it concrete, here is a simplified TLV encoder we can run (real protobuf packs the tag and type into one byte and uses compact variable-length integers, but the idea is identical):</p>
+
+<pre><code># A tiny protobuf-like format. Every field is: tag, length, value
+def put(tag, value):
+    return bytes([tag, len(value)]) + value
+
+def encode(user):
+    out = b""
+    if "id" in user:    out += put(1, user["id"].to_bytes(4, "big"))
+    if "name" in user:  out += put(2, user["name"].encode())
+    if "email" in user: out += put(3, user["email"].encode())
+    return out
+
+def decode(data):
+    i, out = 0, {}
+    while i &lt; len(data):
+        tag, n = data[i], data[i + 1]
+        value = data[i + 2 : i + 2 + n]
+        i += 2 + n
+        if tag == 1:   out["id"] = int.from_bytes(value, "big")
+        elif tag == 2: out["name"] = value.decode()
+        elif tag == 3: out["email"] = value.decode()
+        else:          out["unknown_%d" % tag] = value   # skip what we don't know
+    return out
+
+msg = encode({"id": 7, "name": "Asha", "email": "a@x.io"})
+print(msg.hex(" "), len(msg), "bytes")
+print(decode(msg))</code></pre>
+
+<pre class="terminal" data-title="output"><code>01 04 00 00 00 07 02 04 41 73 68 61 03 06 61 40 78 2e 69 6f 20 bytes
+{'id': 7, 'name': 'Asha', 'email': 'a@x.io'}</code></pre>
+
+<p>Read the bytes as three records:</p>
+
+<div class="fields" style="margin-bottom:6px">
+  <div class="field" style="--w:1">01<small>tag: id</small></div>
+  <div class="field" style="--w:1">04<small>length</small></div>
+  <div class="field" style="--w:2">00 00 00 07<small>value (7)</small></div>
+  <div class="field" style="--w:1">02<small>tag: name</small></div>
+  <div class="field" style="--w:1">04<small>length</small></div>
+  <div class="field" style="--w:2">41 73 68 61<small>"Asha"</small></div>
+  <div class="field" style="--w:1">03<small>tag: email</small></div>
+  <div class="field" style="--w:1">06<small>length</small></div>
+  <div class="field" style="--w:3">61 40 78 2e 69 6f<small>"a@x.io"</small></div>
+</div>
+
+<p>The same record as JSON is 39 bytes; our TLV is 20, and real protobuf is 16 (it writes the id as a one-byte variable-length integer, giving <code>08 07 12 04 41 73 68 61 1a 06 61 40 78 2e 69 6f</code>). The savings come from dropping field names, since they live in the schema.</p>
+
+<h3>Why tags make evolution possible</h3>
+
+<p>Because the data identifies fields by <em>tag number</em> rather than name, a lot becomes safe:</p>
+
+<ul>
+  <li><strong>Renaming a field is free.</strong> Names are only for humans and code generators. Rename <code>name</code> to <code>full_name</code> and keep the tag 2, and every old byte string still decodes into the right field.</li>
+  <li><strong>Adding a field is safe</strong>, if you give it a new tag and old code ignores unknown tags. Our decoder's <code>else</code> branch does exactly that, and it can even skip the value because the length tells it how far to jump:</li>
+</ul>
+
+<pre><code>newer = msg + put(4, b"Lisbon")      # a newer writer adds tag 4
+print(decode(newer))</code></pre>
+
+<pre class="terminal" data-title="output"><code>{'id': 7, 'name': 'Asha', 'email': 'a@x.io', 'unknown_4': b'Lisbon'}</code></pre>
+
+<ul>
+  <li><strong>Reusing a tag number is not safe.</strong> Old records still sitting in files and databases say "tag 2 is the name". If a new schema reassigns tag 2 to something else, say an integer age, those old records are misread: the bytes for "Asha" decode as a very large number.</li>
+</ul>
+
+<pre><code>def decode_reused(data):             # a "new" reader that reused tag 2 as an integer age
+    i, out = 0, {}
+    while i &lt; len(data):
+        tag, n = data[i], data[i + 1]
+        value = data[i + 2 : i + 2 + n]
+        i += 2 + n
+        if tag == 2: out["age"] = int.from_bytes(value, "big")
+    return out
+print(decode_reused(msg))</code></pre>
+
+<pre class="terminal" data-title="output"><code>{'age': 1098082401}</code></pre>
+
+<p>That number is just the four bytes of "Asha" read as an integer. Nothing crashed; the data was silently wrong. So the rule in protobuf shops: <strong>never change a field's meaning or reuse a retired tag</strong>. When you delete a field, mark its number <code>reserved</code> so nobody reuses it later.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: numbered boxes in a warehouse</p>
+  <p>Imagine a warehouse where every shelf slot has a permanent number and the shipping labels say "slot 2: contents". You can repaint the sign above slot 2 from "name" to "full name" without confusing anyone, and you can add slot 4 without disturbing slots 1 to 3. But if you start putting different things into slot 2, every old label now points at the wrong thing.</p>
+  <p><em>Where it breaks down:</em> real field numbers also carry a small type code, and a mismatch there can be detected. Reusing a tag with the same wire type but a different meaning is the dangerous case, because nothing flags it.</p>
+</div>
+
+<h3>Avro: the schema travels separately</h3>
+
+<p><span class="term">Apache Avro</span> takes a different route: there are no tags in the data at all. A record is simply its values written one after another in the order the schema lists them, which makes Avro very compact. To decode, you need the exact schema the data was written with. Avro handles change by keeping two schemas side by side:</p>
+
+<ul>
+  <li>The <span class="term">writer's schema</span> is the one the writer used to encode the data. It is stored with the file, or looked up by an id.</li>
+  <li>The <span class="term">reader's schema</span> is the one the reading program wants the data to look like.</li>
+</ul>
+
+<p>The decoder compares them <em>by field name</em> and reconciles the difference: a field in the writer's schema but not the reader's is skipped; a field in the reader's but not the writer's is filled with its declared <em>default</em> value; reordered fields are matched up by name. So in Avro you can rename a field only with explicit aliases, and a field you add must have a default to stay compatible. Avro is popular for large data files and Kafka streams, where it is easy to attach the writer's schema once per file or by registry reference rather than repeating it in every record.</p>
+
+<p><span class="term">Apache Thrift</span>, from Facebook, is in one line a protobuf-style system with numbered fields and generated code that also bundles an RPC framework.</p>
+
+<h2>Compatibility: old and new code together</h2>
+
+<p>Two terms describe what "safe" means when code and data are different ages:</p>
+
+<ul>
+  <li><span class="term">Backward compatibility</span>: <em>new</em> code can read data written by <em>old</em> code. (Usually straightforward: you know the old format.)</li>
+  <li><span class="term">Forward compatibility</span>: <em>old</em> code can read data written by <em>new</em> code. (Harder: old code must ignore things it has never heard of.)</li>
+</ul>
+
+<p>You need both because of the <span class="term">rolling deploy</span>: instead of stopping everything to upgrade, you replace servers one at a time so the service stays up. For a while, version 1 and version 2 of your code are running at the same time, reading and writing the same database and sending messages to each other.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 320" role="img" aria-label="Timeline of a rolling deploy: three servers switch from code v1 to v2 one after another, so for a while old and new code run side by side and share the same stored data">
+    <text x="250" y="24" text-anchor="middle" class="t-xs t-faint">deploy starts</text>
+    <text x="550" y="24" text-anchor="middle" class="t-xs t-faint">deploy finishes</text>
+    <text x="740" y="24" text-anchor="end" class="t-xs t-faint">time →</text>
+    <line x1="250" y1="32" x2="250" y2="186" class="line-dash"/>
+    <line x1="550" y1="32" x2="550" y2="186" class="line-dash"/>
+
+    <text x="14" y="64" class="t-sm">Server A</text>
+    <text x="14" y="108" class="t-sm">Server B</text>
+    <text x="14" y="152" class="t-sm">Server C</text>
+
+    <rect x="100" y="44" width="150" height="32" class="fs-blue s-blue sw-2"/>
+    <text x="110" y="64" class="t-xs">old code (v1)</text>
+    <rect x="250" y="44" width="490" height="32" class="fs-green s-green sw-2"/>
+    <text x="260" y="64" class="t-xs">new code (v2)</text>
+
+    <rect x="100" y="88" width="300" height="32" class="fs-blue s-blue sw-2"/>
+    <text x="110" y="108" class="t-xs">old code (v1)</text>
+    <rect x="400" y="88" width="340" height="32" class="fs-green s-green sw-2"/>
+    <text x="410" y="108" class="t-xs">new code (v2)</text>
+
+    <rect x="100" y="132" width="450" height="32" class="fs-blue s-blue sw-2"/>
+    <text x="110" y="152" class="t-xs">old code (v1)</text>
+    <rect x="550" y="132" width="190" height="32" class="fs-green s-green sw-2"/>
+    <text x="560" y="152" class="t-xs">new code (v2)</text>
+
+    <line x1="250" y1="186" x2="550" y2="186" class="line s-orange"/>
+    <line x1="250" y1="180" x2="250" y2="192" class="line s-orange"/>
+    <line x1="550" y1="180" x2="550" y2="192" class="line s-orange"/>
+    <text x="400" y="212" text-anchor="middle" class="t-sm t-bold">old and new code run side by side</text>
+
+    <rect x="100" y="228" width="640" height="36" rx="8" class="box"/>
+    <text x="420" y="251" text-anchor="middle" class="t-sm">Database, queue, files: data written by both v1 and v2, mixed together</text>
+
+    <text x="100" y="290" class="t-xs"><tspan class="t-bold">Backward compatible:</tspan> new code can read data written by old code</text>
+    <text x="100" y="308" class="t-xs"><tspan class="t-bold">Forward compatible:</tspan> old code can read data written by new code</text>
+  </svg>
+  <figcaption>During a rolling deploy there is a window when both versions are alive. Anything v2 writes may be read by v1, and everything v1 ever wrote may be read by v2.</figcaption>
+</figure>
+
+<div class="callout warn">
+  <p class="callout-title">A common trap: old code rewrites new fields away</p>
+  <p>Forward compatibility has a subtle extra requirement. If old code reads a record containing a field it does not know, modifies it, and writes it back, it must <em>preserve</em> the unknown field, not drop it. Otherwise a v1 server quietly erases data that v2 added. Careless decode-to-object-then-encode cycles do exactly this, so be careful with read-modify-write on records with unknown fields.</p>
+</div>
+
+<p>Practical rules that follow from the mechanisms above:</p>
+
+<ul>
+  <li>Add fields as <em>optional</em> or with a default; do not add a new required field (old data lacks it, so new code could not read it).</li>
+  <li>Never reuse a protobuf tag. Remove fields by reserving the number.</li>
+  <li>In Avro, give new fields a default, and use aliases to rename.</li>
+  <li>For breaking changes, run both versions in parallel: write the new field in addition to the old one, migrate readers, then retire the old field.</li>
+</ul>
+
+<h2>Data outlives code</h2>
+
+<p>Code can be replaced in minutes by redeploying. Data cannot. A database table may hold rows written five years ago, by code that no longer exists. The oldest backups hold even older shapes. Rewriting all that data into a new format (a "migration") is possible but costly on a large dataset, so many systems keep the old rows as they are and make the reading code understand every version, a quiet cost of schema-on-read from <a href="01-data-models.html">chapter 1</a>.</p>
+
+<p>For streams of messages, teams therefore use a <span class="term">schema registry</span>: a small service that stores every version of each schema, gives each a numeric id, and refuses to accept a new version that would break compatibility with the previous ones. Producers put the schema id in front of each message; consumers look the id up to learn how to decode it. Confluent's Schema Registry for Kafka is the well-known example. It turns "does this change break anyone?" from a hope into an automated check at publish time.</p>
+
+<h2>Encoding in databases, RPC and message queues</h2>
+
+<p>The encoding choice shows up in three places where data flows between processes:</p>
+
+<ul>
+  <li><strong>Databases.</strong> A process writes, and a possibly different or newer process reads later, perhaps years later. A database engine has its own on-disk format. What you choose is the column types or document format on top (JSON columns, protobuf blobs). Data outlives code is most true here.</li>
+  <li><strong>Services and RPC.</strong> Client and server are deployed independently, so they must tolerate each other's versions. REST APIs usually send JSON. Binary RPC systems such as gRPC send protobuf messages (over HTTP/2) and rely on those compatibility rules, because clients and servers are never upgraded at the same moment.</li>
+  <li><strong>Message queues and logs.</strong> A producer writes a message and consumers read it later, possibly much later, and there may be many different consumers. A log such as Kafka may keep messages for days or forever, which is why schemas for them are usually Avro or protobuf plus a registry. We build on this in <a href="19-streams-cdc.html">chapter 19</a>.</li>
+</ul>
+
+<details class="deeper">
+  <summary>Go deeper: how real protobuf writes a tag and an integer <span class="hint">optional</span></summary>
+  <p>Real protobuf combines the field number and a 3-bit <em>wire type</em> into one number, <code>(field_number &lt;&lt; 3) | wire_type</code>, written as a <em>varint</em>. Wire type 0 means "a varint follows" (integers), and 2 means "length-delimited" (strings, bytes, nested messages). So field 1 as an integer has tag byte <code>(1&lt;&lt;3)|0 = 0x08</code>, and field 2 as a string has <code>(2&lt;&lt;3)|2 = 0x12</code>.</p>
+  <p>A <span class="term">varint</span> stores a number 7 bits at a time, least significant group first; the top bit of each byte says "more bytes follow". So 7 is the single byte <code>07</code>, while 300 is <code>ac 02</code> (the low 7 bits of 300 are <code>0101100</code>, with the continuation bit set to make <code>ac</code>, then the remaining value 2). Small numbers, the common case, cost one byte. That is why the id in our record needs one byte in protobuf but four in our fixed-width TLV.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Everything runs with plain <code>python3</code> and nothing is installed. Put the <code>json</code>/<code>struct</code> example and the TLV example into two files and run them, then experiment:</p>
+  <ol>
+    <li>In the <code>struct</code> demo, change <code>score</code> to <code>3.5</code> as an <code>f</code> (4-byte float) instead of <code>d</code>. How many bytes now? What do you lose?</li>
+    <li>Add a field <code>"city"</code> with tag 5 to <code>encode</code> and decode data from a version of <code>decode</code> that has never heard of tag 5. Confirm the old reader still works.</li>
+    <li>Make a "required" field: change <code>decode</code> to raise an error if tag 3 is missing. Then feed it data written before email existed. This is why new required fields break backward compatibility.</li>
+    <li>Encode <code>9007199254740993</code> as JSON and read it back with <code>node -e</code> (or your browser's console). Compare with Python.</li>
+  </ol>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>In a distributed system there is no moment when "everything is now version 2". Rolling deploys, canary releases and long-lived queues guarantee that versions overlap, so compatibility is not a nicety but a requirement. Tags, defaults and registries are how large systems let teams deploy independently without a coordinated "flag day". The same reasoning reappears when we look at replication, where followers may run older software than the leader (<a href="15-replication-practice.html">chapter 15</a>), and at event logs that must stay readable for years (<a href="19-streams-cdc.html">chapter 19</a>).</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Memory holds pointers; files and networks hold bytes. Encoding converts one to the other, and decoding reverses it.</li>
+    <li>Language-specific formats like pickle are convenient but tied to one language, versioning-poor, and unsafe to decode from untrusted input.</li>
+    <li>JSON and CSV are readable and universal, but they have no schema, no binary type, ambiguous or imprecise numbers (big ints collapse in JavaScript), and CSV has no types at all.</li>
+    <li>Schema-based binary formats are smaller and faster. Protobuf and Thrift identify fields by numeric tags; Avro identifies them by name using a writer's and a reader's schema, with no tags in the data.</li>
+    <li>Because of tags, renaming a protobuf field is safe but reusing a tag number silently corrupts old data. Retire numbers with <code>reserved</code>.</li>
+    <li>Backward compatibility (new reads old) and forward compatibility (old reads new) are both needed during rolling deploys. New fields should be optional or have defaults, and unknown fields must be preserved.</li>
+    <li>Data outlives code. Schema registries enforce compatibility and give every message a schema id.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A protobuf schema has <code>string name = 2;</code>. A developer renames it to <code>string full_name = 2;</code>. Is that safe for existing stored data?</p>
+    <ol class="q-options">
+      <li>No: every stored record contains the word "name", so it would not decode</li>
+      <li>No: field names must never change in any format</li>
+      <li>Yes: the bytes contain tag 2, not the name, so old data still decodes into the renamed field</li>
+      <li>Only if the data is first converted to JSON</li>
+    </ol>
+    <div class="q-explain">Names exist only in the schema and generated code. The encoded data identifies the field by its tag number. (In Avro, by contrast, names matter, and renaming needs an alias.)</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why is reusing a retired protobuf tag number for a new field dangerous?</p>
+    <ol class="q-options">
+      <li>Old records in files and databases still use that tag for the old meaning, so they get decoded as the wrong thing, often without any error</li>
+      <li>The compiler refuses to build, which is annoying</li>
+      <li>The tag number is a security token</li>
+      <li>It makes messages larger</li>
+    </ol>
+    <div class="q-explain">Data outlives code. Anything written while the tag meant "name" still says tag 2. Reinterpret it as an integer and you get garbage, silently, as we saw with the 1098082401 result.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">During a rolling deploy, v1 servers must correctly read records written by v2 servers. This property is called...</p>
+    <ol class="q-options">
+      <li>Backward compatibility</li>
+      <li>Atomicity</li>
+      <li>Normalisation</li>
+      <li>Forward compatibility</li>
+    </ol>
+    <div class="q-explain">Old code reading newer data is forward compatibility. New code reading older data is backward compatibility. A rolling deploy needs both, because both versions run at once.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A JavaScript service reads the JSON <code>{"id": 9007199254740993}</code> and sends the id back. What is the likely problem?</p>
+    <ol class="q-options">
+      <li>JSON cannot contain numbers that large and rejects them</li>
+      <li>JavaScript parses numbers as 64-bit doubles, so it will read and write back 9007199254740992, a different id</li>
+      <li>Nothing: JSON numbers are always exact</li>
+      <li>The id will be converted to a string automatically</li>
+    </ol>
+    <div class="q-explain">Doubles represent integers exactly only up to 2<sup>53</sup>. Large ids should be sent as strings. JSON itself does not limit precision, which is part of the problem: it is left to each implementation.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Which statement about Avro is correct?</p>
+    <ol class="q-options">
+      <li>Each field is stored with a numeric tag so readers can skip unknown fields</li>
+      <li>The data is self-describing text, like JSON</li>
+      <li>It resolves differences between the writer's schema and the reader's schema by field name, using defaults for fields the writer did not have</li>
+      <li>It requires the writer and the reader to use identical schemas</li>
+    </ol>
+    <div class="q-explain">Avro data contains no tags or names, just values. The decoder needs the writer's schema and compares it with the reader's by name, which is what lets the two differ safely.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Outbox &amp; Change Data Capture · Data Systems</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="data" data-lab="L6">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 6: The Outbox &amp; Change Data Capture</h1>
+  <p class="lede">An order is placed. The database knows. The cache that serves the dashboard and the search index that powers the search box also need to know, and they are separate systems that no database transaction can reach. In this lab you will watch the obvious code lose that race, then fix it the way production systems do: an outbox row written in the same transaction as the order, a relay that publishes it, and consumers that tolerate being told twice. At the end a brand-new consumer rebuilds its whole state from nothing but the log.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p><a href="../chapters/19-streams-cdc.html">Chapter 19</a> called it the dual-write problem, and <a href="../chapters/14-caching.html">chapter 14</a> showed what stale caches cost. Almost every system that has a database <em>and</em> a cache, a search index, an analytics pipeline or another service ends up with this bug, and it hides well: nothing fails in tests, and in production it appears as one order in ten thousand that never shows up in search. The outbox pattern is the standard cure, and writing a relay and an idempotent consumer yourself is the quickest way to understand "at-least-once delivery plus idempotence equals effectively once".</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Crashes without killing anything</p>
+  <p>The system of record is a <strong>SQLite file</strong> in a temporary folder. The cache and the search index are plain Python dicts inside objects: stand-ins for Redis and Elasticsearch, which really are separate systems and survive when your application dies. A crash is <em>simulated</em>: your functions call a <code>crash("some_point")</code> hook, and the check supplies a hook that raises an exception at the point it wants to test, then throws away the database connection (an open transaction is rolled back, as it would be when a process dies) and reopens the file. It is deterministic, takes about a second, and uses nothing but the standard library. Python 3.8 or newer.</p>
+</div>
+
+<h2>What you'll build</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="The application writes to the database in a single transaction that contains the orders table and the outbox table. A relay reads unpublished outbox rows and appends them to a log. A cache consumer and a search-index consumer each read the log from their own offset.">
+    <defs>
+      <marker id="ahDL6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="110" width="110" height="64" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="75" y="138" text-anchor="middle" class="t-bold">app</text>
+    <text x="75" y="158" text-anchor="middle" class="t-xs t-muted">place_order()</text>
+
+    <rect x="170" y="30" width="230" height="240" rx="14" class="box2" stroke-dasharray="6 5"/>
+    <text x="285" y="52" text-anchor="middle" class="t-xs t-faint t-bold">SQLITE FILE: ONE TRANSACTION</text>
+    <rect x="190" y="70" width="190" height="64" rx="10" class="box"/>
+    <text x="285" y="97" text-anchor="middle" class="t-bold">orders</text>
+    <text x="285" y="117" text-anchor="middle" class="t-xs t-muted">the truth: state + version</text>
+    <rect x="190" y="160" width="190" height="82" rx="10" class="fs-orange s-orange sw-2"/>
+    <text x="285" y="187" text-anchor="middle" class="t-bold">outbox</text>
+    <text x="285" y="207" text-anchor="middle" class="t-xs t-muted">id, aggregate_id, type,</text>
+    <text x="285" y="223" text-anchor="middle" class="t-xs t-muted">payload, created_at, published</text>
+    <line x1="130" y1="142" x2="168" y2="142" class="line s-yellow sw-2" marker-end="url(#ahDL6a)"/>
+
+    <rect x="440" y="110" width="90" height="64" rx="12" class="fs-yellow s-yellow sw-2"/>
+    <text x="485" y="138" text-anchor="middle" class="t-bold">relay</text>
+    <text x="485" y="158" text-anchor="middle" class="t-xs t-muted">relay_once()</text>
+    <line x1="380" y1="200" x2="438" y2="160" class="line s-yellow sw-2" marker-end="url(#ahDL6a)"/>
+    <text x="410" y="196" class="t-xs t-muted">poll</text>
+
+    <rect x="570" y="100" width="170" height="84" rx="10" class="fs-orange s-orange sw-2"/>
+    <text x="655" y="126" text-anchor="middle" class="t-bold">log (a list)</text>
+    <text x="655" y="146" text-anchor="middle" class="t-xs t-muted">offset 0, 1, 2, ...</text>
+    <text x="655" y="164" text-anchor="middle" class="t-xs t-muted">append only</text>
+    <line x1="530" y1="142" x2="568" y2="142" class="line s-yellow sw-2" marker-end="url(#ahDL6a)"/>
+
+    <rect x="470" y="236" width="130" height="70" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="535" y="262" text-anchor="middle" class="t-bold">Cache</text>
+    <text x="535" y="282" text-anchor="middle" class="t-xs t-muted">own offset</text>
+    <rect x="620" y="236" width="130" height="70" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="685" y="262" text-anchor="middle" class="t-bold">SearchIndex</text>
+    <text x="685" y="282" text-anchor="middle" class="t-xs t-muted">own offset</text>
+    <line x1="640" y1="186" x2="552" y2="234" class="line s-yellow sw-2" marker-end="url(#ahDL6a)"/>
+    <line x1="670" y1="186" x2="682" y2="234" class="line s-yellow sw-2" marker-end="url(#ahDL6a)"/>
+  </svg>
+  <figcaption><strong>The target architecture.</strong> One local transaction produces both the order and the event that describes it. Everything to the right of the database is allowed to crash and repeat itself, because the outbox row is durable and the consumers are idempotent.</figcaption>
+</figure>
+
+<p>Five milestones, each building on the last:</p>
+<ol class="steps">
+  <li><strong>The dual-write bug:</strong> write <code>diagnose()</code>, then watch seven crashes leave the cache, the index and the database disagreeing.</li>
+  <li><strong>Transactional outbox:</strong> <code>place_order()</code> inserts the order and its event in one transaction.</li>
+  <li><strong>The relay:</strong> publish outbox rows in order, and discover at-least-once delivery by crashing it.</li>
+  <li><strong>Idempotent consumers:</strong> duplicates and reordering must not corrupt the cache or the index.</li>
+  <li><strong>Catch-up:</strong> a brand-new consumer replays the log from offset 0 and ends up equal to the database.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are inside this guide's folder, in <code>data/labs/code/lab06/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab06/starter.py"><code>starter.py</code></a></td><td>Your file. The schema, the transaction helper, the cache and index classes with their naive <code>put</code>, and the buggy dual-write code are given. Functions with a <code>TODO</code> are yours.</td></tr>
+    <tr><td><a href="code/lab06/check.py"><code>check.py</code></a></td><td>The self-check. It uses a temporary directory, injects crashes at named points, shuffles and duplicates events with seeded randomness, and compares your consumers with the database.</td></tr>
+    <tr><td><a href="code/lab06/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd data/labs/code/lab06</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 6 checks against starter.py
+
+  … Milestone 1: the dual-write bug (diagnose the divergence): not implemented yet (TODO milestone 1: diagnose)
+  … Milestone 2: transactional outbox (order and event, atomically): not implemented yet (TODO milestone 2: place_order)
+  … Milestone 3: relay (at-least-once publishing): not implemented yet (TODO milestone 3: relay_once)
+  … Milestone 4: idempotent consumers: not implemented yet (TODO milestone 4: Cache.handle)
+  … Milestone 5: catch-up and rebuild from offset 0: not implemented yet (TODO milestone 5: rebuild)
+
+0/5 milestones passing</span></code></pre>
+
+<h2>The data</h2>
+
+<p>An order has a customer, an item, a total, a <strong>status</strong> that moves from <code>placed</code> to <code>paid</code>, <code>shipped</code> and so on, and a <strong>version</strong> that goes up by one on every change. Remember the version. Milestone 4 depends on it. The cache keeps a dict <code>order_id -&gt; order state</code>; the search index keeps the same dict plus an inverted index <code>word -&gt; set of order ids</code> over the item, the customer and the status, so that <code>search("paid")</code> finds paid orders. Both need to end up exactly equal to what the <code>orders</code> table says.</p>
+
+<h2>Milestone 1: the dual-write bug</h2>
+
+<p>This is the code everyone writes first. It is already in <code>starter.py</code> as <code>place_order_dual_write</code>:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="The application writes to the database (step 1), then the cache (step 2), then the search index (step 3). A red cross between steps 1 and 2 shows a crash: the database has the order, the cache and the index do not.">
+    <defs>
+      <marker id="ahDL6b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <rect x="20" y="90" width="110" height="64" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="75" y="118" text-anchor="middle" class="t-bold">app</text>
+    <text x="75" y="138" text-anchor="middle" class="t-xs t-muted">dual write</text>
+    <rect x="260" y="20" width="150" height="56" rx="10" class="box"/>
+    <text x="335" y="44" text-anchor="middle" class="t-bold">database</text>
+    <text x="335" y="62" text-anchor="middle" class="t-xs t-muted">order 7: has it</text>
+    <rect x="260" y="98" width="150" height="56" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="335" y="122" text-anchor="middle" class="t-bold">cache</text>
+    <text x="335" y="140" text-anchor="middle" class="t-xs t-muted">order 7: never heard</text>
+    <rect x="260" y="176" width="150" height="56" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="335" y="200" text-anchor="middle" class="t-bold">search index</text>
+    <text x="335" y="218" text-anchor="middle" class="t-xs t-muted">order 7: never heard</text>
+    <line x1="130" y1="108" x2="258" y2="52" class="line s-yellow sw-2" marker-end="url(#ahDL6b)"/>
+    <text x="178" y="64" class="t-xs t-bold">1 commit</text>
+    <line x1="130" y1="122" x2="258" y2="126" class="line-dash"/>
+    <text x="140" y="116" class="t-xs t-bold tc-red">2 crash</text>
+    <line x1="130" y1="140" x2="258" y2="204" class="line-dash"/>
+    <text x="146" y="194" class="t-xs t-muted">3 never runs</text>
+    <rect x="450" y="60" width="290" height="130" rx="12" class="fs-red s-red sw-2"/>
+    <text x="595" y="90" text-anchor="middle" class="t-bold">Nothing failed. Nothing retries.</text>
+    <text x="595" y="114" text-anchor="middle" class="t-xs t-muted">The customer's order exists, but the</text>
+    <text x="595" y="130" text-anchor="middle" class="t-xs t-muted">dashboard and the search never show it.</text>
+    <text x="595" y="154" text-anchor="middle" class="t-xs t-muted">The database cannot help: its</text>
+    <text x="595" y="170" text-anchor="middle" class="t-xs t-muted">transaction ended at step 1.</text>
+  </svg>
+  <figcaption><strong>One logical change, three independent writes.</strong> The database's ACID guarantees (<a href="../chapters/10-acid.html">chapter 10</a>) stop at its own edge. A crash, a timeout or a deploy between the steps leaves the systems disagreeing, and no error is ever reported.</figcaption>
+</figure>
+
+<p>Swapping the order does not help. If you write the cache first and the database second, a crash in between leaves the cache holding an order that does not exist (a <em>phantom</em>). The given function can do either: pass <code>cache_first=True</code>. The same bug exists for updates (<code>update_status_dual_write</code>), where it leaves <em>stale</em> entries instead of missing ones, which is the stale-cache problem of <a href="../chapters/14-caching.html">chapter 14</a> arriving by a new route.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p><strong>First predict, then measure.</strong> Take a piece of paper. For each of the seven situations in the table below, write down what the cache, the index and the database hold after the crash. Then implement <code>diagnose(conn, cache, index)</code>: compare the cache (<code>cache.entries</code>) and the index (<code>index.docs</code>) with the database and return a dict of six sorted lists: <code>cache_missing</code>, <code>cache_extra</code>, <code>cache_stale</code>, <code>index_missing</code>, <code>index_extra</code>, <code>index_stale</code>. <em>Missing</em> means in the database but absent from that system, <em>extra</em> means there but not in the database, <em>stale</em> means present in both with different content. The database is the truth. (If that feels like too much, build <code>missing</code> first, then add the other two.)</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 1 as ✔ and then prints what each crash left behind, using <em>your</em> <code>diagnose</code>. Compare it with your predictions. This is a real run:</p>
+<pre class="terminal" data-title="terminal"><code><span class="out">  ✔ Milestone 1: the dual-write bug (diagnose the divergence)
+      what each crash leaves behind (the DB is the truth):
+        DB first, crash after the DB commit            -> cache_missing=[2], index_missing=[2]
+        DB first, crash after the cache write          -> index_missing=[2]
+        DB first, no crash                             -> all consistent
+        cache first, crash after the cache write       -> cache_extra=[2]
+        cache first, crash after the index write       -> cache_extra=[2], index_extra=[2]
+        status update, crash after the DB commit       -> cache_stale=[1], index_stale=[1]
+        status update, crash after the cache write     -> index_stale=[1]</span></code></pre>
+  <p>Notice two things. Every row except "no crash" is a bug, and each one is a different bug, so no amount of cleverness at one call site fixes the family. And nothing here is about speed or load: the problem is purely that there is no moment at which "all three" changes happen.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>db_snapshot(conn)</code> (given) returns <code>{order_id: state_dict}</code> for every row in the database. <code>cache.entries</code> and <code>index.docs</code> are dicts of the same shape.</li>
+      <li>Set arithmetic is all you need: missing is <code>db - held</code>, extra is <code>held - db</code>, and stale is the ids in both whose dicts are unequal.</li>
+      <li>Return <em>sorted lists</em>, not sets, so the output is stable and comparable.</li>
+      <li>You can write it once as a loop over <code>("cache", cache.entries), ("index", index.docs)</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> diagnose(conn, cache, index):
+    truth = db_snapshot(conn)
+    report = {}
+    <span class="kw">for</span> name, held <span class="kw">in</span> ((<span class="str">"cache"</span>, cache.entries), (<span class="str">"index"</span>, index.docs)):
+        report[name + <span class="str">"_missing"</span>] = sorted(i <span class="kw">for</span> i <span class="kw">in</span> truth <span class="kw">if</span> i <span class="kw">not</span> <span class="kw">in</span> held)
+        report[name + <span class="str">"_extra"</span>] = sorted(i <span class="kw">for</span> i <span class="kw">in</span> held <span class="kw">if</span> i <span class="kw">not</span> <span class="kw">in</span> truth)
+        report[name + <span class="str">"_stale"</span>] = sorted(i <span class="kw">for</span> i <span class="kw">in</span> truth <span class="kw">if</span> i <span class="kw">in</span> held <span class="kw">and</span> held[i] != truth[i])
+    <span class="kw">return</span> report</code></pre>
+<p>The dual-write functions themselves, for reference (they are given in the starter):</p>
+<pre><code><span class="kw">def</span> place_order_dual_write(conn, cache, index, order_id, customer, item, total_cents,
+                           crash=no_crash, cache_first=<span class="kw">False</span>):
+    <span class="kw">def</span> db():
+        <span class="kw">with</span> transaction(conn):
+            conn.execute(<span class="str">"INSERT INTO orders VALUES (?, ?, ?, ?, 'placed', 1)"</span>,
+                         (order_id, customer, item, total_cents))
+
+    order = {<span class="str">"id"</span>: order_id, <span class="str">"customer"</span>: customer, <span class="str">"item"</span>: item,
+             <span class="str">"total_cents"</span>: total_cents, <span class="str">"status"</span>: <span class="str">"placed"</span>, <span class="str">"version"</span>: <span class="num">1</span>}
+    <span class="kw">if</span> <span class="kw">not</span> cache_first:
+        db()
+        crash(<span class="str">"after_db"</span>)
+        cache.put(order)
+        crash(<span class="str">"after_cache"</span>)
+        index.put(order)
+        crash(<span class="str">"after_index"</span>)
+    <span class="kw">else</span>:
+        cache.put(order)
+        crash(<span class="str">"after_cache"</span>)
+        index.put(order)
+        crash(<span class="str">"after_index"</span>)
+        db()
+        crash(<span class="str">"after_db"</span>)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: the transactional outbox</h2>
+
+<p>If the database is the only system that can make a change atomic, then make the database hold <em>everything that must happen</em>. Add an <strong><code>outbox</code></strong> table next to <code>orders</code>. When an order changes, insert a row into <code>outbox</code> describing the change <strong>in the same transaction</strong> (<a href="../chapters/10-acid.html">atomicity</a>). Now there are only two possible worlds: the order and its event both exist, or neither does. There is no instant in which the order has been committed but nobody has been told, because "told" is now a durable row that can be delivered later, however many crashes it takes.</p>
+
+<p>Each outbox row records the event <code>type</code>, the <code>aggregate_id</code> (which order it concerns) and a <code>payload</code>. This lab puts the <em>complete new state</em> of the order, with its version, in the payload (sometimes called <em>event-carried state transfer</em>). That is a deliberate choice, and milestone 4 shows why it pays: an event that carries full state can simply be applied, in whatever order it arrives, if you know which version is newer.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>_emit</code> (insert one outbox row), <code>place_order</code> (insert the order, status <code>placed</code>, version 1, plus an <code>OrderPlaced</code> event) and <code>update_status</code> (change the status, bump the version, and emit an <code>OrderStatusChanged</code> event with the <em>new</em> state). Wrap each in <code>with transaction(conn):</code> and keep the <code>crash(...)</code> calls where the docstrings say.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 2 as ✔. The check crashes <code>place_order</code> after the order insert, just before the commit, and just after it, each time discarding the connection and reopening the file. Before the commit the counts must be <code>(orders, outbox) = (0, 0)</code>, after it <code>(1, 1)</code>, and never <code>(1, 0)</code>. It does the same to <code>update_status</code>, and checks that a failing insert (a duplicate order id) leaves no stray outbox row and no half-open transaction.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>The given <code>transaction(conn)</code> issues <code>BEGIN IMMEDIATE</code>, and <code>COMMIT</code> when the block ends normally. If anything escapes the block, even a simulated crash, it issues <code>ROLLBACK</code> and re-raises.</li>
+      <li>Both statements must be <em>inside</em> the same <code>with</code> block. Two separate blocks are two transactions, and a crash between them is the dual-write bug again, just closer to home. The check has a crash point between the two inserts to catch that.</li>
+      <li><code>json.dumps(order, sort_keys=True)</code> gives a stable payload. The order dict has the keys <code>id, customer, item, total_cents, status, version</code>; <code>order_state(row)</code> builds it from a database row.</li>
+      <li>For <code>update_status</code>, <code>UPDATE ... SET status = ?, version = version + 1</code> and then <code>SELECT</code> the row to put the new state into the event.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> _emit(conn, event_type, order):
+    conn.execute(<span class="str">"INSERT INTO outbox (aggregate_id, type, payload, created_at) VALUES (?, ?, ?, ?)"</span>,
+                 (order[<span class="str">"id"</span>], event_type, json.dumps(order, sort_keys=<span class="kw">True</span>), time.time()))
+
+<span class="kw">def</span> place_order(conn, order_id, customer, item, total_cents, crash=no_crash):
+    order = {<span class="str">"id"</span>: order_id, <span class="str">"customer"</span>: customer, <span class="str">"item"</span>: item,
+             <span class="str">"total_cents"</span>: total_cents, <span class="str">"status"</span>: <span class="str">"placed"</span>, <span class="str">"version"</span>: <span class="num">1</span>}
+    <span class="kw">with</span> transaction(conn):
+        conn.execute(<span class="str">"INSERT INTO orders (id, customer, item, total_cents, status, version) "</span>
+                     <span class="str">"VALUES (?, ?, ?, ?, ?, ?)"</span>,
+                     (order_id, customer, item, total_cents, <span class="str">"placed"</span>, <span class="num">1</span>))
+        crash(<span class="str">"after_order_insert"</span>)
+        _emit(conn, <span class="str">"OrderPlaced"</span>, order)
+        crash(<span class="str">"before_commit"</span>)
+    crash(<span class="str">"after_commit"</span>)
+
+<span class="kw">def</span> update_status(conn, order_id, status, crash=no_crash):
+    <span class="kw">with</span> transaction(conn):
+        conn.execute(<span class="str">"UPDATE orders SET status = ?, version = version + 1 WHERE id = ?"</span>, (status, order_id))
+        crash(<span class="str">"after_order_update"</span>)
+        row = conn.execute(<span class="str">"SELECT * FROM orders WHERE id = ?"</span>, (order_id,)).fetchone()
+        _emit(conn, <span class="str">"OrderStatusChanged"</span>, order_state(row))
+        crash(<span class="str">"before_commit"</span>)
+    crash(<span class="str">"after_commit"</span>)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 3: the relay, and at-least-once</h2>
+
+<p>A separate process, the <strong>relay</strong>, reads outbox rows that have not been published, in id order, sends them to the log (here a Python list; in real life Kafka, a queue or a topic), and marks them published. It can crash, restart, or run twice. The question is what order to do the last two steps in, because they are two different systems again (the log and the database), and you have just learned that you cannot make two systems atomic.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two orderings of the relay. Publish then mark: a crash between leaves the row unmarked, so it is published again after restart, giving a duplicate. Mark then publish: a crash between leaves the row marked but never published, so the event is lost.">
+    <defs>
+      <marker id="ahDL6c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="24" class="t-bold">publish, then mark</text>
+    <rect x="20" y="36" width="150" height="46" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="95" y="64" text-anchor="middle" class="t-xs t-bold">append to log</text>
+    <rect x="260" y="36" width="150" height="46" rx="8" class="fs-red s-red sw-2"/>
+    <text x="335" y="64" text-anchor="middle" class="t-xs t-bold">crash here</text>
+    <rect x="500" y="36" width="150" height="46" rx="8" class="box"/>
+    <text x="575" y="64" text-anchor="middle" class="t-xs t-bold">mark published</text>
+    <line x1="170" y1="59" x2="258" y2="59" class="line s-yellow sw-2" marker-end="url(#ahDL6c)"/>
+    <line x1="410" y1="59" x2="498" y2="59" class="line-dash"/>
+    <text x="20" y="108" class="t-sm t-bold tc-green">After restart: the row is still unpublished, so it is sent again.</text>
+    <text x="20" y="126" class="t-xs t-muted">Nothing lost, one duplicate: AT-LEAST-ONCE. Consumers must cope.</text>
+
+    <text x="20" y="166" class="t-bold">mark, then publish</text>
+    <rect x="20" y="178" width="150" height="46" rx="8" class="box"/>
+    <text x="95" y="206" text-anchor="middle" class="t-xs t-bold">mark published</text>
+    <rect x="260" y="178" width="150" height="46" rx="8" class="fs-red s-red sw-2"/>
+    <text x="335" y="206" text-anchor="middle" class="t-xs t-bold">crash here</text>
+    <rect x="500" y="178" width="150" height="46" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="575" y="206" text-anchor="middle" class="t-xs t-bold">append to log</text>
+    <line x1="170" y1="201" x2="258" y2="201" class="line s-yellow sw-2" marker-end="url(#ahDL6c)"/>
+    <line x1="410" y1="201" x2="498" y2="201" class="line-dash"/>
+    <text x="20" y="250" class="t-sm t-bold tc-red">After restart: the row says "published", the log never got it. LOST: at-most-once.</text>
+  </svg>
+  <figcaption><strong>Pick your failure.</strong> With two systems and a crash between them you can have duplicates or losses, not neither. A duplicate is fixable by the receiver (milestone 4); a loss is not fixable by anyone. So: publish first, mark second. This is the same <a href="../chapters/19-streams-cdc.html">at-least-once rule</a> as for a consumer committing its offset after processing.</figcaption>
+</figure>
+
+<p>This is the same trade-off as the sender in <a href="../../networking/chapters/16-failure.html">networking chapter 16</a> that cannot tell whether a lost acknowledgement means a lost request: the only safe policy is to retry, and the price of retrying is that the receiver may see the message twice.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>relay_once(conn, log)</code>: select the rows with <code>published = 0</code> ordered by id; for each, append an event <code>{"id", "aggregate_id", "type", "payload"}</code> (payload decoded from JSON into a dict) to <code>log</code>, call <code>crash("after_publish")</code>, then mark that row published, then call <code>crash("after_mark")</code>. Return how many events you published.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 3 as ✔ and prints the log after a crash:</p>
+<pre class="terminal" data-title="terminal"><code><span class="out">  ✔ Milestone 3: relay (at-least-once publishing)
+      after the crash and restart the log holds ids [1, 2, 3, 3, 4, 5, 6]: event 3 is delivered twice (at-least-once)</span></code></pre>
+  <p>The check seeds six outbox rows with its own code, so this milestone does not depend on yours from milestone 2. It publishes them, runs the relay again (nothing new), adds a row (only that one goes out), then crashes after the third publish and restarts. No event may be missing, events must first appear in id order, and event 3 must appear <em>twice</em>. The duplicate is the point.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>SELECT * FROM outbox WHERE published = 0 ORDER BY id</code>, then <code>.fetchall()</code> so the cursor is not held open while you update the table.</li>
+      <li>Mark each row immediately after publishing it, in its own small transaction, not all at the end. That keeps the window for duplicates to one event instead of the whole batch (a valid design, but a wider window).</li>
+      <li>Because <code>row_factory = sqlite3.Row</code> is set, <code>row["payload"]</code> works; pass it through <code>json.loads</code>.</li>
+      <li>If the check says an event was lost, you marked before you published.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> relay_once(conn, log, crash=no_crash):
+    rows = conn.execute(<span class="str">"SELECT * FROM outbox WHERE published = 0 ORDER BY id"</span>).fetchall()
+    <span class="kw">for</span> row <span class="kw">in</span> rows:
+        log.append({<span class="str">"id"</span>: row[<span class="str">"id"</span>], <span class="str">"aggregate_id"</span>: row[<span class="str">"aggregate_id"</span>],
+                    <span class="str">"type"</span>: row[<span class="str">"type"</span>], <span class="str">"payload"</span>: json.loads(row[<span class="str">"payload"</span>])})
+        crash(<span class="str">"after_publish"</span>)                  <span class="cmt"># a crash HERE means the row is published but not marked</span>
+        <span class="kw">with</span> transaction(conn):
+            conn.execute(<span class="str">"UPDATE outbox SET published = 1 WHERE id = ?"</span>, (row[<span class="str">"id"</span>],))
+        crash(<span class="str">"after_mark"</span>)
+    <span class="kw">return</span> len(rows)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: idempotent consumers</h2>
+
+<p>The log can now repeat itself, and it may be read twice by a consumer that crashed before saving its offset, or replayed on purpose. An <span class="term">idempotent</span> operation is one where doing it twice has the same effect as doing it once. Adding a number to a balance is not idempotent; setting a value is. The consumers must be built so that handling an event again changes nothing. There are two classic tools:</p>
+<ul>
+  <li><strong>Remember the ids of processed events.</strong> If the id has been seen, skip it. Simple, but the set of ids grows, and (here is the catch) it cannot cope with <em>reordering</em>. If an old event arrives after a newer one, its id is new, so it gets applied and the state goes backwards.</li>
+  <li><strong>Use a version number and an upsert.</strong> Every event carries the entity's version. Apply it only if its version is higher than what you hold. A duplicate has the same version (not higher: skip), an old event has a lower version (skip), and a late-arriving newer event is simply applied. No memory of ids is needed. This is why milestone 2 put the version in the payload.</li>
+</ul>
+
+<p>Events that carry the full state make this work smoothly. If they only said "status changed to shipped", dropping or reordering one would be unrecoverable. The cost is bigger events, and the technique only fits when you can name a version per entity. (Real systems use per-key offsets or sequence numbers from the log, or the row's version column, for the same job.)</p>
+
+<p>For the search index there is an extra subtlety. When an order moves from <code>placed</code> to <code>paid</code>, the document must leave the posting list of the word <code>placed</code> and join <code>paid</code>. The given <code>SearchIndex.put</code> already does that, so <code>handle</code> only has to decide <em>whether</em> to call it.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Cache.handle(event)</code> and <code>SearchIndex.handle(event)</code>. The order is <code>event["payload"]</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 4 as ✔. The check builds 34 events from a database history it made itself, then feeds fresh consumers the clean log and then seven hostile versions of it: every event twice in a row, the whole log twice, 25 random duplicates inserted at random places, reordering within windows of 3 and of 5, duplicates and reordering together, and the entire log in <em>reverse</em>. After each it asserts that the cache equals the database, the index's documents equal it, the inverted index equals one built from scratch, and <code>search</code> returns the right ids. If you chose to remember event ids only, it fails on the reordered streams with a message that names an order whose cached version is older than the database's.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Look up what you currently hold for <code>order["id"]</code>. If you hold something and its <code>version</code> is greater than or equal to the event's, return without doing anything. Otherwise call <code>self.put(order)</code>.</li>
+      <li>Both classes follow exactly the same rule. The index just stores its state in <code>docs</code> instead of <code>entries</code>.</li>
+      <li>Do not modify the event: the check replays the same event objects many times, and <code>put</code> copies the dict for you.</li>
+      <li>"Equal" matters: an event for version 3 arriving when you hold version 3 is a duplicate and should do nothing at all.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> handle(self, event):
+    order = event[<span class="str">"payload"</span>]
+    have = self.entries.get(order[<span class="str">"id"</span>])
+    <span class="kw">if</span> have <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> have[<span class="str">"version"</span>] &gt;= order[<span class="str">"version"</span>]:
+        <span class="kw">return</span>                              <span class="cmt"># a duplicate or an older event: ignore it</span>
+    self.put(order)
+
+<span class="kw">def</span> handle(self, event):
+    order = event[<span class="str">"payload"</span>]
+    have = self.docs.get(order[<span class="str">"id"</span>])
+    <span class="kw">if</span> have <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> have[<span class="str">"version"</span>] &gt;= order[<span class="str">"version"</span>]:
+        <span class="kw">return</span>
+    self.put(order)</code></pre>
+<p>Together with the given upserts, which keep the inverted index consistent:</p>
+<pre><code><span class="kw">def</span> put(self, order):
+    old = self.docs.get(order[<span class="str">"id"</span>])
+    <span class="kw">if</span> old <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        <span class="kw">for</span> t <span class="kw">in</span> tokens(old):
+            self.inverted[t].discard(order[<span class="str">"id"</span>])
+    self.docs[order[<span class="str">"id"</span>]] = dict(order)
+    <span class="kw">for</span> t <span class="kw">in</span> tokens(order):
+        self.inverted.setdefault(t, set()).add(order[<span class="str">"id"</span>])</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: catch-up and rebuild</h2>
+
+<p>A log is not just a pipe, it is a <em>history</em>. Every consumer keeps its own <strong>offset</strong>: the position of the next event it has not handled. A consumer that is up to date reads only what is new. A consumer that crashed resumes from its saved offset. A consumer that has never run starts at offset 0 and replays everything, ending in exactly the state the others hold. This is how you add a second search index, or a new analytics table, or repair a corrupted cache: throw the state away and replay. It is the same idea as a new database replica catching up from a leader's log (<a href="../chapters/15-replication-practice.html">chapter 15</a>), and it only works because milestone 4 made handling events safe to repeat.</p>
+
+<p>There is a subtle ordering rule hiding in <code>poll</code>: advance the offset <em>after</em> handling the event. If you advance it first and crash, the event is skipped forever (at-most-once). Handled-then-crash means one redelivery, which the idempotent consumer shrugs off. It is the relay's lesson again, one stage later.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>Consumer.poll(log, crash)</code> (handle every event from <code>self.offset</code> to the end, calling <code>crash("handled")</code> after each <code>handle</code> and before incrementing the offset; return the number handled) and <code>rebuild(log, consumer_cls)</code> (create a new consumer, poll it, return it).</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows milestone 5 as ✔. The check replays a 37-event log into brand-new consumers and compares them with the database. It adds three more events and requires that an up-to-date consumer's <code>poll</code> handles exactly those three. It crashes a consumer on its fifth event (after handling, before saving the offset), restarts it, and requires the final state to be right and the offset to have been 4 at the crash. It also replays a log in which every event appears twice, and checks that two consumers keep independent offsets.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>A <code>while self.offset &lt; len(log):</code> loop is the simplest shape. Re-read <code>len(log)</code> each time round; it is a list that may grow.</li>
+      <li>The order inside the loop is: <code>handle</code>, then <code>crash("handled")</code>, then <code>self.offset += 1</code>.</li>
+      <li>If the check says <code>crash('handled')</code> was never called, you did not call the hook between handling and the increment.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> poll(self, log, crash=no_crash):
+    n = <span class="num">0</span>
+    <span class="kw">while</span> self.offset &lt; len(log):
+        self.handle(log[self.offset])
+        crash(<span class="str">"handled"</span>)                    <span class="cmt"># a crash HERE: handled, but the offset was not saved</span>
+        self.offset += <span class="num">1</span>
+        n += <span class="num">1</span>
+    <span class="kw">return</span> n
+
+<span class="kw">def</span> rebuild(log, consumer_cls):
+    consumer = consumer_cls()
+    consumer.poll(log)
+    <span class="kw">return</span> consumer</code></pre>
+  </details>
+</div>
+
+<h2>Real CDC versus polling an outbox</h2>
+
+<p>Your relay polls: it asks a table "anything new?" The big alternative, <strong>change data capture</strong>, reads the database's own write-ahead log instead (<a href="../chapters/13-crash-recovery.html">chapter 13</a>), and the best-known tool is <a href="../chapters/19-streams-cdc.html">Debezium</a>. For PostgreSQL it uses logical decoding through a replication slot; for MySQL it reads the binlog. It acts like a replica, decodes each committed row change into an event, and publishes it to Kafka. The two approaches combine and compete:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>Poll an outbox table (this lab)</th><th>Read the WAL / binlog (Debezium-style)</th></tr></thead>
+  <tbody>
+    <tr><td>What the application must do</td><td>Write the outbox row itself, in the same transaction</td><td>Nothing: every committed change is captured, whoever made it, even a manual SQL fix</td></tr>
+    <tr><td>What an event looks like</td><td>Exactly what you choose: a domain event such as <code>OrderPlaced</code></td><td>A row-level change in a table's schema (before/after values). Consumers become coupled to your table layout unless you reshape the events</td></tr>
+    <tr><td>Load and latency</td><td>Repeated queries against the database; latency is the polling interval</td><td>No extra queries; the log is already being written. Events follow the commit closely</td></tr>
+    <tr><td>Ordering</td><td>You need an id or sequence. On a database with concurrent writers, ids are assigned at insert but become visible at commit, so a reader that tracks "the highest id I saw" can skip a row that commits late. (This lab selects <code>published = 0</code> instead; SQLite also has a single writer at a time.)</td><td>The log is in commit order by construction</td></tr>
+    <tr><td>Starting a new consumer</td><td>Replay the log you kept, as in milestone 5</td><td>An initial snapshot of the current rows, then the stream from the position where the snapshot was taken</td></tr>
+    <tr><td>Operational cost</td><td>An extra table to clean up and index</td><td>Database settings (for example logical-level WAL in Postgres), and a replication slot makes the database keep log segments until the connector reads them, so a stalled connector can fill a disk</td></tr>
+  </tbody>
+</table></div>
+
+<p>They are often used together: the application writes outbox rows, and a CDC connector reads <em>the outbox table's</em> changes from the WAL instead of polling, which gives the domain-event shape of the outbox and the efficiency and ordering of the log. Either way the consumer side is identical to what you built: at-least-once delivery, and idempotent handlers.</p>
+
+<h2>Look under the hood</h2>
+
+<p>After the milestones, open the database and look at the thing you built. This only touches a temporary file:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -c "
+import tempfile, os
+from solution import *
+path = os.path.join(tempfile.mkdtemp(), 'shop.db')
+conn = open_db(path)
+place_order(conn, 2, 'ben', 'blue lamp', 1800)
+update_status(conn, 2, 'paid')
+for r in conn.execute('SELECT id, aggregate_id, type, payload, published FROM outbox'):
+    print(tuple(r))
+log = []
+print(relay_once(conn, log), [e['id'] for e in log])
+c = rebuild(log, Cache); print(c.entries[2], c.offset)
+print(rebuild(log, SearchIndex).search('paid'))
+"</span>
+<span class="out">(1, 2, 'OrderPlaced', '{"customer": "ben", "id": 2, "item": "blue lamp", "status": "placed", "total_cents": 1800, "version": 1}', 0)
+(2, 2, 'OrderStatusChanged', '{"customer": "ben", "id": 2, "item": "blue lamp", "status": "paid", "total_cents": 1800, "version": 2}', 0)
+2 [1, 2]
+{'customer': 'ben', 'id': 2, 'item': 'blue lamp', 'status': 'paid', 'total_cents': 1800, 'version': 2} 2
+[2]</span></code></pre>
+
+<p>The outbox is an ordinary table, so you can inspect it with the <code>sqlite3</code> command-line tool while the lab runs. It is the log of everything that has ever happened to your orders, and the unpublished rows (<code>published = 0</code>) are your backlog.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Swap the relay's two steps.</strong> Mark first, publish second. Milestone 3 now reports a lost event. This is the at-most-once failure, and it is the one nobody can repair after the fact.</li>
+    <li><strong>Split the transaction.</strong> In <code>place_order</code>, commit after the order insert and start a second transaction for the outbox row. The check's "after_order_insert" point finds an order with no event: you have rebuilt the dual-write bug inside one database.</li>
+    <li><strong>Deduplicate by event id only.</strong> Replace the version comparison in <code>Cache.handle</code> with a <code>seen</code> set of event ids. Duplicates are fine and milestone 4 fails on the reordered streams. Then keep both: ids and versions. When would you want ids as well (think about events that have no version)?</li>
+    <li><strong>Make a non-idempotent consumer.</strong> Add a <code>revenue_cents</code> counter to the cache that adds <code>total_cents</code> on every <code>OrderPlaced</code> event. Replay the log twice and compare with <code>SELECT SUM(total_cents) FROM orders</code>. Now fix it without remembering event ids (hint: derive the total from the entries).</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>Compaction:</strong> a log that grows forever is not realistic. Write <code>compact(log)</code> that keeps only the newest event per order, and show that <code>rebuild</code> from the compacted log still equals the database. Which events may you never drop?</li>
+  <li><strong>Snapshot plus stream:</strong> a consumer that starts when the early part of the log is gone needs an initial snapshot. Implement <code>bootstrap(conn, log)</code> that copies the current <code>orders</code> rows into a consumer and then polls from the log offset recorded at the moment of the snapshot. What goes wrong if you take the snapshot and read the offset at different times?</li>
+  <li><strong>Batching:</strong> make the relay publish in batches of 50 with one <code>UPDATE ... WHERE id IN (...)</code>. How does the duplicate window change on a crash?</li>
+  <li><strong>Cleaning up:</strong> delete published outbox rows older than a day. Why is it safer to delete only after you know every consumer has read past them?</li>
+  <li><strong>Many relays:</strong> run two relays at once. What do they do to ordering and duplicates? Try <code>SELECT ... LIMIT n</code> with a claim column, or make the second one fail to start, as with a lock row.</li>
+  <li><strong>Per-key ordering:</strong> split the log into partitions by <code>aggregate_id % 3</code> as Kafka does (<a href="../chapters/19-streams-cdc.html">chapter 19</a>). Which orderings are still guaranteed, and does the version rule still work?</li>
+  <li><strong>Delete events:</strong> add an <code>OrderCancelled</code> tombstone that removes an order. What stops an old, delayed <code>OrderPlaced</code> from resurrecting it?</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>A relay and a consumer are two machines that can crash independently, with a network between them that can lose or repeat messages. That is the setting of <a href="../../networking/chapters/16-failure.html">networking chapter 16</a>, and the lab is a worked answer to its conclusion: you cannot get exactly-once delivery between machines, but you can get <em>effectively once</em> by combining at-least-once delivery with an idempotent receiver. The same pattern appears in <a href="../../networking/chapters/18-replication.html">replication</a> (a follower re-applying log entries it already has), in retried payment requests with idempotency keys, and in Kafka consumers committing offsets. The outbox is the local half of a bigger idea: let one system be the authority and turn its changes into a durable log, and every other system is just a function of that log.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>Writing to a database and then to a cache or an index is a dual write. There is no atomicity across them, and a crash between the steps leaves them disagreeing, silently, in a different way at each crash point.</li>
+    <li>Swapping the order of the writes moves the bug (missing entries become phantoms); it never removes it.</li>
+    <li>The transactional outbox makes "the change" and "the record that the change must be announced" one atomic local transaction. Everything after that can be retried.</li>
+    <li>A relay that publishes before it marks gives at-least-once delivery: no loss, occasional duplicates. Marking first would give at-most-once, which loses events.</li>
+    <li>Idempotent consumers make duplicates harmless. Event ids alone do not survive reordering; a version number per entity, with "apply only if newer", survives both. Full-state events make this simple.</li>
+    <li>A log with per-consumer offsets lets a brand-new consumer rebuild its state from offset 0, and lets a crashed one resume. Advance the offset after handling.</li>
+    <li>Real CDC reads the database's own WAL or binlog instead of polling a table. It trades the application's control over event shape for completeness, ordering and lower load.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">An order is committed in the database, and the process crashes before it updates the cache. Which statement is true?</p>
+    <ol class="q-options">
+      <li>The database transaction is rolled back when the process dies, so everything is consistent</li>
+      <li>The commit had already completed, so the database has the order and the cache does not; the database cannot know it should have told the cache</li>
+      <li>The cache will notice and fetch the order itself</li>
+      <li>Writing to the cache first, then the database, would have prevented the problem</li>
+    </ol>
+    <div class="q-explain">The database transaction had ended successfully at the commit. The cache is a different system and was never part of it. Reversing the order just changes the failure into a phantom cache entry for an order that does not exist.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Why must the order row and the outbox row be inserted in the <em>same</em> database transaction?</p>
+    <ol class="q-options">
+      <li>So that they are written faster</li>
+      <li>So that the relay can read them in one query</li>
+      <li>So that the outbox row can be deleted after publishing</li>
+      <li>So that either both exist or neither does: there is never an order that no one will be told about, nor an announcement of an order that does not exist</li>
+    </ol>
+    <div class="q-explain">The outbox pattern only moves the problem into a place where atomicity is available. Two transactions would reintroduce a crash window between them.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">The relay appends event 3 to the log, then crashes before marking it published. What happens after restart, and what must the consumers be able to do?</p>
+    <ol class="q-options">
+      <li>Event 3 is published again, so consumers receive it twice and must handle duplicates harmlessly</li>
+      <li>Event 3 is lost, so consumers must ask the database for it</li>
+      <li>Event 3 is delivered exactly once, because the row is still in the outbox</li>
+      <li>The relay refuses to restart until a person marks the row</li>
+    </ol>
+    <div class="q-explain">The row is still marked unpublished, so the restarted relay publishes it again. That is at-least-once delivery. Exactly-once is built out of it by making the receiver idempotent.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A consumer remembers the ids of the events it has processed and skips repeats. Events for one order arrive as version 2, then version 1. What does the cache end up holding, and why does a version check fix it?</p>
+    <ol class="q-options">
+      <li>Version 2, because the id check also sorts events</li>
+      <li>Nothing, because both events are rejected as out of order</li>
+      <li>Version 1, because both ids are new so both are applied in arrival order; comparing versions would ignore the older event</li>
+      <li>Version 2, because the database overrides the cache</li>
+    </ol>
+    <div class="q-explain">Event ids detect repeats, not staleness. Version 1's id has never been seen, so it overwrites version 2. With a version number, "apply only if newer" makes the result independent of arrival order.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual Memory · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/vm-translate.css">
+</head>
+<body data-root="../.." data-course="sys" data-chapter="06">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Virtual Memory</h1>
+  <p class="lede">Every program you run believes it owns a huge, private, perfectly tidy block of memory. None of that is true: the addresses are fiction, and the real memory is shared, scattered and sometimes not even there. This chapter explains the translation trick behind the illusion, and how it gives us protection, cheap <code>fork</code>, memory-mapped files, swapping, and the occasional out-of-memory kill.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>"Memory" is the resource that most often decides whether a service stays up. Virtual memory explains why the memory that processes have asked for can add up to more than your RAM and everything still runs, why <code>ps</code> shows two different memory numbers, why a container is mysteriously killed with exit code 137, why a database that forks to take a snapshot can suddenly need double the RAM, and why a machine that starts swapping becomes unusably slow rather than just a bit slower. It is the second of the "three illusions" from <a href="00-start-here.html">chapter 0</a>: <em>you have memory to yourself</em>. Here we see how it is made, and how it leaks.</p>
+</div>
+
+<h2>The problem: many programs, one RAM</h2>
+
+<p>Suppose we skip all cleverness: when you start a program, the OS loads it into some free stretch of physical RAM, and the program uses the real addresses directly. Three things go wrong.</p>
+
+<ol>
+  <li><strong>No protection.</strong> Nothing stops one program from reading or overwriting another's bytes, or the kernel's. One stray pointer can take down the machine.</li>
+  <li><strong>Fixed addresses.</strong> A program compiled to expect its data at address 5,000 breaks if another program is already there. Every program would have to be built knowing exactly where it will land.</li>
+  <li><strong>Fragmentation.</strong> Programs start and stop, leaving free space in awkward gaps. A new program needs one <em>contiguous</em> block, so it may fail to load even though plenty of memory is free in total.</li>
+</ol>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 224" role="img" aria-label="Physical RAM holding programs A, B, C and D with three small free holes between them; a new program that needs a larger contiguous block cannot fit">
+    <text x="380" y="22" text-anchor="middle" class="t-sm t-muted">Without virtual memory: programs sit directly in physical RAM</text>
+    <rect x="20" y="40" width="150" height="50" rx="4" class="fs-blue s-blue sw-2"/><text x="95" y="70" text-anchor="middle" class="t-sm">program A</text>
+    <rect x="170" y="40" width="60" height="50" class="box"/><text x="200" y="70" text-anchor="middle" class="t-xs t-faint">free</text>
+    <rect x="230" y="40" width="170" height="50" class="fs-green s-green sw-2"/><text x="315" y="70" text-anchor="middle" class="t-sm">program B</text>
+    <rect x="400" y="40" width="50" height="50" class="box"/><text x="425" y="70" text-anchor="middle" class="t-xs t-faint">free</text>
+    <rect x="450" y="40" width="170" height="50" class="fs-pink s-pink sw-2"/><text x="535" y="70" text-anchor="middle" class="t-sm">program C</text>
+    <rect x="620" y="40" width="60" height="50" class="box"/><text x="650" y="70" text-anchor="middle" class="t-xs t-faint">free</text>
+    <rect x="680" y="40" width="60" height="50" rx="4" class="fs-cyan s-cyan sw-2"/><text x="710" y="70" text-anchor="middle" class="t-sm">D</text>
+
+    <rect x="20" y="112" width="270" height="40" rx="8" class="fs-red s-red sw-2"/><text x="155" y="137" text-anchor="middle" class="t-sm">new program needs one 150-unit block</text>
+    <text x="310" y="128" class="t-sm">Free space totals 170, but the biggest hole is only 60.</text>
+    <text x="310" y="146" class="t-sm">It can't be loaded, although RAM isn't full.</text>
+
+    <text x="20" y="188" class="t-xs t-muted">Also: nothing stops program C from writing into B's bytes,</text>
+    <text x="20" y="206" class="t-xs t-muted">and every program must know in advance where in RAM it will be loaded.</text>
+  </svg>
+  <figcaption><strong>Direct use of physical memory.</strong> Free memory is split into unusable slivers, and no program is protected from the others.</figcaption>
+</figure>
+
+<p>The fix is a layer of indirection, the oldest trick in computer science: <strong>don't let programs use real addresses</strong>. Give each process its own made-up set of addresses, and have the hardware translate every one of them to a real location as the program runs.</p>
+
+<h2>Virtual and physical addresses</h2>
+
+<p>A <span class="term">virtual address</span> is what a program sees: the number in a pointer, in a stack frame, in the program counter. A <span class="term">physical address</span> is the actual location in the RAM chips. Every memory access made by user code, every load, store and instruction fetch, uses a virtual address, and the CPU's <span class="term">memory management unit</span> (<span class="term">MMU</span>) translates it to a physical one in hardware before the access reaches RAM. The kernel controls the translations; the program never sees a physical address.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: hotel room numbers</p>
+  <p>Every guest's key card says "Room 1", "Room 2" and "Room 3". Two different guests both have a "Room 1", and they never collide, because the front desk keeps a book translating each guest's room numbers into real rooms: guest A's Room 1 is 412, guest B's Room 1 is 907. A guest can't open a door they have no entry for. Rooms can be moved around, or kept in storage until needed, without the guest noticing, as long as the book is updated.</p>
+  <p><em>Where it breaks down:</em> a hotel desk is consulted once, at check-in. The MMU is consulted on <em>every single memory access</em> (billions per second), so the "book" has to be backed by a very fast hardware cache (the TLB, below), and the translation is done by silicon, not by a person.</p>
+</div>
+
+<h3>Pages, frames and page tables</h3>
+
+<p>Translating each individual byte address separately would need a table as large as memory itself. Instead, memory is divided into fixed-size blocks, and whole blocks are mapped at a time. A block of <em>virtual</em> memory is a <span class="term">page</span>; a block of <em>physical</em> memory is a <span class="term">frame</span>; they are the same size. The usual size is <strong>4 KiB</strong> (4,096 bytes). Apple Silicon Macs use <strong>16 KiB</strong> pages, and some other systems use 64 KiB.</p>
+
+<p>An address then splits into two parts. With 4 KiB pages, the low 12 bits (2<sup>12</sup> = 4,096) are the <span class="term">offset</span>: which byte inside the page. The remaining high bits are the <span class="term">page number</span>. Only the page number gets translated. The offset is copied across unchanged, because the page lands in a frame of the same size.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="A 16-bit virtual address 0x3A7C is split into a 4-bit page number 3 and a 12-bit offset 0xA7C; the page number goes through the TLB and page table to frame 7; the offset is copied unchanged, giving physical address 0x7A7C">
+    <defs>
+      <marker id="ahS06a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="14" class="t-sm t-bold">virtual address 0x3A7C  (16 bits in this toy)</text>
+    <text x="80" y="36" text-anchor="middle" class="t-xs t-faint">page number</text>
+    <text x="290" y="36" text-anchor="middle" class="t-xs t-faint">offset within the page (12 bits)</text>
+    <rect x="20" y="44" width="120" height="40" class="fs-blue s-blue sw-2"/><text x="80" y="69" text-anchor="middle" class="t-sm t-bold mono">0011</text>
+    <rect x="140" y="44" width="300" height="40" class="fs-orange s-orange sw-2"/><text x="290" y="69" text-anchor="middle" class="t-sm t-bold mono">1010 0111 1100</text>
+
+    <path d="M80,86 L80,116" class="line s-blue sw-2" marker-end="url(#ahS06a)"/>
+    <rect x="20" y="118" width="200" height="42" rx="8" class="box2"/><text x="120" y="144" text-anchor="middle" class="t-sm">TLB, then page table</text>
+    <path d="M80,162 L80,198" class="line s-green sw-2" marker-end="url(#ahS06a)"/>
+    <text x="92" y="184" class="t-xs t-muted">page 3 lives in frame 7</text>
+    <path d="M290,86 L290,198" class="line s-orange sw-2" marker-end="url(#ahS06a)"/>
+    <text x="302" y="146" class="t-xs t-muted">copied unchanged</text>
+
+    <rect x="20" y="200" width="120" height="40" class="fs-green s-green sw-2"/><text x="80" y="225" text-anchor="middle" class="t-sm t-bold mono">111</text>
+    <rect x="140" y="200" width="300" height="40" class="fs-orange s-orange sw-2"/><text x="290" y="225" text-anchor="middle" class="t-sm t-bold mono">1010 0111 1100</text>
+    <text x="20" y="260" class="t-sm t-bold">physical address 0x7A7C  (frame 7 + the same offset)</text>
+
+    <text x="480" y="104" class="t-sm t-bold">Why split like this?</text>
+    <text x="480" y="124" class="t-sm t-muted">The page is the unit of mapping:</text>
+    <text x="480" y="142" class="t-sm t-muted">4,096 bytes move together, so</text>
+    <text x="480" y="160" class="t-sm t-muted">only the page number needs a</text>
+    <text x="480" y="178" class="t-sm t-muted">lookup. The table is 4,096 times</text>
+    <text x="480" y="196" class="t-sm t-muted">smaller than one entry per byte.</text>
+  </svg>
+  <figcaption><strong>One address, two jobs.</strong> This is a toy 16-bit address (real ones are 48 bits or more), but the split works the same way.</figcaption>
+</figure>
+
+<p>The kernel keeps, for each process, a <span class="term">page table</span>: for every virtual page, an entry saying where it lives (which frame, or "not in RAM") plus <em>permission bits</em>: present, writable, executable, user-accessible. This is where protection comes from. A page is simply absent from a process's table unless the kernel mapped it, so the process has no address that reaches another's data. Writing to a read-only code page, or jumping to a data page marked non-executable, triggers a fault. Address 0 is deliberately left unmapped, which is why dereferencing a null pointer crashes immediately instead of corrupting something.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 306" role="img" aria-label="Two processes each with virtual pages 0, 1 and 2 are mapped by the MMU to different physical frames; one page of process A is on disk and not in RAM; one frame is free">
+    <defs>
+      <marker id="ahS06b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <text x="20" y="32" class="t-xs t-faint t-bold">PROCESS A: virtual pages</text>
+    <rect x="20" y="40" width="190" height="30" rx="6" class="fs-purple s-purple sw-2"/><text x="115" y="60" text-anchor="middle" class="t-sm">A · page 0</text>
+    <rect x="20" y="80" width="190" height="30" rx="6" class="fs-purple s-purple sw-2"/><text x="115" y="100" text-anchor="middle" class="t-sm">A · page 1</text>
+    <rect x="20" y="120" width="190" height="30" rx="6" class="box"/><text x="115" y="140" text-anchor="middle" class="t-sm t-faint">A · page 2: on disk</text>
+    <text x="20" y="178" class="t-xs t-faint t-bold">PROCESS B: virtual pages</text>
+    <rect x="20" y="186" width="190" height="30" rx="6" class="fs-pink s-pink sw-2"/><text x="115" y="206" text-anchor="middle" class="t-sm">B · page 0</text>
+    <rect x="20" y="226" width="190" height="30" rx="6" class="fs-pink s-pink sw-2"/><text x="115" y="246" text-anchor="middle" class="t-sm">B · page 1</text>
+    <rect x="20" y="266" width="190" height="30" rx="6" class="fs-pink s-pink sw-2"/><text x="115" y="286" text-anchor="middle" class="t-sm">B · page 2</text>
+
+    <text x="385" y="30" text-anchor="middle" class="t-xs t-faint">the MMU translates every access</text>
+    <text x="560" y="32" class="t-xs t-faint t-bold">PHYSICAL RAM: frames</text>
+    <rect x="560" y="40" width="180" height="34" rx="6" class="box"/><text x="650" y="62" text-anchor="middle" class="t-sm">F0 · B page 1</text>
+    <rect x="560" y="84" width="180" height="34" rx="6" class="box"/><text x="650" y="106" text-anchor="middle" class="t-sm">F1 · A page 1</text>
+    <rect x="560" y="128" width="180" height="34" rx="6" class="box"/><text x="650" y="150" text-anchor="middle" class="t-sm t-faint">F2 · free</text>
+    <rect x="560" y="172" width="180" height="34" rx="6" class="box"/><text x="650" y="194" text-anchor="middle" class="t-sm">F3 · A page 0</text>
+    <rect x="560" y="216" width="180" height="34" rx="6" class="box"/><text x="650" y="238" text-anchor="middle" class="t-sm">F4 · B page 0</text>
+    <rect x="560" y="260" width="180" height="34" rx="6" class="box"/><text x="650" y="282" text-anchor="middle" class="t-sm">F5 · B page 2</text>
+
+    <path d="M212,55 L558,187" class="line s-purple sw-2" marker-end="url(#ahS06b)"/>
+    <path d="M212,95 L558,101" class="line s-purple sw-2" marker-end="url(#ahS06b)"/>
+    <path d="M212,201 L558,233" class="line s-pink sw-2" marker-end="url(#ahS06b)"/>
+    <path d="M212,241 L558,57" class="line s-pink sw-2" marker-end="url(#ahS06b)"/>
+    <path d="M212,281 L558,277" class="line s-pink sw-2" marker-end="url(#ahS06b)"/>
+  </svg>
+  <figcaption><strong>Same virtual page numbers, different frames.</strong> Both processes have a "page 0", but they map to different frames, so neither can reach the other's data. Page 2 of process A is valid but currently lives on disk.</figcaption>
+</figure>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A pointer's value is a location in RAM." A pointer holds a <em>virtual</em> address. Two different processes can use the very same virtual address and mean different physical memory. (If you print a variable's address in two copies of a program you will often see different numbers, because the OS randomises layouts for security, but even matching numbers would not mean shared memory.) And the same virtual page can move to another frame (or out to disk and back) while your program is running, without the pointer changing at all.</p>
+</div>
+
+<h3>Multi-level tables</h3>
+
+<p>A real 64-bit address space is gigantic. A flat page table covering 48-bit addresses with 4 KiB pages would need 2<sup>36</sup> entries, at 8 bytes each: 512 GiB, per process, mostly describing memory that doesn't exist. Real CPUs use a <strong>tree</strong>: on x86-64, four levels of tables, each indexed by 9 bits of the address (9 + 9 + 9 + 9 + 12 offset bits = 48). Branches of the tree for unused regions simply aren't allocated, so a small program needs only a few kilobytes of tables. The price: a full lookup, a <em>page-table walk</em>, takes up to four memory reads. That would make every memory access several times slower, unless something remembers recent translations.</p>
+
+<h3>The TLB</h3>
+
+<p>That something is the <span class="term">TLB</span> (translation lookaside buffer), a small, very fast cache inside the CPU that holds recent page-number-to-frame translations. On each access the hardware checks the TLB first. A <strong>hit</strong> costs essentially nothing extra. A <strong>miss</strong> forces the page-table walk, and the result is stored in the TLB (pushing an older entry out). TLBs hold anywhere from dozens to a few thousand entries, yet hit rates are typically very high, because programs show <em>locality</em> (<a href="02-memory-hierarchy.html">chapter 2</a>): they keep touching the same few pages. Two consequences are worth knowing:</p>
+
+<ul>
+  <li>When the CPU switches from one process to another, the old process's translations must not be used for the new one. Either the TLB is flushed (the new process starts cold and takes a burst of misses) or its entries are tagged with a process identifier so they can coexist. This is part of the hidden cost of a context switch (<a href="07-scheduling.html">chapter 7</a>).</li>
+  <li>The TLB covers only <em>entries × page size</em> of memory. A program that sweeps through a very large random working set misses constantly. This is one reason for huge pages, below.</li>
+</ul>
+
+<h2>Try the translation yourself</h2>
+
+<p>The widget below is a deliberately tiny machine, a <strong>toy</strong>: 16-bit addresses, 4 KiB pages (so 16 virtual pages), only 8 physical frames and a 4-entry TLB. Type a virtual address in hex (or pick one), press <em>Translate</em> and read the steps. Things to try:</p>
+
+<ol>
+  <li>Translate <code>0x0123</code> twice. The first time misses the TLB; the second hits.</li>
+  <li>Choose an <em>untouched</em> page (minor fault) and an <em>on disk</em> page (major fault). Watch a frame fill up in RAM. Do a few more until RAM is full and a page has to be evicted.</li>
+  <li>Aim at an <em>unmapped</em> page and see the segmentation fault.</li>
+  <li>Press <em>New process</em> and translate <code>0x0123</code> again: the same virtual address now maps to a different frame.</li>
+  <li>Press <em>Run 10 accesses</em> several times and watch the hit rate climb as locality warms the TLB.</li>
+</ol>
+
+<div class="widget" id="vm-translate">
+  <div class="widget-head"><span class="widget-tag">Interactive</span><h4 class="widget-title">Virtual-address translator (toy sizes)</h4></div>
+  <p class="widget-help">Toy machine: 16-bit virtual addresses, 4 KiB pages, 8 physical frames, 4-entry TLB, one flat page table per process. Real machines are bigger and use multi-level tables, but the logic is the same.</p>
+  <noscript><p>This widget needs JavaScript.</p></noscript>
+</div>
+
+<h2>Page faults and demand paging</h2>
+
+<p>The page table can say "this page is valid but <em>not in RAM right now</em>". Touching such a page makes the MMU raise an exception, a <span class="term">page fault</span>, which transfers control into the kernel (<a href="04-kernel-syscalls.html">chapter 4</a>). The kernel works out why, fixes it if it can, and <em>restarts the instruction</em> that faulted. The program never knows. There are two common kinds:</p>
+
+<dl class="terms">
+  <dt>Minor fault</dt><dd>The data needs no disk read. Examples: the first touch of fresh memory (the kernel supplies a zero-filled frame), or a page that is already in RAM in the page cache and just needs mapping into this process. It costs roughly the order of a microsecond or so.</dd>
+  <dt>Major fault</dt><dd>The data must be fetched from disk: a page that was swapped out, or the first read of a file-backed page not yet cached. The process sleeps until the disk delivers. This is tens to thousands of times slower than a minor fault (an SSD read is tens of microseconds or more, a spinning disk milliseconds).</dd>
+</dl>
+
+<p>This is the basis of <span class="term">demand paging</span>: the kernel is lazy. When you start a program, it doesn't read the whole executable into RAM. It maps the file's pages into the address space and loads each one only when the program first touches it. When a program calls <code>malloc(1 GB)</code>, nothing is allocated in RAM; the kernel records "this range is valid" and supplies frames one page at a time as the program writes to them. Memory that is requested but never used costs nothing.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 146" role="img" aria-label="A bar showing a process's address space: a small part resident in RAM (RSS), a large part mapped but never touched, and a part on disk; the whole bar is VSZ">
+    <text x="100" y="18" text-anchor="middle" class="t-xs t-bold tc-green">RSS: what is in RAM now</text>
+    <path d="M20,34 v-8 h160 v8" class="line s-green"/>
+    <rect x="20" y="40" width="160" height="56" rx="6" class="fs-green s-green sw-2"/><text x="100" y="72" text-anchor="middle" class="t-sm">in RAM</text>
+    <rect x="180" y="40" width="380" height="56" class="box"/><text x="370" y="72" text-anchor="middle" class="t-sm t-muted">mapped but never touched: costs no RAM</text>
+    <rect x="560" y="40" width="180" height="56" rx="6" class="box"/><text x="650" y="64" text-anchor="middle" class="t-sm t-muted">on disk</text><text x="650" y="82" text-anchor="middle" class="t-xs t-faint">swapped, or file not read yet</text>
+    <path d="M20,104 v8 h720 v-8" class="line s-purple"/>
+    <text x="380" y="132" text-anchor="middle" class="t-xs t-bold tc-purple">VSZ: everything this process has mapped, whether or not it is in RAM</text>
+  </svg>
+  <figcaption><strong>Two memory numbers.</strong> <code>ps</code> reports both. RSS is the resident part; VSZ is the whole mapped address space, which is usually much larger.</figcaption>
+</figure>
+
+<h2>The address-space layout</h2>
+
+<p>Each process's virtual address space is arranged in regions. This is the picture to hold in your head when you read about the stack and heap (<a href="03-stack-heap.html">chapter 3</a>) or a crash report:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 386" role="img" aria-label="Address space layout from high to low addresses: kernel, stack, big unmapped gap, mmap region, gap, heap, data, code">
+    <text x="20" y="32" class="t-xs t-faint">high</text>
+    <text x="20" y="352" class="t-xs t-faint">low</text>
+    <rect x="90" y="16" width="260" height="30" class="box2"/><text x="104" y="36" class="t-sm">kernel (off limits)</text>
+    <rect x="90" y="46" width="260" height="50" class="fs-blue s-blue sw-2"/><text x="104" y="68" class="t-sm t-bold">stack</text><text x="104" y="85" class="t-xs t-muted">grows down</text>
+    <rect x="90" y="96" width="260" height="50" class="box"/><text x="220" y="126" text-anchor="middle" class="t-sm t-faint">unmapped (huge gap)</text>
+    <rect x="90" y="146" width="260" height="50" class="fs-cyan s-cyan sw-2"/><text x="104" y="168" class="t-sm t-bold">mmap region</text><text x="104" y="185" class="t-xs t-muted">libraries, mapped files</text>
+    <rect x="90" y="196" width="260" height="36" class="box"/><text x="220" y="219" text-anchor="middle" class="t-sm t-faint">unmapped</text>
+    <rect x="90" y="232" width="260" height="50" class="fs-green s-green sw-2"/><text x="104" y="254" class="t-sm t-bold">heap</text><text x="104" y="271" class="t-xs t-muted">grows up</text>
+    <rect x="90" y="282" width="260" height="34" class="fs-yellow s-yellow sw-2"/><text x="104" y="304" class="t-sm t-bold">data</text>
+    <rect x="90" y="316" width="260" height="40" class="fs-orange s-orange sw-2"/><text x="104" y="341" class="t-sm t-bold">code</text>
+
+    <text x="370" y="35" class="t-xs t-muted">Reserved for the kernel: user code can't touch it</text>
+    <text x="370" y="75" class="t-xs t-muted">Locals and call frames, one stack per thread</text>
+    <text x="370" y="125" class="t-xs t-muted">Any access here is a segmentation fault</text>
+    <text x="370" y="175" class="t-xs t-muted">Shared libraries (libc), mmap()ed files, big allocations</text>
+    <text x="370" y="261" class="t-xs t-muted">malloc and Python objects: memory the program asks for</text>
+    <text x="370" y="303" class="t-xs t-muted">Global and static variables</text>
+    <text x="370" y="341" class="t-xs t-muted">Machine code: read-only, shared by all copies</text>
+    <text x="20" y="378" class="t-xs t-faint">Schematic. Real layouts vary by OS, and ASLR randomises where each region starts on every run.</text>
+  </svg>
+  <figcaption><strong>A process's virtual address space.</strong> Only small parts of this enormous range are mapped. The rest is simply absent from the page table.</figcaption>
+</figure>
+
+<h2>Copy-on-write, and why fork is cheap</h2>
+
+<p>In <a href="05-processes.html">chapter 5</a> we said <code>fork</code> "clones the process, including its memory". Copying gigabytes of RAM every time a shell starts <code>ls</code> would be absurd, especially since the child usually calls <code>exec</code> a moment later and throws the copy away. The trick is <span class="term">copy-on-write</span> (COW):</p>
+
+<ol>
+  <li>At fork, the kernel copies only the page <em>table</em>, not the pages. Parent and child now map the same physical frames, and every shared page is marked read-only in both.</li>
+  <li>As long as both only <em>read</em>, they happily share. Nothing is copied, and no extra RAM is used.</li>
+  <li>When either one tries to <em>write</em>, the read-only mark triggers a page fault. The kernel allocates a new frame, copies that single page into it, points the writer's table entry at the copy with write permission, and restarts the write.</li>
+</ol>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 236" role="img" aria-label="Three panels: after fork parent and child share frame F5 read-only; when the child writes a page fault occurs; the kernel copies the page into frame F9 so each process has its own writable copy">
+    <defs>
+      <marker id="ahS06c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    </defs>
+    <path d="M250,10 L250,222" class="line-thin"/><path d="M500,10 L500,222" class="line-thin"/>
+
+    <text x="130" y="20" text-anchor="middle" class="t-sm t-bold">1. After fork()</text>
+    <rect x="20" y="36" width="105" height="48" rx="8" class="fs-purple s-purple sw-2"/><text x="72" y="56" text-anchor="middle" class="t-sm">parent</text><text x="72" y="73" text-anchor="middle" class="t-xs t-muted">F5 · read-only</text>
+    <rect x="135" y="36" width="105" height="48" rx="8" class="fs-pink s-pink sw-2"/><text x="187" y="56" text-anchor="middle" class="t-sm">child</text><text x="187" y="73" text-anchor="middle" class="t-xs t-muted">F5 · read-only</text>
+    <rect x="65" y="130" width="130" height="44" rx="8" class="box"/><text x="130" y="150" text-anchor="middle" class="t-sm t-bold">frame F5</text><text x="130" y="166" text-anchor="middle" class="t-xs t-muted">one shared copy</text>
+    <path d="M72,86 L100,128" class="line" marker-end="url(#ahS06c)"/><path d="M187,86 L160,128" class="line" marker-end="url(#ahS06c)"/>
+    <text x="130" y="198" text-anchor="middle" class="t-xs t-muted">no pages copied yet:</text><text x="130" y="214" text-anchor="middle" class="t-xs t-muted">only the page table</text>
+
+    <text x="380" y="20" text-anchor="middle" class="t-sm t-bold">2. Child writes</text>
+    <rect x="270" y="36" width="105" height="48" rx="8" class="fs-purple s-purple sw-2"/><text x="322" y="56" text-anchor="middle" class="t-sm">parent</text><text x="322" y="73" text-anchor="middle" class="t-xs t-muted">F5 · read-only</text>
+    <rect x="385" y="36" width="105" height="48" rx="8" class="fs-red s-red sw-2"/><text x="437" y="56" text-anchor="middle" class="t-sm">child</text><text x="437" y="73" text-anchor="middle" class="t-xs t-muted">tries to write!</text>
+    <rect x="315" y="130" width="130" height="44" rx="8" class="box"/><text x="380" y="150" text-anchor="middle" class="t-sm t-bold">frame F5</text><text x="380" y="166" text-anchor="middle" class="t-xs t-muted">still shared</text>
+    <path d="M322,86 L350,128" class="line" marker-end="url(#ahS06c)"/><path d="M437,86 L410,128" class="line" marker-end="url(#ahS06c)"/>
+    <text x="380" y="198" text-anchor="middle" class="t-xs t-muted">write to a read-only page =</text><text x="380" y="214" text-anchor="middle" class="t-xs t-muted">page fault, kernel steps in</text>
+
+    <text x="630" y="20" text-anchor="middle" class="t-sm t-bold">3. Kernel copies the page</text>
+    <rect x="520" y="36" width="105" height="48" rx="8" class="fs-purple s-purple sw-2"/><text x="572" y="56" text-anchor="middle" class="t-sm">parent</text><text x="572" y="73" text-anchor="middle" class="t-xs t-muted">F5 · writable</text>
+    <rect x="635" y="36" width="105" height="48" rx="8" class="fs-pink s-pink sw-2"/><text x="687" y="56" text-anchor="middle" class="t-sm">child</text><text x="687" y="73" text-anchor="middle" class="t-xs t-muted">F9 · writable</text>
+    <rect x="520" y="130" width="105" height="44" rx="8" class="box"/><text x="572" y="150" text-anchor="middle" class="t-sm t-bold">F5</text><text x="572" y="166" text-anchor="middle" class="t-xs t-muted">original</text>
+    <rect x="635" y="130" width="105" height="44" rx="8" class="fs-yellow s-yellow sw-2"/><text x="687" y="150" text-anchor="middle" class="t-sm t-bold">F9</text><text x="687" y="166" text-anchor="middle" class="t-xs t-muted">child's copy</text>
+    <path d="M572,86 L572,128" class="line" marker-end="url(#ahS06c)"/><path d="M687,86 L687,128" class="line" marker-end="url(#ahS06c)"/>
+    <text x="630" y="198" text-anchor="middle" class="t-xs t-muted">only the page that changed</text><text x="630" y="214" text-anchor="middle" class="t-xs t-muted">is duplicated</text>
+  </svg>
+  <figcaption><strong>Copy-on-write.</strong> fork duplicates the page table (cheap) and defers copying each page until someone writes to it.</figcaption>
+</figure>
+
+<p>The consequences are all over real systems. <code>fork</code> + <code>exec</code> is cheap because almost nothing is ever copied. And a process that forks to take a snapshot of its own state, as Redis does for its background save, gets a frozen, consistent view of memory for almost nothing. But every page the parent then modifies <em>must</em> be duplicated, so under heavy writes a snapshot can nearly double memory use (we'll see this in the <a href="../cases/case-05-redis.html">Redis case study</a>).</p>
+
+<h2>mmap: files as memory</h2>
+
+<p>The page-table machinery can also map <em>files</em>. The <code>mmap</code> system call tells the kernel: "make this file appear at these virtual addresses". No data is read up front. As the program touches a mapped page, a page fault pulls that part of the file in (from the page cache if possible), and from then on reading the file is just reading memory. Writes to a shared mapping end up in the file. It is how the kernel loads executables and shared libraries (every process using <code>libc</code> maps the <em>same</em> physical frames of it), and some databases and search engines use it to treat a big file as an array.</p>
+
+<p><code>mmap</code> is also what <code>malloc</code> uses for large allocations, with no file at all (an "anonymous" mapping), as in the experiment below.</p>
+
+<h2>Running out: swap, overcommit and the OOM killer</h2>
+
+<p>RAM is finite, but the sum of what processes <em>asked for</em> can exceed it. The kernel has three levers.</p>
+
+<ol>
+  <li><strong>Evict clean pages.</strong> Pages backed by a file (code, mapped files, cached file data) can be dropped and re-read later. This is cheap and happens constantly.</li>
+  <li><strong>Swap.</strong> Pages with no file behind them, such as heap and stack, can be written to a swap file or partition on disk, freeing the frame; touching the page later causes a major fault to bring it back. Swapping is a safety valve, but if the <em>working set</em> (the pages actually in active use) doesn't fit in RAM, the system <span class="term">thrashes</span>: it spends its time swapping pages in and out, and everything crawls. macOS also compresses inactive memory before swapping.</li>
+  <li><strong>Kill someone.</strong> On Linux, if there is truly nothing left to reclaim, the <span class="term">OOM killer</span> (out-of-memory killer) picks a process, using a "badness" score that favours large memory users, and sends it <code>SIGKILL</code> (<a href="05-processes.html">chapter 5</a>). The victim sees nothing; it just dies, and its parent sees exit status 137.</li>
+</ol>
+
+<p>This ties into <span class="term">overcommit</span>. Because pages are allocated only when first touched, Linux by default lets processes <em>promise</em> more memory than exists: several processes can each <code>malloc</code> a few GB on an 8 GB machine and all succeed, since each only reserves address space. (Linux's default heuristic does refuse a single request that is obviously larger than all of RAM plus swap.) The bill arrives later, as the pages get written to. If everyone cashes in at once, the OOM killer steps in. This is a bet that most programs ask for more than they use. It usually pays off, and it is why memory exhaustion on Linux often looks like "a random process died" rather than "allocation failed". (Linux lets you tune this, <code>vm.overcommit_memory</code>, and containers add per-container limits that trigger the same kill; see <a href="19-containers-vms.html">chapter 19</a>.) macOS has no OOM killer in the Linux sense: it compresses, then swaps heavily, and in extreme cases the system asks you to force-quit applications.</p>
+
+<h2>RSS vs VSZ</h2>
+
+<p>The two numbers in the earlier figure are what <code>ps</code> shows. <strong>VSZ</strong> (virtual size) is the total address space the process has mapped. It includes libraries, mapped files, untouched reservations and swapped-out pages, and it is often huge and not alarming at all. <strong>RSS</strong> (resident set size) is how much of it is actually in RAM right now. RSS is the better guide to "how much RAM is this using", with two caveats: shared pages (like <code>libc</code>) are counted in <em>every</em> process that has them resident, so summing RSS across processes over-counts, and RSS shrinks if pages get swapped out even though the program still "has" the memory. (On macOS, VSZ looks absurdly large, hundreds of gigabytes, for every process because of how the system reserves shared regions. Ignore it there.)</p>
+
+<details class="deeper">
+  <summary>Go deeper: page sizes and huge pages <span class="hint">optional</span></summary>
+  <p>4 KiB is the traditional page size on x86 and many ARM systems. <strong>Apple Silicon uses 16 KiB</strong>, and some Linux ARM systems use 64 KiB. Bigger pages mean fewer page-table entries and a TLB that covers more memory (a 64-entry TLB reaches only 256 KiB with 4 KiB pages, but 1 MiB with 16 KiB pages). The cost is more wasted space when a program needs only a little (internal fragmentation) and coarser granularity for copy-on-write and swapping.</p>
+  <p>x86-64 also supports <span class="term">huge pages</span> of 2 MiB (and 1 GiB). One TLB entry then covers 512 times as much memory (for 2 MiB pages), a big win for programs with large working sets, such as databases and virtual machine hosts. Linux can use them explicitly (hugetlbfs) or automatically with <em>transparent huge pages</em> (THP). The catch is that the kernel needs 2 MiB of physically contiguous memory, and finding or assembling it can cause latency spikes; several databases recommend disabling THP for that reason. Page size is a classic trade-off: fewer, larger units are cheaper to manage but waste more and are clumsier.</p>
+</details>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: RSS, VSZ and page faults</p>
+  <p>All read-only and no sudo. macOS commands first, Linux where they differ. Your numbers will differ.</p>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">getconf PAGESIZE</span>                          <span class="cmt"># page size in bytes</span>
+<span class="out">16384</span>                                      <span class="cmt"># Apple Silicon; x86 Linux/macOS prints 4096</span>
+<span class="prompt">$ </span><span class="cmd">ps -o pid,rss,vsz,comm -p $$</span>              <span class="cmt"># RSS and VSZ are in KiB</span>
+<span class="out">  PID   RSS        VSZ COMM
+48211  4912  410712400 -zsh</span>                  <span class="cmt"># macOS VSZ looks huge; on Linux it is far smaller</span>
+<span class="prompt">$ </span><span class="cmd">ps -axo pid,rss,vsz,comm | sort -k2 -n | tail -3</span>   <span class="cmt"># biggest RSS: who uses the RAM?</span>
+
+<span class="prompt">$ </span><span class="cmd">/usr/bin/time -l python3 -c pass 2&gt;&amp;1 | grep -i -E "fault|reclaim"</span>     <span class="cmt"># macOS</span>
+<span class="out">        1651  page reclaims
+          42  page faults</span>
+<span class="prompt">$ </span><span class="cmd">/usr/bin/time -v python3 -c pass 2&gt;&amp;1 | grep -i fault</span>                <span class="cmt"># Linux (GNU time)</span>
+<span class="out">Major (requiring I/O) page faults: 0
+Minor (reclaiming a frame) page faults: 1204</span>
+
+<span class="prompt">$ </span><span class="cmd">grep -E 'VmSize|VmRSS' /proc/self/status</span>  <span class="cmt"># Linux only</span>
+<span class="prompt">$ </span><span class="cmd">cat /proc/sys/vm/overcommit_memory; cat /proc/$$/oom_score</span>   <span class="cmt"># Linux: overcommit mode (0 = heuristic) and this shell's OOM score</span></code></pre>
+
+<p>Now watch demand paging happen. This script asks for 256 MiB, then touches one byte in every page, printing RSS and VSZ each time (it asks <code>ps</code> about itself, so it works on macOS and Linux):</p>
+
+<pre class="terminal" data-title="demand.py"><code>import mmap, os, subprocess
+
+def mem(label):
+    out = subprocess.check_output(["ps", "-o", "rss=,vsz=", "-p", str(os.getpid())]).split()
+    print(f"{label:<12} RSS={int(out[0]) // 1024:>5} MiB   VSZ={int(out[1]) // 1024:>7} MiB")
+
+mem("start")
+m = mmap.mmap(-1, 256 * 1024 * 1024)       # anonymous mapping: reserves address space only
+mem("after mmap")
+for i in range(0, len(m), mmap.PAGESIZE):  # touch one byte per page
+    m[i] = 1
+mem("after touch")</code></pre>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 demand.py</span>
+<span class="out">start        RSS=   16 MiB   VSZ= 425065 MiB
+after mmap   RSS=   16 MiB   VSZ= 425321 MiB
+after touch  RSS=  272 MiB   VSZ= 425321 MiB</span></code></pre>
+
+<p>(That output is from macOS, where the baseline VSZ is absurdly large; on Linux you would see a few hundred MiB.) VSZ jumped by 256 MiB the moment we mapped; RSS didn't move until we touched the pages. The loop caused roughly 65,536 minor faults on 4 KiB pages (about 16,384 with 16 KiB pages), though Linux may use transparent huge pages and fault far fewer times. Last, a file mapped as memory:</p>
+
+<pre class="terminal" data-title="mapfile.py"><code>import mmap
+
+with open("/etc/hosts", "rb") as f:
+    m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)   # no read() call anywhere
+    print(m[:40])                                           # slicing memory reads the file
+    print("first 'localhost' at byte", m.find(b"localhost"))</code></pre>
+
+<div class="callout vm">
+  <p class="callout-title">On a Linux VM</p>
+  <p>Linux lays a process's address space out as a readable file. On your <a href="../../lab-machine.html">lab machine</a> (no sudo):</p>
+<pre class="terminal" data-title="Linux VM"><code><span class="prompt">$ </span><span class="cmd">cat /proc/self/maps | head -8</span>  <span class="cmt"># regions of this very "cat" process: code, data, heap, stack</span>
+<span class="prompt">$ </span><span class="cmd">head -5 /proc/meminfo</span>  <span class="cmt"># total, free and "available" RAM</span>
+<span class="prompt">$ </span><span class="cmd">cat /proc/sys/vm/overcommit_memory</span>  <span class="cmt"># 0 = heuristic; the kernel lets you reserve more than you have</span></code></pre>
+  <p>Each line of <code>maps</code> is a range of virtual addresses with permissions such as <code>r-xp</code> (readable, executable, private). Notice how little of it is "heap" and how much is shared libraries.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Memory limits are how clusters keep tenants apart. A container (<a href="19-containers-vms.html">chapter 19</a>) gets a memory ceiling; when its processes' pages exceed it, the kernel's OOM killer ends one with <code>SIGKILL</code> and the orchestrator reports "OOMKilled". Capacity planners therefore think in terms of working set and RSS, not VSZ, and scheduling systems such as <a href="../cases/case-08-borg.html">Borg</a> pack jobs together by their memory demands.</p>
+  <p>Thrashing is a failure mode that looks like a network failure. A node that is swapping stops answering heartbeats on time, and peers conclude it is dead (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>), when really it is just paging. For the same reason, many latency-sensitive services run with swap disabled, preferring a clean crash and restart to a slow limp. And copy-on-write shows up again whenever a store snapshots itself with <code>fork</code>, so "how much RAM do I need?" must include the pages that will be duplicated while the snapshot runs.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Virtual memory gives every process its own private address space, solving protection, fixed addresses and fragmentation with one idea: translate every address.</li>
+    <li>Memory is divided into pages (4 KiB typically, 16 KiB on Apple Silicon); the MMU uses the page table to map a virtual page to a physical frame, and the offset within the page is unchanged.</li>
+    <li>The TLB caches recent translations. A hit is nearly free, a miss costs a page-table walk, and switching processes makes the TLB cold.</li>
+    <li>A page fault is the kernel stepping in. Minor faults need no disk; major faults read from disk and are tens to thousands of times slower. Demand paging means memory costs nothing until it is touched.</li>
+    <li>Copy-on-write makes <code>fork</code> cheap by sharing pages until someone writes. <code>mmap</code> maps files (and anonymous memory) into the address space.</li>
+    <li>Under pressure the kernel evicts clean pages, swaps others and, on Linux, may OOM-kill a process (exit code 137). Overcommit lets a process allocate more than exists.</li>
+    <li>VSZ is mapped address space; RSS is what is in RAM now. Judge memory use by RSS and the working set.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Two processes both print the address <code>0x7f0000001000</code> for a variable. What does that tell you?</p>
+    <ol class="q-options">
+      <li>They are sharing the same variable</li>
+      <li>Nothing about sharing: it is a virtual address, and each process's page table may map it to different physical memory</li>
+      <li>One of them has a bug</li>
+      <li>They are the same process</li>
+    </ol>
+    <div class="q-explain">Virtual addresses are private to each process. The same number can map to different frames in different processes (as the widget's "New process" button showed), or to the same frame only if the kernel deliberately shares it (for example a library).</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">What does the TLB store?</p>
+    <ol class="q-options">
+      <li>The most recently used bytes of RAM</li>
+      <li>A list of running processes</li>
+      <li>The contents of the swap file</li>
+      <li>Recent virtual-page-to-physical-frame translations, so the CPU can skip the page-table walk</li>
+    </ol>
+    <div class="q-explain">The TLB caches translations, not data. (The data caches of chapter 2 hold the bytes.) A TLB hit avoids extra memory reads for the page-table walk on every access.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">What is the key difference between a minor and a major page fault?</p>
+    <ol class="q-options">
+      <li>A major fault needs a disk read; a minor one is resolved from memory (for example by supplying a zeroed frame or mapping a cached page)</li>
+      <li>A minor fault terminates the process; a major one doesn't</li>
+      <li>A major fault happens only on Linux</li>
+      <li>A minor fault happens in the kernel; a major one happens in user mode</li>
+    </ol>
+    <div class="q-explain">Both are handled by the kernel and both are invisible to the program. The difference is the cost: a major fault waits on a disk, often tens to thousands of times longer than a minor one.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why is <code>fork()</code> fast even for a process using 8 GB of RAM?</p>
+    <ol class="q-options">
+      <li>Because the child gets only a tiny part of the memory</li>
+      <li>Because the kernel compresses the memory first</li>
+      <li>Because only the page tables are copied; pages are shared read-only and copied lazily when one side writes (copy-on-write)</li>
+      <li>Because the child waits until the parent exits</li>
+    </ol>
+    <div class="q-explain">Copy-on-write postpones the work. The child sees all 8 GB (logically), but physical copying happens one page at a time, and only for pages that are actually modified. If the child calls exec immediately, almost nothing is ever copied.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A process shows VSZ = 12 GB and RSS = 300 MB in <code>ps</code>. What is the most reasonable reading?</p>
+    <ol class="q-options">
+      <li>It is using 12 GB of RAM and will soon run out</li>
+      <li>It has 12 GB of address space mapped, but only about 300 MB currently resident in RAM; the rest is untouched, shared, mapped or swapped</li>
+      <li>It has a memory leak of 12 GB</li>
+      <li>The two numbers are measuring the same thing in different units</li>
+    </ol>
+    <div class="q-explain">VSZ counts every mapped page whether or not it occupies RAM (reservations, libraries, mapped files, swapped pages). RSS is the part resident now. A large VSZ alone is normal and not a sign of a leak.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">On a Linux machine with default settings, a program successfully calls <code>malloc</code> for more memory than is currently free, and later is killed with exit status 137. What most likely happened?</p>
+    <ol class="q-options">
+      <li>malloc always fails when you ask for too much, so the program must have a bug</li>
+      <li>The program ran out of disk space</li>
+      <li>The CPU overheated and the kernel killed it</li>
+      <li>Overcommit let the allocation succeed because pages are only provided when touched; when the program wrote to enough of them, memory ran out and the OOM killer sent SIGKILL (128 + 9 = 137)</li>
+    </ol>
+    <div class="q-explain">With overcommit, malloc reserves address space, not RAM. The real cost arrives on first touch. If the pages can't be supplied, the OOM killer picks a victim and sends SIGKILL, which the shell or container runtime reports as 137.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/vm-translate.js"></script>
+</body>
+</html>

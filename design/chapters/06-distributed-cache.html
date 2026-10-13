@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design a Distributed Cache · System Design Studio</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="design" data-chapter="06">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design a Distributed Cache</h1>
+  <p class="lede">Partitioning, replication, eviction, hot keys and the consistency of the cache with its database. A shared in-memory cache looks like a hash map with a network in front of it, and the interesting part is everything that goes wrong when the map is spread across forty machines in three regions.</p>
+</header>
+
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>A cache is the cheapest performance fix in the book and the easiest to get subtly wrong. A distributed cache adds new questions on top of the single-node one: which node owns a key, what happens to the database when a node disappears, how a key taking a quarter of all traffic gets served, and how the cache and the database stay in agreement. The answers are all derived from a handful of numbers, which is why this makes a good design exercise.</p>
+</div>
+
+<h2>The problem</h2>
+<p><em>"Design a distributed in-memory cache that our services share, like memcached or a Redis cluster. It should make reads fast, protect our databases, and scale as we grow."</em></p>
+<p>Four things are loose. How big is "big"? Is it a pure cache (any data can vanish) or a data store (Redis-as-a-database)? How fresh must data be? And who is the caller: one product or a whole company's worth of services? You met the single-node ideas in <a href="../../data/chapters/14-caching.html">caching</a>; this chapter is about running a fleet of them.</p>
+
+<h2>Clarify requirements</h2>
+<table>
+  <thead><tr><th>Question</th><th>Assumed answer</th></tr></thead>
+  <tbody>
+    <tr><td>Cache or store?</td><td>A cache. Every item can be rebuilt from a database, so losing a node is a performance event, not a data-loss event.</td></tr>
+    <tr><td>API?</td><td>Key-value: get, set with TTL, delete, plus multi-get. Values up to 1 MB, typically about 1 KB.</td></tr>
+    <tr><td>Consistency with the database?</td><td>Eventual, with a bound: a cached value should not stay stale more than a few seconds after a write, and never forever.</td></tr>
+    <tr><td>Scale?</td><td>1.2 million lookups per second at peak, 1.5 billion resident items.</td></tr>
+    <tr><td>Latency?</td><td>p99 under 2 ms from the application.</td></tr>
+    <tr><td>Availability?</td><td>A cache node failure must not take the product down; the database must survive a node loss.</td></tr>
+    <tr><td>Regions?</td><td>Three, each with its own cache, one writable database region.</td></tr>
+  </tbody>
+</table>
+<p><strong>Functional.</strong> get/multi-get/set/delete with TTL; atomic increment (counters); a lease operation to prevent herds; per-tenant namespaces.</p>
+<p><strong>Non-functional.</strong> The numbers above, plus a hit ratio of at least 99% for hot workloads, graceful behaviour when nodes join, leave or fail, and observability of hit ratio and evictions per tenant.</p>
+<p><strong>Out of scope.</strong> Durable persistence of cache contents, secondary indexes, transactions across keys, and a full data-structure server. (Those make it a database; see <a href="../../data/chapters/17-specialised-stores.html">specialised stores</a>.)</p>
+
+<h2>Estimate</h2>
+<p>The question we need answered is how many nodes, and whether the database can survive the cache's worst day. Memory and throughput each give a node count; the larger wins.</p>
+<pre class="terminal" data-title="sizing.py"><code>&quot;&quot;&quot;Sizing a distributed cache cluster from the numbers. Every input is an assumption; change it and re-run.&quot;&quot;&quot;
+import math
+
+# --- workload (assumptions) ---
+peak_reads   = 1_200_000       # cache lookups per second at peak
+write_frac   = 0.05            # fraction of operations that are sets/deletes
+items        = 1_500_000_000   # distinct items we want resident
+key_bytes    = 40
+value_bytes  = 1_000
+overhead     = 60              # assumed per-item metadata (hash chain, LRU links, expiry, header)
+slab_waste   = 0.15            # assumed internal fragmentation of size classes
+
+per_item = (key_bytes + value_bytes + overhead) * (1 + slab_waste)
+data_gb  = items * per_item / 1e9
+print(f&quot;per item incl. overhead and slab waste: {per_item:,.0f} B   ({(per_item/value_bytes - 1):.0%} above the raw value)&quot;)
+print(f&quot;total resident data: {data_gb:,.0f} GB&quot;)
+
+# --- machine (assumptions) ---
+ram_gb, usable = 64, 0.75      # leave room for the OS, connections and growth
+node_ops = 100_000             # rough simple ops/s per node
+util     = 0.5                 # run at half speed so a failure or a hot key has headroom
+
+by_mem = math.ceil(data_gb / (ram_gb * usable))
+by_ops = math.ceil(peak_reads / (node_ops * util))
+nodes  = max(by_mem, by_ops)
+print(f&quot;\nnodes needed for memory: {by_mem}   for throughput: {by_ops}   -&gt; {nodes} (the larger wins)&quot;)
+print(f&quot;add 1 spare so that one failure leaves capacity: {nodes + 1} nodes&quot;)
+
+# --- what a hit ratio buys ---
+db_ceiling = 20_000            # reads/s the backing database can take
+print(f&quot;\nbacking database can take {db_ceiling:,} reads/s&quot;)
+for h in (0.90, 0.95, 0.99, 0.999):
+    miss = peak_reads * (1 - h)
+    flag = &quot;OK&quot; if miss &lt;= db_ceiling else &quot;overloaded&quot;
+    print(f&quot;  hit ratio {h:.1%}: database sees {miss:&gt;9,.0f}/s  {flag}&quot;)
+
+# --- network ---
+gbit = peak_reads * value_bytes * 8 / 1e9
+print(f&quot;\ncluster egress at peak: {gbit:.1f} Gbit/s total, {gbit/nodes*1000:.0f} Mbit/s per node (a 10 Gbit/s NIC is nowhere near)&quot;)
+
+# --- a single hot key ---
+for share in (0.01, 0.10, 0.25):
+    ops = peak_reads * share
+    print(f&quot;a key taking {share:.0%} of reads = {ops:,.0f} ops/s on one node ({ops/node_ops:.1f}x a node&#x27;s rough capacity)&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>per item incl. overhead and slab waste: 1,265 B   (26% above the raw value)
+total resident data: 1,898 GB
+
+nodes needed for memory: 40   for throughput: 24   -&gt; 40 (the larger wins)
+add 1 spare so that one failure leaves capacity: 41 nodes
+
+backing database can take 20,000 reads/s
+  hit ratio 90.0%: database sees   120,000/s  overloaded
+  hit ratio 95.0%: database sees    60,000/s  overloaded
+  hit ratio 99.0%: database sees    12,000/s  OK
+  hit ratio 99.9%: database sees     1,200/s  OK
+
+cluster egress at peak: 9.6 Gbit/s total, 240 Mbit/s per node (a 10 Gbit/s NIC is nowhere near)
+a key taking 1% of reads = 12,000 ops/s on one node (0.1x a node&#x27;s rough capacity)
+a key taking 10% of reads = 120,000 ops/s on one node (1.2x a node&#x27;s rough capacity)
+a key taking 25% of reads = 300,000 ops/s on one node (3.0x a node&#x27;s rough capacity)</code></pre>
+<p>Three decisions fall out. First, the cluster is <strong>memory-bound</strong>: 40 nodes for memory versus 24 for throughput, so scaling out for capacity is driven by data size and the per-item overhead is not negligible (26% above the raw value under these assumptions). Second, the hit ratio must be around 99%: at 95% the database would see 60k reads/s against a 20k ceiling, so the cache is not an optimisation but part of the capacity of the system. Third, a single key can exceed a node: at 10% of traffic one key needs more than one node's throughput, which is the hot-key problem.</p>
+
+<h2>API</h2>
+<pre class="terminal" data-title="cache API"><code>get(key)                      -&gt; value | MISS | {MISS, lease_token} | {WAIT}
+mget(keys[])                  -&gt; map of key -&gt; value        // batched per shard
+set(key, value, ttl, lease?)  -&gt; STORED | REJECTED           // REJECTED if the lease was revoked
+delete(key)                   -&gt; OK                          // also revokes any outstanding lease
+incr(key, delta)              -&gt; new value                   // atomic, for counters
+cas(key, value, version)      -&gt; STORED | EXISTS             // optimistic update
+
+Limits: key &lt;= 250 B, value &lt;= 1 MB, TTL mandatory (default 1 hour)</code></pre>
+<p>Make TTL mandatory: it is the safety net that bounds staleness when an invalidation is lost, which will eventually happen. Multi-get matters because one page view may touch dozens of keys; the client library groups them per shard and sends the batches in parallel, so the user waits for the slowest shard, not the sum (the <a href="../../reliability/chapters/09-tail-latency.html">tail at scale</a> problem: fan-out amplifies the slow tail).</p>
+
+<h2>Data model</h2>
+<ul>
+  <li><strong>Key:</strong> <code>namespace:version:id</code>, for example <code>profile:v3:42</code>. The version lets you invalidate a whole class of keys after a schema change by bumping it, with no scan.</li>
+  <li><strong>Value:</strong> an opaque byte string, serialised and optionally compressed by the client. The cache never interprets it.</li>
+  <li><strong>Item in memory:</strong> key, value, expiry time, flags, plus hash-chain and eviction-list links. That per-item bookkeeping is the "overhead" in the estimate; real systems have roughly tens of bytes of it, and the exact figure varies by software and version.</li>
+  <li><strong>Partitioning:</strong> by hash of the key onto a consistent-hash ring with virtual nodes (<a href="../../networking/chapters/19-partitioning.html">partitioning</a>). Redis Cluster does the same job with a fixed set of 16,384 hash slots assigned to nodes; the idea is closely related (it is slot-based, not a ring), and the unit of movement is the slot.</li>
+</ul>
+
+<h2>High-level design</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Distributed cache architecture: app servers with a client library and a local L1 cache route each key to one of several cache primaries on a consistent-hash ring, each with an asynchronous replica; misses read the database, and a change log from the database drives an invalidator that deletes cache keys.">
+<defs><marker id="ahG06a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="100" width="170" height="80" rx="8" class="fs-blue s-blue sw-2"/><text x="95.0" y="137" text-anchor="middle" class="t-sm t-bold">App server</text><text x="95.0" y="153" text-anchor="middle" class="t-xs t-muted">client lib + L1 cache</text></g>
+<text x="480" y="28" text-anchor="middle" class="t-xs t-muted">Cache cluster (consistent-hash ring)</text>
+<g><rect x="400" y="40" width="100" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="450.0" y="59" text-anchor="middle" class="t-sm t-bold">Shard 1</text><text x="450.0" y="75" text-anchor="middle" class="t-xs t-muted">primary</text></g>
+<g><rect x="400" y="100" width="100" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="450.0" y="119" text-anchor="middle" class="t-sm t-bold">Shard 2</text><text x="450.0" y="135" text-anchor="middle" class="t-xs t-muted">primary</text></g>
+<g><rect x="400" y="160" width="100" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="450.0" y="179" text-anchor="middle" class="t-sm t-bold">Shard 3</text><text x="450.0" y="195" text-anchor="middle" class="t-xs t-muted">primary</text></g>
+<g><rect x="540" y="40" width="100" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="590.0" y="67" text-anchor="middle" class="t-sm t-bold">Replica 1</text></g>
+<g><rect x="540" y="100" width="100" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="590.0" y="127" text-anchor="middle" class="t-sm t-bold">Replica 2</text></g>
+<g><rect x="540" y="160" width="100" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="590.0" y="187" text-anchor="middle" class="t-sm t-bold">Replica 3</text></g>
+<g><rect x="215" y="236" width="150" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="290.0" y="258" text-anchor="middle" class="t-sm t-bold">Database</text><text x="290.0" y="274" text-anchor="middle" class="t-xs t-muted">source of truth</text></g>
+<g><rect x="400" y="236" width="110" height="50" rx="8" class="fs-orange s-orange sw-2"/><text x="455.0" y="258" text-anchor="middle" class="t-sm t-bold">Change log</text><text x="455.0" y="274" text-anchor="middle" class="t-xs t-muted">CDC</text></g>
+<g><rect x="545" y="236" width="130" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="610.0" y="258" text-anchor="middle" class="t-sm t-bold">Invalidator</text><text x="610.0" y="274" text-anchor="middle" class="t-xs t-muted">deletes keys</text></g>
+<line x1="180" y1="125" x2="400" y2="62" class="line" marker-end="url(#ahG06a)"/>
+<line x1="180" y1="140" x2="400" y2="122" class="line" marker-end="url(#ahG06a)"/>
+<line x1="180" y1="155" x2="400" y2="182" class="line" marker-end="url(#ahG06a)"/>
+<line x1="500" y1="62" x2="540" y2="62" class="line-dash" marker-end="url(#ahG06a)"/>
+<line x1="500" y1="122" x2="540" y2="122" class="line-dash" marker-end="url(#ahG06a)"/>
+<line x1="500" y1="182" x2="540" y2="182" class="line-dash" marker-end="url(#ahG06a)"/>
+<line x1="95" y1="180" x2="215" y2="255" class="line" marker-end="url(#ahG06a)"/>
+<text x="60" y="226" text-anchor="start" class="t-xs t-muted">miss: read</text>
+<line x1="365" y1="261" x2="400" y2="261" class="line" marker-end="url(#ahG06a)"/>
+<line x1="510" y1="261" x2="545" y2="261" class="line" marker-end="url(#ahG06a)"/>
+<line x1="610" y1="236" x2="470" y2="204" class="line-dash" marker-end="url(#ahG06a)"/>
+<text x="600" y="222" text-anchor="start" class="t-xs t-muted">delete k</text>
+<text x="220" y="92" text-anchor="start" class="t-xs t-muted">get k</text>
+<text x="650" y="62" text-anchor="start" class="t-xs t-faint">async replication</text>
+<text x="650" y="126" text-anchor="start" class="t-xs t-faint">(hot reads may</text>
+<text x="650" y="140" text-anchor="start" class="t-xs t-faint">use replicas)</text>
+  </svg>
+  <figcaption>Cache-aside with CDC invalidation. Apps read through the cache and fill it on a miss; they never write the cache on a database write. A change-log consumer deletes keys, so the cache cannot get ahead of the database.</figcaption>
+</figure>
+<p>Applications link a client library that holds the ring, routes each key to its owning node and talks to it directly. Each primary has an asynchronous replica for failover. The database remains the source of truth, and a change log feeds an invalidator. Walk through one read and one write:</p>
+<div class="widget stepper" data-autoplay-ms="5000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">A read and a write, end to end</h4></div>
+  <svg viewBox="0 0 760 280" role="img" aria-label="Read path: app to cache shard hit or miss with lease, read database, fill. Write path: update database, change log, invalidator deletes cache key.">
+<defs><marker id="ahG06d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g data-active="1-6"><rect x="10" y="110" width="110" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="65.0" y="145" text-anchor="middle" class="t-sm t-bold">App server</text></g>
+<g data-active="1-5,8"><rect x="280" y="40" width="130" height="60" rx="8" class="fs-cyan s-cyan sw-2"/><text x="345.0" y="75" text-anchor="middle" class="t-sm t-bold">Cache shard</text></g>
+<g data-active="4,6"><rect x="280" y="200" width="130" height="60" rx="8" class="fs-purple s-purple sw-2"/><text x="345.0" y="235" text-anchor="middle" class="t-sm t-bold">Database</text></g>
+<g data-active="7"><rect x="500" y="200" width="120" height="60" rx="8" class="fs-orange s-orange sw-2"/><text x="560.0" y="235" text-anchor="middle" class="t-sm t-bold">Change log</text></g>
+<g data-active="8"><rect x="500" y="40" width="130" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="565.0" y="67" text-anchor="middle" class="t-sm t-bold">Invalidator</text></g>
+<line x1="120" y1="120" x2="280" y2="75" class="line" marker-end="url(#ahG06d)" data-steps="1-3"/>
+<text x="130" y="92" text-anchor="start" class="t-xs t-faint" data-steps="1">get k</text>
+<text x="130" y="92" text-anchor="start" class="t-xs t-faint" data-steps="2-3">get k</text>
+<line x1="280" y1="90" x2="120" y2="135" class="line-dash" marker-end="url(#ahG06d)" data-steps="2-3"/>
+<text x="206" y="142" text-anchor="start" class="t-xs t-faint" data-steps="2">hit: value</text>
+<text x="206" y="142" text-anchor="start" class="t-xs tc-red" data-steps="3">miss + lease #7</text>
+<line x1="120" y1="150" x2="280" y2="225" class="line" marker-end="url(#ahG06d)" data-steps="4"/>
+<text x="130" y="196" text-anchor="start" class="t-xs t-faint" data-steps="4">read row</text>
+<line x1="120" y1="120" x2="280" y2="75" class="line" marker-end="url(#ahG06d)" data-steps="5"/>
+<text x="130" y="92" text-anchor="start" class="t-xs t-faint" data-steps="5">set k, lease #7</text>
+<line x1="120" y1="150" x2="280" y2="225" class="line" marker-end="url(#ahG06d)" data-steps="6"/>
+<text x="130" y="196" text-anchor="start" class="t-xs t-faint" data-steps="6">UPDATE row</text>
+<line x1="410" y1="230" x2="500" y2="230" class="line" marker-end="url(#ahG06d)" data-steps="7-8"/>
+<text x="414" y="222" text-anchor="start" class="t-xs t-faint" data-steps="7-8">log</text>
+<line x1="565" y1="200" x2="565" y2="84" class="line" marker-end="url(#ahG06d)" data-steps="7-8"/>
+<text x="573" y="150" text-anchor="start" class="t-xs t-faint" data-steps="7-8">change event</text>
+<line x1="500" y1="62" x2="410" y2="62" class="line" marker-end="url(#ahG06d)" data-steps="8"/>
+<text x="416" y="54" text-anchor="start" class="t-xs tc-red" data-steps="8">delete k</text>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Route.</strong> The client library hashes the key onto the ring and sends <code>get k</code> straight to the owning shard. It checks its small local L1 cache first for keys marked hot.</li>
+    <li><strong>Hit.</strong> Most of the time (99% in our estimate) the shard answers from memory in well under a millisecond and the database never hears about it.</li>
+    <li><strong>Miss.</strong> The shard has nothing, so it hands this one client a lease token. Any other client asking meanwhile is told to wait briefly or is served a slightly stale value.</li>
+    <li><strong>Read the database.</strong> The lease holder reads the row from the source of truth. This is the only database read for the key, however many clients wanted it.</li>
+    <li><strong>Fill.</strong> It sets the key with its token. The shard accepts the fill only if the lease is still valid, so a value that was already invalidated cannot be installed.</li>
+    <li><strong>Write.</strong> A write goes to the database only. The application does not update the cache, because two writers racing on a database and a cache can leave them disagreeing forever.</li>
+    <li><strong>Capture.</strong> The database's change log records the committed write. This is change data capture: the log is ordered and contains only committed changes.</li>
+    <li><strong>Invalidate.</strong> The invalidator consumes the event and deletes the key, which also revokes any outstanding lease. The next read misses and refills with the new value.</li>
+  </ol>
+</div>
+
+<h2>Deep dive 1: partitioning, routing and failover</h2>
+<p>Consistent hashing is the reason adding or losing a node moves only a small share of keys. The script measures it on this design's cluster size, since the interesting number is not the fraction moved but what that fraction does to the database.</p>
+<pre class="terminal" data-title="remap.py"><code>&quot;&quot;&quot;How many keys change owner when the cluster changes? Modulo hashing vs a consistent-hash ring with virtual nodes.&quot;&quot;&quot;
+import hashlib, bisect
+
+def h(s: str) -&gt; int:
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:8], &quot;big&quot;)
+
+def modulo_owner(nodes):
+    return lambda key: nodes[h(key) % len(nodes)]
+
+def ring_owner(nodes, vnodes=150):
+    ring = sorted((h(f&quot;{n}#{v}&quot;), n) for n in nodes for v in range(vnodes))
+    points = [p for p, _ in ring]
+    def owner(key):
+        i = bisect.bisect(points, h(key)) % len(ring)
+        return ring[i][1]
+    return owner
+
+keys = [f&quot;user:{i}&quot; for i in range(100_000)]
+base  = [f&quot;cache{i:02d}&quot; for i in range(40)]
+cases = {&quot;add one node (40 -&gt; 41)&quot;: base + [&quot;cache40&quot;],
+         &quot;lose one node (40 -&gt; 39)&quot;: base[:-1]}
+
+for name, after in cases.items():
+    print(name)
+    for label, make in ((&quot;modulo&quot;, modulo_owner), (&quot;ring, 150 vnodes&quot;, ring_owner)):
+        a, b = make(base), make(after)
+        moved = sum(a(k) != b(k) for k in keys)
+        print(f&quot;  {label:&lt;18} {moved / len(keys):6.1%} of keys change owner&quot;)
+
+# the cost of a moved key is a cache miss: extra database reads right after the change
+peak_reads, hit, db_ceiling = 1_200_000, 0.99, 20_000
+print(f&quot;\nafter losing one node, the lost node&#x27;s keys all miss at once (database normally sees {peak_reads*(1-hit):,.0f}/s, ceiling {db_ceiling:,}/s):&quot;)
+for label, make in ((&quot;modulo&quot;, modulo_owner), (&quot;ring&quot;, ring_owner)):
+    a, b = make(base), make(base[:-1])
+    frac = sum(a(k) != b(k) for k in keys) / len(keys)
+    total = peak_reads * (1 - hit) + peak_reads * hit * frac     # hits that become misses
+    print(f&quot;  {label:&lt;7} {frac:5.1%} of traffic misses -&gt; database sees about {total:&gt;9,.0f}/s&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>add one node (40 -&gt; 41)
+  modulo              97.5% of keys change owner
+  ring, 150 vnodes     2.6% of keys change owner
+lose one node (40 -&gt; 39)
+  modulo              97.5% of keys change owner
+  ring, 150 vnodes     2.8% of keys change owner
+
+after losing one node, the lost node&#x27;s keys all miss at once (database normally sees 12,000/s, ceiling 20,000/s):
+  modulo  97.5% of traffic misses -&gt; database sees about 1,170,300/s
+  ring     2.8% of traffic misses -&gt; database sees about    44,872/s</code></pre>
+<p>Modulo hashing remaps almost everything when the node count changes, so every membership change is a cache wipe and a database stampede. The ring moves about 1/N of the keys. But look at the last line: even with a ring, losing <em>one</em> node of 40 sends about 2.8% of traffic to the database, and 45k reads/s is over the 20k ceiling. The consistent hash is necessary and not sufficient: you also need protection (leases, below), replicas, or spare database capacity sized for a node loss.</p>
+<h3>Client-side or proxy routing</h3>
+<table>
+  <thead><tr><th></th><th>Smart client library</th><th>Proxy tier</th></tr></thead>
+  <tbody>
+    <tr><td>Hops</td><td>One (client to node)</td><td>Two (client to proxy to node)</td></tr>
+    <tr><td>Topology changes</td><td>Every client must learn the ring; a bad rollout or stale view causes inconsistent routing</td><td>Only proxies learn; clients stay simple</td></tr>
+    <tr><td>Languages</td><td>One client per language to maintain</td><td>One implementation, any language</td></tr>
+    <tr><td>Connections</td><td>Every app instance connects to every node: thousands of connections per node</td><td>Proxies pool connections, so nodes see few</td></tr>
+    <tr><td>Policy</td><td>Hard to centralise</td><td>Easy: replicate writes to a warm standby pool, route by prefix, rate limit, mirror traffic</td></tr>
+  </tbody>
+</table>
+<p><strong>Recommendation:</strong> start with a thin smart client plus a configuration service that publishes the ring (small fleets pay for no extra hop). Move to a proxy tier when connection counts or fleet-wide policy (failover pools, cross-region mirroring) start to matter. Large deployments commonly end up with a proxy tier for exactly those reasons; the <a href="../../data/cases/case-03-memcache-facebook.html">memcache case study</a> describes one.</p>
+<h3>Replication and failover</h3>
+<p>Plain memcached has no replication at all: losing a node loses its keys and the application refills from the database. Redis-style clusters give each primary one or more <strong>asynchronous replicas</strong> and promote a replica when the primary is judged dead, using a majority vote among the primaries to avoid two sides each promoting (<a href="../../distributed/chapters/03-failure-detection.html">failure detection</a>, <a href="../../distributed/chapters/04-leases-fencing.html">fencing</a>). Asynchronous replication means a promoted replica can be missing the last few writes: for a cache that is acceptable, because TTLs and invalidations repair it, but it is a reason not to treat the cache as a database. The alternative to replicas is a <strong>gutter pool</strong>: a small set of spare nodes that serve a failed node's traffic with a very short TTL, so a node loss costs misses, not an outage, and does not require doubling the memory bill.</p>
+<table>
+  <thead><tr><th>Option</th><th>Memory cost</th><th>On node failure</th><th>Complexity</th></tr></thead>
+  <tbody>
+    <tr><td>No replicas</td><td>1x</td><td>1/N of keys miss; database takes the spike</td><td>Lowest</td></tr>
+    <tr><td>Replica per primary</td><td>2x</td><td>Promote; near-zero misses; possible small staleness</td><td>Failure detection and promotion logic</td></tr>
+    <tr><td>Gutter pool (a few spare nodes)</td><td>1x + a few percent</td><td>Spare absorbs misses with short TTLs; database spike is bounded</td><td>Client logic to detect and redirect</td></tr>
+  </tbody>
+</table>
+<p>Because the cluster here is memory-bound, doubling it for replicas means 80 nodes instead of 40, which has to be justified by the cost of a miss. Our estimate says a node loss pushes the database over its ceiling. My preference: no replicas for the bulk of the data, a gutter pool plus leases to bound the spike, and replicas only for the small set of items whose miss is genuinely expensive (the expensive-to-compute and the hot).</p>
+
+<h2>Deep dive 2: eviction and memory</h2>
+<p>When memory is full, something has to go. The policy decides the hit ratio, which, as the estimate showed, decides whether the database survives. The script runs a skewed workload (Zipf, the usual shape of real popularity) through four policies, then adds one-time scan traffic such as a crawler or batch job.</p>
+<pre class="terminal" data-title="evict.py"><code>&quot;&quot;&quot;Hit ratio of eviction policies on a skewed (Zipf) workload, with and without one-time scan traffic.&quot;&quot;&quot;
+import random, bisect, itertools
+from collections import OrderedDict, Counter
+
+def zipf_stream(n_keys, n_req, s, seed, scan_frac=0.0):
+    rnd = random.Random(seed)
+    weights = [1 / (i + 1) ** s for i in range(n_keys)]
+    cum = list(itertools.accumulate(weights))
+    total, scan_id = cum[-1], n_keys
+    out = []
+    for _ in range(n_req):
+        if rnd.random() &lt; scan_frac:
+            out.append(scan_id); scan_id += 1               # a key never seen again (a crawler or batch job)
+        else:
+            out.append(bisect.bisect(cum, rnd.random() * total))
+    return out
+
+def lru(stream, cap):
+    c, hits = OrderedDict(), 0
+    for k in stream:
+        if k in c: hits += 1; c.move_to_end(k)
+        else:
+            c[k] = 1
+            if len(c) &gt; cap: c.popitem(last=False)
+    return hits / len(stream)
+
+def fifo(stream, cap):
+    c, hits = OrderedDict(), 0
+    for k in stream:
+        if k in c: hits += 1
+        else:
+            c[k] = 1
+            if len(c) &gt; cap: c.popitem(last=False)
+    return hits / len(stream)
+
+def rand_evict(stream, cap, seed=7):
+    rnd, c, keys, hits = random.Random(seed), {}, [], 0
+    for k in stream:
+        if k in c: hits += 1
+        else:
+            if len(keys) &gt;= cap:
+                i = rnd.randrange(len(keys)); old = keys[i]; keys[i] = k; del c[old]
+            else: keys.append(k)
+            c[k] = 1
+    return hits / len(stream)
+
+def lfu(stream, cap):
+    &quot;&quot;&quot;Frequency counted over the whole run: an idealised LFU, a ceiling rather than a real policy.&quot;&quot;&quot;
+    freq, c, hits = Counter(), set(), 0
+    for k in stream:
+        freq[k] += 1
+        if k in c: hits += 1; continue
+        if len(c) &gt;= cap:
+            victim = min(c, key=freq.__getitem__)
+            if freq[victim] &gt;= freq[k]: continue            # do not admit a colder key
+            c.remove(victim)
+        c.add(k)
+    return hits / len(stream)
+
+N_KEYS, N_REQ = 20_000, 150_000
+for scan in (0.0, 0.30):
+    s = zipf_stream(N_KEYS, N_REQ, 1.0, seed=1, scan_frac=scan)
+    print(f&quot;Zipf(1.0) over {N_KEYS:,} keys, {scan:.0%} one-time scan traffic, {N_REQ:,} requests&quot;)
+    print(f&quot;  {&#x27;cache size&#x27;:&lt;12}{&#x27;FIFO&#x27;:&gt;8}{&#x27;random&#x27;:&gt;8}{&#x27;LRU&#x27;:&gt;8}{&#x27;LFU*&#x27;:&gt;8}&quot;)
+    for pct in (1, 5, 10):
+        cap = N_KEYS * pct // 100
+        print(f&quot;  {pct:&gt;3}% of keys {fifo(s,cap):&gt;8.1%}{rand_evict(s,cap):&gt;8.1%}{lru(s,cap):&gt;8.1%}{lfu(s,cap):&gt;8.1%}&quot;)
+print(&quot;*LFU here counts frequency over the whole run and refuses to admit colder keys: an idealised upper bound.&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>Zipf(1.0) over 20,000 keys, 0% one-time scan traffic, 150,000 requests
+  cache size      FIFO  random     LRU    LFU*
+    1% of keys    38.3%   38.3%   42.9%   55.6%
+    5% of keys    56.9%   57.0%   61.4%   69.7%
+   10% of keys    65.3%   65.4%   69.4%   75.3%
+Zipf(1.0) over 20,000 keys, 30% one-time scan traffic, 150,000 requests
+  cache size      FIFO  random     LRU    LFU*
+    1% of keys    23.1%   23.1%   26.5%   38.8%
+    5% of keys    34.8%   34.7%   38.3%   48.2%
+   10% of keys    39.8%   39.7%   43.2%   51.7%
+*LFU here counts frequency over the whole run and refuses to admit colder keys: an idealised upper bound.</code></pre>
+<p>Frequency-aware policies beat recency alone on a skewed workload, and with scans polluting the cache the gap stays large (and is bigger in relative terms): LRU lets every scanned key push out a genuinely popular one, while a policy that refuses to admit colder keys does not. The LFU column is an idealised ceiling (it uses whole-run knowledge), so treat it as "how much is on the table", not a number any implementation reaches. Practical systems approximate it: sampled LRU/LFU in Redis, and admission filters (TinyLFU-style) in some local caches. Also note how weak the gains from cache size are: going from 5% to 10% of keys adds only about 8 points, so the cost of memory per hit point rises quickly.</p>
+<table>
+  <thead><tr><th>Policy</th><th>Idea</th><th>Strength</th><th>Weakness</th></tr></thead>
+  <tbody>
+    <tr><td>LRU</td><td>Evict the least recently used</td><td>Simple, adapts to shifting popularity</td><td>Scan pollution; needs a list updated on every hit</td></tr>
+    <tr><td>LFU</td><td>Evict the least frequently used</td><td>Keeps stable favourites; resists scans</td><td>Slow to forget yesterday's favourites unless counters decay</td></tr>
+    <tr><td>FIFO / random</td><td>Oldest, or any</td><td>No per-hit bookkeeping</td><td>Lower hit ratio on skewed loads</td></tr>
+    <tr><td>TTL only</td><td>Expire by time</td><td>Bounds staleness</td><td>Not a space policy: memory can fill before anything expires</td></tr>
+  </tbody>
+</table>
+<h3>Memory overhead and allocation</h3>
+<p>Per-item overhead hurts most when values are small: a 100-byte value with 60 bytes of bookkeeping is 60% overhead, while a 10 KB value barely notices. Memcached-style allocators use <strong>slab classes</strong> (size classes with fixed chunk sizes) to avoid fragmentation, at the cost of internal waste (the 15% in the estimate) and the risk that a shift in item sizes leaves memory stranded in the wrong class. Mitigations: batch many tiny values into one key where access patterns allow, compress large values on the client (trading CPU for memory), and watch evictions-per-class, not just overall evictions.</p>
+
+<h2>Deep dive 3: hot keys and thundering herds</h2>
+<h3>Hot keys</h3>
+<p>The estimate showed a key taking 10% of reads is already more than a node can serve. A consistent hash puts that key on exactly one node, so adding nodes does nothing. Options:</p>
+<table>
+  <thead><tr><th>Technique</th><th>How</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td>Local L1 cache in the client</td><td>Keep the hottest keys in the app server's memory for a second or two</td><td>Staleness of up to the L1 TTL; memory on every app server; works only when "slightly stale" is acceptable</td></tr>
+    <tr><td>Replicate the key</td><td>Store <code>k#0..k#R-1</code> on different nodes; the client reads a random one; a write updates or invalidates all</td><td>R times the memory for that key and R deletes per invalidation; briefly inconsistent copies</td></tr>
+    <tr><td>Read from replicas</td><td>Allow reads of hot keys from the primary's replicas</td><td>Replica lag; fits where replicas already exist</td></tr>
+    <tr><td>Detect and promote</td><td>Sample request counts per key; automatically move a key to the L1 or replicated mode when it exceeds a threshold</td><td>A detection pipeline; but no one has to guess which keys are hot in advance</td></tr>
+  </tbody>
+</table>
+<p>The order I would present: L1 for the few hottest keys (cheap, no cluster change), automatic detection to decide which, and key replication where staleness across copies is tolerable. Counters (such as a "likes" total) need a different trick: shard the counter into sub-counters and sum them on read, the same idea as in the <a href="05-rate-limiter.html">rate limiter</a>.</p>
+<h3>Thundering herds and leases</h3>
+<p>When a hot key expires or is deleted, every client that wants it misses at the same instant and all hit the database. This is the stampede of <a href="../../data/chapters/14-caching.html">caching</a> (try the simulator there). A <span class="term">lease</span> is the fix that fits a shared cache: on a miss the cache hands one client a token that licenses the refill, and tells the others to wait or serves them a slightly stale value. The same token fixes a second race, the stale set, in which a slow reader fills the cache with a value the database has since replaced.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 276" role="img" aria-label="Sequence diagram of a lease. Client A gets a miss and a lease token, client B is told to wait, A reads the database and sets the key with its token, then B retries and hits.">
+<defs><marker id="ahG06b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="40" y="8" width="120" height="36" rx="8" class="fs-blue s-blue sw-2"/><text x="100.0" y="31" text-anchor="middle" class="t-sm t-bold">Client A</text></g>
+<g><rect x="200" y="8" width="120" height="36" rx="8" class="fs-blue s-blue sw-2"/><text x="260.0" y="31" text-anchor="middle" class="t-sm t-bold">Client B</text></g>
+<g><rect x="360" y="8" width="120" height="36" rx="8" class="fs-cyan s-cyan sw-2"/><text x="420.0" y="31" text-anchor="middle" class="t-sm t-bold">Cache</text></g>
+<g><rect x="520" y="8" width="120" height="36" rx="8" class="fs-purple s-purple sw-2"/><text x="580.0" y="31" text-anchor="middle" class="t-sm t-bold">Database</text></g>
+<line x1="100" y1="44" x2="100" y2="266" class="line-dash"/>
+<line x1="260" y1="44" x2="260" y2="266" class="line-dash"/>
+<line x1="420" y1="44" x2="420" y2="266" class="line-dash"/>
+<line x1="580" y1="44" x2="580" y2="266" class="line-dash"/>
+<line x1="100" y1="74" x2="420" y2="74" class="line" marker-end="url(#ahG06b)"/>
+<text x="110" y="68" text-anchor="start" class="t-xs t-bold">1  get k</text>
+<line x1="420" y1="92" x2="100" y2="92" class="line-dash" marker-end="url(#ahG06b)"/>
+<text x="255" y="106" text-anchor="start" class="t-xs t-muted">miss, you hold lease #7</text>
+<line x1="260" y1="128" x2="420" y2="128" class="line" marker-end="url(#ahG06b)"/>
+<text x="268" y="122" text-anchor="start" class="t-xs t-bold">2  get k</text>
+<line x1="420" y1="146" x2="260" y2="146" class="line-dash" marker-end="url(#ahG06b)"/>
+<text x="268" y="160" text-anchor="start" class="t-xs t-muted">wait / stale</text>
+<line x1="100" y1="184" x2="580" y2="184" class="line" marker-end="url(#ahG06b)"/>
+<text x="110" y="178" text-anchor="start" class="t-xs t-bold">3  read row for k</text>
+<line x1="100" y1="214" x2="420" y2="214" class="line" marker-end="url(#ahG06b)"/>
+<text x="110" y="208" text-anchor="start" class="t-xs t-bold">4  set k, lease #7</text>
+<line x1="260" y1="246" x2="420" y2="246" class="line" marker-end="url(#ahG06b)"/>
+<text x="268" y="240" text-anchor="start" class="t-xs t-bold">5  retry get k: hit</text>
+  </svg>
+  <figcaption>A lease turns N simultaneous misses into one database read. The token also lets the cache refuse a fill that was invalidated in the meantime (the stale-set race below).</figcaption>
+</figure>
+<pre class="terminal" data-title="lease.py"><code>&quot;&quot;&quot;Two classic cache races, replayed deterministically, with and without leases.&quot;&quot;&quot;
+
+class Cache:
+    def __init__(self, leases: bool):
+        self.data, self.leases, self.token_seq, self.live = {}, leases, 0, {}
+    def get(self, key):
+        if key in self.data: return (&quot;hit&quot;, self.data[key])
+        if not self.leases: return (&quot;miss&quot;, None)
+        if key in self.live: return (&quot;wait&quot;, None)                 # someone else holds the lease
+        self.token_seq += 1; self.live[key] = self.token_seq
+        return (&quot;miss&quot;, self.token_seq)                            # you are the one who may refill
+    def set(self, key, val, token=None):
+        if self.leases and self.live.get(key) != token: return False   # lease invalidated: refuse stale fill
+        self.data[key] = val; self.live.pop(key, None); return True
+    def delete(self, key):
+        self.data.pop(key, None); self.live.pop(key, None)         # also kills any outstanding lease
+
+def stampede(leases, requests=1000):
+    c, db_reads = Cache(leases), 0
+    results = [c.get(&quot;hot&quot;) for _ in range(requests)]               # all arrive while the key is missing
+    for status, token in results:
+        if status == &quot;miss&quot;:
+            db_reads += 1                                           # each miss reads the database
+            c.set(&quot;hot&quot;, &quot;v1&quot;, token)
+    return db_reads
+
+def stale_set(leases):
+    db, c = {&quot;k&quot;: &quot;v1&quot;}, Cache(leases)
+    status, token = c.get(&quot;k&quot;)                                      # reader: miss
+    value_read = db[&quot;k&quot;]                                            # reader reads v1 from the database
+    db[&quot;k&quot;] = &quot;v2&quot;                                                  # writer updates the database...
+    c.delete(&quot;k&quot;)                                                   # ...and invalidates the cache
+    ok = c.set(&quot;k&quot;, value_read, token)                              # reader finally fills with what it read (v1)
+    return c.data.get(&quot;k&quot;), db[&quot;k&quot;], ok
+
+for leases in (False, True):
+    print(f&quot;leases={leases!s:&lt;5}  stampede: 1000 simultaneous misses cause {stampede(leases):&gt;4} database reads&quot;)
+for leases in (False, True):
+    cached, truth, ok = stale_set(leases)
+    print(f&quot;leases={leases!s:&lt;5}  stale set: cache holds {cached!r}, database holds {truth!r}, reader&#x27;s fill accepted: {ok}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>leases=False  stampede: 1000 simultaneous misses cause 1000 database reads
+leases=True   stampede: 1000 simultaneous misses cause    1 database reads
+leases=False  stale set: cache holds &#x27;v1&#x27;, database holds &#x27;v2&#x27;, reader&#x27;s fill accepted: True
+leases=True   stale set: cache holds None, database holds &#x27;v2&#x27;, reader&#x27;s fill accepted: False</code></pre>
+<p>The first pair of lines is the herd: 1,000 simultaneous misses become one database read. The second pair is the race: a reader read <code>v1</code>, a writer changed the row to <code>v2</code> and deleted the key, then the reader's slow fill arrives. Without a lease the cache keeps <code>v1</code> indefinitely (until TTL); with one, the delete revoked the token and the fill is refused. Pair leases with other herd defences: jittered TTLs so keys do not expire in unison, early refresh of popular keys before they expire, and serving stale while one refill runs. These are the techniques the <a href="../../data/cases/case-03-memcache-facebook.html">Facebook memcache case study</a> describes at scale, and it is worth reading how much of that paper concerns exactly these small races.</p>
+
+<h2>Deep dive 4: consistency, regions and warm-up</h2>
+<h3>Keeping the cache honest</h3>
+<p>The default pattern is <strong>cache-aside</strong> (read-through at the client): read the cache, on a miss read the database and fill; on a write, update the database and <em>delete</em> the cache entry. Deleting rather than updating matters because two concurrent writers can apply their cache updates in a different order from their database commits, leaving a stale value that no later event corrects.</p>
+<table>
+  <thead><tr><th>Invalidation source</th><th>How</th><th>Weakness</th></tr></thead>
+  <tbody>
+    <tr><td>TTL only</td><td>Let entries expire</td><td>Staleness up to the TTL; short TTLs cost hit ratio</td></tr>
+    <tr><td>Application deletes after write</td><td>The writing service deletes the key after committing</td><td>If it crashes between commit and delete, the entry is stale until TTL; every writer must remember</td></tr>
+    <tr><td>CDC-driven deletes (recommended)</td><td>Tail the database's commit log; an invalidator deletes affected keys</td><td>An extra pipeline and lag of milliseconds to seconds; the mapping from row change to cache keys must be maintained</td></tr>
+    <tr><td>Write-through</td><td>The cache layer writes the database and itself</td><td>Cache becomes a write path; harder failure semantics; fine for a dedicated data-access service</td></tr>
+  </tbody>
+</table>
+<p>CDC invalidation has a property the others lack: it works for <em>any</em> writer, including batch jobs, migrations and manual fixes, because it watches the database rather than trusting applications to remember (<a href="../../data/chapters/19-streams-cdc.html">streams and CDC</a>, the <a href="03-building-blocks.html">outbox</a> is the application-side cousin). Keep TTL as the backstop: a lost event then becomes bounded staleness, not permanent staleness.</p>
+<h3>Cross-region caching</h3>
+<figure class="diagram">
+  <svg viewBox="0 0 760 258" role="img" aria-label="Two regions. Region A holds the database primary and writes; region B holds an asynchronous replica. Each region has its own change log and invalidator that deletes keys in that region&#x27;s cache.">
+<defs><marker id="ahG06c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="10" y="8" width="330" height="214" rx="10" class="line-dash" style="fill:none"/>
+<rect x="420" y="8" width="330" height="214" rx="10" class="line-dash" style="fill:none"/>
+<text x="24" y="28" text-anchor="start" class="t-xs t-bold">Region A (writes)</text>
+<text x="434" y="28" text-anchor="start" class="t-xs t-bold">Region B (reads)</text>
+<g><rect x="24" y="46" width="90" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="69.0" y="73" text-anchor="middle" class="t-sm t-bold">App A</text></g>
+<g><rect x="24" y="126" width="90" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="69.0" y="153" text-anchor="middle" class="t-sm t-bold">Cache A</text></g>
+<g><rect x="228" y="86" width="100" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="278.0" y="116" text-anchor="middle" class="t-sm t-bold">DB primary</text></g>
+<g><rect x="228" y="164" width="100" height="44" rx="8" class="fs-orange s-orange sw-2"/><text x="278.0" y="191" text-anchor="middle" class="t-sm t-bold">Change log</text></g>
+<g><rect x="642" y="46" width="96" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="690.0" y="73" text-anchor="middle" class="t-sm t-bold">App B</text></g>
+<g><rect x="642" y="126" width="96" height="44" rx="8" class="fs-cyan s-cyan sw-2"/><text x="690.0" y="153" text-anchor="middle" class="t-sm t-bold">Cache B</text></g>
+<g><rect x="432" y="86" width="100" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="482.0" y="116" text-anchor="middle" class="t-sm t-bold">DB replica</text></g>
+<g><rect x="432" y="164" width="100" height="44" rx="8" class="fs-orange s-orange sw-2"/><text x="482.0" y="191" text-anchor="middle" class="t-sm t-bold">Change log</text></g>
+<line x1="69" y1="90" x2="69" y2="126" class="line" marker-end="url(#ahG06c)"/>
+<line x1="114" y1="64" x2="228" y2="100" class="line" marker-end="url(#ahG06c)"/>
+<line x1="278" y1="136" x2="278" y2="164" class="line" marker-end="url(#ahG06c)"/>
+<line x1="228" y1="186" x2="114" y2="156" class="line-dash" marker-end="url(#ahG06c)"/>
+<line x1="690" y1="90" x2="690" y2="126" class="line" marker-end="url(#ahG06c)"/>
+<line x1="642" y1="64" x2="532" y2="100" class="line" marker-end="url(#ahG06c)"/>
+<line x1="482" y1="136" x2="482" y2="164" class="line" marker-end="url(#ahG06c)"/>
+<line x1="532" y1="186" x2="642" y2="156" class="line-dash" marker-end="url(#ahG06c)"/>
+<line x1="328" y1="111" x2="432" y2="111" class="line" marker-end="url(#ahG06c)"/>
+<text x="380" y="104" text-anchor="middle" class="t-xs t-muted">async</text>
+<text x="380" y="128" text-anchor="middle" class="t-xs t-muted">replication</text>
+<text x="380" y="246" text-anchor="middle" class="t-xs t-muted">Each region invalidates from its own database&#x27;s change log, so invalidation can never outrun replication.</text>
+  </svg>
+  <figcaption>Cross-region caching: every region has its own cache and invalidates from its own database copy. Deleting region B's key before B's replica has applied the change would let B re-fill the old value.</figcaption>
+</figure>
+<p>Give each region its own cache, filled from its nearest database copy. Writes go to the primary region. Each region's invalidator reads <em>that region's</em> change log, which is derived from its own (replicated) database. This ordering is the point: if the primary region deleted region B's key as soon as it wrote, B could miss, read its replica before the replica had applied the write, and cache the old value for a full TTL. Invalidating from the replica's own log makes that impossible. Reads in each region stay local at memory speed; the price is that a write is visible in remote regions after the replication delay (<a href="../../distributed/chapters/18-multi-region.html">multi-region</a>). Do not try to replicate cache contents across regions directly: you would ship the entire working set over the most expensive link you have to save misses that the local database can serve.</p>
+<h3>Cold start and warm-up</h3>
+<p>A new or restarted cache is empty, and an empty cache is a load test on your database. Our estimate has the database at 12k reads/s at a 99% hit ratio with a 20k ceiling, so a fully cold cluster (1.2M misses/s) would be about 60 times over it. Plan for it:</p>
+<ul>
+  <li><strong>Do not restart everything at once.</strong> Roll node by node so each wave of misses is a small fraction of traffic; keep deploys from also changing the ring.</li>
+  <li><strong>Warm a replacement before it takes traffic:</strong> replay recent keys from another region's cache or from a sampled access log, or copy a replica; or run the new node "shadowing" (receiving fills but serving no reads) for a while.</li>
+  <li><strong>Add nodes gradually:</strong> a ring with virtual nodes can ramp the new node's weight upward.</li>
+  <li><strong>Cap database concurrency</strong> with the lease and a rate limit on refills, so the worst case is slow pages, not a database outage (<a href="../../reliability/chapters/11-overload.html">overload</a>).</li>
+  <li><strong>Persist what is expensive:</strong> if some entries take seconds to rebuild, snapshot them or keep them in a store designed to survive restarts.</li>
+</ul>
+
+<h2>Failure modes &amp; operations</h2>
+<table>
+  <thead><tr><th>What breaks</th><th>Blast radius</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>One node dies</td><td>1/40 of keys miss</td><td>Gutter pool or replica; leases and refill limits to keep the database alive</td></tr>
+    <tr><td>Network partition between app and a node</td><td>That node looks dead to some clients, alive to others</td><td>Short client timeouts, treat as a miss, never block the request on the cache (<a href="../../architecture/chapters/17-resilience.html">timeouts and breakers</a>)</td></tr>
+    <tr><td>Inconsistent rings across clients</td><td>Same key on different nodes; duplicated entries and missed invalidations</td><td>Versioned ring config, staged rollout, or move routing to a proxy</td></tr>
+    <tr><td>Invalidation lag or lost event</td><td>Stale data for the TTL</td><td>CDC lag alert; TTL backstop; reconciliation scan for critical keys</td></tr>
+    <tr><td>Hot key</td><td>One node saturates, its other keys suffer</td><td>L1, replication, detection</td></tr>
+    <tr><td>Eviction storm (working set outgrows memory)</td><td>Hit ratio falls, database load rises</td><td>Alert on evictions and hit ratio; capacity plan from the estimate</td></tr>
+  </tbody>
+</table>
+<p><strong>SLOs.</strong> Get latency p99 under 2 ms measured at the client; cache availability as seen by clients 99.95%; hit ratio per namespace; staleness (time from database commit to invalidation) p99 under 5 s. <strong>Alert</strong> on hit-ratio drops (the earliest sign of trouble), evictions, per-node ops/s skew (hot keys) and invalidation lag, in the style of <a href="../../reliability/chapters/07-alerting-oncall.html">burn-rate alerts</a>. <strong>Roll out</strong> by node, check hit ratio after each, and never change the ring and the software in the same deploy.</p>
+
+<h2>Trade-offs &amp; alternatives</h2>
+<ul>
+  <li><strong>Cache-aside versus write-through.</strong> We chose cache-aside with delete-on-write because it fails softly. If the cache were also the system of record (a Redis-as-database design), you would need persistence, synchronous replication and a different mental model.</li>
+  <li><strong>Memory versus database headroom.</strong> A larger cache and replicas cost money; a bigger database costs money. The hit-ratio table in the estimate is how you price one against the other.</li>
+  <li><strong>Freshness versus hit ratio.</strong> Longer TTLs and L1 caches raise the hit ratio and the staleness. If a use case needs read-your-writes, route that user's reads past the cache for a short time after their write.</li>
+  <li><strong>If strong consistency were required,</strong> do not cache that data in a shared cache at all, or cache it with version checks against the database.</li>
+  <li><strong>Where it breaks down:</strong> workloads with uniform, unique reads (no locality) get no value from the cache, only cost and complexity.</li>
+</ul>
+
+<h2>What a strong answer adds</h2>
+<ul>
+  <li>Sizes the cluster from both memory and throughput and notes which one binds, including per-item overhead.</li>
+  <li>Connects the hit ratio to the database ceiling with a number, and says a node loss is a database-capacity question.</li>
+  <li>Knows consistent hashing is necessary but not sufficient, and names leases, a gutter pool or replicas as the complement.</li>
+  <li>Names both herd problems, the stampede and the stale-set race, and fixes them with the same mechanism.</li>
+  <li>Prefers delete over update on writes, CDC over hand-written invalidation, and keeps a TTL as the safety net.</li>
+  <li>Distinguishes hot keys from hot nodes and offers L1, key replication and detection, each with its staleness cost.</li>
+  <li>Invalidates each region from its own database copy.</li>
+  <li>Plans cold start explicitly: staged restarts, warm-up, refill limits.</li>
+</ul>
+
+<h2>Follow-up questions</h2>
+<details class="deeper">
+  <summary>Why not use write-through and keep the cache always correct?</summary>
+  <p>Write-through still has two systems to update, so it needs a protocol for failure between the two writes, and it caches data that may never be read. It also does not help writers that bypass the cache layer. Cache-aside with CDC deletes has weaker freshness but simpler failure behaviour, and any writer is covered. Use write-through when a single data-access service owns all writes and read-your-writes is essential.</p>
+</details>
+<details class="deeper">
+  <summary>How would you resize the cluster from 40 to 60 nodes without hurting the database?</summary>
+  <p>Add nodes with small ring weights and ramp them, so each step moves a small share of keys; warm each new node by shadowing before it serves reads; keep leases and refill limits on. With a ring, the new nodes take about 1/N of the keys each, but every moved key is a miss, so schedule the ramp in off-peak hours and watch hit ratio and database load between steps.</p>
+</details>
+<details class="deeper">
+  <summary>Memcached or Redis?</summary>
+  <p>For a pure cache of simple values with huge fan-out, memcached's simplicity and multi-threading are attractive, and the design above fits it. Redis adds data structures, persistence and replication, useful when you need counters, sorted sets or failover, at the cost of a single-threaded core per instance (scale by running more instances) and more to operate. The choice follows the access pattern and the operational team, not fashion.</p>
+</details>
+<details class="deeper">
+  <summary>A deploy changes the serialisation format of cached values. What happens?</summary>
+  <p>Old readers see new values and the reverse, or deserialisation fails and everything becomes a miss. Put a version in the key (<code>profile:v4:...</code>), deploy readers that accept both, switch writers, and let the old keys age out. Treat the cached format as a public contract (<a href="../../architecture/chapters/10-evolving-contracts.html">evolving contracts</a>).</p>
+</details>
+<details class="deeper">
+  <summary>How do you cache a personalised page?</summary>
+  <p>Usually do not cache the whole page. Cache the shared fragments (the product data, the rendered recommendations list) under keys without the user id, and assemble the personal parts per request. Per-user keys are only worth it if the same user re-requests soon, and they multiply memory by the user count, which our estimate can tell you before you commit.</p>
+</details>
+<details class="deeper">
+  <summary>How would you know the cache is actually helping?</summary>
+  <p>Measure hit ratio per namespace, database load with and without (a canary that bypasses the cache for 1% of reads), and latency. A cache with a 60% hit ratio on an inexpensive query may cost more than it saves in complexity. Evaluate by the load removed from the database, not by the hit ratio alone.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Edit the sizing script: halve the value size to 500 bytes and see which constraint (memory or throughput) now binds and how the overhead percentage changes. Then change the remap script's virtual node count from 150 to 10 and compare how evenly a node loss spreads, and how the fraction of keys moved varies between runs of different node names. Finally, add a stale-while-revalidate branch to the lease script so that waiting clients receive the old value.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>The stale-set race is an ordering problem: the cache sees events (fill, delete) in a different order from the database. Leases are a small instance of a token that rejects stale actors, the same idea as <a href="../../distributed/chapters/04-leases-fencing.html">fencing tokens</a>. Cross-region invalidation from the local replica's log is a consequence of asynchronous replication, and the whole design leans on the consistency models in <a href="../../distributed/chapters/05-consistency-models.html">consistency models</a>: the cache gives you bounded staleness, never linearizability.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Size from memory and throughput; per-item overhead and allocator waste are a real share of the memory, and the hit ratio is a capacity number for the database.</li>
+    <li>Consistent hashing keeps node changes to about 1/N of the keys, but one node loss can still overload the database, so add leases, a gutter pool or replicas.</li>
+    <li>Route with a smart client first and a proxy tier when connections and fleet policy demand it.</li>
+    <li>Frequency-aware eviction beats plain LRU on skewed and scan-polluted workloads; measure, because size gains diminish.</li>
+    <li>Hot keys defeat sharding: use an L1 cache, key replication and automatic detection.</li>
+    <li>Leases fix both the thundering herd and the stale-set race.</li>
+    <li>On writes, update the database and delete the key, driven by CDC, with a TTL as the backstop; invalidate each region from its own database copy.</li>
+    <li>A cold cache is a load test on the database: stage restarts, warm new nodes, and cap refills.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why does modulo hashing (<code>hash(key) % N</code>) make resizing a cache cluster dangerous?</p>
+    <ol class="q-options">
+      <li>It cannot hash strings</li>
+      <li>Changing N remaps almost every key, so nearly everything misses at once and the database takes the surge</li>
+      <li>It requires replicas</li>
+      <li>It is slower than a ring</li>
+    </ol>
+    <div class="q-explain">In the measurement about 97% of keys changed owner when one node was added. A consistent-hash ring moves about 1/N.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Your estimate says one key receives 10% of all reads, which is more than one node's rough throughput. What helps?</p>
+    <ol class="q-options">
+      <li>Add more nodes to the ring</li>
+      <li>Serve that key from per-client L1 caches and/or replicate it under several key names</li>
+      <li>Increase the TTL to one day</li>
+      <li>Switch to modulo hashing</li>
+    </ol>
+    <div class="q-explain">A key lives on one node regardless of cluster size, so the only options spread that key's reads: local caches, copies on several nodes, or replicas.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">What does a lease token in the cache protect against, besides a thundering herd?</p>
+    <ol class="q-options">
+      <li>Network partitions</li>
+      <li>A slow reader filling the cache with an old value after a writer has deleted the key</li>
+      <li>Memory fragmentation</li>
+      <li>Hash collisions</li>
+    </ol>
+    <div class="q-explain">Deleting the key revokes outstanding leases, so the late fill is rejected. Without it the stale value could remain until its TTL.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">On a database write, why is deleting the cache key usually better than updating it?</p>
+    <ol class="q-options">
+      <li>Deleting is faster over the network</li>
+      <li>Two concurrent writers can apply cache updates in a different order than their database commits, leaving a stale value; a delete just forces a fresh read</li>
+      <li>Caches cannot store updated values</li>
+      <li>Updates break consistent hashing</li>
+    </ol>
+    <div class="q-explain">A delete is idempotent and order-insensitive; the next read repopulates from the source of truth.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Region B's cache is invalidated by a message from the primary region at write time. What can go wrong?</p>
+    <ol class="q-options">
+      <li>Nothing, since the key is deleted</li>
+      <li>B may re-fill from its replica before the replica has applied the write, and then hold the old value for a full TTL</li>
+      <li>The message will be delivered twice</li>
+      <li>The cache will run out of memory</li>
+    </ol>
+    <div class="q-explain">Invalidate from the local replica's change log so that the delete always follows the replicated write.</div>
+  </div>
+</section>
+
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

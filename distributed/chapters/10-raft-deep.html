@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raft in Depth · Distributed Systems, Deep</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/raft-commit.css">
+</head>
+<body data-root="../.." data-course="dist" data-chapter="10">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+<header class="chapter-head">
+  <h1>Raft in Depth</h1>
+  <p class="lede">Raft's headline algorithm fits on a page, but the difficulty lives in its corners: why a leader must refuse to count some replicas, how to change the set of servers while the cluster is running, how to stop logs growing forever, how to serve a read that is truly up to date, and how one badly connected machine can knock over a healthy cluster. This chapter proves the two properties everything rests on, then works through each corner, with a widget that replays the paper's most famous trap.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Raft is the consensus algorithm you are most likely to operate: etcd, Consul and many databases embed it. When such a system misbehaves in production, the cause is almost never the basic election or replication; it is one of the corners in this chapter, such as a stale read from a deposed leader, a membership change gone wrong, or a flapping node that keeps forcing elections. Knowing why each rule exists is what lets you read an incident report, judge a Jepsen result, or review an implementation.</p>
+</div>
+
+<h2>Recap, then notation</h2>
+
+<p>You met Raft in <a href="../../networking/chapters/20-consensus.html">networking chapter 20</a> and built a toy one in <a href="../../networking/labs/lab-06-raft.html">Lab 6</a>: time is cut into numbered <span class="term">terms</span>; a follower that hears no leader becomes a candidate and wins by collecting votes from a majority; the leader appends client commands to its log and replicates them with AppendEntries; an entry is <span class="term">committed</span> once the leader knows it is stored on a majority. The previous chapter, <a href="09-paxos.html">Paxos, Step by Step</a>, showed that this is Multi-Paxos with a strong leader, no gaps and a restricted election. Here we go past the sketch.</p>
+
+<p>Notation: a log entry has an <em>index</em> (position, from 1) and a <em>term</em> (the term of the leader that created it). Each server keeps three things on stable storage: <code>currentTerm</code>, <code>votedFor</code> (who it voted for in the current term, if anyone) and the <code>log</code>. Everything else (commit index, role) can be rebuilt after a restart.</p>
+
+<h2>Election safety: one leader per term</h2>
+
+<p><strong>Property.</strong> At most one leader is elected in any given term.</p>
+
+<p><strong>Why it holds.</strong> A server grants at most one vote per term, and writes <code>votedFor</code> to disk before replying. A candidate wins only with votes from a majority. Two different candidates in the same term would need two majorities of voters, which share at least one server (quorum intersection again), and that server would have voted twice. So there is at most one winner.</p>
+
+<p>The disk write matters. If a server forgot its vote on restart, it could vote for candidate A, crash, reboot and vote for candidate B in the same term, and two leaders could appear in one term. Note what the property does <em>not</em> say: there may be several leaders over time, and a deposed leader may still believe it is leader for a while. Each of those facts returns below.</p>
+
+<h2>Leader completeness and the voting restriction</h2>
+
+<p><strong>Property.</strong> If an entry is committed in some term, it is present in the log of the leader of every higher term.</p>
+
+<p>This is the property that makes the whole protocol safe: a leader is the only writer, and it only ever appends, so if every leader already holds all committed entries, nothing committed can be lost. It does not come for free, since an elected server may have been cut off for a long time. It comes from a single rule in RequestVote: <strong>a voter refuses a candidate whose log is less up to date than its own.</strong> "More up to date" compares the term of the last entry first (higher wins) and, if equal, the length (longer wins).</p>
+
+<p><strong>Proof sketch (by contradiction).</strong> Suppose entry E is committed by the leader of term T, so it is stored on a majority. Let U be the smallest term greater than T whose leader does <em>not</em> contain E. That leader won with votes from a majority, which must include at least one server V that also stored E (intersection). V stored E before voting for U's leader, since after seeing term U it would have rejected the term-T leader's AppendEntries. V voted, so the candidate's log was at least as up to date as V's. Two cases:</p>
+
+<ul>
+  <li><strong>The last terms are equal.</strong> Then the candidate's log is at least as long as V's, and by the log matching property (next section) two logs that agree on the term of their last common index agree on everything before it. So the candidate holds everything V holds, including E. Contradiction.</li>
+  <li><strong>The candidate's last term L is larger than V's last term.</strong> V's last term is at least T (it holds E), so T &le; (V's last term) &lt; L, and L &lt; U because an earlier leader created the candidate's last entry. U was the <em>smallest</em> term whose leader lacks E, so the leader of term L did contain E, and the candidate's last entry was copied from that leader's log; by log matching its prefix, which includes E, came with it. Contradiction.</li>
+</ul>
+
+<p>Either way, such a U cannot exist. The proof uses two ingredients: majorities intersect, and the voting restriction. Without the restriction, a lagging server with a short log could be elected and would then <em>overwrite</em> committed entries on followers as it "repairs" their logs. That is the Raft analogue of Paxos's adoption rule. In Paxos, a proposer finds out what may be chosen and adopts it; in Raft, the election makes sure that only a server that already has it can win.</p>
+
+<h2>The log matching property, as an induction</h2>
+
+<p><strong>Property.</strong> If two logs contain an entry with the same index and the same term, then (a) the entries store the same command, and (b) the logs are identical in all entries up to and including that index.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 270" role="img" aria-label="Three logs drawn as rows of numbered cells showing entry terms. S1: 1 1 2 2 3 3 3. S2: 1 1 2 2 2 2. S3: 1 1 1 4 4. S1 and S2 both hold term 2 at index 4, so indexes 1 to 4 are identical. All three hold term 1 at index 2, so indexes 1 and 2 are identical.">
+<text x="107.0" y="22" text-anchor="middle" class="t-xs t-faint"  >index 1</text>
+<text x="171.0" y="22" text-anchor="middle" class="t-xs t-faint"  >index 2</text>
+<text x="235.0" y="22" text-anchor="middle" class="t-xs t-faint"  >index 3</text>
+<text x="299.0" y="22" text-anchor="middle" class="t-xs t-faint"  >index 4</text>
+<text x="363.0" y="22" text-anchor="middle" class="t-xs t-faint"  >index 5</text>
+<text x="427.0" y="22" text-anchor="middle" class="t-xs t-faint"  >index 6</text>
+<text x="491.0" y="22" text-anchor="middle" class="t-xs t-faint"  >index 7</text>
+<rect x="74" y="30" width="264" height="90" rx="8" fill="none" class="s-green" stroke-width="2" stroke-dasharray="6 4"/>
+<rect x="70" y="26" width="144" height="142" rx="10" fill="none" class="s-yellow" stroke-width="2"/>
+<text x="10" y="58" text-anchor="start" class="t-sm t-bold tc-blue"  >S1</text>
+<rect x="80" y="36" width="54" height="32" rx="5" class="fs-blue s-blue"/><text x="107.0" y="56.0" text-anchor="middle" class="t-sm t-bold"  >1</text>
+<rect x="144" y="36" width="54" height="32" rx="5" class="fs-blue s-blue"/><text x="171.0" y="56.0" text-anchor="middle" class="t-sm t-bold"  >1</text>
+<rect x="208" y="36" width="54" height="32" rx="5" class="fs-yellow s-yellow"/><text x="235.0" y="56.0" text-anchor="middle" class="t-sm t-bold"  >2</text>
+<rect x="272" y="36" width="54" height="32" rx="5" class="fs-yellow s-yellow"/><text x="299.0" y="56.0" text-anchor="middle" class="t-sm t-bold"  >2</text>
+<rect x="336" y="36" width="54" height="32" rx="5" class="fs-orange s-orange"/><text x="363.0" y="56.0" text-anchor="middle" class="t-sm t-bold"  >3</text>
+<rect x="400" y="36" width="54" height="32" rx="5" class="fs-orange s-orange"/><text x="427.0" y="56.0" text-anchor="middle" class="t-sm t-bold"  >3</text>
+<rect x="464" y="36" width="54" height="32" rx="5" class="fs-orange s-orange"/><text x="491.0" y="56.0" text-anchor="middle" class="t-sm t-bold"  >3</text>
+<text x="10" y="104" text-anchor="start" class="t-sm t-bold tc-blue"  >S2</text>
+<rect x="80" y="82" width="54" height="32" rx="5" class="fs-blue s-blue"/><text x="107.0" y="102.0" text-anchor="middle" class="t-sm t-bold"  >1</text>
+<rect x="144" y="82" width="54" height="32" rx="5" class="fs-blue s-blue"/><text x="171.0" y="102.0" text-anchor="middle" class="t-sm t-bold"  >1</text>
+<rect x="208" y="82" width="54" height="32" rx="5" class="fs-yellow s-yellow"/><text x="235.0" y="102.0" text-anchor="middle" class="t-sm t-bold"  >2</text>
+<rect x="272" y="82" width="54" height="32" rx="5" class="fs-yellow s-yellow"/><text x="299.0" y="102.0" text-anchor="middle" class="t-sm t-bold"  >2</text>
+<rect x="336" y="82" width="54" height="32" rx="5" class="fs-yellow s-yellow"/><text x="363.0" y="102.0" text-anchor="middle" class="t-sm t-bold"  >2</text>
+<rect x="400" y="82" width="54" height="32" rx="5" class="fs-yellow s-yellow"/><text x="427.0" y="102.0" text-anchor="middle" class="t-sm t-bold"  >2</text>
+<rect x="464" y="82" width="54" height="32" rx="5" class="box" stroke-dasharray="4 4"/>
+<text x="10" y="150" text-anchor="start" class="t-sm t-bold tc-blue"  >S3</text>
+<rect x="80" y="128" width="54" height="32" rx="5" class="fs-blue s-blue"/><text x="107.0" y="148.0" text-anchor="middle" class="t-sm t-bold"  >1</text>
+<rect x="144" y="128" width="54" height="32" rx="5" class="fs-blue s-blue"/><text x="171.0" y="148.0" text-anchor="middle" class="t-sm t-bold"  >1</text>
+<rect x="208" y="128" width="54" height="32" rx="5" class="fs-blue s-blue"/><text x="235.0" y="148.0" text-anchor="middle" class="t-sm t-bold"  >1</text>
+<rect x="272" y="128" width="54" height="32" rx="5" class="fs-purple s-purple"/><text x="299.0" y="148.0" text-anchor="middle" class="t-sm t-bold"  >4</text>
+<rect x="336" y="128" width="54" height="32" rx="5" class="fs-purple s-purple"/><text x="363.0" y="148.0" text-anchor="middle" class="t-sm t-bold"  >4</text>
+<rect x="400" y="128" width="54" height="32" rx="5" class="box" stroke-dasharray="4 4"/>
+<rect x="464" y="128" width="54" height="32" rx="5" class="box" stroke-dasharray="4 4"/>
+<text x="380" y="190" text-anchor="middle" class="t-xs"  >Green: S1 and S2 both hold (index 4, term 2), so their indexes 1 to 4 are identical.</text>
+<text x="380" y="207" text-anchor="middle" class="t-xs"  >Yellow: all three hold (index 2, term 1), so indexes 1 and 2 are identical on all three.</text>
+<text x="380" y="224" text-anchor="middle" class="t-xs t-muted"  >S1 and S2 differ at index 5 (3 against 2): the property says nothing about index 5 or beyond.</text>
+<text x="380" y="256" text-anchor="middle" class="t-xs t-faint"  >Cell number = the term in which the leader created that entry.</text>
+</svg>
+  <figcaption>Log matching in pictures. Each cell is one entry, labelled with its term. Where two logs share (index, term), they share the whole prefix. Beyond a disagreement, the property is silent: those entries are exactly the ones a new leader may overwrite.</figcaption>
+</figure>
+
+<p>Both parts follow by induction on the history of the cluster, using two facts about how logs are built.</p>
+
+<p><strong>Fact 1 (part a).</strong> A leader creates at most one entry with a given index in its term, and it never moves or changes an entry in its own log. Since each term has at most one leader (election safety), the pair (index, term) identifies one command, and every copy of that pair anywhere is a copy of it.</p>
+
+<p><strong>Fact 2 (part b), the consistency check.</strong> AppendEntries carries <code>prevLogIndex</code> and <code>prevLogTerm</code>, the position and term of the entry just before the new ones. A follower accepts only if its own log has an entry at <code>prevLogIndex</code> with term <code>prevLogTerm</code>; otherwise it replies "no" and the leader tries an earlier <code>prevLogIndex</code> for that follower (the <code>nextIndex</code> backtracking).</p>
+
+<p><strong>Induction.</strong> Take as the invariant "all logs in the cluster satisfy log matching." The base case is the empty logs, where it holds trivially. Suppose it holds before some step. The only steps that change logs are appends. A leader appending to its own log extends it with a fresh (index, term) pair, which no other log has yet (Fact 1), so the property is untouched. A follower accepting an AppendEntries with prev = (i, t) now has a log whose entry at i has term t, the same as the leader's. By the invariant applied to those two logs <em>before</em> the step, they agree on everything up to i. The follower then writes the leader's entries after i (deleting any conflicting entries that followed), so after the step the follower's log is the leader's prefix up to i followed by the leader's new entries, which means they agree up to the last appended index. Any (index, term) match between the follower and a third log existed already (or involves the new entries, which are the leader's), so by the invariant it extends to the whole prefix. The invariant is preserved, so it holds forever. &#9633;</p>
+
+<p>Notice the economy: the check looks at <em>one</em> pair, but the induction turns it into a guarantee about the whole prefix. This is why Raft's logs never have gaps or mismatches hidden in the middle, and why repairing a follower only requires finding the latest point of agreement and overwriting everything after it. Only uncommitted entries can be overwritten that way: committed ones are on a majority, so by leader completeness any leader has them and never asks to replace them.</p>
+
+<h2>The commitment subtlety: Figure 8</h2>
+
+<p>The obvious commit rule says: the leader marks an entry committed once it is stored on a majority of servers. It is wrong for entries from <em>older</em> terms, and Section 5.4.2 and Figure 8 of the Raft paper exist to show it. Walk through the story, which is the one the widget below plays (five servers, S1 to S5, each cell labelled with the entry's term):</p>
+
+<ol>
+  <li>S1 is leader in term 2. It appends an entry at index 2 and replicates it to S2 only, then crashes.</li>
+  <li>S5 is elected in term 3 (S3 and S4 vote for it; their logs are as short as its own). It appends a <em>different</em> entry at index 2 and crashes before replicating it.</li>
+  <li>S1 restarts and wins term 4. It carries on replicating its old term-2 entry, and S3 now has it. The term-2 entry is on S1, S2, S3: a majority.</li>
+  <li>S1 crashes again. S5 restarts. Its last log term is 3, which beats the term-2 entries on S2 and S3, so S2, S3, S4 all vote for it. S5 wins term 5 and overwrites index 2 on everyone with its term-3 entry.</li>
+</ol>
+
+<p>If S1 had treated the term-2 entry as committed at step 3 (it was on a majority) and told the client "done", step 4 destroys a committed entry. Nothing in the voting rule prevented it, because the voting rule compares <em>last log terms</em>, and S5's term 3 legitimately beats 2. A majority holding an entry does not stop that entry from being overwritten later.</p>
+
+<p><strong>Raft's fix.</strong> A leader <em>never</em> commits an entry from a previous term by counting replicas. It commits only entries from its own current term that way. Once an entry of the current term is on a majority, everything before it in the log is committed too, indirectly, thanks to log matching. In the story, if S1 manages to replicate a term-4 entry to a majority before crashing (branch E in the widget), the term-2 entry underneath becomes committed with it, and S5 can no longer win: the servers holding a term-4 entry refuse its candidacy because its last term, 3, is older. The widget lets you step both branches under both rules.</p>
+
+<div class="widget" id="raft-commit"></div>
+
+<p>The rule fits in a few lines. This script is the leader's commit computation, applied to the Figure 8 situation, with a switch for the naive rule and then the same check for who could win the next election:</p>
+
+<pre class="terminal" data-title="raft_commit.py"><code>"""Raft's commit rule on the Figure 8 scenario. A log is a list of entry terms; index 1 is the first entry."""
+
+def majority(n: int) -&gt; int:
+    return n // 2 + 1
+
+def commit_index(leader_term: int, leader_log: list[int], match_index: list[int],
+                 old: int, current_term_only: bool = True) -&gt; int:
+    """Highest index the leader may treat as committed.
+
+    match_index[i] = highest index known to be stored on server i (the leader counts itself).
+    Raft rule: only an index whose entry has the leader's *current* term may be committed by counting.
+    """
+    best = old
+    for idx in range(old + 1, len(leader_log) + 1):
+        replicas = sum(1 for m in match_index if m &gt;= idx)
+        if replicas &lt; majority(len(match_index)):
+            continue
+        if current_term_only and leader_log[idx - 1] != leader_term:
+            continue                                  # an old-term entry: do not count it
+        best = idx
+    return best
+
+# Figure 8 (c): S1 is leader in term 4. Its log is [1, 2]: index 2 holds a term-2 entry.
+# It has just copied that entry to S2 and S3, so three of five servers store index 2.
+log = [1, 2]
+match = [2, 2, 2, 1, 1]               # S1..S5
+print("S1 leader, term 4, log terms", log, "match", match)
+print("  naive rule (any entry on a majority) -&gt; commit index",
+      commit_index(4, log, match, 1, current_term_only=False))
+print("  Raft rule  (current-term entries only) -&gt; commit index",
+      commit_index(4, log, match, 1, current_term_only=True))
+
+# Now S1 appends a no-op (or any client entry) of term 4 and replicates it to S2 and S3.
+log = [1, 2, 4]
+match = [3, 3, 3, 1, 1]
+print("S1 appends a term-4 no-op, three servers store it: log", log, "match", match)
+print("  Raft rule  -&gt; commit index", commit_index(4, log, match, 1),
+      "(index 2 is committed too, indirectly: it is in the prefix)")
+
+# Why it matters: could S5 (last log term 3) still win an election and overwrite index 2?
+def can_win(candidate_last_term: int, candidate_len: int, voters: list[tuple[int, int]]) -&gt; bool:
+    votes = 1 + sum(1 for (t, n) in voters
+                    if (candidate_last_term, candidate_len) &gt;= (t, n))   # Raft "at least as up to date"
+    return votes &gt;= majority(5)
+
+others_before = [(2, 2), (2, 2), (1, 1)]     # S2, S3 hold [1,2]; S4 holds [1]  (S1 is down)
+others_after  = [(4, 3), (4, 3), (1, 1)]     # S2, S3 hold [1,2,4]; S4 holds [1]
+print("S5 (log [1,3]) wins if index 2 is only a term-2 entry on a majority:", can_win(3, 2, others_before))
+print("S5 (log [1,3]) wins once a term-4 entry is on a majority:           ", can_win(3, 2, others_after))</code></pre>
+
+<pre class="terminal" data-title="python3 raft_commit.py"><code>S1 leader, term 4, log terms [1, 2] match [2, 2, 2, 1, 1]
+  naive rule (any entry on a majority) -&gt; commit index 2
+  Raft rule  (current-term entries only) -&gt; commit index 1
+S1 appends a term-4 no-op, three servers store it: log [1, 2, 4] match [3, 3, 3, 1, 1]
+  Raft rule  -&gt; commit index 3 (index 2 is committed too, indirectly: it is in the prefix)
+S5 (log [1,3]) wins if index 2 is only a term-2 entry on a majority: True
+S5 (log [1,3]) wins once a term-4 entry is on a majority:            False</code></pre>
+
+<p>The naive rule says index 2 is committed after step 3; the Raft rule leaves the commit index at 1. After the term-4 entry reaches a majority the commit index jumps to 3, and index 2 is covered. The last two lines are the election check: S5, whose last entry has term 3, wins when index 2 sits only as a term-2 entry on a majority, and cannot win once a term-4 entry is on a majority.</p>
+
+<h3>The no-op at the start of a term</h3>
+
+<p>The rule has a practical consequence: a newly elected leader that receives no client commands cannot commit anything from earlier terms, because it has no current-term entry to count. A cluster could sit with a perfectly good log whose tail is "uncommitted" until a client happens to write. So every Raft leader appends a <span class="term">no-op</span> entry (an entry that changes nothing in the state machine) as soon as it is elected. Replicating it commits it, and with it every earlier entry. The no-op also lets the new leader learn the true commit index, which a fresh leader does not know, and, as we will see, makes linearizable reads possible. This is the same reason a Multi-Paxos leader fills gaps with no-ops, for a similar purpose.</p>
+
+<div class="callout warn">
+  <p class="callout-title">"Committed" and "stored on a majority" are not the same thing</p>
+  <p>An entry stored on a majority <em>might</em> be committed. Whether the system may treat it as committed depends on who is counting and in which term. The same distinction in Paxos terms: an old-ballot proposal accepted by a majority is chosen, but a new leader cannot <em>know</em> that without re-running the protocol for it, which is what committing a current-term entry does.</p>
+</div>
+
+<h2>Changing membership</h2>
+
+<p>Servers die and have to be replaced; clusters grow; operators move machines. The configuration (the set of voting servers) must itself be agreed upon, and changing it is harder than it looks.</p>
+
+<h3>Why you cannot just switch</h3>
+
+<p>Suppose the cluster is {S1, S2, S3} (majority: 2) and you want {S1, S2, S3, S4, S5} (majority: 3). You tell every server the new configuration, but the message reaches them at different moments. For a while, S1 and S2 still run the old rules while S3, S4 and S5 run the new ones. S1 can win an election in term 7 with S1's and S2's votes (2 of old 3). S3 can win term 7 with the votes of S3, S4, S5 (3 of new 5). The two voter sets are disjoint: two leaders in one term, each committing different entries. The intersection argument assumed everyone used the <em>same</em> set of servers.</p>
+
+<h3>Joint consensus</h3>
+
+<p>The Raft paper's solution is a two-step change through a transitional configuration, C<sub>old,new</sub>, in which a decision needs <strong>a majority of the old servers and a majority of the new servers</strong>, separately. Procedure:</p>
+
+<ol>
+  <li>The leader appends a log entry describing C<sub>old,new</sub>. Each server uses the <em>latest configuration in its log</em> as soon as the entry is appended, committed or not.</li>
+  <li>While in C<sub>old,new</sub>, entries are committed only with both majorities, and elections need both too. Servers from either configuration may be elected.</li>
+  <li>When the C<sub>old,new</sub> entry is committed, the leader appends C<sub>new</sub>. When that is committed, the change is complete, servers not in C<sub>new</sub> can be shut down, and a leader that is not in C<sub>new</sub> steps down.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 250" role="img" aria-label="Timeline of a Raft membership change using joint consensus: first the old configuration alone decides, then the joint configuration Cold,new where both majorities are required, then the new configuration alone. Marks show when each configuration entry is appended and committed.">
+<defs><marker id="ahX10aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-blue"/></marker><marker id="ahX10ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-green"/></marker><marker id="ahX10ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-red"/></marker><marker id="ahX10ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-orange"/></marker></defs>
+<rect x="30" y="90" width="210" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="135" y="112" text-anchor="middle" class="t-sm t-bold"  >C_old alone</text><text x="135" y="129" text-anchor="middle" class="t-xs t-muted"  >old majority decides</text>
+<rect x="240" y="90" width="290" height="50" rx="8" class="fs-orange s-orange sw-2"/><text x="385" y="112" text-anchor="middle" class="t-sm t-bold"  >C_old,new (joint)</text><text x="385" y="129" text-anchor="middle" class="t-xs t-muted"  >needs a majority of old AND of new</text>
+<rect x="530" y="90" width="200" height="50" rx="8" class="fs-green s-green sw-2"/><text x="630" y="112" text-anchor="middle" class="t-sm t-bold"  >C_new alone</text><text x="630" y="129" text-anchor="middle" class="t-xs t-muted"  >new majority decides</text>
+<line x1="240" y1="70" x2="240" y2="160" class="line s-yellow" stroke-width="2"/>
+<line x1="530" y1="70" x2="530" y2="160" class="line s-yellow" stroke-width="2"/>
+<line x1="730" y1="70" x2="730" y2="160" class="line s-yellow" stroke-width="2"/>
+<text x="240" y="50" text-anchor="middle" class="t-xs t-bold"  >leader appends C_old,new:</text>
+<text x="240" y="64" text-anchor="middle" class="t-xs t-muted"  >in force the moment it is appended</text>
+<text x="530" y="50" text-anchor="middle" class="t-xs t-bold"  >C_old,new committed:</text>
+<text x="530" y="64" text-anchor="middle" class="t-xs t-muted"  >append C_new</text>
+<text x="726" y="50" text-anchor="end" class="t-xs t-bold"  >C_new committed:</text>
+<text x="726" y="64" text-anchor="end" class="t-xs t-muted"  >old servers may go</text>
+<line x1="30" y1="205" x2="715" y2="205" class="line" marker-end="url(#ahX10aa)"/>
+<text x="30" y="225" text-anchor="start" class="t-xs t-faint"  >time</text>
+<text x="380" y="190" text-anchor="middle" class="t-xs"  >No point in time at which old-only and new-only majorities can both act: in the middle, every decision needs both.</text>
+</svg>
+  <figcaption>Joint consensus. There is no moment at which C_old alone and C_new alone could both make progress: until C_old,new is committed only C_old (or the joint rule) can act, and from the moment it is appended every decision needs both majorities. The yellow ticks are log entries.</figcaption>
+</figure>
+
+<h3>Single-server changes</h3>
+
+<p>Joint consensus is general but intricate. In his thesis, Ongaro describes a simpler alternative that many implementations use: <strong>change membership one server at a time.</strong> Adding or removing a single server means the old and new configurations differ by one member, and any majority of one overlaps any majority of the other, so no disjoint-majorities split can arise. The arithmetic: with n servers a majority is &lfloor;n/2&rfloor; + 1. For n = 2k, the old majority is k + 1 and the new (2k+1) majority is k + 1; together 2k + 2 &gt; 2k + 1. For n = 2k + 1, old k + 1 and new (2k+2) majority k + 2 sum to 2k + 3 &gt; 2k + 2. Either way the two majorities must share a server. Larger changes are made as a sequence of single steps, each committed before the next begins.</p>
+
+<p>Practical details that matter: a new server should first be added as a non-voting <em>learner</em> that catches up on the log (otherwise a cluster of 3 that adds a cold fourth member needs 3 of 4 votes before the newcomer has any data, and is more fragile than before). And the single-server algorithm had a subtle flaw that Ongaro later described publicly: a new leader must not start a configuration change before it has committed an entry from its own term (the no-op again), or overlapping leaders with partly committed changes can produce disjoint majorities. Implementations that skip the check have shipped the bug. This is a good example of why the corners deserve a model checker (<a href="20-formal-methods.html">chapter 20</a>).</p>
+
+<h2>Log compaction and snapshots</h2>
+
+<p>A log that grows without bound fills the disk and makes a restart replay all of history. The cure is a <span class="term">snapshot</span>: the full state of the state machine at some applied index, saved with that index (<code>lastIncludedIndex</code>), its term (<code>lastIncludedTerm</code>), and the current configuration. Everything in the log up to that point can be discarded. Each server snapshots <strong>independently</strong>, covering only entries it knows are committed and applied; the leader does not coordinate it. The <code>lastIncludedTerm</code> is kept so that the AppendEntries consistency check can still compare against the entry just before the new log start.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 260" role="img" aria-label="Log compaction. Before: a log with entries 1 to 10. After: entries 1 to 6 are replaced by a snapshot recording the state at index 6, term 3, while entries 7 to 10 remain. A slow follower holding only entries 1 to 3 receives the snapshot by an InstallSnapshot message.">
+<defs><marker id="ahX10ba" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-blue"/></marker><marker id="ahX10bb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-green"/></marker><marker id="ahX10bc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-red"/></marker><marker id="ahX10bd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-orange"/></marker></defs>
+<text x="10" y="38" text-anchor="start" class="t-sm t-bold"  >Before</text>
+<rect x="130" y="18" width="48" height="32" rx="5" class="box2"/><text x="154.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >1</text>
+<rect x="184" y="18" width="48" height="32" rx="5" class="box2"/><text x="208.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >2</text>
+<rect x="238" y="18" width="48" height="32" rx="5" class="box2"/><text x="262.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >3</text>
+<rect x="292" y="18" width="48" height="32" rx="5" class="box2"/><text x="316.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >4</text>
+<rect x="346" y="18" width="48" height="32" rx="5" class="box2"/><text x="370.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >5</text>
+<rect x="400" y="18" width="48" height="32" rx="5" class="box2"/><text x="424.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >6</text>
+<rect x="454" y="18" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="478.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >7</text>
+<rect x="508" y="18" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="532.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >8</text>
+<rect x="562" y="18" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="586.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >9</text>
+<rect x="616" y="18" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="640.0" y="38.0" text-anchor="middle" class="t-xs t-bold"  >10</text>
+<text x="10" y="108" text-anchor="start" class="t-sm t-bold"  >After</text>
+<rect x="130" y="88" width="318" height="32" rx="6" class="fs-teal s-teal sw-2"/>
+<text x="289.0" y="108" text-anchor="middle" class="t-xs t-bold"  >snapshot: state machine as of index 6, term 3</text>
+<rect x="454" y="88" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="478.0" y="108.0" text-anchor="middle" class="t-xs t-bold"  >7</text>
+<rect x="508" y="88" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="532.0" y="108.0" text-anchor="middle" class="t-xs t-bold"  >8</text>
+<rect x="562" y="88" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="586.0" y="108.0" text-anchor="middle" class="t-xs t-bold"  >9</text>
+<rect x="616" y="88" width="48" height="32" rx="5" class="fs-orange s-orange"/><text x="640.0" y="108.0" text-anchor="middle" class="t-xs t-bold"  >10</text>
+<text x="10" y="198" text-anchor="start" class="t-sm t-bold tc-blue"  >Slow follower</text>
+<rect x="170" y="178" width="48" height="32" rx="5" class="box2"/><text x="194.0" y="198.0" text-anchor="middle" class="t-xs t-bold"  >1</text>
+<rect x="224" y="178" width="48" height="32" rx="5" class="box2"/><text x="248.0" y="198.0" text-anchor="middle" class="t-xs t-bold"  >2</text>
+<rect x="278" y="178" width="48" height="32" rx="5" class="box2"/><text x="302.0" y="198.0" text-anchor="middle" class="t-xs t-bold"  >3</text>
+<rect x="332" y="178" width="48" height="32" rx="5" class="box" stroke-dasharray="4 4"/>
+<rect x="386" y="178" width="48" height="32" rx="5" class="box" stroke-dasharray="4 4"/>
+<rect x="440" y="178" width="48" height="32" rx="5" class="box" stroke-dasharray="4 4"/>
+<path d="M280,122 C280,150 460,150 460,176" class="line s-teal" fill="none" marker-end="url(#ahX10ba)"/>
+<text x="530" y="148" text-anchor="start" class="t-xs"  >InstallSnapshot(lastIncludedIndex=6,</text>
+<text x="530" y="163" text-anchor="start" class="t-xs"  >lastIncludedTerm=3, data)</text>
+<text x="530" y="194" text-anchor="start" class="t-xs t-muted"  >The leader has discarded 4 to 6,</text>
+<text x="530" y="209" text-anchor="start" class="t-xs t-muted"  >so it cannot send them.</text>
+<text x="380" y="248" text-anchor="middle" class="t-xs t-muted"  >gray: entries already applied and safe to discard    orange: entries still in the log</text>
+</svg>
+  <figcaption>Compaction. After the snapshot, entries 1 to 6 are gone from the leader's log. A follower that is missing entries the leader has already discarded cannot be repaired one entry at a time, so the leader sends the snapshot itself.</figcaption>
+</figure>
+
+<p>That is the one situation in which data flows <em>from</em> the leader as a snapshot: a very slow, newly added or long-offline follower whose <code>nextIndex</code> points into the discarded region. The leader sends <code>InstallSnapshot</code> with the snapshot (in chunks, if large) and its metadata. The follower's rules: if the snapshot covers entries beyond its log, it discards the log and loads the snapshot; if the follower already has an entry at <code>lastIncludedIndex</code> with the same term, the snapshot describes a prefix of its log, so it keeps the entries after it. Either way, replication then resumes from the entry after the snapshot.</p>
+
+<p>Costs worth knowing: taking a snapshot of a large state machine is expensive and must not block the server (implementations use copy-on-write or a forked process, and run it on a size threshold); sending one to a follower can saturate a network link; and a snapshot encodes the state machine, so a bug in application code is baked into it. Some systems instead keep the log in a database that compacts itself.</p>
+
+<h2>Linearizable reads</h2>
+
+<p>Writes go through the log. Reads need not, but serving a read from the leader's state machine <em>without checking</em> is unsafe, and the reason is the thing Raft proved above: a deposed leader may not know it. Suppose a leader S1 is partitioned from the others, a new leader S2 is elected and accepts writes, and S1 still believes it leads. A client talking to S1 reads a value that S2 has since changed. The system has returned stale data in violation of linearizability (<a href="05-consistency-models.html">chapter 5</a>). There are three standard answers.</p>
+
+<p><strong>1. Read through the log.</strong> Treat the read as a command: append it, commit it, and answer when it is applied. Correct and simple, but it costs a full log round, a disk write, and log growth for something that changes nothing.</p>
+
+<p><strong>2. ReadIndex.</strong> Avoid the log but still confirm leadership. On receiving a read, the leader (a) makes sure it has committed an entry in its own term (the no-op), so its commit index is trustworthy; (b) records the current commit index as the <code>readIndex</code>; (c) sends a round of heartbeats and waits for acknowledgements from a majority, proving that no newer leader existed when it received the read; (d) waits until its applied index reaches <code>readIndex</code>; (e) reads from the state machine and replies. Followers can serve reads too: they ask the leader for a <code>readIndex</code> and wait to catch up to it. The cost is a heartbeat round per read, which can be shared by batching many reads into one round.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 272" role="img" aria-label="Space-time diagram of a ReadIndex read. The client sends a read to the leader; the leader records its commit index, sends a heartbeat round to followers F1 and F2 to confirm it is still leader, receives acknowledgements from a majority, waits until it has applied up to the recorded index, then replies.">
+<defs><marker id="ahX10ca" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-blue"/></marker><marker id="ahX10cb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-green"/></marker><marker id="ahX10cc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-red"/></marker><marker id="ahX10cd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-orange"/></marker></defs>
+<line x1="70" y1="52" x2="746" y2="52" class="line s-green" stroke-width="2.5" opacity="0.8"/>
+<text x="8" y="56" text-anchor="start" class="t-sm t-bold tc-green"  >Client</text>
+<line x1="70" y1="112" x2="746" y2="112" class="line s-purple" stroke-width="2.5" opacity="0.8"/>
+<text x="8" y="116" text-anchor="start" class="t-sm t-bold tc-purple"  >Leader</text>
+<line x1="70" y1="172" x2="746" y2="172" class="line s-blue" stroke-width="2.5" opacity="0.8"/>
+<text x="8" y="176" text-anchor="start" class="t-sm t-bold tc-blue"  >F1</text>
+<line x1="70" y1="232" x2="746" y2="232" class="line s-blue" stroke-width="2.5" opacity="0.8"/>
+<text x="8" y="236" text-anchor="start" class="t-sm t-bold tc-blue"  >F2</text>
+<line x1="80" y1="52" x2="130" y2="112" class="line s-blue" marker-end="url(#ahX10ca)"/>
+<text x="79.0" y="77.0" text-anchor="middle" class="t-xs" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >read x</text>
+<line x1="170" y1="112" x2="230" y2="172" class="line s-blue" marker-end="url(#ahX10ca)"/>
+<text x="154.0" y="131.0" text-anchor="middle" class="t-xs" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >heartbeat</text>
+<line x1="170" y1="112" x2="230" y2="232" class="line s-blue" marker-end="url(#ahX10ca)"/>
+<line x1="240" y1="172" x2="300" y2="112" class="line s-green" marker-end="url(#ahX10cb)"/>
+<line x1="240" y1="232" x2="300" y2="112" class="line s-green" marker-end="url(#ahX10cb)"/>
+<text x="295.0" y="161.0" text-anchor="middle" class="t-xs" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >acks</text>
+<line x1="360" y1="112" x2="420" y2="52" class="line s-green" marker-end="url(#ahX10cb)"/>
+<text x="434.0" y="80.0" text-anchor="middle" class="t-xs" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >value of x</text>
+<circle cx="130" cy="112" r="5" class="f-yellow" stroke="var(--bg)" stroke-width="1.5"/>
+<circle cx="300" cy="112" r="5" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+<text x="140" y="98" text-anchor="start" class="t-xs t-bold tc-yellow"  >readIndex = commitIndex = 7</text>
+<text x="310" y="100" text-anchor="start" class="t-xs t-bold tc-orange"  >majority: still leader</text>
+<text x="430" y="122" text-anchor="start" class="t-xs t-muted"  >wait until applied index &gt;= 7,</text>
+<text x="430" y="137" text-anchor="start" class="t-xs t-muted"  >then read the state machine</text>
+<line x1="70" y1="262" x2="706" y2="262" class="line-thin" marker-end="url(#ahX10ca)"/>
+<text x="712" y="266" text-anchor="start" class="t-xs t-faint"  >time</text>
+</svg>
+  <figcaption>ReadIndex. The heartbeat round is the proof of leadership: if a majority still acknowledges this leader after the read arrived, no other leader can have committed anything in between. The read then waits for the state machine to reach the recorded index, so it sees every write that completed before the read began.</figcaption>
+</figure>
+
+<p><strong>3. Lease reads.</strong> To skip even the heartbeat round, the leader can use time. Having been acknowledged by a majority, it knows that no other server can win an election until at least an election timeout after those acknowledgements, so for a slightly shorter <em>lease</em> it can answer reads locally. This is fast, and it is also a bet on clocks: the correctness argument requires that clock <em>rates</em> on different servers differ by a bounded amount and that the leader does not pause (a long garbage-collection or VM stall) between checking the lease and replying. If a clock jumps or the process freezes, the leader may serve a stale read from a lease it no longer holds. This is the same hazard as the lock-lease failures in <a href="04-leases-fencing.html">chapter 4</a>, and the same defence applies: bound drift conservatively, and prefer ReadIndex when correctness matters more than the last few milliseconds. Production systems usually let the operator choose; etcd, for instance, offers linearizable reads by default and a cheaper "serializable" option that may be stale.</p>
+
+<h2>Pre-vote and CheckQuorum: keeping a stray node from hurting the cluster</h2>
+
+<p>A node that cannot reach the leader assumes the leader is dead, times out, increments its term and campaigns. If it is merely partitioned away, it fails to win, but its term keeps rising: 3, 4, 5, 6... When the partition heals, its first message carries term 6. Every server that sees a higher term must adopt it, and a leader that sees it steps down. A healthy cluster loses its leader and has to run an election, because of a node that could not even communicate.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 262" role="img" aria-label="Space-time diagram of a partitioned follower. S3 is cut off from S1 and S2. Each election timeout it raises its term to 3, 4, 5 and 6 and its requests are lost. When the partition heals, S3 sends RequestVote with term 6 to S1, which sees the higher term and steps down although it was a healthy leader.">
+<defs><marker id="ahX10da" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-blue"/></marker><marker id="ahX10db" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-green"/></marker><marker id="ahX10dc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-red"/></marker><marker id="ahX10dd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-orange"/></marker></defs>
+<rect x="100" y="14" width="400" height="228" rx="6" class="fs-red s-red" stroke-dasharray="6 5" stroke-width="1.5" opacity="0.55"/>
+<text x="300.0" y="28" text-anchor="middle" class="t-xs t-bold tc-red"  >network partition: S3 is cut off</text>
+<line x1="50" y1="70" x2="746" y2="70" class="line s-purple" stroke-width="2.5" opacity="0.8"/>
+<text x="8" y="74" text-anchor="start" class="t-sm t-bold tc-purple"  >S1</text>
+<line x1="50" y1="130" x2="746" y2="130" class="line s-blue" stroke-width="2.5" opacity="0.8"/>
+<text x="8" y="134" text-anchor="start" class="t-sm t-bold tc-blue"  >S2</text>
+<line x1="50" y1="200" x2="746" y2="200" class="line s-blue" stroke-width="2.5" opacity="0.8"/>
+<text x="8" y="204" text-anchor="start" class="t-sm t-bold tc-blue"  >S3</text>
+<line x1="100" y1="70" x2="140" y2="130" class="line s-blue" marker-end="url(#ahX10da)"/>
+<line x1="210" y1="70" x2="250" y2="130" class="line s-blue" marker-end="url(#ahX10da)"/>
+<line x1="320" y1="70" x2="360" y2="130" class="line s-blue" marker-end="url(#ahX10da)"/>
+<line x1="470" y1="70" x2="510" y2="130" class="line s-blue" marker-end="url(#ahX10da)"/>
+<text x="482.0" y="92.0" text-anchor="middle" class="t-xs" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >heartbeats</text>
+<line x1="210" y1="200" x2="232.0" y2="161.5" class="line s-red" stroke-dasharray="5 4"/>
+<text x="232.0" y="166.5" text-anchor="middle" class="t-sm t-bold tc-red"  >✕</text>
+<line x1="300" y1="200" x2="322.0" y2="161.5" class="line s-red" stroke-dasharray="5 4"/>
+<text x="322.0" y="166.5" text-anchor="middle" class="t-sm t-bold tc-red"  >✕</text>
+<line x1="390" y1="200" x2="412.0" y2="161.5" class="line s-red" stroke-dasharray="5 4"/>
+<text x="412.0" y="166.5" text-anchor="middle" class="t-sm t-bold tc-red"  >✕</text>
+<line x1="540" y1="200" x2="620" y2="70" class="line s-red" marker-end="url(#ahX10dc)"/>
+<text x="528.0" y="137.0" text-anchor="middle" class="t-xs" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >RequestVote(term 6)</text>
+<circle cx="150" cy="200" r="5" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+<text x="150" y="220" text-anchor="middle" class="t-xs t-bold tc-orange" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >timeout: term 3</text>
+<circle cx="270" cy="200" r="5" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+<text x="270" y="220" text-anchor="middle" class="t-xs t-bold tc-orange" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >term 4</text>
+<circle cx="360" cy="200" r="5" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+<text x="360" y="220" text-anchor="middle" class="t-xs t-bold tc-orange" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >term 5</text>
+<circle cx="450" cy="200" r="5" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+<text x="450" y="220" text-anchor="middle" class="t-xs t-bold tc-orange" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >term 6</text>
+<circle cx="620" cy="70" r="5" class="f-red" stroke="var(--bg)" stroke-width="1.5"/>
+<text x="620" y="59" text-anchor="end" class="t-xs t-bold tc-red" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round" >sees term 6: steps down</text>
+<line x1="50" y1="252" x2="706" y2="252" class="line-thin" marker-end="url(#ahX10da)"/>
+<text x="712" y="256" text-anchor="start" class="t-xs t-faint"  >time</text>
+</svg>
+  <figcaption>A partitioned follower inflating its term. S3 cannot hear heartbeats, so each timeout raises its term, and its vote requests are lost. When it reconnects, its RequestVote carries term 6 and the healthy leader S1, obeying the rule that a higher term wins, steps down. S3 will not win (its log is stale), but the cluster has been disrupted for an election.</figcaption>
+</figure>
+
+<p>Ongaro's thesis describes two complementary mechanisms:</p>
+
+<ul>
+  <li><strong>Pre-vote.</strong> Before incrementing its term, a would-be candidate first runs a trial election: it asks the others "would you vote for me in term t+1?" without changing anyone's term. A server says yes only if the candidate's log is up to date <em>and</em> it has not heard from a current leader recently. A partitioned node never gets a majority of yes answers, so it never raises its term, and nothing disruptive happens when it rejoins.</li>
+  <li><strong>CheckQuorum</strong> (and leader stickiness). A leader that has not heard from a majority within an election timeout steps down on its own, so an isolated old leader stops serving instead of waiting to be told. Servers that have recently heard from a leader also ignore RequestVote messages, making it harder for a stray candidate to unseat a healthy leader. Together they bound how long a leader can hold office without a quorum, which also matters for the lease reads above.</li>
+</ul>
+
+<p>These are optional additions to the paper's core algorithm, but they are widely implemented (etcd's Raft library has configuration switches for both). They do not make the problem vanish: they assume that connectivity is <em>transitive</em>, i.e. that if S3 can reach S2 and S2 can reach S1, then S1 and S3 can talk or neither can reach the leader. Real networks produce partial partitions in which S1 can reach S2, S2 can reach S3, but S1 cannot reach S3. In that situation a node may repeatedly lose contact with the leader while other nodes can still hear it, and the interplay of timeouts, terms and votes can keep the cluster electing and un-electing leaders. A real incident of this kind, in which a switch that dropped some traffic but not all confused a Raft-based cluster for a long time, is told in <a href="../cases/case-06-cloudflare-partial-partition.html">the Cloudflare partial-partition case study</a>. Keep it in mind for <a href="12-byzantine.html">chapter 12</a> on Byzantine failures: an asymmetric fault looks to the protocol like a node that gives different answers to different peers, even though nothing is malicious.</p>
+
+<h2>What else is subtle</h2>
+
+<ul>
+  <li><strong>Client retries and duplicates.</strong> A leader may commit a command and crash before replying, so the client retries and the command is applied twice. Raft implementations give each client a session and number its requests, and the state machine deduplicates (the idempotency idea of <a href="../../networking/chapters/16-failure.html">networking chapter 16</a>, now inside the replicated state machine).</li>
+  <li><strong>Persistent state is the whole contract.</strong> The three persisted items must reach disk before the server replies to any message that depends on them; a lying disk (a cache that acknowledges writes without flushing, <a href="../../systems/cases/case-01-fsyncgate.html">fsyncgate</a>) breaks safety, not just durability.</li>
+  <li><strong>Disk, not network, is usually the bottleneck.</strong> Every commit includes a synchronous flush on a majority of servers, so slow disks or noisy neighbours produce election timeouts that look like network problems.</li>
+  <li><strong>Timeouts are a tuning problem with a cliff.</strong> The election timeout must be comfortably larger than the broadcast round trip plus a disk flush, or healthy leaders are deposed; far larger and failover is slow. This is the failure-detector trade-off of <a href="03-failure-detection.html">chapter 3</a>.</li>
+</ul>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Run a real three-node Raft cluster with etcd (download from the project's releases, or use a package manager), and break it.</p>
+</div>
+
+<ol>
+  <li>Start three members with the standard clustering flags from the etcd documentation and run <code>etcdctl endpoint status --cluster -w table</code>. Find the leader, its Raft term, and each member's Raft index. Kill the leader's process and watch the term go up by at least one.</li>
+  <li>With one member stopped, write a key, restart the member, and watch its index catch up. If you set a very low snapshot count, compare how long catching up takes.</li>
+  <li>Add and remove a member with <code>etcdctl member add</code> and <code>member remove</code>, one at a time. Notice that etcd refuses a second change while the first is incomplete.</li>
+  <li>Compare a linearizable read with a serializable one: <code>etcdctl get foo</code> versus <code>etcdctl get foo --consistency=s</code> pointed at a lagging or isolated member.</li>
+  <li>Back in the widget, find the exact step where the naive rule first diverges from Raft's, in both branches, and say what a client was told.</li>
+  <li>Maelstrom's Raft workload (see the course tools list) tests a Raft implementation you write against a nemesis of partitions; <a href="19-testing.html">chapter 19</a> shows how such history checking works.</li>
+</ol>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>Each corner of this chapter is a lesson about the whole subject. The Figure 8 rule says that evidence about the <em>past</em> is only trustworthy when counted in the <em>present</em> term; the voting restriction is the Raft form of Paxos's adoption rule; membership change shows that "the set of participants" is itself shared state; ReadIndex versus lease reads is the safety-versus-speed choice that returns with Spanner's TrueTime in <a href="07-time-revisited.html">chapter 7</a>; and the pre-vote discussion shows how a protocol that is perfectly safe can still be defeated in liveness by the shape of the network. Services such as etcd, which you will meet next in <a href="11-coordination-services.html">chapter 11</a>, wrap exactly this machinery behind a small key-value API.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Election safety: each server votes once per term (persisted), and winning needs a majority, so a term has at most one leader.</li>
+    <li>Leader completeness comes from the voting restriction: a server only votes for a candidate whose log is at least as up to date (last term, then length). With majority intersection and log matching this guarantees every leader holds every committed entry.</li>
+    <li>Log matching: the same (index, term) means the same command and the same prefix. It is proved by induction, from "one leader per term appends one entry per index" and the prevLogIndex/prevLogTerm check.</li>
+    <li>A leader counts replicas to commit only entries from its own term; older entries commit indirectly. Figure 8 shows that an old-term entry on a majority can still be overwritten. Hence the no-op at the start of every term.</li>
+    <li>Membership: switching configurations in one step allows disjoint majorities. Use joint consensus (both majorities required) or single-server changes, one committed change at a time, with new servers joining as non-voting learners first.</li>
+    <li>Snapshots let each server discard a committed log prefix; InstallSnapshot repairs followers that fall behind the discarded region.</li>
+    <li>Linearizable reads need proof of current leadership: read through the log, ReadIndex (heartbeat round, wait to apply), or lease reads that trade a clock assumption for speed.</li>
+    <li>Pre-vote and CheckQuorum keep a partitioned or flaky node from disrupting a healthy cluster, but partial (non-transitive) partitions can still cause trouble.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">In Figure 8, S1 (leader in term 4) has copied an entry from term 2 to a majority. Why must S1 not treat it as committed?</p>
+    <ol class="q-options">
+      <li>Because entries from term 2 are always invalid</li>
+      <li>Because the followers have not yet applied it</li>
+      <li>Because a server whose last entry has term 3 could still win an election and overwrite it on a majority</li>
+      <li>Because S1 is not yet sure it is the leader</li>
+    </ol>
+    <div class="q-explain">The voting rule compares last log terms, so a server with a term-3 entry beats servers whose last entry is from term 2, and its log repair then overwrites the term-2 entry everywhere. Being on a majority is therefore not enough for an old-term entry. Once a term-4 entry is on a majority, servers holding it refuse that candidate, and the old entry is safe too.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">What is the purpose of the no-op entry a new leader appends?</p>
+    <ol class="q-options">
+      <li>To get a current-term entry onto a majority, which commits all earlier entries and tells the leader the true commit index</li>
+      <li>To test the network latency to followers</li>
+      <li>To reset all followers' election timers</li>
+      <li>To trigger a snapshot</li>
+    </ol>
+    <div class="q-explain">Earlier-term entries can only be committed indirectly, so a leader needs a current-term entry. Without client traffic there would be none. The no-op supplies one, and committing it also gives the leader a trustworthy commit index, which ReadIndex relies on. Heartbeats alone already reset timers.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A cluster of {S1, S2, S3} is switched in one step to {S1..S5}. What can go wrong?</p>
+    <ol class="q-options">
+      <li>Nothing, as long as the new servers have empty logs</li>
+      <li>The log will fork permanently but heal after a snapshot</li>
+      <li>Only liveness: elections will be slower</li>
+      <li>Two disjoint majorities (S1+S2 under the old rules, S3+S4+S5 under the new) can each elect a leader in the same term</li>
+    </ol>
+    <div class="q-explain">Servers learn the new configuration at different times, so different majorities exist simultaneously and need not intersect. Joint consensus (decisions need both majorities) or single-server changes (old and new majorities always overlap) avoid it. This is a safety failure, not only a liveness one.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why does a ReadIndex read include a heartbeat round to a majority?</p>
+    <ol class="q-options">
+      <li>To replicate the read to the followers</li>
+      <li>To prove that no newer leader exists, so the leader's commit index is not stale</li>
+      <li>To increase the commit index</li>
+      <li>To avoid reading from disk</li>
+    </ol>
+    <div class="q-explain">A deposed leader may believe it still leads. Acknowledgement from a majority after the read arrived shows that no other leader could have been elected and committed anything in the meantime, so waiting for the recorded index to be applied yields an up-to-date read. Lease reads replace this proof with a clock assumption.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A follower is partitioned for a minute and keeps timing out. What does pre-vote change?</p>
+    <ol class="q-options">
+      <li>It makes the follower win the election when it rejoins</li>
+      <li>It stops the follower from timing out</li>
+      <li>The follower does not increment its term until a trial election shows it could win, so it does not depose the leader on rejoining</li>
+      <li>It makes the leader step down earlier</li>
+    </ol>
+    <div class="q-explain">With pre-vote, a trial round asks "would you vote for me?" without anyone changing terms, and servers that have recently heard from a leader say no. The isolated node never reaches a majority, so its term stays put. Stepping down on lost quorum is CheckQuorum, a complementary mechanism.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">What does the log matching property let a new leader do when repairing a follower?</p>
+    <ol class="q-options">
+      <li>Replace the follower's entire log with its own, always</li>
+      <li>Find the latest index where their logs agree and overwrite everything after it, knowing all earlier entries already match</li>
+      <li>Skip repairing, since logs always match</li>
+      <li>Delete committed entries that differ</li>
+    </ol>
+    <div class="q-explain">One matching (index, term) pair implies an identical prefix, so the leader only needs to find where agreement stops (backing up nextIndex after each rejection) and overwrite after that point. Only uncommitted entries can differ there, because a leader always holds every committed entry.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/raft-commit.js"></script>
+</body>
+</html>

@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design a Stock Exchange · System Design Studio</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="design" data-studio="S5">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design a Stock Exchange</h1>
+  <p class="lede">A stock exchange looks like a database problem and is not one. It is an ordering problem: one total order of every input, a deterministic engine that turns that order into trades, and a network that tells everyone fairly. This studio builds it from the requirement that matters most (strict order at microsecond latency without loss) and shows why most of the usual tools are left out.</p>
+</header>
+<div class="callout why">
+  <p class="callout-title">How a design studio works</p>
+  <p>This page is a mock design session of 45 to 60 minutes. Each of the nine stages follows the <a href="../chapters/01-framework.html">framework of chapter 1</a> and opens with a question. Write your own answer in the notes box first (it saves in this browser), <em>then</em> open the worked answer and compare. The worked answer is one strong design with its reasoning, not the only right one. A rubric at the end separates what a mid-level answer covers from what a senior answer adds. All numbers are assumptions to reason with, not measurements of any real system.</p>
+</div>
+
+<div class="studio-brief">
+  <p class="brief-title">📐 The brief</p>
+  <p>An interviewer says: <em>"Design a stock exchange: participants send buy and sell orders for listed shares; the exchange matches them and tells everyone what happened."</em></p>
+  <ul>
+    <li>Think of an equities venue with about <strong>8,000 listed instruments</strong>, a few hundred trading firms connected, and a bursty day: the opening auction and the close are the peaks.</li>
+    <li>Participants care about two things above all: <strong>fairness</strong> (same rules for everyone, in a provable order) and <strong>latency that is low and predictable</strong>. A trade that happened must never be lost.</li>
+    <li>You have no existing system. You can assume ordinary data-centre hardware and a good network, and you can use anything from the earlier courses.</li>
+  </ul>
+  <p>Draw on <a href="../../architecture/cases/case-08-lmax.html">the LMAX case</a>, <a href="../../distributed/chapters/08-consensus-smr.html">consensus and replicated state machines</a>, <a href="../chapters/16-payments.html">the payments design</a> for post-trade money movement, <a href="../../systems/chapters/02-memory-hierarchy.html">the memory hierarchy</a>, <a href="../../systems/chapters/14-queues-backpressure.html">queues and backpressure</a> and <a href="../chapters/02-estimation.html">estimation</a>. This is a conceptual design: real venues differ in many details.</p>
+</div>
+
+<h2>Your notes</h2>
+<p>Keep requirements, numbers and decisions here.</p>
+<textarea class="studio-notes" aria-label="Your design notes for this studio" placeholder="Requirements and the hardest one…&#10;Numbers: msgs/s, one thread's capacity, latency budget…&#10;Sequencer, engine, market data, failure handling…"></textarea>
+<section class="stage">
+<h2><span class="h-num">1</span>Clarify the requirements</h2>
+<p class="stage-q">Which five questions would you ask in the first five minutes, what answer would you assume for each, and which single requirement is the hardest one?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>Questions that change the design, with assumed answers (<a href="../chapters/01-framework.html">chapter 1</a>):</p>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><td>Order types?</td><td>Limit and market orders, cancel, replace. Time in force: day, IOC (immediate or cancel). No options, no auctions beyond a simple open and close</td><td>The matching rules. Auctions are an extension, not a rewrite</td></tr>
+<tr><td>Matching rule?</td><td>Price-time priority: best price first, then earliest arrival at that price</td><td>The core data structure, and why <em>order of arrival</em> is a first-class concept</td></tr>
+<tr><td>Scale?</td><td>8,000 instruments; about 1M order messages/s at the peak second; a few hundred sessions</td><td>Whether one machine suffices, and what is partitioned</td></tr>
+<tr><td>Latency?</td><td>Order in to acknowledgement: median under 50 µs inside the venue, p99.99 under 200 µs. Predictability matters more than the median</td><td>The whole hot path: no databases, no garbage collection pauses, no cross-region hops</td></tr>
+<tr><td>Durability and availability?</td><td>No acknowledged order or trade is ever lost (RPO 0). Failover within a second; trading may pause briefly but must resume with identical state (RTO about 1 s)</td><td>Replication on the hot path; deterministic replay</td></tr>
+<tr><td>Who sees what?</td><td>Everyone gets the same public market data at the same time; each firm sees its own acks privately</td><td>Multicast, fairness design</td></tr>
+<tr><td>Post-trade?</td><td>Out of scope for the matching path: we emit trades to a clearing house, which settles</td><td>A clean boundary: matching is fast, clearing is correct and slow</td></tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Hardest requirement:</strong> <em>total order with microsecond latency and zero loss</em>. Everything else (APIs, scale of instruments) is routine; this is a strict ordering problem on the critical path.</li>
+<li><strong>Out of scope:</strong> derivatives, cross-venue routing, surveillance analytics, and the details of regulatory reporting.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">2</span>Estimate: volume, bandwidth, and one thread's capacity</h2>
+<p class="stage-q">Estimate message rates per instrument, the inbound log bandwidth, the market-data fan-out, and a latency budget in microseconds. Is the matching engine the bottleneck?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>Skew is the key input: a few hundred symbols carry most of the traffic (<a href="../chapters/02-estimation.html">chapter 2</a> on peaks and skew). The script uses explicit assumptions and prints every figure.</p>
+<pre class="terminal" data-title="exchange_estimates.py"><code>"""Exchange napkin maths (all inputs are assumptions)."""
+instruments, peak_msgs_per_s = 8_000, 1_000_000        # inbound orders+cancels at the open
+hot_share = 0.05                                       # top 5% of symbols get...
+hot_traffic = 0.60                                     # ...60% of messages
+hot_syms = int(instruments * hot_share)
+per_hot = peak_msgs_per_s * hot_traffic / hot_syms
+print(f"hot symbols: {hot_syms}, about {per_hot:,.0f} msgs/s each")
+service_us = 3                                         # one match step, in-memory
+print(f"one thread at {service_us} us/msg handles {1e6/service_us:,.0f} msgs/s -&gt; utilisation {per_hot/(1e6/service_us):.1%}")
+msg_bytes = 64
+print(f"inbound log: {peak_msgs_per_s*msg_bytes/1e6:.0f} MB/s at peak, {peak_msgs_per_s*msg_bytes*6.5*3600/1e9:,.0f} GB per 6.5 h session")
+out_bytes, fanout = 40, 5_000                          # market-data message, subscribers
+print(f"market data out: {peak_msgs_per_s*2*out_bytes*8/1e9:.1f} Gbit/s on the feed if multicast (one copy)")
+print(f"same feed as unicast to {fanout} subscribers: {peak_msgs_per_s*2*out_bytes*8*fanout/1e12:.1f} Tbit/s")
+budget = [("gateway: parse + auth", 10), ("risk checks (in-memory)", 5), ("to sequencer (kernel-bypass NIC)", 3),
+          ("sequence + journal + replicate (quorum)", 20), ("matching engine", 3), ("publish ack + market data", 5)]
+tot = 0
+for n, us in budget:
+    tot += us; print(f"{n:42s}{us:4d} us   running {tot:4d} us")</code></pre>
+<pre class="terminal" data-title="output"><code>hot symbols: 400, about 1,500 msgs/s each
+one thread at 3 us/msg handles 333,333 msgs/s -&gt; utilisation 0.5%
+inbound log: 64 MB/s at peak, 1,498 GB per 6.5 h session
+market data out: 0.6 Gbit/s on the feed if multicast (one copy)
+same feed as unicast to 5000 subscribers: 3.2 Tbit/s
+gateway: parse + auth                       10 us   running   10 us
+risk checks (in-memory)                      5 us   running   15 us
+to sequencer (kernel-bypass NIC)             3 us   running   18 us
+sequence + journal + replicate (quorum)     20 us   running   38 us
+matching engine                              3 us   running   41 us
+publish ack + market data                    5 us   running   46 us</code></pre>
+<ul>
+<li><strong>The matching engine is nowhere near the bottleneck.</strong> A hot symbol sees about 1,500 messages per second, while one thread doing a 3 µs match step can do over 300,000. One core per <em>group</em> of symbols is plenty. That is why a single-threaded, lock-free design is viable (<a href="../../architecture/cases/case-08-lmax.html">LMAX</a>).</li>
+<li><strong>The cost is in the I/O around it,</strong> in this order: network hops, the durable journal write plus replication, and the market-data fan-out. The 46 µs budget above is dominated by journaling and replication (20 µs), which we have to make cheap.</li>
+<li><strong>Inbound log:</strong> 64 MB/s is trivial for disk bandwidth; it is the <em>latency of a durable append</em> that matters. A battery-backed or NVMe-with-power-loss-protection log, or a replicated in-memory log with a quorum, gets this to tens of microseconds. An fsync to a consumer SSD (hundreds of microseconds to milliseconds) would blow the budget (<a href="../../systems/chapters/09-durability.html">durability</a>).</li>
+<li><strong>Market data:</strong> multicast sends one copy. Unicast to thousands of subscribers would be terabits per second; this single number settles the transport choice.</li>
+<li>All figures are assumptions. The decision they support: partition by instrument across a few engines, journal every input before it is acted on, and use multicast out.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">3</span>API: order entry and execution reports</h2>
+<p class="stage-q">Sketch the messages a participant sends and receives. How does a client know a message was lost or duplicated, and how does a retry stay safe?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>Participants use a persistent, sequenced binary session (the FIX family of protocols is the long-standing standard; binary variants exist for speed). Conceptually:</p>
+<table>
+<thead><tr><th>Message</th><th>Key fields</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Logon</td><td>firm, session id, next expected sequence number</td><td>Both sides state what they expect next; gaps are re-requested after a reconnect</td></tr>
+<tr><td>NewOrder</td><td>client order id, instrument, side, quantity, type (limit/market), limit price, time in force, session sequence number</td><td>The client order id is unique per session per day; a duplicate is rejected, so retrying a lost-ack message is idempotent (<a href="../chapters/16-payments.html">same idea as idempotency keys</a>)</td></tr>
+<tr><td>Cancel / Replace</td><td>original client order id, new id, new price or quantity</td><td>A replace that changes price or raises quantity loses time priority; one that only reduces quantity keeps it (a rule most venues share, in some form)</td></tr>
+<tr><td>ExecutionReport (to the firm)</td><td>order id, status (accepted, partial fill, fill, cancelled, rejected + reason), last quantity and price, cumulative quantity</td><td>Private to the firm. Every state change produces exactly one report, each with its own sequence number</td></tr>
+<tr><td>Market data (public)</td><td>instrument, order or price-level add/modify/delete, trade (price, quantity), feed sequence number</td><td>Broadcast. Gap detection by sequence number</td></tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Loss and duplicates:</strong> each direction carries a session sequence number. The receiver detects gaps and asks for a resend; it ignores numbers it has already seen. This is TCP-like reliability layered above the transport so that it survives reconnects.</li>
+<li><strong>Cancel-on-disconnect:</strong> if a firm's session drops, its resting orders can be pulled automatically (an opt-in protective feature), because a firm that cannot see the market must not stay exposed.</li>
+<li><strong>Sizing the protocol:</strong> fixed-width binary fields, no parsing allocations. At a million messages a second, text parsing would be an avoidable cost.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">4</span>Data model: state lives in memory, truth lives in the log</h2>
+<p class="stage-q">What state does the matching engine hold, where is it durable, and which data is allowed to live in a database?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<table>
+<thead><tr><th>Data</th><th>Where</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Order book per instrument: price levels, each a FIFO queue of orders</td><td>In the memory of the matching engine only</td><td>The hot path must never wait for storage. Rebuilt from the log, never read from a database</td></tr>
+<tr><td>Input log: every accepted message with its global sequence number and timestamp</td><td>Append-only journal, replicated to followers, on fast durable storage</td><td>The system of record for <em>what happened</em>. State is a pure function of this log</td></tr>
+<tr><td>Snapshots of book state at a log position</td><td>Periodic, written off the hot path</td><td>Bound the replay time after a restart (<a href="../../data/chapters/13-crash-recovery.html">checkpoint plus log replay</a>)</td></tr>
+<tr><td>Reference data: instruments, tick sizes, trading hours, firm limits</td><td>Relational database, loaded into memory at start of day</td><td>Changes slowly; the engine reads a copy. A change is itself a sequenced message</td></tr>
+<tr><td>Trade and order history, for reports, audit and clearing</td><td>Downstream store fed from the output stream</td><td>Queryable and large; never on the matching path</td></tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Key idea:</strong> the input log is the database. This is event sourcing at its most literal (<a href="../../architecture/chapters/16-cqrs-event-sourcing.html">chapter 16 of architecture</a>), but with a hard rule: the log records <em>inputs</em> (orders, cancels, clock ticks) not derived facts, so replay re-runs the logic.</li>
+<li><strong>Partition key:</strong> instrument. One instrument never spans two engines, so price-time priority needs no cross-engine coordination.</li>
+<li>Money, positions and settlement balances are <em>not</em> in this model; they belong to the clearing system.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">5</span>High-level design</h2>
+<p class="stage-q">Draw the smallest architecture that gives one total order of all inputs and keeps the matching core single-threaded. Where does durability sit?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<figure class="diagram">
+<svg viewBox="0 0 760 360" role="img" aria-label="Architecture of the exchange. Participants connect to order-entry gateways that authenticate and run pre-trade risk checks. Gateways send to a sequencer that assigns a global sequence number, journals the input and replicates it to a standby sequencer. The sequenced stream feeds matching engines, each owning a set of instruments, and a hot standby engine that processes the same stream. Engines output execution reports back through gateways, market data to a multicast publisher, and trades to clearing.">
+<defs><marker id="ahGS1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="150" width="90" height="60" rx="8" class="fs-green s-green sw-2"/><text x="55.0" y="177.0" text-anchor="middle" class="t-sm t-bold">Participants</text><text x="55.0" y="193.0" text-anchor="middle" class="t-xs t-muted">firms</text></g>
+<g><rect x="140" y="140" width="110" height="80" rx="8" class="fs-blue s-blue sw-2"/><text x="195.0" y="177.0" text-anchor="middle" class="t-sm t-bold">Gateways</text><text x="195.0" y="193.0" text-anchor="middle" class="t-xs t-muted">auth, risk, session</text></g>
+<g><rect x="300" y="140" width="120" height="80" rx="8" class="fs-orange s-orange sw-2"/><text x="360.0" y="177.0" text-anchor="middle" class="t-sm t-bold">Sequencer</text><text x="360.0" y="193.0" text-anchor="middle" class="t-xs t-muted">order + journal</text></g>
+<g><rect x="300" y="270" width="120" height="60" rx="8" class="fs-orange s-orange sw-2"/><text x="360.0" y="297.0" text-anchor="middle" class="t-sm t-bold">Standby journal</text><text x="360.0" y="313.0" text-anchor="middle" class="t-xs t-muted">quorum copy</text></g>
+<g><rect x="480" y="60" width="130" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="545.0" y="87.0" text-anchor="middle" class="t-sm t-bold">Engine A</text><text x="545.0" y="103.0" text-anchor="middle" class="t-xs t-muted">symbols A–M</text></g>
+<g><rect x="480" y="140" width="130" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="545.0" y="167.0" text-anchor="middle" class="t-sm t-bold">Engine B</text><text x="545.0" y="183.0" text-anchor="middle" class="t-xs t-muted">symbols N–Z</text></g>
+<g><rect x="480" y="220" width="130" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="545.0" y="247.0" text-anchor="middle" class="t-sm t-bold">Hot standby</text><text x="545.0" y="263.0" text-anchor="middle" class="t-xs t-muted">replays same stream</text></g>
+<g><rect x="640" y="40" width="110" height="50" rx="8" class="fs-cyan s-cyan sw-2"/><text x="695.0" y="62.0" text-anchor="middle" class="t-sm t-bold">Market data</text><text x="695.0" y="78.0" text-anchor="middle" class="t-xs t-muted">multicast A/B</text></g>
+<g><rect x="640" y="150" width="110" height="50" rx="8" class="box2"/><text x="695.0" y="172.0" text-anchor="middle" class="t-sm t-bold">Clearing</text><text x="695.0" y="188.0" text-anchor="middle" class="t-xs t-muted">trades out</text></g>
+<g><rect x="300" y="20" width="120" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="360.0" y="42.0" text-anchor="middle" class="t-sm t-bold">Snapshots</text><text x="360.0" y="58.0" text-anchor="middle" class="t-xs t-muted">+ reference data</text></g>
+<line x1="100" y1="170" x2="140" y2="170" class="line" marker-end="url(#ahGS1a)"/>
+<text x="120" y="162" text-anchor="middle" class="t-xs t-faint">orders</text>
+<line x1="250" y1="180" x2="300" y2="180" class="line" marker-end="url(#ahGS1a)"/>
+<text x="275.0" y="174.0" text-anchor="middle" class="t-xs t-faint">checked</text>
+<line x1="360" y1="220" x2="360" y2="270" class="line-dash" marker-end="url(#ahGS1a)"/>
+<text x="372" y="250" text-anchor="start" class="t-xs t-faint">replicate</text>
+<line x1="420" y1="165" x2="480" y2="95" class="line" marker-end="url(#ahGS1a)"/>
+<text x="440" y="118" text-anchor="middle" class="t-xs t-faint">seq stream</text>
+<line x1="420" y1="175" x2="480" y2="170" class="line" marker-end="url(#ahGS1a)"/>
+<line x1="420" y1="190" x2="480" y2="245" class="line-dash" marker-end="url(#ahGS1a)"/>
+<line x1="610" y1="80" x2="640" y2="65" class="line" marker-end="url(#ahGS1a)"/>
+<line x1="610" y1="175" x2="640" y2="175" class="line" marker-end="url(#ahGS1a)"/>
+<line x1="420" y1="45" x2="480" y2="75" class="line-dash" marker-end="url(#ahGS1a)"/>
+<text x="160" y="300" text-anchor="middle" class="t-xs t-muted">Reports return to firms via gateways.</text>
+<text x="160" y="320" text-anchor="middle" class="t-xs t-muted">Hot path: gateway, sequencer, engine, back.</text>
+</svg>
+<figcaption><strong>The exchange.</strong> Orange is the ordered log; blue is stateless-by-design logic (state is rebuildable from the log); cyan is the public feed; the dashed line is the standby that replays the same stream.</figcaption>
+</figure>
+<ol>
+<li><strong>Order path.</strong> A firm sends NewOrder over its session. A <strong>gateway</strong> authenticates it, checks the session sequence number, and runs <strong>pre-trade risk checks</strong>: fat-finger limits (price far from the last trade, quantity too large), per-firm exposure and rate limits, instrument is tradable. In the US, SEC Rule 15c3-5 (the market access rule) requires brokers with market access to have risk controls like these before orders reach the exchange, and other jurisdictions have similar rules, so the checks sit <em>in front of</em> the sequencer.</li>
+<li><strong>Sequencing.</strong> The sequencer assigns the next global sequence number, appends to the journal, replicates it, and only then releases the message to the engines. The sequence number <em>is</em> time priority.</li>
+<li><strong>Matching.</strong> The engine that owns the instrument consumes the stream in order, on one thread, with no locks and no I/O, updates its book, and emits events: execution reports, public market-data updates, trades.</li>
+<li><strong>Outputs.</strong> Reports return to the firm through its gateway. Public data goes out by multicast. Trades go to the clearing house over a reliable channel.</li>
+<li><strong>Standby.</strong> A second engine consumes the same sequenced stream and arrives at the same state. Failover is a decision to listen to <em>its</em> output, not a recovery process.</li>
+</ol>
+<p>What we did not draw: any database on the order path, any load balancer in front of engines (routing is a static map from instrument to engine), any retry loop (the session protocol handles that).</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">6</span>Deep dive 1: the sequencer, replication and replay</h2>
+<p class="stage-q">How do you produce one total order, make it durable without destroying latency, and fail over without losing or reordering anything? What are the alternatives?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>The sequencer is a <em>total order broadcast</em> (<a href="../../distributed/chapters/08-consensus-smr.html">replicated state machines and consensus</a>): all replicas see the same inputs in the same order. If the engine is deterministic, identical inputs give identical state. That one equivalence powers durability, failover and audit.</p>
+<table>
+<thead><tr><th>Option</th><th>How it works</th><th>Cost</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>Consensus on every message (Raft/Paxos group)</td><td>Leader appends, a majority acknowledges before the message is released (<a href="../../distributed/chapters/10-raft-deep.html">Raft</a>)</td><td>One network round trip to a majority per message, plus election delay on failure. Can be tuned to tens of microseconds in one data centre with batching, but a leader change is a visible pause</td><td>Correct and standard; good if you can afford the round trip and want automatic leader election</td></tr>
+<tr><td>Single sequencer, synchronous replication to 1 or 2 standby journals</td><td>One designated sequencer; a message is released after the standby journals acknowledge. A separate, small consensus or lease service decides who is sequencer</td><td>A round trip to the standby, same as above. Simpler hot path (no election logic in it); the failover decision is rare and done with a lease and fencing (<a href="../../distributed/chapters/04-leases-fencing.html">fencing tokens</a>)</td><td>Recommended: keep election off the hot path</td></tr>
+<tr><td>Hot standby fed by multicast of the input stream, no quorum</td><td>Standby listens to the same inputs, journal on primary only</td><td>No added latency; but if the primary dies after releasing a message the standby never saw, the engine acted on something that is now lost</td><td>Rejected: violates RPO 0. Only OK with a separate, independently journaled copy</td></tr>
+<tr><td>Partition the sequencer per instrument group</td><td>Each engine group has its own sequencer</td><td>Scales out, no global order across groups</td><td>Fine here: priority is only defined within an instrument. Needed only if one sequencer runs out of throughput (ours does not, see stage 2). Adds complexity for cross-instrument events like halts</td></tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Recommendation:</strong> one sequencer per engine group, synchronously replicated to a standby (and optionally a third copy), release after acknowledgement, with a lease and fencing token deciding the single active sequencer. This is the LMAX shape: journal and replicate <em>before</em> business logic (<a href="../../architecture/cases/case-08-lmax.html">case study</a>).</li>
+<li><strong>Determinism is a hard rule,</strong> not a hope. The engine may use only the sequenced message and a <em>sequenced timestamp</em> the sequencer stamped on it. No wall-clock reads, no random numbers, no hash-map iteration order that depends on addresses, no floating-point differences between machines, no threads. Time-based events (end of auction) are also messages in the log.</li>
+<li><strong>Failover:</strong> the standby engine has been applying the same stream; it takes over the output role at sequence N. Clients detect via session sequence numbers any execution reports not yet delivered and request a resend. Detecting the primary's death uses a lease with a short timeout (<a href="../../distributed/chapters/03-failure-detection.html">failure detection</a>); the fencing token stops a "zombie" primary that is only slow from also publishing.</li>
+<li><strong>Replay:</strong> to rebuild a restarted engine, load the latest snapshot and replay the log from its sequence number. Replay also gives an <em>audit tool</em>: regulators and customers can reproduce any disputed trade by replaying the log into a test engine.</li>
+</ul>
+<p>The next stage shows the property in code: same ordered log, same result; swap two inputs, different result. That is why the order is the product.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">7</span>Deep dive 2: the matching engine and price-time priority</h2>
+<p class="stage-q">Choose the data structure for one order book, say what each operation costs, and prove (with a runnable demo) that replaying the log gives identical results.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>Each side of the book is a set of price levels, each level a FIFO queue ordered by sequence number. Operations needed: add at a price, cancel by order id, match against the best opposite price.</p>
+<table>
+<thead><tr><th>Structure</th><th>Add</th><th>Cancel</th><th>Match best</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Sorted array of levels + FIFO per level</td><td>O(log n) find level, O(n) insert of a new level</td><td>O(1) via order-id hash map to the queue node</td><td>O(1)</td><td>Excellent cache behaviour; new levels are rare near the touch, and most activity is at the best few levels</td></tr>
+<tr><td>Balanced tree of levels (std::map style)</td><td>O(log n)</td><td>O(log n) or O(1) with a handle</td><td>O(1) to O(log n)</td><td>Simple; pointer-chasing hurts the CPU cache</td></tr>
+<tr><td>Two heaps keyed by (price, sequence), lazy deletion (the demo below)</td><td>O(log n)</td><td>O(1) mark, cleaned lazily</td><td>O(log n) amortised</td><td>Shortest to write and correct, so a good interview answer; real engines use the array/level form</td></tr>
+<tr><td>Database table with an index</td><td>Milliseconds</td><td>Milliseconds</td><td>A query</td><td>Hundreds of times too slow and lock-heavy (stage 9)</td></tr>
+</tbody>
+</table>
+<p>Whichever you pick, the logic is a pure function: <code>(book, message with sequence number) → (book', events)</code>. Here it is, with the sequencer's job (assigning the number) done in the loop:</p>
+<pre class="terminal" data-title="order_book.py"><code>"""A tiny exchange core: sequencer -&gt; single-threaded matcher (price-time priority) -&gt; replay."""
+import heapq, hashlib, itertools
+
+class Book:
+    """One instrument. Bids: max-heap by price; asks: min-heap by price; ties broken by sequence number."""
+    def __init__(self):
+        self.bids, self.asks, self.live = [], [], {}   # heaps hold (price key, seq, order_id)
+        self.trades = []
+
+    def new_order(self, seq, oid, side, price, qty):
+        """Returns the list of trades; the sequence number IS the time priority."""
+        out = []
+        book = self.asks if side == "B" else self.bids
+        while qty and book:
+            key, s, rid = book[0]
+            rest = self.live.get(rid)
+            if rest is None:                      # cancelled earlier: lazy delete
+                heapq.heappop(book); continue
+            rprice = key if side == "B" else -key
+            if (side == "B" and price &lt; rprice) or (side == "S" and price &gt; rprice):
+                break
+            fill = min(qty, rest["qty"])
+            rest["qty"] -= fill; qty -= fill
+            out.append((seq, rid, oid, rprice, fill))   # trade at the resting order's price
+            if rest["qty"] == 0:
+                del self.live[rid]; heapq.heappop(book)
+        if qty:                                   # remainder rests
+            self.live[oid] = {"side": side, "price": price, "qty": qty}
+            key = price if side == "S" else -price
+            heapq.heappush(self.bids if side == "B" else self.asks, (key, seq, oid))
+        self.trades += out
+        return out
+
+    def cancel(self, seq, oid):
+        return self.live.pop(oid, None) is not None
+
+def run(log):
+    """The matcher is a pure function of the ordered input log."""
+    books, h = {}, hashlib.sha256()
+    for seq, (op, *a) in enumerate(log, start=1):     # the sequencer's job: assign seq
+        if op == "new":
+            sym, oid, side, price, qty = a
+            for t in books.setdefault(sym, Book()).new_order(seq, oid, side, price, qty):
+                h.update(repr((sym,) + t).encode())
+        else:
+            sym, oid = a
+            h.update(repr((seq, "cxl", oid, books[sym].cancel(seq, oid))).encode())
+    return books, h.hexdigest()[:16]
+
+log = [
+    ("new", "ACME", "a1", "S", 101, 100),
+    ("new", "ACME", "a2", "S", 100, 50),
+    ("new", "ACME", "a3", "S", 100, 70),     # same price as a2, arrives later
+    ("new", "ACME", "b1", "B",  99, 40),
+    ("new", "ACME", "b2", "B", 100, 80),     # crosses: takes a2 (50) first, then a3 (30)
+    ("cxl", "ACME", "b1"),
+    ("new", "ACME", "b3", "B", 102, 200),    # sweeps a3 (40 left) then a1 (100), rests 60
+]
+books, digest = run(log)
+for t in books["ACME"].trades:
+    print("trade seq=%d resting=%s aggressor=%s px=%d qty=%d" % t)
+print("resting after:", sorted((o, v["side"], v["price"], v["qty"]) for o, v in books["ACME"].live.items()))
+print("state digest, run 1:", digest)
+print("state digest, replay:", run(list(log))[1])
+print("digest if two inputs swap order:", run(log[:3][::-1] + log[3:])[1])</code></pre>
+<pre class="terminal" data-title="output"><code>trade seq=5 resting=a2 aggressor=b2 px=100 qty=50
+trade seq=5 resting=a3 aggressor=b2 px=100 qty=30
+trade seq=7 resting=a3 aggressor=b3 px=100 qty=40
+trade seq=7 resting=a1 aggressor=b3 px=101 qty=100
+resting after: [('b3', 'B', 102, 60)]
+state digest, run 1: 8d20add7d3ff324c
+state digest, replay: 8d20add7d3ff324c
+digest if two inputs swap order: 6a86ba50da4ba7a8</code></pre>
+<ul>
+<li><strong>Read the output.</strong> <code>b2</code> buys 80 at 100: it takes <code>a2</code> (50) before <code>a3</code> (30) because both rest at 100 and <code>a2</code> has the lower sequence number. Trades print at the <em>resting</em> order's price (<code>b3</code>, bidding 102, pays 100 and 101, not 102).</li>
+<li><strong>Replay is exact:</strong> the same digest after re-running the log. Swapping two inputs gives a different digest. If your engine disagrees with its replica, the order or a nondeterminism bug is the cause, and the digest tells you at once. Production systems exchange such checksums periodically to detect divergence.</li>
+<li><strong>Threading model.</strong> One thread per engine pinned to a core, busy-polling its input ring buffer (no kernel sleeps, no context switches), with I/O threads on other cores feeding and draining queues. Sharing memory between threads is the cost to avoid (<a href="../../systems/chapters/10-threads.html">threads</a>, <a href="../../systems/chapters/02-memory-hierarchy.html">caches</a>). Pre-allocate objects and avoid garbage collection on the hot path (or use a language without a collector).</li>
+<li><strong>Scaling out:</strong> by instrument. Moving a symbol between engines is an operation done at start of day or through a controlled halt, never mid-session.</li>
+<li><strong>Where it gets harder:</strong> auctions (collect orders, compute one clearing price that maximises volume), self-trade prevention, stop orders, and halts. Each is more deterministic logic on the same stream.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">8</span>Deep dive 3: market data fan-out and fairness</h2>
+<p class="stage-q">Thousands of subscribers need the same public data at nearly the same time. How do you distribute it, and what does fairness mean in practice?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<table>
+<thead><tr><th>Option</th><th>Mechanism</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Multicast UDP, two redundant feeds (A and B), with a snapshot and retransmit channel</td><td>The publisher sends each update once to a multicast group; receivers join. Both feeds carry identical sequenced packets; receivers take whichever arrives first and drop duplicates</td><td>One copy leaves the venue regardless of subscriber count; every subscriber's copy is sent at the same instant by the network (<a href="../../networking/chapters/07-ports-udp.html">UDP</a>)</td><td>UDP loses packets: receivers detect gaps by sequence number and recover from the other feed, a retransmission service, or a periodic snapshot. Needs a network that supports multicast</td></tr>
+<tr><td>TCP unicast per subscriber</td><td>The venue writes to every connection</td><td>Reliable, easy to operate</td><td>Terabits of egress at our estimate; the order in which connections are written <em>is</em> an unfairness; slow consumers apply backpressure on the publisher</td></tr>
+<tr><td>Pub/sub broker (a message queue)</td><td>Subscribers read from topics</td><td>Familiar</td><td>An extra hop and an extra buffer of unpredictable latency, with a different arrival time per consumer</td></tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Recommendation:</strong> multicast with an A/B pair on separate network paths, plus a TCP snapshot/retransmit service for recovery. The packet format carries a feed sequence number so a receiver that sees 105 then 108 knows 106 and 107 are missing and recovers them.</li>
+<li><strong>Tiers of data:</strong> a depth-of-book feed (every order event) for professional participants and a lighter top-of-book feed for everyone else; both generated from the same event stream by separate publishers so that a slow consumer of one cannot slow the engine.</li>
+<li><strong>Fairness has several parts,</strong> and an exchange has to state its definition:
+  <ul>
+  <li><em>Ordering fairness:</em> price-time priority with a single total order that everyone can audit.</li>
+  <li><em>Access fairness:</em> equal-length cables (so co-located participants get the same propagation delay), identical gateway hardware and the same number of hops. A participant paying for a closer rack is a business choice to disclose, not hide.</li>
+  <li><em>Information fairness:</em> private acks must not leak ahead of public data in a way that lets one firm trade on it. Many designs publish the public update and the private ack from the same event and at the same time.</li>
+  <li><em>Speed bumps:</em> some venues deliberately delay inbound orders by a fixed tiny amount (IEX uses about 350 microseconds) to blunt latency arbitrage. It is a policy trade-off, not a technical necessity.</li>
+  </ul></li>
+<li><strong>Timestamps:</strong> take the time at the gateway on the way in and at the sequencer, using synchronised clocks with sub-microsecond error where possible (PTP with hardware timestamping), for audit. Ordering uses the sequence number, never the clock (<a href="../../networking/chapters/17-time.html">time</a>).</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">9</span>Deep dive 4: why no database on the hot path, and what happens after the trade</h2>
+<p class="stage-q">Put numbers on why a database does not belong on the matching path, then say how trades become settled money at a high level.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<table>
+<thead><tr><th>Step</th><th>Typical cost</th><th>Where it appears</th></tr></thead>
+<tbody>
+<tr><td>L1/L2 cache hit, main-memory access</td><td>about 1 ns, about 100 ns</td><td>Matching engine hot path</td></tr>
+<tr><td>Local network hop, kernel-bypass NIC, same rack</td><td>low single-digit µs</td><td>Gateway to sequencer to engine</td></tr>
+<tr><td>Replicate to a standby journal in the same data centre</td><td>tens of µs</td><td>Sequencer release rule</td></tr>
+<tr><td>Commit to a database (consensus or fsync, indexes, locks)</td><td>hundreds of µs to several ms, with a heavy tail</td><td>Not on the hot path</td></tr>
+<tr><td>Cross-region replication</td><td>tens of ms</td><td>Disaster recovery only (asynchronous)</td></tr>
+</tbody>
+</table>
+<p>A database commit is roughly 5 to 100 times our whole-path budget of 46 µs, and its <em>tail</em> (checkpoints, lock waits, a compaction) is worse. The log gives the durability a database would, in the one shape the problem needs: append and replay (<a href="../../data/chapters/04-log-hash-index.html">append-only logs</a>). Queries (history, reports, audit) are served by a downstream store built from the output stream, so they cannot disturb matching.</p>
+<p><strong>After the trade.</strong> Matching is not settlement. In outline (general pattern; details differ by market and asset class):</p>
+<ul>
+<li><strong>Trade capture:</strong> every trade is emitted from the engine with both order ids, price, quantity and a unique trade id. Downstream consumers must deduplicate on the trade id (the same discipline as <a href="../chapters/16-payments.html">payment idempotency</a>).</li>
+<li><strong>Clearing:</strong> a central counterparty (CCP) typically steps in between buyer and seller, nets each firm's obligations, and manages the risk that someone fails to deliver (margin, default funds). Clearing is correctness-critical and runs seconds to hours after the trade; it is a reconciliation problem.</li>
+<li><strong>Settlement:</strong> the exchange of cash for securities, in the US on the next business day (T+1 since May 2024; other markets differ). It runs in batches against the books of a depository and banks.</li>
+<li><strong>Reconciliation:</strong> the venue's trade log, the clearing house's records and the firms' own books are compared; breaks are investigated. Because the venue log is immutable and ordered, it is the reference.</li>
+<li><strong>Consequence for the design:</strong> a clean one-way boundary. The matching path never blocks on clearing; the clearing feed is a reliable, sequenced stream with resend, just like the market-data recovery channel.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">10</span>Failure modes, SLOs and rollout</h2>
+<p class="stage-q">Walk the diagram: what happens when each box fails, what is the SLO, and how do you deploy a change to a system with this trust requirement?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<table>
+<thead><tr><th>Failure</th><th>Effect</th><th>Response</th></tr></thead>
+<tbody>
+<tr><td>Gateway dies</td><td>Its firms' sessions drop</td><td>Firms reconnect to another gateway; session sequence numbers resume; cancel-on-disconnect protects exposed firms. Blast radius: the firms on that gateway</td></tr>
+<tr><td>Active sequencer dies or is partitioned</td><td>No new orders released</td><td>Lease expires (a second or less), standby takes over with a higher fencing token; the old one is rejected by the engines. Messages journaled but unreleased are released in order; none are lost</td></tr>
+<tr><td>Engine process crashes</td><td>Instruments on it stop matching</td><td>Hot standby promoted; clients re-request missed reports. If no standby: restart from snapshot and replay, trading halted for those instruments meanwhile</td></tr>
+<tr><td>Divergence between engine and standby</td><td>Different books, a bug or a nondeterminism leak</td><td>Periodic state digests catch it; halt the affected instruments rather than guess which is right (<a href="../../reliability/chapters/15-blast-radius.html">blast radius</a>)</td></tr>
+<tr><td>Multicast packet loss on one feed</td><td>A receiver has gaps</td><td>Takes the missing packets from the other feed; else retransmit or snapshot</td></tr>
+<tr><td>Slow disk on the journal</td><td>Latency rises</td><td>Release is gated on the journal, so latency shows it instantly. Alert and switch to the standby; never skip the journal</td></tr>
+<tr><td>Data-centre loss</td><td>Venue down</td><td>Asynchronous copy of the log in a second site; recovery drill with a documented RPO of a few seconds of the last acknowledged orders. A venue usually accepts a short halt over a risk of divergence</td></tr>
+<tr><td>Flood from one firm</td><td>Others slowed</td><td>Rate limits at the gateway per session; a kill switch to disconnect a firm</td></tr>
+</tbody>
+</table>
+<ul>
+<li><strong>SLIs and SLOs</strong> (<a href="../../reliability/chapters/02-slos-error-budgets.html">chapter 2</a>): order-to-ack latency measured at the edge, with p50, p99 and p99.99 each tracked (the tail is the product); percentage of sequence gaps recovered within a deadline; failover time; zero divergence events. Assume 99.99% of orders acknowledged under 200 µs and an availability target by trading hours, not by calendar month.</li>
+<li><strong>Page on</strong> tail-latency burn, journal lag, standby lag behind the primary, digest mismatch, and any feed gap that recovery has not closed (<a href="../../reliability/chapters/07-alerting-oncall.html">alerting</a>).</li>
+<li><strong>Rollout:</strong> never during trading. Deploy engines to the standby first, <em>replay a full day of production inputs</em> through the new version and compare the output stream byte for byte with the old one (deterministic replay is the regression test). Then fail over to it at a quiet point, keep the old version as the new standby for rollback. Freeze changes around corporate-action days and index rebalances (<a href="../../reliability/chapters/12-deployments.html">deployments</a>).</li>
+<li><strong>Game days:</strong> kill the sequencer under load on a schedule, during off hours, and time the failover.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">11</span>Trade-offs, and what changes if requirements change</h2>
+<p class="stage-q">What did you give up? What would you change if the venue needed to double volume, go multi-region, or add a new product?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<ul>
+<li><strong>What we gave up:</strong> flexibility. A single-threaded, in-memory engine with a strict determinism rule is hard to extend (any new feature must obey it) and hard to debug live. We paid with engineering discipline in exchange for tail latency and exact replay.</li>
+<li><strong>Synchronous replication adds latency</strong> (about 20 µs of the 46 µs). We accepted it for RPO 0. If a venue accepted losing the last few microseconds on a crash, asynchronous replication would be cheaper, and we would say so openly.</li>
+<li><strong>Volume doubles:</strong> engines are far below capacity (stage 2); we add engine groups, each with its own sequencer. The first thing to hit a limit will be the market-data publisher and network, not matching.</li>
+<li><strong>A single instrument becomes enormously hot:</strong> a single book cannot be split without breaking price-time priority. Options: a faster core, trimming work on the thread (move risk checks and output formatting off it), and reducing per-message cost. Sharding one book is a last resort and changes the fairness semantics.</li>
+<li><strong>Multi-region matching:</strong> only if participants are far apart and it is acceptable that a distant firm is slower. The honest answer is one primary venue site and a synchronous nearby standby, with a distant asynchronous copy (<a href="../../distributed/chapters/18-multi-region.html">multi-region</a>). Matching in two regions at once would need consensus per message across a WAN: tens of milliseconds, the opposite of the goal.</li>
+<li><strong>Auctions and new order types:</strong> new deterministic logic and new message types in the same log. The architecture does not change.</li>
+<li><strong>Crypto or 24-hour markets:</strong> no daily boundary to snapshot at and apply new software; rolling failover between active and standby, and continuous snapshotting, become routine.</li>
+<li><strong>If you used a cloud:</strong> shared tenancy adds jitter. You would need dedicated hosts and a placement group, and you would measure whether the tail fits the SLO before committing.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">12</span>A model five-minute verbal summary</h2>
+<p class="stage-q">Say the design out loud in five minutes, starting with the requirement that drives it. Time yourself, then compare.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<div class="callout mentor">
+<p class="callout-title">Model answer, about 700 words spoken</p>
+<p>"The hard requirement is a single total order with microsecond latency and no lost trades. So I'd derive the design from that. Estimates: about a million messages a second at the open, concentrated in a few hundred symbols, so a hot symbol sees maybe fifteen hundred a second. One thread doing a three-microsecond match handles hundreds of thousands, so the matching engine is not the bottleneck, and I can make it single-threaded and in memory. The cost is the I/O around it, so I budget about 46 microseconds end to end with the journal and replication taking the biggest slice.</p>
+<p>Flow: participants connect to gateways over sequenced sessions. Gateways authenticate and run pre-trade risk checks, then send to a sequencer, which stamps a global sequence number, journals it, replicates it synchronously to a standby, and only then releases it to the engines. That number is time priority. Each engine owns a set of instruments, consumes the stream on one pinned thread, keeps the book as price levels with FIFO queues, and emits execution reports, public market data and trades.</p>
+<p>Deep dive one: the sequencer. Consensus on every message works but puts elections near the hot path, so I'd use one active sequencer per group with a synchronous standby, and a lease with fencing tokens deciding who is active. Because the engine is deterministic, a hot standby fed the same stream has identical state, so failover is a decision to read its output. Replay from a snapshot rebuilds any engine and doubles as the regression test and audit tool; I'd show a run where the same log gives the same digest and swapping two inputs gives a different one. Then market data. Multicast, A/B feeds with sequence numbers, and a snapshot and retransmit service for gaps. Unicast to thousands would be terabits and would make the write order itself unfair. Fairness also means equal cable lengths and a single audited order.</p>
+<p>No database on the hot path: a commit costs hundreds of microseconds with a bad tail, against a whole budget of tens, so the log is the database, and history is a downstream store. After the trade, trades go to a clearing house as a deduplicated stream; a central counterparty nets obligations and settlement is next-day in the US.</p>
+<p>Failure modes: sequencer loss is a lease expiry and promotion with a higher fencing token; engine loss is promotion of the standby; divergence is caught by state digests and handled by halting the symbols. I'd page on tail latency burn, journal and standby lag, and unrecovered feed gaps, and I'd deploy by replaying a day of production inputs through the new version and comparing the output byte for byte. Trade-offs: we gave up flexibility and some latency for exactness and RPO zero. If volume doubles, add engine groups; if one symbol gets too hot, trim work from the thread before ever sharding a book. Where would you like to probe?"</p>
+</div>
+</details>
+</section>
+
+<h2>Self-check rubric</h2>
+<p>Tick what your own design (before reading the answers) covered. Items are grouped by the level at which they usually appear: a mid-level answer gets the first group right; a senior answer also makes the second group visible.</p>
+<ul class="rubric">
+  <li><strong>Mid-level:</strong> Clarified order types, matching rule (price-time priority), scale, latency target and the no-loss requirement; named the hardest requirement.</li>
+  <li><strong>Mid-level:</strong> Estimated message rates with skew and showed that one thread per engine group is enough.</li>
+  <li><strong>Mid-level:</strong> Described gateways with authentication and pre-trade risk checks in front of matching.</li>
+  <li><strong>Mid-level:</strong> Used one single-threaded matching engine per instrument group and could explain why no locks are needed.</li>
+  <li><strong>Mid-level:</strong> Kept databases off the hot path and said why with numbers.</li>
+  <li><strong>Mid-level:</strong> Designed the API with client order ids and session sequence numbers for safe retries.</li>
+  <li><strong>Senior:</strong> Introduced a <strong>sequencer</strong> as total order broadcast and said that the sequence number is time priority.</li>
+  <li><strong>Senior:</strong> Required <strong>determinism</strong> (no wall clock, no randomness, no threads) and used it for replica failover, replay and audit; offered a state digest to detect divergence.</li>
+  <li><strong>Senior:</strong> Compared consensus-per-message with a leased sequencer plus synchronous standby, including <strong>fencing</strong>, and chose with reasons.</li>
+  <li><strong>Senior:</strong> Made market data multicast with A/B feeds, gap detection by sequence number and a recovery channel; explained why unicast fails at this scale.</li>
+  <li><strong>Senior:</strong> Defined <strong>fairness</strong> in several parts (order, access, information) and treated speed bumps as policy.</li>
+  <li><strong>Senior:</strong> Gave a microsecond <strong>latency budget</strong> and located the largest items (journal and replication).</li>
+  <li><strong>Senior:</strong> Described post-trade (clearing, settlement, reconciliation) as a separate one-way boundary with deduplicated trade ids.</li>
+  <li><strong>Senior:</strong> Planned rollout by <strong>replaying production inputs</strong> through new code and comparing outputs; named the SLIs and what to page on.</li>
+</ul>
+<p class="studio-status" id="studio-status"></p>
+
+<h2>Saying it in an interview</h2>
+<div class="callout mentor">
+  <p class="callout-title">The shape of a strong summary</p>
+  <p>Stage 12 has a model five-minute answer. Notice its shape: <strong>hardest requirement → numbers → sequencer → engine → fan-out → no database on the hot path → failure and rollout → trade-offs</strong>, ending with an invitation to probe.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+<ul>
+  <li>The hardest requirement is a single total order with low and predictable latency and zero loss; derive everything from it.</li>
+  <li>Skew and an estimate show the matching thread is not the bottleneck: the journal, replication and fan-out are.</li>
+  <li>A sequencer gives total order; the sequence number is time priority. Journal and replicate before the engine acts.</li>
+  <li>A deterministic engine makes replicas, failover, replay, audit and regression testing all the same mechanism.</li>
+  <li>Multicast with sequence numbers and a recovery channel is the only sane market-data fan-out; unicast is both too big and unfair.</li>
+  <li>No database on the hot path: the input log is the database, and queries are served from downstream copies.</li>
+  <li>Matching and clearing are separate: a one-way, deduplicated, reconcilable stream.</li>
+</ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/studio.js"></script>
+</body>
+</html>

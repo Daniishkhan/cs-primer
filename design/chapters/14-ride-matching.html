@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Ride Matching · System Design Studio</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/geo-cells.css">
+</head>
+<body data-root="../.." data-course="design" data-chapter="14">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design Ride Matching</h1>
+  <p class="lede">Location updates, geospatial indexes, matching and the dispatch state machine. A quarter of a million pings a second go into memory, a cell index turns "who is near" into a lookup, and a lease on each driver makes sure no one is promised to two riders.</p>
+</header>
+
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Ride matching is a real-time marketplace on a map. It teaches three things that recur everywhere: how to treat <em>ephemeral</em> state (where drivers are right now) as a different class of data from durable state (trips, money); how a spatial index turns "find nearby" from a scan into a lookup; and how to hand out a scarce resource (a driver) to exactly one of many racing dispatchers with a lease and a fencing token. The state machine and payments at the end are where the marketplace meets the rest of the business.</p>
+</div>
+
+<h2>The problem</h2>
+<p><em>"Design a ride-hailing service. Riders request a ride from their location; the system finds a nearby available driver, offers the trip, and tracks it to the end."</em></p>
+<p>Notice what the prompt leaves open: how many drivers, how fresh their position must be, whether we match one rider at a time or in batches, what "nearby" means (distance or time), what happens when two riders want the same driver, and what the system must do when the city's biggest stadium empties at once. Those are the questions to ask first (<a href="01-framework.html">framework</a>).</p>
+
+<h2>Clarify requirements</h2>
+<table>
+  <thead><tr><th>Question</th><th>Assumed answer</th></tr></thead>
+  <tbody>
+    <tr><td>Scale?</td><td>1M drivers online at the global peak, 20M trips a day, about 400 active cities with a very uneven size distribution.</td></tr>
+    <tr><td>Location freshness?</td><td>Drivers report position about every 4 seconds while online. A position older than ~15 seconds is treated as unreliable.</td></tr>
+    <tr><td>Matching latency?</td><td>A rider should have a driver offered within 2 to 3 seconds of tapping; the accepted match within ~30 seconds typically.</td></tr>
+    <tr><td>Consistency?</td><td>A driver must never be assigned to two trips at once. A slightly stale map of cars near me is fine.</td></tr>
+    <tr><td>Matching style?</td><td>Start greedy and per-request (best available now). Discuss batched global matching as an evolution.</td></tr>
+    <tr><td>Pricing?</td><td>Dynamic pricing (surge) in scope at the concept level; the rider sees a price before confirming.</td></tr>
+    <tr><td>Payments?</td><td>Charged at trip end. The design of the payment system is the next chapter (<a href="16-payments.html">payments</a>); here we only define the hand-off.</td></tr>
+    <tr><td>Not in scope</td><td>Route navigation turn-by-turn, pooling (shared rides), safety features, driver incentives, map data production, fraud.</td></tr>
+  </tbody>
+</table>
+<p><strong>Functional.</strong> Drivers go online/offline and stream location; riders request a ride and see nearby cars; the system matches, offers with a timeout, and tracks the trip through a state machine; price is quoted up front; payment is collected at the end. <strong>Non-functional.</strong> Location ingestion keeps up with a quarter of a million writes a second; matching is fast and never double-assigns; a failure of the location system degrades matching quality but does not corrupt trips; and an event that concentrates demand in one place degrades gracefully.</p>
+
+<h2>Estimate</h2>
+<p>The key is to separate the <em>ephemeral hot data</em> (locations) from the <em>durable cold data</em> (trips). The script below computes both and also tests geohash cell sizes against driver density, which is the number that picks the index resolution. All inputs are assumptions.</p>
+<pre class="terminal" data-title="ride_napkin.py"><code>&quot;&quot;&quot;Napkin maths for ride matching. Every input is an assumption.&quot;&quot;&quot;
+import math
+drivers_online_peak = 1_000_000          # globally, at the busiest hour
+update_every_s      = 4                  # location ping interval while online
+bytes_per_update    = 60                 # id, lat, lng, heading, speed, timestamp, status (binary-ish)
+trips_per_day       = 20_000_000
+peak_factor         = 5                  # peak trips/s vs average
+riders_open_apps_peak = 3_000_000        # riders with the app open at peak, each might ask for nearby cars
+nearby_refresh_s    = 10
+
+w = drivers_online_peak / update_every_s
+print(f&quot;location writes: {drivers_online_peak:,} drivers / {update_every_s} s = {w:,.0f} writes/s  ({w*bytes_per_update*8/1e6:,.0f} Mbit/s inbound)&quot;)
+state_mb = drivers_online_peak * 100 / 1e6
+print(f&quot;latest-location table: {drivers_online_peak:,} x ~100 B = {state_mb:,.0f} MB  -&gt; fits in RAM on one machine; the issue is write rate, not size&quot;)
+history_tb_day = w * 86400 * bytes_per_update / 1e12
+print(f&quot;if we also kept every ping: {w*86400/1e9:,.1f} B rows/day = {history_tb_day:,.1f} TB/day  -&gt; an append-only log, never the serving store&quot;)
+avg_trips_s = trips_per_day / 86400
+print(f&quot;\ntrips: {trips_per_day/1e6:.0f}M/day = {avg_trips_s:,.0f}/s average, ~{avg_trips_s*peak_factor:,.0f}/s at peak (x{peak_factor})&quot;)
+q = riders_open_apps_peak / nearby_refresh_s
+print(f&quot;&#x27;cars near me&#x27; map reads: {riders_open_apps_peak/1e6:.0f}M riders / {nearby_refresh_s} s = {q:,.0f} queries/s (reads are ~{q/w:.1f}x the writes)&quot;)
+print(f&quot;matching queries (a request triggers ~3 nearest-k searches as offers fail): ~{avg_trips_s*peak_factor*3:,.0f}/s&quot;)
+
+# partitioning
+cities = 400
+print(f&quot;\nshard by city/region: ~{cities} active cities; busiest-city share assumed 3% of drivers&quot;)
+big = 0.03 * drivers_online_peak
+print(f&quot;  busiest city: {big:,.0f} drivers -&gt; {big/update_every_s:,.0f} writes/s, {big*100/1e6:,.0f} MB: one in-memory node handles it with room (assume 100k updates/s per node)&quot;)
+shards_for_writes = math.ceil(w / 100_000)
+print(f&quot;  global writes need &gt;= {shards_for_writes} nodes at 100k/s each; we run ~{cities//20}+ with replicas for headroom and failover&quot;)
+
+# cell sizing
+print(&quot;\ncell size vs candidates per cell, dense city (assume 1 driver per 0.5 km^2 average, 10x in downtown)&quot;)
+for name, km in ((&quot;geohash-5 (~4.9 km)&quot;, 4.9), (&quot;geohash-6 (~1.2 km x 0.6 km)&quot;, math.sqrt(1.2*0.6)), (&quot;H3 res 8 (edge 0.53 km, ~0.74 km^2)&quot;, 0.86)):
+    area = km*km
+    print(f&quot;  {name:&lt;38} area {area:6.2f} km^2 -&gt; avg {area/0.5:5.1f} drivers/cell, downtown {area/0.05:6.1f}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>location writes: 1,000,000 drivers / 4 s = 250,000 writes/s  (120 Mbit/s inbound)
+latest-location table: 1,000,000 x ~100 B = 100 MB  -&gt; fits in RAM on one machine; the issue is write rate, not size
+if we also kept every ping: 21.6 B rows/day = 1.3 TB/day  -&gt; an append-only log, never the serving store
+
+trips: 20M/day = 231/s average, ~1,157/s at peak (x5)
+&#x27;cars near me&#x27; map reads: 3M riders / 10 s = 300,000 queries/s (reads are ~1.2x the writes)
+matching queries (a request triggers ~3 nearest-k searches as offers fail): ~3,472/s
+
+shard by city/region: ~400 active cities; busiest-city share assumed 3% of drivers
+  busiest city: 30,000 drivers -&gt; 7,500 writes/s, 3 MB: one in-memory node handles it with room (assume 100k updates/s per node)
+  global writes need &gt;= 3 nodes at 100k/s each; we run ~20+ with replicas for headroom and failover
+
+cell size vs candidates per cell, dense city (assume 1 driver per 0.5 km^2 average, 10x in downtown)
+  geohash-5 (~4.9 km)                    area  24.01 km^2 -&gt; avg  48.0 drivers/cell, downtown  480.2
+  geohash-6 (~1.2 km x 0.6 km)           area   0.72 km^2 -&gt; avg   1.4 drivers/cell, downtown   14.4
+  H3 res 8 (edge 0.53 km, ~0.74 km^2)    area   0.74 km^2 -&gt; avg   1.5 drivers/cell, downtown   14.8</code></pre>
+<p>Decisions from the output.</p>
+<ul>
+  <li><strong>Writes are the load; size is not.</strong> A million drivers pinging every 4 seconds is 250,000 writes a second, but the latest position of all of them is only about 100 MB. That fits in RAM on one machine and rules out a relational primary as the store of record for locations: you would be paying durable-commit costs for data that is worthless in 15 seconds. <strong>Keep the latest location in memory, sharded, and let it be lossy.</strong> If a node dies, drivers re-announce themselves within one ping interval, which is the recovery procedure.</li>
+  <li><strong>History is a log, not a table.</strong> If you want every ping for analytics, safety review or training, that is 1.3 TB a day written as an append-only stream (<a href="../../data/chapters/19-streams-cdc.html">streams</a>) and sunk to cheap object storage. It is never on the matching path.</li>
+  <li><strong>Trips are a modest transactional workload.</strong> 231 a second on average and about 1,200 at peak: a sharded relational store is comfortable. The marketplace's difficulty is the location firehose and the correctness of assignment, not trip volume.</li>
+  <li><strong>Reads outnumber writes</strong> once riders watch the map (300k queries a second), which is another reason for in-memory spatial indexes with many read replicas per city rather than a database.</li>
+  <li><strong>Resolution choice.</strong> At about 4.9 km, a geohash-5 cell holds ~48 drivers on average and ~480 downtown: too coarse, because each query reads hundreds of irrelevant drivers. At about 1.2 km x 0.6 km (geohash-6) the average is ~1.4 and downtown ~14: a 3x3 neighbourhood is about a dozen candidates on average and over a hundred downtown. Cell size should track density, which is the argument for adaptive structures (quadtrees) or multi-resolution cells.</li>
+  <li><strong>Shard by city.</strong> The busiest city is ~30,000 drivers and ~7,500 writes a second: one node handles that with headroom, so the global rate is spread across a few dozen nodes, not thousands. Partitioning by region is natural because a rider in Lagos never needs a driver in Paris.</li>
+</ul>
+
+<h2>API</h2>
+<pre class="terminal" data-title="rider and driver API (shape, not exact wire format)"><code>-- driver
+POST /v1/drivers/me/status    {online: true, product_ids: [...]}
+WS   /v1/drivers/me/stream    -&gt; server pushes offers; client sends {type: "ping", lat, lng, heading, speed, ts, seq} every ~4 s
+POST /v1/offers/{offer_id}/accept    {token}          -&gt; 200 | 409 offer_expired
+POST /v1/offers/{offer_id}/decline
+
+-- rider
+GET  /v1/nearby?lat=..&amp;lng=..&amp;product=economy      -&gt; [{lat, lng, heading} x up to 8]  (approximate, cached ~2-5 s)
+POST /v1/quotes               {pickup, dropoff, product}  -&gt; {quote_id, price_minor, currency, surge_multiplier, expires_at, eta_s}
+POST /v1/trips                {quote_id}  Idempotency-Key: ...   -&gt; 201 {trip_id, status: "requested"}
+GET  /v1/trips/{id}          -&gt; status, driver, vehicle, eta, route so far
+POST /v1/trips/{id}/cancel</code></pre>
+<p>Three API choices matter. <strong>Pings are tiny and unacknowledged-by-default</strong>: sequence numbers let the server drop out-of-order duplicates, and a missed ping costs four seconds of staleness. <strong>The quote is a contract</strong>: it carries a price, a multiplier and an expiry, and <code>POST /trips</code> references it, so the rider is never surprised by surge computed after the tap. <strong>Offers carry a token</strong> that the accept must echo, which is how a late or duplicated accept is rejected (see the lease deep dive). Trip creation is idempotent via a key, as in any API that moves money or reserves something (<a href="../../architecture/chapters/09-api-design.html">API design</a>).</p>
+
+<h2>Data model</h2>
+<ul>
+  <li><strong>Driver location (ephemeral):</strong> in-memory map <code>driver_id -&gt; (lat, lng, heading, ts, cell)</code> plus a reverse index <code>cell -&gt; set of driver_id</code>, sharded by city or region, replicated to a follower for failover. Not durable, by design.</li>
+  <li><strong>Driver state (small, hot, needs atomic update):</strong> <code>driver_id -&gt; (status: offline|idle|offered|on_trip, owner_trip, lease_expiry, token)</code>. Atomic compare-and-set on one record; a key-value store with conditional writes or a scripted in-memory store, sharded with the location shard so a match touches one shard.</li>
+  <li><strong>Trips (durable):</strong> <code>trips(trip_id, rider_id, driver_id, state, version, pickup, dropoff, quote_id, price_minor, currency, requested_at, ...)</code> in a sharded relational store, partitioned by <code>trip_id</code> with a secondary index on <code>rider_id</code> and <code>driver_id</code> for "my active trip". The <code>version</code> column makes each state change an optimistic compare-and-set (<a href="../../data/chapters/12-mvcc-locking.html">MVCC and locking</a>).</li>
+  <li><strong>Event log:</strong> every ping and trip transition appended to a partitioned log (keyed by city/cell for pings, by trip for transitions). Feeds surge computation, ETA model training, safety audits, and the sync of the trip projection for analytics (<a href="../../data/chapters/19-streams-cdc.html">CDC</a>).</li>
+  <li><strong>Cell aggregates:</strong> per cell and minute: supply (idle drivers), demand (ride requests), completions. Small and streaming-computed; drives surge and the heat maps.</li>
+</ul>
+
+<h2>High-level design</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 346" role="img" aria-label="Ride matching architecture: rider and driver apps connect through a gateway with persistent connections; a location service writes pings into an in-memory location index and an event log; the matching service reads candidates from the index, asks the ETA service, leases a driver in the driver state store, and records the trip in the trip database; a surge service reads the event log; payments is an external system called at trip end.">
+<defs><marker id="ahG14a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="10" y="50" width="90" height="46" rx="8" class="fs-green s-green sw-2"/><text x="55" y="78" text-anchor="middle" class="t-sm t-bold">Rider app</text></g>
+<g><rect x="10" y="214" width="90" height="46" rx="8" class="fs-green s-green sw-2"/><text x="55" y="242" text-anchor="middle" class="t-sm t-bold">Driver app</text></g>
+<g><rect x="135" y="130" width="120" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="195" y="157" text-anchor="middle" class="t-sm t-bold">Gateway</text><text x="195" y="173" text-anchor="middle" class="t-xs t-muted">long-lived conns</text></g>
+<g><rect x="300" y="10" width="130" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="365" y="29" text-anchor="middle" class="t-sm t-bold">Trip DB</text><text x="365" y="45" text-anchor="middle" class="t-xs t-muted">state + version</text></g>
+<g><rect x="300" y="100" width="130" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="365" y="127" text-anchor="middle" class="t-sm t-bold">Matching</text><text x="365" y="143" text-anchor="middle" class="t-xs t-muted">candidates, offers</text></g>
+<g><rect x="300" y="230" width="130" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="365" y="252" text-anchor="middle" class="t-sm t-bold">Location service</text><text x="365" y="268" text-anchor="middle" class="t-xs t-muted">ingest pings</text></g>
+<g><rect x="480" y="70" width="130" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="545" y="97" text-anchor="middle" class="t-sm t-bold">ETA / routing</text></g>
+<g><rect x="480" y="125" width="130" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="545" y="147" text-anchor="middle" class="t-sm t-bold">Driver state</text><text x="545" y="163" text-anchor="middle" class="t-xs t-muted">status, lease, token</text></g>
+<g><rect x="480" y="190" width="130" height="50" rx="8" class="fs-cyan s-cyan sw-2"/><text x="545" y="212" text-anchor="middle" class="t-sm t-bold">Location index</text><text x="545" y="228" text-anchor="middle" class="t-xs t-muted">in-memory cells</text></g>
+<g><rect x="480" y="290" width="130" height="44" rx="8" class="fs-orange s-orange sw-2"/><text x="545" y="309" text-anchor="middle" class="t-sm t-bold">Event log</text><text x="545" y="325" text-anchor="middle" class="t-xs t-muted">pings, trip events</text></g>
+<g><rect x="640" y="290" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="695" y="317" text-anchor="middle" class="t-sm t-bold">Surge pricing</text></g>
+<g><rect x="640" y="10" width="110" height="44" rx="8" class="box2"/><text x="695" y="37" text-anchor="middle" class="t-sm t-bold">Payments</text></g>
+<line x1="100" y1="73" x2="135" y2="150" class="line" marker-end="url(#ahG14a)"/>
+<line x1="100" y1="237" x2="135" y2="172" class="line" marker-end="url(#ahG14a)"/>
+<line x1="255" y1="150" x2="300" y2="130" class="line" marker-end="url(#ahG14a)"/>
+<line x1="255" y1="178" x2="300" y2="250" class="line" marker-end="url(#ahG14a)"/>
+<line x1="365" y1="100" x2="365" y2="54" class="line" marker-end="url(#ahG14a)"/>
+<line x1="430" y1="32" x2="640" y2="32" class="line-dash" marker-end="url(#ahG14a)"/>
+<line x1="430" y1="115" x2="480" y2="95" class="line" marker-end="url(#ahG14a)"/>
+<line x1="430" y1="135" x2="480" y2="150" class="line" marker-end="url(#ahG14a)"/>
+<line x1="430" y1="152" x2="480" y2="205" class="line" marker-end="url(#ahG14a)"/>
+<line x1="430" y1="248" x2="480" y2="225" class="line" marker-end="url(#ahG14a)"/>
+<line x1="430" y1="275" x2="480" y2="308" class="line" marker-end="url(#ahG14a)"/>
+<line x1="610" y1="312" x2="640" y2="312" class="line-dash" marker-end="url(#ahG14a)"/>
+<text x="10" y="280" text-anchor="start" class="t-xs t-faint">ping every ~4 s</text>
+<text x="10" y="42" text-anchor="start" class="t-xs t-faint">request ride</text>
+<text x="520" y="24" text-anchor="start" class="t-xs t-faint">trip complete</text>
+</svg>
+  <figcaption>The hot write path (pings) and the matching path share one in-memory index but nothing durable. The trip database sees about a thousand writes a second; the location index sees a quarter of a million.</figcaption>
+</figure>
+<p>Drivers hold persistent connections to a gateway fleet (the same pattern as chat: <a href="10-chat-presence.html">chapter 10</a>; the trade-offs of keeping many long-lived connections are in <a href="../../networking/cases/case-05-persistent-connections.html">persistent connections</a>). The gateway forwards pings to the location service and pushes offers back. The matching service is stateless apart from what it fetches: it reads the index, asks for ETAs, leases a driver and writes the trip. The path in order:</p>
+<div class="widget stepper" data-autoplay-ms="5000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One ride request, from tap to assigned driver</h4></div>
+  <svg viewBox="0 0 760 330" role="img" aria-label="Stepper diagram of a ride request: rider, gateway, matching service, location index, ETA service, driver state store and driver.">
+<defs><marker id="ahG14c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g data-active="1,9"><rect x="10" y="20" width="90" height="50" rx="8" class="fs-green s-green sw-2"/><text x="55" y="50" text-anchor="middle" class="t-sm t-bold">Rider</text></g>
+<g data-active="1,6-9"><rect x="150" y="20" width="110" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="205" y="50" text-anchor="middle" class="t-sm t-bold">Gateway</text></g>
+<g data-active="1-9"><rect x="310" y="20" width="130" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="375" y="42" text-anchor="middle" class="t-sm t-bold">Matching</text><text x="375" y="58" text-anchor="middle" class="t-xs t-muted">orchestrates</text></g>
+<g data-active="2-3"><rect x="490" y="20" width="120" height="50" rx="8" class="fs-cyan s-cyan sw-2"/><text x="550" y="50" text-anchor="middle" class="t-sm t-bold">Location index</text></g>
+<g data-active="4"><rect x="650" y="20" width="100" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="700" y="50" text-anchor="middle" class="t-sm t-bold">ETA</text></g>
+<g data-active="5-8"><rect x="310" y="150" width="130" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="375" y="172" text-anchor="middle" class="t-sm t-bold">Driver state</text><text x="375" y="188" text-anchor="middle" class="t-xs t-muted">lease + token</text></g>
+<g data-active="6-8"><rect x="150" y="250" width="110" height="50" rx="8" class="fs-green s-green sw-2"/><text x="205" y="280" text-anchor="middle" class="t-sm t-bold">Driver</text></g>
+<g data-active="8-9"><rect x="310" y="250" width="130" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="375" y="280" text-anchor="middle" class="t-sm t-bold">Trip DB</text></g>
+<line x1="100" y1="45" x2="150" y2="45" class="line" marker-end="url(#ahG14c)" data-steps="1"/>
+<line x1="260" y1="45" x2="310" y2="45" class="line" marker-end="url(#ahG14c)" data-steps="1"/>
+<line x1="440" y1="45" x2="490" y2="45" class="line" marker-end="url(#ahG14c)" data-steps="2-3"/>
+<line x1="610" y1="45" x2="650" y2="45" class="line" marker-end="url(#ahG14c)" data-steps="4"/>
+<line x1="375" y1="70" x2="375" y2="150" class="line" marker-end="url(#ahG14c)" data-steps="5"/>
+<line x1="375" y1="200" x2="375" y2="250" class="line" marker-end="url(#ahG14c)" data-steps="8"/>
+<line x1="310" y1="175" x2="205" y2="250" class="line-dash" marker-end="url(#ahG14c)" data-steps="6-7"/>
+<line x1="205" y1="250" x2="205" y2="70" class="line-dash" marker-end="url(#ahG14c)" data-steps="6-8"/>
+<text x="110" y="38" text-anchor="start" class="t-xs t-faint" data-steps="1">ride?</text>
+<text x="500" y="100" text-anchor="start" class="t-xs t-faint" data-steps="2">cells around rider</text>
+<text x="500" y="100" text-anchor="start" class="t-xs t-faint" data-steps="3">nearest k of the cells</text>
+<text x="620" y="100" text-anchor="start" class="t-xs t-faint" data-steps="4">road ETA, batch</text>
+<text x="390" y="118" text-anchor="start" class="t-xs t-faint" data-steps="5">CAS: idle to offered</text>
+<text x="390" y="118" text-anchor="start" class="t-xs t-faint" data-steps="7">token fences accept</text>
+<text x="198" y="150" text-anchor="end" class="t-xs t-faint" data-steps="6">offer, 15 s timeout</text>
+<text x="198" y="150" text-anchor="end" class="t-xs t-faint" data-steps="7">accept + token</text>
+<text x="450" y="232" text-anchor="start" class="t-xs t-faint" data-steps="8">trip state: accepted</text>
+<text x="110" y="318" text-anchor="start" class="t-xs t-faint" data-steps="9">ETA to pickup shown to rider</text>
+</svg>
+  <ol class="stepper-captions">
+    <li><strong>Request.</strong> The rider's app sends pickup, destination and product (<em>economy</em>, <em>XL</em>, ...) over its persistent connection. The gateway forwards to matching. A trip row is created in <code>requested</code> with an idempotency key so a retried tap does not create two trips.</li>
+    <li><strong>Find the rider's cells.</strong> Matching computes the pickup's cell and asks the location index for the ring of cells around it. The index holds each driver's <em>latest</em> position only, grouped by cell, in memory.</li>
+    <li><strong>Nearest-k candidates.</strong> It takes the drivers in those cells that are <code>idle</code> and eligible for the product, measures straight-line distance, and widens the search ring by ring until it has k candidates and the k-th is provably closer than anything unsearched.</li>
+    <li><strong>Rank by ETA, not distance.</strong> A straight line ignores rivers, one-way streets and traffic. Matching sends the top 10 to 15 candidates to the ETA service in one batch request, gets road-time estimates, and re-ranks.</li>
+    <li><strong>Lease the best driver.</strong> One atomic compare-and-set on the driver's state: <code>idle</code> becomes <code>offered</code>, with an owner, an expiry a few seconds out and a fresh fencing token. If another dispatcher got there first the CAS fails and matching tries the next candidate.</li>
+    <li><strong>Push the offer.</strong> The offer goes through the gateway to the driver's open connection, with a timeout (on the order of 10 to 15 seconds). If the driver declines or the lease expires, the driver returns to the pool and matching moves to the next candidate.</li>
+    <li><strong>Accept with the token.</strong> The driver accepts; the request carries the token. The state store checks owner, token and expiry and moves the driver to <code>on_trip</code>. A slow accept after the lease expired fails, because someone else may hold the driver now.</li>
+    <li><strong>Record the trip.</strong> Matching writes the trip as <code>accepted</code> with the driver id, in a transaction that checks the previous version. This durable write is the commit point; everything before it is soft state that can be lost and recomputed.</li>
+    <li><strong>Tell the rider.</strong> The rider gets the driver, the vehicle and an ETA; from now on the driver's pings are relayed to the rider's map. If no driver ever accepts, the trip ends in <code>no driver found</code> after the retry budget.</li>
+  </ol>
+</div>
+
+<h2>Deep dive 1: geospatial indexing</h2>
+<p>"Find the nearest k drivers" over a million moving points, 3,500 times a second, with positions that change every 4 seconds. A full scan is out (the script below measures 80 ms per query at 200,000 drivers). We need an index that is cheap to update, because it is write-heavy, and cheap to query by area.</p>
+<table>
+  <thead><tr><th>Index</th><th>Idea</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+  <tbody>
+    <tr><td>Geohash grid</td><td>Interleave longitude and latitude bits into a string; truncate for coarser cells. A hash map from cell to drivers.</td><td>Trivial, string keys work in any key-value store or sorted set, hierarchical by prefix, O(1) update</td><td>Fixed cell size (dense and sparse areas cost the same); cells are rectangles whose size shrinks toward the poles; <em>nearby points can have very different prefixes</em> across a cell boundary, so you must always search neighbour cells</td></tr>
+    <tr><td>Quadtree</td><td>Recursively split a square into four when it holds more than N points</td><td>Adapts to density (small leaves downtown, large in the suburbs); good for nearest queries</td><td>Mutating a tree under 250k updates a second needs care (locking, rebalancing); a pointer structure in memory per shard; cell identity is not a stable key</td></tr>
+    <tr><td>S2 (Google)</td><td>Project the sphere onto a cube, order cells along a space-filling (Hilbert) curve; cells are named by 64-bit ids at 30 levels</td><td>Hierarchical, ids are sortable integers, good area coverings, works across the globe without seams</td><td>A library dependency; square-ish cells have unequal neighbour distances</td></tr>
+    <tr><td>H3 (Uber)</td><td>Hexagonal hierarchical cells over an icosahedron projection; 16 resolutions; every cell has six equidistant neighbours (twelve cells in the world are pentagons)</td><td>Uniform neighbour distance makes ring expansion and smoothing (like surge) behave evenly; neighbour lookup is a function call</td><td>Hexagons do not nest exactly, so parent/child is approximate; a library dependency; pentagon edge cases</td></tr>
+    <tr><td>Database spatial index (R-tree/GiST)</td><td>A tree of bounding boxes inside the database</td><td>Rich queries, great for static data (places, regions), durable</td><td>Update-heavy moving points are a poor fit: every ping rewrites index pages (<a href="../../data/chapters/17-specialised-stores.html">specialised stores</a>)</td></tr>
+  </tbody>
+</table>
+<p>The full story of why a hexagonal grid suits a marketplace, with the numbers, is in the <a href="../cases/case-04-uber-h3.html">Uber H3 case study</a>; the sources are cited there, and I rely on it rather than repeat the claims. As a reference point from the H3 documentation, resolution 8 has an average edge of about 0.53 km and resolution 9 about 0.20 km, and there are 122 coarsest "base" cells, 12 of which are pentagons. My recommendation, as an opinion: for a first design, a geohash or H3 cell index in a sharded in-memory map is the simplest thing that works; reach for a quadtree when density varies enough that one resolution cannot serve both downtown and the suburbs; and keep the index behind an interface so the cell scheme can change without touching matching.</p>
+<h3>Explore it</h3>
+<p>The widget draws real geohash cells (the actual base-32 algorithm) over a small area with 70 drivers. In <em>Cell and neighbours</em> mode, click a cell to see its hash and its eight neighbours; change the precision to see how the same drivers fall into more or fewer cells. In <em>Nearest k</em> mode, click to place a rider and watch the search widen ring by ring. Try a rider on a cell edge, a large k, and the coarse precision.</p>
+<div class="widget" id="geo-cells"></div>
+<h3>k-nearest by expanding rings</h3>
+<p>A cell grid answers "who is in this cell" in constant time. "Who are the k nearest" is a loop: search the rider's cell, then the ring of eight around it, then the ring of sixteen around that, and so on. The stopping rule is the part people get wrong. Having found k candidates in the cells searched so far is <em>not</em> enough: a driver just outside the searched block could be closer than the k-th you found. The safe rule: after searching rings 0 to r, anything unsearched is at least <code>r x (smallest cell side)</code> away from the rider, because the rider sits somewhere inside their own cell and the block extends r full cells beyond it. So stop when you hold k candidates and the k-th is closer than that bound. The widget applies exactly that rule. The script implements it and checks it against brute force.</p>
+<pre class="terminal" data-title="geo_index.py"><code>&quot;&quot;&quot;Geohash + grid index vs brute force for nearest-k drivers. Pure stdlib, deterministic.
+The index maps cell -&gt; {driver ids}; a k-nearest query searches rings of cells outward from the rider&#x27;s cell.
+Correctness rule: after searching ring r, anything unsearched is at least r * (smallest cell side) away, so stop
+only when we have k candidates and the k-th is closer than that bound.&quot;&quot;&quot;
+import math, random, time
+B32 = &quot;0123456789bcdefghjkmnpqrstuvwxyz&quot;
+
+def encode(lat, lng, prec):
+    lat_r, lng_r, bits, even, h, ch = [-90.0, 90.0], [-180.0, 180.0], 0, True, &quot;&quot;, 0
+    while len(h) &lt; prec:
+        rng, v = (lng_r, lng) if even else (lat_r, lat)
+        mid = (rng[0] + rng[1]) / 2
+        ch &lt;&lt;= 1
+        if v &gt;= mid: ch |= 1; rng[0] = mid
+        else: rng[1] = mid
+        even = not even; bits += 1
+        if bits == 5: h += B32[ch]; bits = ch = 0
+    return h
+
+def cell_size_deg(prec):
+    lng_bits = (5 * prec + 1) // 2; lat_bits = 5 * prec // 2
+    return 180 / 2 ** lat_bits, 360 / 2 ** lng_bits
+
+def km(a, b):                                   # equirectangular approximation, fine at city scale
+    dlat = math.radians(b[0] - a[0]); dlng = math.radians(b[1] - a[1]) * math.cos(math.radians((a[0] + b[0]) / 2))
+    return 6371 * math.hypot(dlat, dlng)
+
+PREC = 6
+DLAT, DLNG = cell_size_deg(PREC)
+class Index:
+    def __init__(self): self.cells, self.where = {}, {}
+    def update(self, did, lat, lng):
+        c = encode(lat, lng, PREC)
+        old = self.where.get(did)
+        if old and old != c: self.cells[old].discard(did)
+        self.cells.setdefault(c, set()).add(did); self.where[did] = c
+    def knn(self, lat, lng, k, pos):
+        best, searched, r = [], 0, 0
+        side_km = min(DLAT * 111.2, DLNG * 111.2 * math.cos(math.radians(lat)))
+        while True:
+            for di in range(-r, r + 1):
+                for dj in range(-r, r + 1):
+                    if max(abs(di), abs(dj)) != r: continue          # only the new ring
+                    c = encode(lat + di * DLAT, lng + dj * DLNG, PREC)
+                    for d in self.cells.get(c, ()): best.append((km((lat, lng), pos[d]), d)); searched += 1
+            best.sort(); best = best[:k]
+            if len(best) == k and best[-1][0] &lt;= r * side_km: return best, r, searched
+            r += 1
+            if r &gt; 60: return best, r, searched
+
+def populate(n, seed):
+    rnd = random.Random(seed); pos, idx = {}, Index()
+    for i in range(n):                                             # a metro region of roughly 60 km x 60 km
+        hot = rnd.random() &lt; 0.4                                   # 40% clustered downtown
+        lat = 37.77 + (rnd.gauss(0, 0.03) if hot else rnd.uniform(-0.27, 0.27))
+        lng = -122.42 + (rnd.gauss(0, 0.04) if hot else rnd.uniform(-0.33, 0.33))
+        pos[i] = (lat, lng); idx.update(i, lat, lng)
+    return pos, idx
+
+k = 8
+qr = random.Random(11)
+queries = [(37.77 + qr.uniform(-0.2, 0.2), -122.42 + qr.uniform(-0.25, 0.25)) for _ in range(200)]
+def brute(q, pos): return sorted((km(q, p), d) for d, p in pos.items())[:k]
+for n in (200_000, 3_000):
+    pos, idx = populate(n, 7)
+    t0 = time.perf_counter(); res = [idx.knn(q[0], q[1], k, pos) for q in queries]; t1 = time.perf_counter()
+    same = sum([d for _, d in res[i][0]] == [d for _, d in brute(queries[i], pos)] for i in range(20))
+    t2 = time.perf_counter(); [brute(q, pos) for q in queries[:20]]; t3 = time.perf_counter()
+    rings = [r for _, r, _ in res]; scanned = [s for _, _, s in res]
+    print(f&quot;{n:&gt;7,} drivers, geohash-{PREC} (cell {DLAT*111.2:.2f} km tall x {DLNG*111.2*math.cos(math.radians(37.77)):.2f} km wide), {len(idx.cells):,} non-empty cells&quot;)
+    print(f&quot;   matches brute force on 20/20 sampled queries: {same == 20}&quot;)
+    print(f&quot;   rings searched: mean {sum(rings)/len(rings):.1f}, max {max(rings)};  drivers examined: mean {sum(scanned)/len(scanned):.0f} (not {n:,})&quot;)
+    print(f&quot;   grid index {(t1-t0)/len(queries)*1000:.2f} ms/query   brute force {(t3-t2)/20*1000:.1f} ms/query&quot;)
+
+print(&quot;\nencode(57.64911, 10.40744, 11) =&quot;, encode(57.64911, 10.40744, 11), &quot;(reference value from the geohash literature: u4pruydqqvj)&quot;)
+edge = (int(-122.42 / DLNG) - 1) * DLNG                               # a cell boundary in longitude
+for lng in (edge - 0.0001, edge + 0.0001):
+    print(f&quot;  lng {lng:.6f}: {encode(37.77, lng, PREC)}&quot;)
+a, b = encode(37.77, edge - 0.0001, PREC), encode(37.77, edge + 0.0001, PREC)
+print(f&quot;  those points are about {km((37.77, edge-0.0001), (37.77, edge+0.0001))*1000:.0f} m apart and share a prefix of {len(__import__(&#x27;os&#x27;).path.commonprefix([a, b]))} of {PREC} characters&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>200,000 drivers, geohash-6 (cell 0.61 km tall x 0.97 km wide), 6,025 non-empty cells
+   matches brute force on 20/20 sampled queries: True
+   rings searched: mean 1.0, max 1;  drivers examined: mean 375 (not 200,000)
+   grid index 0.21 ms/query   brute force 77.3 ms/query
+  3,000 drivers, geohash-6 (cell 0.61 km tall x 0.97 km wide), 1,750 non-empty cells
+   matches brute force on 20/20 sampled queries: True
+   rings searched: mean 3.9, max 6;  drivers examined: mean 30 (not 3,000)
+   grid index 0.20 ms/query   brute force 0.8 ms/query
+
+encode(57.64911, 10.40744, 11) = u4pruydqqvj (reference value from the geohash literature: u4pruydqqvj)
+  lng -122.420754: 9q8yy5
+  lng -122.420554: 9q8yy7
+  those points are about 18 m apart and share a prefix of 5 of 6 characters</code></pre>
+<p>Read it three ways. <strong>Correctness:</strong> the ring search returned exactly the brute-force answer on every sampled query (the stopping rule works). <strong>Efficiency:</strong> with 200,000 drivers the index examines a few hundred candidates instead of all of them, and answers in a fraction of a millisecond against ~80 ms for the scan. <strong>Density matters:</strong> with only 3,000 drivers over the same region the search needs about four rings on average and up to six, because the cells are mostly empty; the index is still cheaper than the scan in candidates examined, but the ring count shows why a fixed cell size is the wrong tool for sparse areas and why coarser cells, or a quadtree, serve them better. The last lines show the geohash boundary effect: two points about 18 m apart that land in different cells (and, in other places, in cells with very different prefixes). This is why a query must read the neighbours, and why you compute neighbours geometrically rather than by editing the string.</p>
+<p>You can build your own and benchmark it against a scan in the <a href="../labs/lab-05-geo-index.html">geospatial index lab</a>.</p>
+<h3>Updating the index</h3>
+<p>Each ping is a move: remove the driver from the old cell's set, add to the new one, update the position map. Most pings stay in the same cell, so most are a single map write. Do the update inside the shard's single thread or under a per-cell lock; do not take a global lock. Expire entries by timestamp: a sweeper (or a lazy check at read time) removes drivers whose last ping is older than the freshness bound, so a driver whose phone died stops being matched.</p>
+
+<h2>Deep dive 2: matching, offers and not double-assigning</h2>
+<h3>Distance is not ETA</h3>
+<p>The nearest driver in a straight line may be across a river or on the wrong side of a one-way street. So matching has two stages: the cheap, geometric <em>candidate generation</em> (nearest k from the index, k maybe 10 to 15), then an <em>ETA ranking</em> of just those candidates using road-network travel time, computed by a routing service in one batched request. Computing ETA for every driver in the city would be absurd; computing it for a dozen is cheap. Keep the straight-line stage generous (the true best by road is usually within the top k by distance, not always the first) and be explicit that this is a heuristic. Other things enter the ranking: driver heading and whether they are about to finish a trip nearby, vehicle type, acceptance history.</p>
+<h3>Greedy offers versus batched matching</h3>
+<table>
+  <thead><tr><th>Strategy</th><th>How it works</th><th>Good</th><th>Bad</th></tr></thead>
+  <tbody>
+    <tr><td>Greedy, sequential</td><td>For each request, offer to the best candidate; on decline/timeout, the next</td><td>Simple; fast for the first rider; stateless</td><td>Locally optimal only: it may use up the closest driver for a rider who had other options, leaving a worse match for the next</td></tr>
+    <tr><td>Broadcast, first accept wins</td><td>Offer to several drivers at once; the first to accept gets it</td><td>Short time to match</td><td>Many drivers see offers they then lose (annoying, and they may drive toward a pickup that is no longer theirs); needs the same lease logic per offer</td></tr>
+    <tr><td>Batched (global) matching</td><td>Collect requests for a short window (a couple of seconds), then solve an assignment problem over all riders and drivers in an area minimising total pickup time</td><td>Better overall wait times at high density</td><td>A deliberate delay for each rider; more complex; needs a good cost function</td></tr>
+  </tbody>
+</table>
+<p>Opinion: start greedy; move to batching in dense cells where concurrent requests are common, since that is where greedy wastes the most. The assignment problem itself (minimum-cost bipartite matching) is textbook and not the interesting part; the interesting parts are the window length and the cost function.</p>
+<h3>The race: one driver, many dispatchers</h3>
+<p>At peak, matching runs on many stateless workers. Two of them can pick the same driver at the same moment, each convinced that he is idle. The naive code reads status, checks it is idle, then writes <code>offered</code>: a classic check-then-act race. The cure is the lease from <a href="../../distributed/chapters/04-leases-fencing.html">leases and fencing</a>, applied to a driver:</p>
+<ul>
+  <li><strong>Reserve atomically.</strong> One conditional write: "if status is idle (or holds an <em>expired</em> lease), set status offered, owner this trip, expiry now + a few seconds, and issue a new monotonically increasing token." Exactly one dispatcher's write succeeds; the others get a failure and try their next candidate.</li>
+  <li><strong>The lease expires on its own.</strong> If the dispatcher crashes after reserving, or the driver ignores the offer, nobody needs to clean up: the expiry returns the driver to the pool. No process has to remember to release.</li>
+  <li><strong>Accept carries the token.</strong> A driver (or a dispatcher acting for one) that was paused for longer than the lease and then tries to confirm presents an old token; the state store rejects it because the current token is newer. This is the fencing-token argument, here protecting the case where dispatcher A stalls, B re-leases the driver, and A wakes up and "accepts".</li>
+</ul>
+<p>The simulation runs many interleaved dispatchers over a small pool of popular drivers, once with the naive read-then-write and once with the lease. Every <code>yield</code> is a point where another dispatcher can run. An invariant check after each step counts the moments two live trips believe they hold the same driver.</p>
+<pre class="terminal" data-title="dispatch_lease.py"><code>&quot;&quot;&quot;Dispatch without double assignment. Many dispatcher requests run concurrently (generators interleaved by a seeded
+scheduler; every `yield` is a point where another dispatcher can run). Two ways to reserve a driver:
+  naive : read the driver&#x27;s status, then (a yield later) write &#x27;offered&#x27;. A check-then-act race.
+  lease : ONE atomic compare-and-set: status must be idle, or hold an EXPIRED lease. It sets owner, expiry and a fencing token.
+          A driver&#x27;s accept carries the token; the store rejects anything but the current token.
+Invariant checked after every step: no driver is held by two live trips at once.&quot;&quot;&quot;
+import random
+
+class Store:
+    def __init__(self, n):
+        self.status = [&quot;idle&quot;] * n; self.owner = [None] * n; self.expires = [0.0] * n; self.token = [0] * n; self.seq = 0
+    def try_lease(self, d, trip, now, ttl):                       # atomic (one shard, single-threaded or a Lua script)
+        if self.status[d] == &quot;idle&quot; or (self.status[d] == &quot;offered&quot; and self.expires[d] &lt;= now):
+            self.seq += 1; self.status[d], self.owner[d], self.expires[d], self.token[d] = &quot;offered&quot;, trip, now + ttl, self.seq
+            return self.token[d]
+    def accept(self, d, trip, tok, now):                          # atomic; fencing: only the current token wins
+        if self.status[d] == &quot;offered&quot; and self.owner[d] == trip and self.token[d] == tok and self.expires[d] &gt; now:
+            self.status[d] = &quot;on_trip&quot;; return True
+        return False
+    def release(self, d, trip, tok):
+        if self.owner[d] == trip and self.token[d] == tok: self.status[d], self.owner[d] = &quot;idle&quot;, None
+
+def simulate(scheme, seed, drivers=40, trips=300, ttl=3.0):
+    rnd, st = random.Random(seed), Store(drivers)
+    holders = [set() for _ in range(drivers)]                     # which live trips believe they hold each driver
+    clock = [0.0]; stats = dict(matched=0, declined=0, timed_out=0, no_driver=0, violations=0)
+    def check(d):
+        if len(holders[d]) &gt; 1: stats[&quot;violations&quot;] += 1
+
+    def dispatcher(trip):
+        cands = sorted(range(drivers), key=lambda d: abs(d - trip % 6) + rnd.random())[:6]     # popular drivers near a hot spot
+        for d in cands:
+            if scheme == &quot;naive&quot;:
+                seen = st.status[d]; yield                         # read ... another dispatcher may run here ...
+                if seen != &quot;idle&quot;: continue
+                st.status[d], st.owner[d] = &quot;offered&quot;, trip        # ... then write, based on a stale read
+                holders[d].add(trip); check(d); tok = 0
+            else:
+                tok = st.try_lease(d, trip, clock[0], ttl)
+                if not tok: continue
+                holders[d].add(trip); check(d)
+            yield                                                  # the offer is out; wait for the driver
+            r = rnd.random()
+            if r &lt; 0.55:
+                ok = True if scheme == &quot;naive&quot; else st.accept(d, trip, tok, clock[0])
+                if ok:
+                    st.status[d] = &quot;on_trip&quot;; st.owner[d] = trip; stats[&quot;matched&quot;] += 1
+                    yield from [None] * rnd.randint(5, 25)         # the trip lasts a while
+                    holders[d].discard(trip); st.status[d] = &quot;idle&quot;; st.owner[d] = None
+                    return
+            elif r &lt; 0.80: stats[&quot;declined&quot;] += 1
+            else: stats[&quot;timed_out&quot;] += 1; yield from [None] * 4   # silence until the timeout
+            holders[d].discard(trip)
+            if scheme == &quot;naive&quot;: st.status[d] = &quot;idle&quot;
+            else: st.release(d, trip, tok)
+        stats[&quot;no_driver&quot;] += 1
+
+    live, nxt = [], 0
+    while nxt &lt; trips or live:
+        clock[0] += 0.1
+        if nxt &lt; trips and rnd.random() &lt; 0.6: live.append(dispatcher(nxt)); nxt += 1
+        rnd.shuffle(live)
+        for g in live[:]:
+            try: next(g)
+            except StopIteration: live.remove(g)
+    return stats
+
+print(f&quot;{&#x27;scheme&#x27;:&lt;7}{&#x27;matched&#x27;:&gt;9}{&#x27;declined&#x27;:&gt;10}{&#x27;timed out&#x27;:&gt;11}{&#x27;no driver&#x27;:&gt;11}{&#x27;double-assign events&#x27;:&gt;22}&quot;)
+for scheme in (&quot;naive&quot;, &quot;lease&quot;):
+    s = simulate(scheme, seed=5)
+    print(f&quot;{scheme:&lt;7}{s[&#x27;matched&#x27;]:&gt;9}{s[&#x27;declined&#x27;]:&gt;10}{s[&#x27;timed_out&#x27;]:&gt;11}{s[&#x27;no_driver&#x27;]:&gt;11}{s[&#x27;violations&#x27;]:&gt;22}&quot;)
+
+st = Store(1)
+tA = st.try_lease(0, &quot;tripA&quot;, now=0.0, ttl=3.0)
+tB = st.try_lease(0, &quot;tripB&quot;, now=4.0, ttl=3.0)                    # A paused past its lease; the lease expired at t=3
+print(f&quot;\nA token={tA}, B token={tB}&quot;)
+print(&quot;A&#x27;s late accept at t=5.0:&quot;, st.accept(0, &quot;tripA&quot;, tA, 5.0), &quot;| B&#x27;s accept at t=5.0:&quot;, st.accept(0, &quot;tripB&quot;, tB, 5.0))</code></pre>
+<pre class="terminal" data-title="output"><code>scheme   matched  declined  timed out  no driver  double-assign events
+naive        222       114         89         78                   210
+lease        175        75         63        125                     0
+
+A token=1, B token=2
+A&#x27;s late accept at t=5.0: False | B&#x27;s accept at t=5.0: True</code></pre>
+<p>The naive scheme double-assigned drivers hundreds of times in this run; the lease scheme did so zero times. Look at the price, though, because there is one: the lease run <em>matched fewer trips and left more riders without a driver</em> in this toy because contention on the same few drivers is now resolved by refusal instead of by duplication. That is the right trade: a rider told "no driver yet" can be retried or batched; a driver sent to two riders is a failed trip and an angry person. The last lines are the stale accept: A's lease expired at t=3, B re-leased at t=4, and A's late accept at t=5 is rejected while B's succeeds. Where the state lives matters: the lease record and the location shard should be co-located so reserving and reading the driver's position are the same shard, or you reintroduce a cross-shard coordination problem.</p>
+<p>Also handle the driver side of double assignment: a driver app that is offered a trip must not simultaneously be offered another; <code>offered</code> being a distinct status handles it. And think about the other direction: a rider who taps twice, or whose request is retried by the client, must not get two cars; the idempotency key on <code>POST /trips</code> handles it.</p>
+
+<h2>Deep dive 3: the trip state machine</h2>
+<p>A trip is a long-lived entity that several actors mutate concurrently: the rider (cancel), the driver (accept, arrive, start, end), the matcher (assign, time out), a payment system (charge result), and support staff. Model it as an explicit state machine and make every transition a compare-and-set on the trip's version, with the allowed edges enumerated in code.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Trip state machine: requested, matching, offered, accepted, arrived, in trip, completed, paid; with failure exits to cancelled, no driver found and payment failed.">
+<defs><marker id="ahG14b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g><rect x="6" y="40" width="104" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="58" y="67" text-anchor="middle" class="t-sm t-bold">Requested</text></g>
+<g><rect x="137" y="40" width="104" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="189" y="67" text-anchor="middle" class="t-sm t-bold">Matching</text></g>
+<g><rect x="268" y="40" width="104" height="44" rx="8" class="fs-orange s-orange sw-2"/><text x="320" y="67" text-anchor="middle" class="t-sm t-bold">Offered</text></g>
+<g><rect x="399" y="40" width="104" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="451" y="67" text-anchor="middle" class="t-sm t-bold">Accepted</text></g>
+<g><rect x="530" y="40" width="104" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="582" y="67" text-anchor="middle" class="t-sm t-bold">Arrived</text></g>
+<g><rect x="661" y="40" width="104" height="44" rx="8" class="fs-yellow s-yellow sw-2"/><text x="713" y="67" text-anchor="middle" class="t-sm t-bold">In trip</text></g>
+<line x1="110" y1="62" x2="137" y2="62" class="line" marker-end="url(#ahG14b)"/>
+<line x1="241" y1="62" x2="268" y2="62" class="line" marker-end="url(#ahG14b)"/>
+<line x1="372" y1="62" x2="399" y2="62" class="line" marker-end="url(#ahG14b)"/>
+<line x1="503" y1="62" x2="530" y2="62" class="line" marker-end="url(#ahG14b)"/>
+<line x1="634" y1="62" x2="661" y2="62" class="line" marker-end="url(#ahG14b)"/>
+<line x1="268" y1="76" x2="241" y2="76" class="line-dash" marker-end="url(#ahG14b)"/>
+<text x="199" y="104" text-anchor="start" class="t-xs t-faint">declined / timed out</text>
+<g><rect x="6" y="190" width="104" height="44" rx="8" class="fs-red s-red sw-2"/><text x="58" y="217" text-anchor="middle" class="t-sm t-bold">Cancelled</text></g>
+<line x1="58" y1="84" x2="58" y2="190" class="line" marker-end="url(#ahG14b)"/>
+<text x="66" y="150" text-anchor="start" class="t-xs t-faint">rider cancels</text>
+<g><rect x="137" y="190" width="104" height="44" rx="8" class="fs-red s-red sw-2"/><text x="189" y="217" text-anchor="middle" class="t-sm t-bold">No driver</text></g>
+<line x1="189" y1="84" x2="189" y2="190" class="line" marker-end="url(#ahG14b)"/>
+<text x="197" y="175" text-anchor="start" class="t-xs t-faint">retries run out</text>
+<g><rect x="661" y="190" width="104" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="713" y="217" text-anchor="middle" class="t-sm t-bold">Completed</text></g>
+<line x1="713" y1="84" x2="713" y2="190" class="line" marker-end="url(#ahG14b)"/>
+<text x="707" y="150" text-anchor="end" class="t-xs t-faint">drop-off</text>
+<g><rect x="530" y="190" width="104" height="44" rx="8" class="fs-purple s-purple sw-2"/><text x="582" y="217" text-anchor="middle" class="t-sm t-bold">Paid</text></g>
+<line x1="661" y1="212" x2="634" y2="212" class="line" marker-end="url(#ahG14b)"/>
+<g><rect x="399" y="190" width="104" height="44" rx="8" class="fs-red s-red sw-2"/><text x="451" y="217" text-anchor="middle" class="t-sm t-bold">Payment failed</text></g>
+<line x1="713" y1="234" x2="713" y2="270" class="line-dash"/>
+<line x1="713" y1="270" x2="451" y2="270" class="line-dash"/>
+<line x1="451" y1="270" x2="451" y2="234" class="line-dash" marker-end="url(#ahG14b)"/>
+<text x="540" y="290" text-anchor="start" class="t-xs t-faint">charge fails: collect later</text>
+</svg>
+  <figcaption>Each transition is a compare-and-set on the trip row's version, so two actors racing (rider cancels as driver accepts) have exactly one winner. Failure exits are states too, not exceptions.</figcaption>
+</figure>
+<table>
+  <thead><tr><th>From</th><th>Event</th><th>To</th><th>Side effects (after commit, via the log/outbox)</th></tr></thead>
+  <tbody>
+    <tr><td>requested</td><td>matching started</td><td>matching</td><td>Emit demand event for surge</td></tr>
+    <tr><td>matching</td><td>driver leased and offer pushed</td><td>offered</td><td>Push offer; start offer timer</td></tr>
+    <tr><td>offered</td><td>accept with valid token</td><td>accepted</td><td>Notify rider; start streaming driver location to rider</td></tr>
+    <tr><td>offered</td><td>decline / timeout</td><td>matching</td><td>Release lease (or let it lapse); next candidate</td></tr>
+    <tr><td>matching</td><td>retry budget exhausted</td><td>no driver</td><td>Tell rider; offer to try again or schedule</td></tr>
+    <tr><td>requested, matching, offered, accepted</td><td>rider cancels</td><td>cancelled</td><td>Release driver; apply cancellation fee rules if after accept</td></tr>
+    <tr><td>accepted</td><td>driver arrives</td><td>arrived</td><td>Start waiting clock</td></tr>
+    <tr><td>arrived</td><td>trip started</td><td>in trip</td><td>Begin metering; record route</td></tr>
+    <tr><td>in trip</td><td>drop-off</td><td>completed</td><td>Compute final fare; enqueue payment</td></tr>
+    <tr><td>completed</td><td>payment captured</td><td>paid</td><td>Receipt; driver earnings credited</td></tr>
+    <tr><td>completed</td><td>payment fails</td><td>payment failed</td><td>Retry; collect later; flag rider</td></tr>
+  </tbody>
+</table>
+<p>The reasons to be this strict. <strong>Racing events have one winner.</strong> If the rider cancels while the driver accepts, both try to move the same version; one commit succeeds and the other sees a conflict and is told the truth. <strong>Side effects follow the state change through an outbox</strong> (<a href="../../data/chapters/19-streams-cdc.html">streams and CDC</a>), so a crash between "trip is accepted" and "rider is notified" cannot lose the notification; consumers are idempotent. <strong>Failure states are first-class.</strong> No-driver, cancelled and payment-failed are states with their own handling, not exceptions. When a step spans several services (matching, pricing, payment) and one can fail after another has acted, the design is a saga with compensations (<a href="../../architecture/chapters/15-sagas.html">sagas</a>): releasing the driver is the compensation for a cancelled trip.</p>
+
+<h2>Deep dive 4: surge, partitioning and hot spots</h2>
+<h3>Surge pricing, at concept level</h3>
+<p>When demand in an area exceeds supply, prices rise to bring more drivers in and to ration scarce cars to riders who value them most. Mechanically: in each cell, every minute, compute a supply/demand ratio from the streaming aggregates (idle drivers versus requests plus app opens), smooth it over time and across neighbouring cells (this is where H3's uniform neighbours are convenient), map the smoothed ratio to a bounded multiplier, and apply hysteresis so the price does not flicker. Two design rules matter more than the formula. First, <strong>the quote locks the price</strong> for a short window, so the multiplier is computed before the tap and honoured after. Second, pricing is an <em>eventually consistent</em>, per-cell, read-mostly value: stale by seconds is fine, and it can be served from a cache. The policy questions (caps during emergencies, fairness, transparency) are product and ethics decisions that engineering must make easy to configure and audit, not hard-code.</p>
+<h3>Partitioning</h3>
+<p>Matching is local: a rider in one city only ever needs drivers in that city. So partition by <strong>city or region</strong>: each region has its own location index shard, driver-state shard and matching workers, and the global layer only routes a request to its region (a lookup from coordinates to region). Properties: failures are contained by region (a bad deploy or crash affects one region; see <a href="../../reliability/chapters/15-blast-radius.html">blast radius</a>); capacity can be sized and scaled per region; data can live near its users (<a href="../../distributed/chapters/18-multi-region.html">multi-region</a>). Costs: regions near a boundary need to see drivers across it (a halo: the neighbouring shard is queried as well, or boundary cells are replicated), and a city that outgrows one node needs a second level of partitioning by cell range. Use consistent hashing of cells within a region to spread them (<a href="../../networking/chapters/19-partitioning.html">partitioning</a>), keeping neighbouring cells together enough that a ring query hits one or two shards, not twenty.</p>
+<h3>Hot spots</h3>
+<p>A stadium emptying or New Year's Eve produces thousands of requests from a few cells within minutes, and the nearby driver pool is tiny relative to demand. Everything we designed so far has a weakness here: one shard receives most queries, the same few drivers are contended by hundreds of dispatchers, and greedy matching thrashes. Responses, in the order I would build them:</p>
+<ul>
+  <li><strong>Admission and queueing.</strong> Put riders in an ordered queue per hot cell and match at the rate drivers become available, rather than letting every request hammer the index (<a href="../../reliability/chapters/11-overload.html">overload</a>). Show honest wait estimates.</li>
+  <li><strong>Batching.</strong> In hot cells, switch from greedy to windowed assignment so one pass serves many riders without lease conflicts.</li>
+  <li><strong>Shed the free work.</strong> Serve the "cars near me" map from a cached snapshot refreshed every few seconds; it can be hit a hundred times harder than matching without touching the index.</li>
+  <li><strong>Split the shard.</strong> Detect a cell or shard over a load threshold and split the cell range onto another node, which is the adaptive-resolution idea again.</li>
+  <li><strong>Suggest pickup points.</strong> Move riders to a nearby pickup spot, spreading them across cells and reducing the pile-up (a product fix to a systems problem).</li>
+  <li><strong>Pre-position supply.</strong> Surge prices and driver heat maps pull drivers toward the area before the event ends. The best remedy for scarcity is supply.</li>
+</ul>
+
+<h2>Payments at trip end</h2>
+<p>When the trip reaches <code>completed</code>, the fare is final and the payment must be collected. The ride system does not move money itself. It emits a <em>charge request</em> carrying an idempotency key derived from the trip id, the rider's payment method token, the amount in integer minor units and the currency, and a callback address. The payment system authorises and captures with the card network's processor and answers asynchronously with <code>paid</code> or <code>failed</code>; a failure leaves the trip in <code>payment failed</code> and triggers retries and a rider-debt flag. Because the ride is already over, a payment problem never blocks the rider from leaving; it only affects the next request. Idempotency, unknown outcomes, the ledger and reconciliation are the substance of <a href="16-payments.html">Design a Payment System</a>. Many marketplaces also place an <em>authorisation hold</em> at request time to catch invalid cards early; that, too, is a payments concept.</p>
+
+<h2>Failure modes &amp; operations</h2>
+<table>
+  <thead><tr><th>What breaks</th><th>Blast radius</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>Location shard crashes</td><td>Drivers in that region invisible to matching for seconds</td><td>Follower promotion; drivers re-announce within one ping interval; the map can be rebuilt from the next round of pings, so no recovery log is needed</td></tr>
+    <tr><td>Ping storm (reconnect after an outage)</td><td>Location service overload</td><td>Jittered reconnects, rate limit per driver, backpressure at the gateway; drop out-of-order pings by sequence number</td></tr>
+    <tr><td>Driver-state store unavailable</td><td>No new offers in that region</td><td>Replicated store with automatic failover; fail closed: do not offer without a lease (accept a stall over double-assignment)</td></tr>
+    <tr><td>ETA service slow or down</td><td>Poor ranking</td><td>Timeout and fall back to straight-line distance ranking; alert on fallback rate</td></tr>
+    <tr><td>Dispatcher dies after leasing</td><td>One driver unavailable for the lease length</td><td>Short lease expiry returns the driver to the pool; no manual cleanup</td></tr>
+    <tr><td>Gateway fleet loses connections</td><td>Offers not delivered; drivers appear to go offline</td><td>Push offers through a second channel (mobile push) as a fallback; reconnect with resumable sessions</td></tr>
+    <tr><td>Clock skew between nodes</td><td>Leases expire early or late</td><td>Use the state store's own clock for expiry decisions, as in the rate-limiter chapter; token comparison does not need clocks</td></tr>
+    <tr><td>Hot event</td><td>One region's matching latency</td><td>Admission queue, batching, cached map snapshot, shard splitting, as above</td></tr>
+    <tr><td>Bad surge multiplier shipped</td><td>Prices wildly wrong in a region</td><td>Bounds enforced in the quote service, staged rollout, per-region kill switch, alert on multiplier distribution</td></tr>
+  </tbody>
+</table>
+<p><strong>SLOs.</strong> Match latency (request to first offer) p95 under 3 s; offer-to-accept time tracked, not alerted; a correctness SLI of zero double-assigned drivers (alert at the first); location freshness (fraction of idle drivers whose last ping is under 10 s old) above 99%; request-success (a rider gets a driver within the time limit) per region, with burn-rate alerts. <strong>Roll out</strong> by region, smallest cities first, with a shadow mode for new matching logic that computes the alternative assignment and logs it without acting, so you can compare pickup times before the switch. Load-test with replayed pings and synthetic events at 3x peak (<a href="../../reliability/chapters/10-load-testing-capacity.html">load testing</a>).</p>
+
+<h2>Trade-offs &amp; alternatives</h2>
+<ul>
+  <li><strong>Freshness versus cost.</strong> A 4-second ping gives accurate matching and a 250k writes/second ingest bill. Adaptive rates (more often when moving fast or near a request, less when parked) cut writes without hurting quality; this is a battery argument too.</li>
+  <li><strong>Greedy versus batched matching.</strong> Latency to first offer versus overall efficiency. Mixed by density.</li>
+  <li><strong>Ephemeral versus durable location.</strong> We chose to lose location on a crash because it re-converges in seconds. If regulations required a durable breadcrumb for every trip, write the trip-time pings to the log (we already do) but still serve matching from memory.</li>
+  <li><strong>Fixed grid versus adaptive structure.</strong> Fixed cells are simple and cache-friendly but waste work in sparse or dense extremes. Adaptive structures fit the data and cost complexity.</li>
+  <li><strong>If it were delivery with batching of multiple orders per courier,</strong> the problem becomes vehicle routing, not nearest-driver search.</li>
+  <li><strong>If drivers were scheduled in advance (airport pickups),</strong> inventory-style reservation (the next chapter) replaces the real-time lease.</li>
+  <li><strong>Where it breaks down:</strong> GPS error in city canyons puts drivers in the wrong cell or on the wrong side of a road. Map-matching to the road network on the server, and a pickup point rather than a coordinate, fix most of it.</li>
+</ul>
+
+<h2>What a strong answer adds</h2>
+<ul>
+  <li>Separates ephemeral location from durable trips, and justifies in-memory, sharded, lossy storage with the write-rate and size numbers.</li>
+  <li>Chooses a cell resolution from driver density, not by habit, and names geohash, quadtree, S2 and H3 with one real strength and weakness each.</li>
+  <li>States the stopping rule for ring expansion (the bound on unsearched distance), not just "keep widening".</li>
+  <li>Explains distance versus ETA and uses a two-stage candidate and rank pipeline.</li>
+  <li>Prevents double assignment with an atomic lease with expiry and a fencing token, and explains why a crashed dispatcher needs no cleanup.</li>
+  <li>Draws the trip state machine with failure states and uses a version check on each transition and an outbox for side effects.</li>
+  <li>Partitions by city, thinks about the boundary halo, and has a plan for a hot cell beyond "add servers".</li>
+  <li>Keeps surge at concept level but locks the price in a quote, and hands payment off with an idempotency key.</li>
+</ul>
+
+<h2>Follow-up questions</h2>
+<details class="deeper">
+  <summary>How do you find drivers near a rider who is exactly on a cell boundary?</summary>
+  <p>Always search the rider's cell plus its neighbours. A boundary rider has drivers just across the line in the next cell, and nearby points can have very different geohash prefixes. The ring-expansion stopping rule accounts for it, because it only trusts the k-th candidate once the searched block extends far enough in every direction.</p>
+</details>
+<details class="deeper">
+  <summary>What if two riders both get offered the same driver?</summary>
+  <p>They cannot, if reserving is a single atomic compare-and-set on the driver's state (idle to offered, with an owner, an expiry and a token). The second dispatcher's CAS fails and it tries the next candidate. If we had used read-then-write instead, both would proceed; the simulation shows it. A late accept is rejected because its token is stale.</p>
+</details>
+<details class="deeper">
+  <summary>How would you handle the stadium letting out?</summary>
+  <p>Queue riders per hot cell and match at the rate supply appears; switch the cell to batched assignment; serve the nearby-cars map from a cached snapshot so it does not load the index; split the hot shard if it saturates; suggest walkable pickup points to spread riders across cells; and let surge pricing pull drivers in. Show honest wait times.</p>
+</details>
+<details class="deeper">
+  <summary>How do you keep driver positions fresh without melting the backend?</summary>
+  <p>Cheaper pings, not fewer drivers: adaptive intervals (slower when stationary), compact binary messages, batching at the gateway, and in-memory sharding so a ping is one map write. Drop out-of-order pings by sequence number. Staleness has a defined bound (about 15 seconds) after which a driver is excluded.</p>
+</details>
+<details class="deeper">
+  <summary>Why not store locations in Postgres with PostGIS?</summary>
+  <p>For static places, PostGIS and an R-tree are excellent. For 250k updates a second on points that are worthless in seconds, you would pay durable-commit and index-maintenance costs for data that needs neither. The ephemeral store is faster, cheaper, and its crash recovery is 'wait one ping interval'. Use the database for trips, where durability matters.</p>
+</details>
+<details class="deeper">
+  <summary>How would you show a rider an ETA that is honest?</summary>
+  <p>The matched driver's route ETA to pickup, recomputed from live positions every few seconds, with a pessimistic margin on uncertain segments, and an explicit change message if it moves a lot. Before matching, the 'N minutes away' figure is an estimate from nearby idle drivers, labelled as such.</p>
+</details>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In the geo-index script, change the geohash precision to 5 and then 7 and compare the number of candidates examined and the ring counts for both population sizes. Then change the dispatch simulation so the lease TTL is 0.2 seconds and watch what happens to double-assignment (the check-then-act race is gone, but a slow driver's accept now races with expiry). Finally, in the widget, pick a rider at a cell corner, set k to 15 at precision 6 and note how many rings are needed.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>The lease with a fencing token is the same mechanism you met for distributed locks, applied to a physical resource, and the check-then-act race is the same one you will find in the <a href="../../data/chapters/11-isolation.html">isolation chapter</a> as a lost update. The trip state machine with version checks and an outbox is optimistic concurrency plus reliable messaging. Sharding by city is partitioning along a natural locality, and the boundary halo is its usual cost.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Locations are ephemeral: 250k writes/s but about 100 MB. Keep the latest position in memory, sharded and lossy; stream history to a log; never put pings in the trip database.</li>
+    <li>Index by cells (geohash, quadtree, S2 or H3). Choose resolution from driver density, always search neighbours, and stop ring expansion only when the k-th candidate is closer than rings x smallest cell side.</li>
+    <li>Generate candidates by straight-line distance and rank a dozen by road ETA. Distance is a heuristic, not the answer.</li>
+    <li>Prevent double assignment with an atomic lease on the driver (owner, expiry, fencing token). Expiry is the cleanup; the token rejects stale accepts.</li>
+    <li>The trip is an explicit state machine with versioned transitions, failure states as first-class states and side effects through an outbox.</li>
+    <li>Partition by city or region with a halo at boundaries; plan for hot cells with queues, batching, cached maps, shard splitting and pricing.</li>
+    <li>Surge is a smoothed per-cell supply/demand multiplier, locked in the quote. Payment is a hand-off with an idempotency key to the payment system.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why are driver locations kept in memory rather than in the primary trips database?</p>
+    <ol class="q-options">
+      <li>Memory is more durable</li>
+      <li>SQL cannot store coordinates</li>
+      <li>250k writes/s of data that is useless in seconds does not need durable commits, and the whole table is about 100 MB</li>
+      <li>It makes the map more accurate</li>
+    </ol>
+    <div class="q-explain">The load is write rate, not size, and the data self-heals within a ping interval after a crash. Durable storage is for trips.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A k-nearest ring search has found k candidates after searching the rider's cell and the first ring. When is it safe to stop?</p>
+    <ol class="q-options">
+      <li>When the k-th candidate's distance is at most the number of rings searched times the smallest cell side</li>
+      <li>Always, k are enough</li>
+      <li>Only after searching at least 5 rings</li>
+      <li>When the cell is empty</li>
+    </ol>
+    <div class="q-explain">Anything unsearched is at least r x cell side away, because the rider sits inside their own cell. A closer driver just outside the block would break correctness otherwise.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Two dispatchers choose the same idle driver at once. What prevents double assignment?</p>
+    <ol class="q-options">
+      <li>Higher priority for the first request</li>
+      <li>Retrying both offers</li>
+      <li>A longer ping interval</li>
+      <li>An atomic conditional write on the driver's state that only succeeds if idle (or the lease expired)</li>
+    </ol>
+    <div class="q-explain">Check-then-act is racy; a single compare-and-set has exactly one winner, and the loser tries its next candidate.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">What is the purpose of the fencing token on an accept?</p>
+    <ol class="q-options">
+      <li>To encrypt the offer</li>
+      <li>To reject an accept that comes from an old lease after the driver was re-leased to someone else</li>
+      <li>To order pings</li>
+      <li>To compute ETA</li>
+    </ol>
+    <div class="q-explain">A paused dispatcher or slow driver may act on an expired lease; the store accepts only the current token.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why shard the matching system by city or region?</p>
+    <ol class="q-options">
+      <li>Cities are the same size</li>
+      <li>It avoids needing an index</li>
+      <li>Matching is local, so regions are independent: failures and load stay contained, with a halo at the boundaries</li>
+      <li>It guarantees equal load</li>
+    </ol>
+    <div class="q-explain">A rider only needs nearby drivers; partitioning along that locality is natural and bounds blast radius.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Which is the best treatment of the straight-line nearest driver?</p>
+    <ol class="q-options">
+      <li>Use it to generate candidates, then re-rank the top few by road ETA</li>
+      <li>Always assign them</li>
+      <li>Ignore distance and use only rating</li>
+      <li>Assign randomly among all idle drivers</li>
+    </ol>
+    <div class="q-explain">Straight-line distance is cheap and approximately right; the road network decides the actual time, so rank a small candidate set by ETA.</div>
+  </div>
+</section>
+
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/geo-cells.js"></script>
+</body>
+</html>

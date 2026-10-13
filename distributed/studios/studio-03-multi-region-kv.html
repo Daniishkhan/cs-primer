@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design a Multi-Region Key-Value Store · Distributed Systems, Deep</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dist" data-studio="S3">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design a Multi-Region Key-Value Store</h1>
+  <p class="lede">Put replicas on three continents and the speed of light becomes your biggest design constraint: a round trip between two regions costs more than a thousand in-region ones. Every choice about consistency, leaders and failover is a choice about which users pay those milliseconds, and which failures you are willing to survive. This studio designs a store where that choice is explicit.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">How a design studio works</p>
+  <p>This page is a design problem, not a chapter. At each stage there's a <strong>Your turn</strong> question. Write your answer in the notes box first (it saves in this browser), <em>then</em> open the worked answer and compare. The worked answer isn't the only right design; it's one strong one with its reasoning. A rubric at the end lets you check whether you covered what an experienced engineer would. Being wrong first and then seeing why is the point of the exercise.</p>
+</div>
+
+<div class="studio-brief">
+  <p class="brief-title">📐 The brief</p>
+  <p>You're designing a <strong>globally distributed key-value store</strong> that a company's product teams use as their primary database, in the family of Spanner, CockroachDB, DynamoDB global tables and Cassandra.</p>
+  <ul>
+    <li>Deployed in <strong>four regions</strong>: US East, US West, EU West and Asia South. Users are spread across all of them.</li>
+    <li>About <strong>500,000 reads and 50,000 writes per second</strong> globally; <strong>100 TB</strong> of data; values around 1 KB.</li>
+    <li>Different tables need <strong>different consistency</strong>: money-like data must be linearizable; a product catalogue can be slightly stale; a shopping cart must stay writable from anywhere.</li>
+    <li>Losing a whole region must be survivable, with targets stated as <strong>RPO and RTO</strong> per table.</li>
+    <li>Some customers' data <strong>must stay inside the EU</strong>.</li>
+  </ul>
+  <p>Prerequisites: consistency models (<a href="../chapters/05-consistency-models.html">chapter 5</a>), hybrid logical clocks (<a href="../chapters/07-time-revisited.html">chapter 7</a>), the speed-of-light budget and failover (<a href="../chapters/18-multi-region.html">chapter 18</a>).</p>
+</div>
+
+<h2>Your notes</h2>
+<p>Keep notes as you go: decisions, numbers, open questions. Plain text is fine; try sketching boxes and timelines with characters, as in an interview whiteboard.</p>
+<textarea class="studio-notes" aria-label="Your design notes for this studio" placeholder="Priorities and guarantees…&#10;Back-of-envelope numbers…&#10;API, data model, components…"></textarea>
+
+<section class="stage">
+<h2><span class="h-num">1</span>Requirements: consistency is a per-table decision</h2>
+<p class="stage-q">Sort the data this store will hold into classes by what a wrong answer costs. For each class, choose a consistency model, and state RPO and RTO in numbers. Which promise do you refuse to make? What is out of scope?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>A single global consistency setting would be either too slow for everything or too weak for money. So the first design decision is to make consistency a <strong>property of the table</strong> and to say which classes exist:</p>
+  <table>
+    <thead><tr><th>Class</th><th>Example tables</th><th>Promise</th><th>Cost you accept</th><th>RPO / RTO target</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Strong</strong></td><td>account balances, inventory counts, unique usernames</td><td>Linearizable reads and writes (<a href='../chapters/05-consistency-models.html'>chapter 5</a>), single-key CAS</td><td>Cross-region commit latency; unavailable on the minority side of a partition</td><td>RPO 0; RTO tens of seconds (election and lease expiry)</td></tr>
+      <tr><td><strong>Bounded-stale</strong></td><td>product catalogue, config, profiles</td><td>Reads from the nearest replica at a timestamp at most T seconds old (say 10 s); writes strong</td><td>Reads may be stale by up to T</td><td>RPO 0 for writes; RTO of the leader, but reads keep working</td></tr>
+      <tr><td><strong>Active-active</strong></td><td>shopping cart, preferences, presence, counters</td><td>Writes accepted in every region at local latency; replicas converge; conflicts are resolved by a stated rule</td><td>Concurrent writes can conflict; recent writes may be lost or merged</td><td>RPO = replication lag (seconds); RTO ≈ 0, since other regions are already serving</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>What we refuse to promise:</strong> low latency <em>and</em> linearizability for the same table across continents. That is the PACELC trade-off (<a href="../chapters/02-impossibility.html">chapter 2</a>): even with no failures, strong consistency costs round trips.</li>
+    <li><strong>Always, for every class:</strong> no corruption, no silently dropped acknowledged write in the strong class, and a clear, tested answer to "what happens when a region disappears?".</li>
+    <li><strong>Residency:</strong> rows tagged as EU data are stored, replicated and failed over only inside EU locations (stage 6e).</li>
+    <li><strong>Out of scope:</strong> SQL and secondary indexes, multi-key transactions across partitions (the atomic-commit machinery of <a href="../chapters/13-atomic-commit.html">chapter 13</a> and <a href="../chapters/14-distributed-transactions.html">14</a>; say it is an extension), analytics, and the storage engine inside one node.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">2</span>Estimates: the speed-of-light budget</h2>
+<p class="stage-q">Take assumed round-trip times between regions. How long does a strongly consistent write take for a client near the leader and far from it? What does the choice of leader region cost? How much cross-region data do you move per day? How many consensus groups do you run?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p><strong>Assumed</strong> round-trip times (illustrative; real values depend on routes and providers, so measure yours): us-east to us-west 65 ms, us-east to eu-west 75 ms, us-west to eu-west 140 ms, and Asia South is farther still (very roughly 120–250 ms to the others). Same region, between zones: about 1 ms. Light in fibre covers roughly 200 km per millisecond one way, so no engineering removes these (chapter 18).</p>
+<pre class="terminal" data-title="geo.py"><code># Assumed round-trip times in ms (illustrative, not measured). Same-region replicas: 1 ms.
+rtt = {("us-east","us-west"):65, ("us-east","eu-west"):75, ("us-west","eu-west"):140}
+def d(a, b):
+    return 1 if a == b else rtt.get((a, b)) or rtt[(b, a)]
+
+def commit_ms(leader, replicas):
+    """Leader needs acks from a majority; it counts itself, so it waits for the
+    (majority-1)-th nearest other replica."""
+    need = len(replicas) // 2 + 1
+    others = sorted(d(leader, r) for r in replicas)[1:]      # drop the leader itself (distance to itself sorts first)
+    return others[need - 2]
+
+layouts = {
+  "3 replicas, one per region":      ["us-east", "us-west", "eu-west"],
+  "5 replicas, 2 + 2 + 1":           ["us-east", "us-east", "us-west", "us-west", "eu-west"],
+}
+for name, reps in layouts.items():
+    print(name)
+    for leader in sorted(set(reps)):
+        print(f"   leader in {leader:8}: commit waits {commit_ms(leader, reps):3} ms")
+    # survive the loss of any whole region?
+    need = len(reps) // 2 + 1
+    ok = all(len(reps) - reps.count(r) &gt;= need for r in set(reps))
+    print(f"   majority = {need}; survives losing any one region: {ok}")
+print()
+for client in ("us-east", "us-west", "eu-west"):
+    print(f"client in {client}, leader us-east, 3 replicas: strong write = {d(client,'us-east') if client!='us-east' else 0} + {commit_ms('us-east', layouts['3 replicas, one per region'])} ms")</code></pre><pre class="terminal" data-title="terminal"><code>3 replicas, one per region
+   leader in eu-west : commit waits  75 ms
+   leader in us-east : commit waits  65 ms
+   leader in us-west : commit waits  65 ms
+   majority = 2; survives losing any one region: True
+5 replicas, 2 + 2 + 1
+   leader in eu-west : commit waits  75 ms
+   leader in us-east : commit waits  65 ms
+   leader in us-west : commit waits  65 ms
+   majority = 3; survives losing any one region: True
+
+client in us-east, leader us-east, 3 replicas: strong write = 0 + 65 ms
+client in us-west, leader us-east, 3 replicas: strong write = 65 + 65 ms
+client in eu-west, leader us-east, 3 replicas: strong write = 75 + 65 ms</code></pre>
+  <ul>
+    <li><strong>A strong write costs one round trip to the leader plus one round trip from the leader to the nearest majority.</strong> With the leader in us-east and three replicas, a us-east client pays 65 ms, a us-west client 130 ms and an eu-west client 140 ms. The commit waits only for the <em>nearest other replica</em> (us-west, 65 ms), not the farthest: majority quorums ignore the slowest replica.</li>
+    <li><strong>Reads:</strong> a strong read must be confirmed by the leader (a lease makes this local to the leader, chapter 10), so a far client pays the trip to the leader: 65–75 ms. A bounded-stale read from a nearby replica is ~1–5 ms. That asymmetry is why most of the 500,000 reads a second should be bounded-stale or follower reads when the table allows it.</li>
+    <li><strong>Volume:</strong> 50,000 writes/s × 1 KB = 50 MB/s. Each write is sent to two remote regions: ≈ 100 MB/s cross-region ≈ <strong>8.6 TB a day</strong> of inter-region traffic, which is a significant cost line as well as a capacity one.</li>
+    <li><strong>Consensus groups:</strong> 100 TB in partitions of about 10 GB is on the order of <strong>10,000 partitions</strong>, each its own replicated group. Heartbeats and elections per group would swamp the network, so real systems coalesce messages between each pair of nodes. Think of this as "multi-Raft".</li>
+    <li><strong>Storage:</strong> 100 TB × 3 replicas = 300 TB, or × 5 = 500 TB for the strong tables if you choose five replicas (stage 6b). Decide per table.</li>
+  </ul>
+  <p>What drives the design: where the <em>leader</em> of each partition lives, since it sets every writer's latency, and how many replicas are in how many regions, since that sets what failures are survivable.</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">3</span>API: consistency is visible in every call</h2>
+<p class="stage-q">Design the client API. How does a table declare its class? How does a read ask for a freshness level? How does a client get read-your-writes when its next read lands on a different replica or region?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <pre class="terminal" data-title="API sketch (pseudocode)"><code>CREATE TABLE accounts  (consistency = STRONG,        home = 'us-east',  replicas = 3 across regions)
+CREATE TABLE catalogue (consistency = STRONG_WRITE,  stale_reads_ok = 10s)
+CREATE TABLE carts     (consistency = ACTIVE_ACTIVE, merge = 'cart-crdt')
+CREATE TABLE eu_users  (consistency = STRONG,        placement = EU_ONLY)
+
+put(table, key, value, if_version=V | if_absent, idempotency_key=K)  -> {version, token}
+get(table, key, read=STRONG | BOUNDED(10s) | LOCAL, after=token)    -> {value, version, token}
+
+# token is an opaque causal timestamp (an HLC value, chapter 7): "I have seen up to here"</code></pre>
+  <ul>
+    <li><strong>Per-request override, never silently weaker.</strong> A caller may ask for a <em>weaker</em> read than the table default (<code>BOUNDED</code>, <code>LOCAL</code>) to save latency; it may not get stronger consistency than the table can provide, and every response states which level it actually got.</li>
+    <li><strong>Session guarantees through a token</strong> (<a href="../chapters/06-causal-session.html">chapter 6</a>). A write returns a causal token (an HLC timestamp). A later read passes <code>after=token</code>; the replica serving it either already has data at least that new, or waits briefly, or forwards to a fresher replica. This gives read-your-writes and monotonic reads across regions without paying for linearizability.</li>
+    <li><strong>Conditional writes</strong> (<code>if_version</code>, <code>if_absent</code>) are the building block of safe updates for strong tables. In active-active tables a conditional write is only checked <em>locally</em>, which is a weaker thing; the API must say so.</li>
+    <li><strong>Idempotency keys</strong> make client retries after a timeout harmless: a timeout does not say whether the write happened (<a href="../chapters/01-system-models.html">chapter 1</a>).</li>
+    <li><strong>Errors tell the truth:</strong> <code>NOT_LEADER</code> (with a hint), <code>UNAVAILABLE_NO_QUORUM</code> (strong class, minority side), <code>STALE_BEYOND_BOUND</code>, and <code>COMMIT_UNKNOWN</code> for a timeout after the proposal was sent.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">4</span>Data model and placement</h2>
+<p class="stage-q">Sketch how a table becomes partitions, how partitions become replica sets, and how the system knows where everything is. Where does the home region live in the key? What metadata must itself be highly available?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <table>
+    <thead><tr><th>Layer</th><th>What it holds</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Catalog</strong> (small, replicated across all regions)</td><td>Tables, their class, placement policy, partition map, replica sets with their leader</td><td>The one thing every region must agree on. Kept small and heavily cached; a stale cached map yields a redirect, never a wrong answer.</td></tr>
+      <tr><td><strong>Partition</strong></td><td>A key range (or hash range) of one table, about 10 GB</td><td>The unit of replication, leadership, movement and failover.</td></tr>
+      <tr><td><strong>Replica set</strong></td><td>3 or 5 replicas, each in a stated zone/region, with a leader preference</td><td>Placement policy: <em>replicas = 5, 2 in us-east, 2 in us-west, 1 in eu-west, leader prefers us-east</em>.</td></tr>
+      <tr><td><strong>Row version</strong></td><td><code>(key, HLC timestamp) → value</code>, MVCC</td><td>Multi-versioning makes bounded-stale reads and snapshot reads cheap and consistent (<a href='../chapters/07-time-revisited.html'>chapter 7</a>).</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>Home region in the key.</strong> For per-user data, make the first part of the key the user's home region, then user id. Ranges then sort by region, partitions can be pinned to a region, and one user's rows sit together. This is geo-partitioning: the leader of a partition lives where most of its writers do.</li>
+    <li><strong>The home region follows the user.</strong> A user who moves keeps their data home until a migration moves it (a background copy and a cut-over with a brief write pause), not on every flight.</li>
+    <li><strong>Leaders are re-electable and movable.</strong> The leader of a partition can be transferred to another replica without data movement; do this when load shifts (follow the sun) or before maintenance.</li>
+    <li><strong>The catalog is a consensus group of its own</strong> with replicas in every region and is excluded from the hot path by caching.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">5</span>Architecture: where the leaders live</h2>
+<p class="stage-q">Draw three regions and two partitions with different home regions. For a client far from the leader, trace one write. Which replica's acknowledgement does the commit wait for, and why does the farthest one not matter?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Every partition is a replicated state machine (<a href="../chapters/08-consensus-smr.html">chapter 8</a>) run by a consensus protocol such as Raft or Paxos (<a href="../chapters/10-raft-deep.html">chapter 10</a>). What makes it <em>multi-region</em> is only the placement of the replicas and the leader.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-label="Three regions, each holding a replica of every partition. Partition P1 has its leader in us-east with followers in us-west and eu-west; partition P2 has its leader in eu-west with followers in the other two. Clients and API servers in each region talk to their local replicas and are redirected to leaders for strong writes. Round-trip times between regions are shown on the replication arrows.">
+<defs><marker id="ahXS1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahXS1ablue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahXS1agreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahXS1ared" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahXS1aorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahXS1apurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahXS1acyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker></defs>
+<rect x="10" y="34" width="220" height="226" rx="12" class="line-dash"/><text x="120" y="52" text-anchor="middle" class="t-sm t-bold">us-west</text><rect x="270" y="34" width="220" height="226" rx="12" class="line-dash"/><text x="380" y="52" text-anchor="middle" class="t-sm t-bold">us-east</text><rect x="530" y="34" width="220" height="226" rx="12" class="line-dash"/><text x="640" y="52" text-anchor="middle" class="t-sm t-bold">eu-west</text><rect x="30" y="66" width="180" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="120.0" y="87.0" text-anchor="middle" class="t-sm t-bold">P1 follower</text><text x="120.0" y="103.0" text-anchor="middle" class="t-xs t-muted">accounts range 7</text><rect x="290" y="66" width="180" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="380.0" y="87.0" text-anchor="middle" class="t-sm t-bold">P1 LEADER</text><text x="380.0" y="103.0" text-anchor="middle" class="t-xs t-muted">home region us-east</text><rect x="550" y="66" width="180" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="640.0" y="87.0" text-anchor="middle" class="t-sm t-bold">P1 follower</text><text x="640.0" y="103.0" text-anchor="middle" class="t-xs t-muted">accounts range 7</text><rect x="30" y="132" width="180" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="120.0" y="153.0" text-anchor="middle" class="t-sm t-bold">P2 follower</text><text x="120.0" y="169.0" text-anchor="middle" class="t-xs t-muted">users range 3</text><rect x="290" y="132" width="180" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="380.0" y="153.0" text-anchor="middle" class="t-sm t-bold">P2 follower</text><text x="380.0" y="169.0" text-anchor="middle" class="t-xs t-muted">users range 3</text><rect x="550" y="132" width="180" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="640.0" y="153.0" text-anchor="middle" class="t-sm t-bold">P2 LEADER</text><text x="640.0" y="169.0" text-anchor="middle" class="t-xs t-muted">home region eu-west</text><rect x="30" y="200" width="180" height="44" rx="8" class="fs-green s-green sw-2"/><text x="120.0" y="218.0" text-anchor="middle" class="t-sm t-bold">Clients + API servers</text><rect x="290" y="200" width="180" height="44" rx="8" class="fs-green s-green sw-2"/><text x="380.0" y="218.0" text-anchor="middle" class="t-sm t-bold">Clients + API servers</text><rect x="550" y="200" width="180" height="44" rx="8" class="fs-green s-green sw-2"/><text x="640.0" y="218.0" text-anchor="middle" class="t-sm t-bold">Clients + API servers</text><line x1="288" y1="88" x2="212" y2="88" class="line s-blue" marker-end="url(#ahXS1ablue)"/><line x1="472" y1="88" x2="548" y2="88" class="line s-blue" marker-end="url(#ahXS1ablue)"/><text x="250" y="80" text-anchor="middle" class="t-xs tc-blue">65 ms</text><text x="510" y="80" text-anchor="middle" class="t-xs tc-blue">75 ms</text><line x1="548" y1="154" x2="472" y2="154" class="line s-blue" marker-end="url(#ahXS1ablue)"/><text x="510" y="146" text-anchor="middle" class="t-xs tc-blue">75 ms</text><text x="380" y="284" text-anchor="middle" class="t-xs t-muted">P2 also replicates to us-west (140 ms); catalog replicated in every region</text>
+</svg>
+<figcaption><strong>Leaders are spread by home region.</strong> Replication arrows run from each leader to its followers; labels are assumed round-trip times.</figcaption>
+</figure>
+  <p>A write goes: client → local API server → (redirect if needed) → the partition's leader → majority → reply.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 294" role="img" aria-label="Space-time diagram of a strong write from a client in us-west whose partition leader is in us-east. The client sends to the leader, the leader appends to the us-west and eu-west followers, the us-west follower acks first so the leader commits with two of three, and replies to the client. The eu-west ack arrives after the commit. Total is about 130 milliseconds.">
+<defs><marker id="ahXS1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahXS1bblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahXS1bgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahXS1bred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahXS1borange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahXS1bpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahXS1bcyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker></defs>
+<line x1="124" y1="52" x2="748" y2="52" class="line-thin"/>
+<text x="6" y="56" class="t-sm t-bold tc-green">Client (us-west)</text>
+<line x1="124" y1="114" x2="748" y2="114" class="line-thin"/>
+<text x="6" y="118" class="t-sm t-bold tc-purple">Leader (us-east)</text>
+<line x1="124" y1="176" x2="748" y2="176" class="line-thin"/>
+<text x="6" y="180" class="t-sm t-bold tc-blue">Follower (us-west)</text>
+<line x1="124" y1="238" x2="748" y2="238" class="line-thin"/>
+<text x="6" y="242" class="t-sm t-bold tc-blue">Follower (eu-west)</text>
+<line x1="140" y1="52" x2="239" y2="114" class="line s-blue" marker-end="url(#ahXS1bblue)"/>
+<rect x="170.5" y="71.0" width="38.0" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="189.5" y="81.0" text-anchor="middle" class="t-xs tc-blue">write</text>
+<line x1="239" y1="114" x2="338" y2="176" class="line s-blue" marker-end="url(#ahXS1bblue)"/>
+<rect x="266.7" y="133.0" width="43.6" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="288.5" y="143.0" text-anchor="middle" class="t-xs tc-blue">append</text>
+<line x1="239" y1="114" x2="351" y2="238" class="line s-blue" marker-end="url(#ahXS1bblue)"/>
+<rect x="273.2" y="184.0" width="43.6" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="295.0" y="194.0" text-anchor="middle" class="t-xs tc-blue">append</text>
+<line x1="338" y1="176" x2="437" y2="114" class="line s-green" marker-end="url(#ahXS1bgreen)"/>
+<rect x="374.1" y="131.0" width="26.8" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="387.5" y="141.0" text-anchor="middle" class="t-xs tc-green">ack</text>
+<line x1="351" y1="238" x2="463" y2="114" class="line s-green" marker-end="url(#ahXS1bgreen)"/>
+<rect x="374.0" y="188.0" width="66.0" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="407.0" y="198.0" text-anchor="middle" class="t-xs tc-green">ack (late)</text>
+<circle cx="437" cy="114" r="4" class="f-purple"/>
+<text x="437" y="104" text-anchor="middle" class="t-xs tc-purple">commit: 2 of 3</text>
+<line x1="437" y1="114" x2="536" y2="52" class="line s-green" marker-end="url(#ahXS1bgreen)"/>
+<rect x="475.9" y="71.0" width="21.2" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="486.5" y="81.0" text-anchor="middle" class="t-xs tc-green">ok</text>
+<rect x="140" y="45" width="396" height="14" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="338.0" y="40" text-anchor="middle" class="t-xs tc-orange">about 130 ms for this client</text>
+</svg>
+<figcaption><strong>A strong write across regions.</strong> The commit waits for the nearest follower; the far one is not on the critical path. Scale: 1 ms ≈ 3 px.</figcaption>
+</figure>
+  <ul>
+    <li>The leader commits when a <em>majority</em> has the entry. With three replicas that is the leader plus one follower, and the nearest follower wins the race. The far follower is up to date a moment later and does not slow the commit.</li>
+    <li>For the <em>client</em>, the cost is the extra leg to the leader. That is the argument for homing a partition near its writers, and for letting reads go to local replicas where the class allows.</li>
+    <li>Strong <strong>reads</strong> go to the leader (or to a follower that has confirmed it is current). Bounded-stale reads go to any replica whose applied timestamp is within the bound; the replica knows its own "safe time" from the leader's heartbeats.</li>
+    <li><strong>Active-active tables</strong> do not follow this path at all: a write is accepted at the nearest replica group and replicated asynchronously to the others (stage 6c).</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">6</span>Deep dives</h2>
+<p class="stage-q">Six hard parts: (a) the menu of consistency mechanisms; (b) replica placement and quorum arithmetic; (c) conflicts in active-active tables; (d) region failover with RPO and RTO; (e) data residency; (f) testing. Take each in turn and write down the number or rule you would commit to.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <h3>(a) The consistency menu, with prices</h3>
+  <table>
+    <thead><tr><th>Mechanism</th><th>Consistency</th><th>Write latency from a far client</th><th>Survives region loss?</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>Single leader per partition, synchronous majority (3 or 5 replicas)</td><td>Linearizable</td><td>One round trip to the leader plus the nearest-majority round trip</td><td>Yes if a majority remains (see 6b)</td><td>Balances, unique constraints</td></tr>
+      <tr><td>Same, with bounded-stale follower reads</td><td>Linearizable writes, reads stale ≤ T</td><td>As above; reads local (~1–5 ms)</td><td>Yes; reads continue even if leader is down</td><td>Catalogues, profiles</td></tr>
+      <tr><td>Async cross-region replica (leader local, followers lag)</td><td>Linearizable in the home region only</td><td>Local (low)</td><td>Region loss loses the lag window: RPO &gt; 0</td><td>DR copies, read replicas</td></tr>
+      <tr><td>Leaderless quorum (R + W &gt; N, Dynamo-style)</td><td>Not linearizable in general (even with R + W &gt; N, there are anomalies: sloppy quorums, concurrent writes, clock-ordered conflicts)</td><td>Wait for W replicas; choose W local to stay fast</td><td>Yes, by design</td><td>High-availability stores</td></tr>
+      <tr><td>Multi-leader active-active, async merge</td><td>Eventual with a conflict rule</td><td>Local</td><td>Yes: other regions already take writes</td><td>Carts, presence, counters</td></tr>
+    </tbody>
+  </table>
+  <p>The honest sentence for each: you buy lower latency or higher availability by <em>giving up</em> a specific guarantee, and the contract must name which.</p>
+
+  <h3>(b) Replica placement: how many, and where?</h3>
+  <p>Quorum arithmetic decides what failures a placement survives. With <em>n</em> replicas the majority is ⌊n/2⌋+1; a region failure removes all replicas in it.</p>
+  <table>
+    <thead><tr><th>Placement</th><th>Majority</th><th>Survives losing one region?</th><th>Strong write latency (leader in us-east)</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>3 replicas, one per region (east, west, eu)</td><td>2 of 3</td><td>Yes (2 remain)</td><td>65 ms (nearest other: us-west)</td><td>Simple. After one region is lost, a single further node failure stops the partition</td></tr>
+      <tr><td>5 replicas: 2 east, 2 west, 1 eu</td><td>3 of 5</td><td>Yes (lose a 2-replica region: 3 remain)</td><td>65 ms: one ack from the same-region peer (1 ms), then one from us-west (65 ms)</td><td>Tolerates any two node failures, and the loss of any one region; costs 5 copies</td></tr>
+      <tr><td>2 regions, 3 + 3 replicas</td><td>4 of 6</td><td><strong>No</strong>: losing either region leaves 3, below the majority of 4</td><td>About 65 ms: leader, two local peers and one remote ack make the 4</td><td>The two-region trap: a quorum system cannot survive a loss of either half. Add a tie-breaker in a third place</td></tr>
+      <tr><td>2 regions + a small witness in a third (votes, stores no data or only the log tail)</td><td>majority across all voters</td><td>Yes, if the witness is up</td><td>Like 3 regions</td><td>Cheap way out of the trap; the witness is a single point of vulnerability that you monitor closely</td></tr>
+      <tr><td>Strong table limited to one region's 3 zones</td><td>2 of 3 zones</td><td>No: survives a zone, not a region</td><td>~1–2 ms</td><td>For data that does not need to survive a region, or has a separate DR copy</td></tr>
+    </tbody>
+  </table>
+  <p>The runnable calculation in stage 2 shows the 3-replica and 5-replica layouts commit in the same time for a leader in us-east (65 ms) because the 5-replica layout's extra acknowledgement comes from a same-region peer at about 1 ms. What 5 replicas buys is not speed but resilience: any two simultaneous node failures, and one region failure, are survivable, at the price of five copies of the data and more replication traffic. The leader's location sets everyone's latency; place it near the majority of writers (<em>follow the workload</em>), keep it away from places with unreliable power or networks, and move it deliberately.</p>
+
+  <h3>(c) Conflicts in active-active tables</h3>
+  <p>If two regions accept writes to the same key without talking first, they will sometimes write concurrently (<a href="../chapters/15-crdts.html">chapter 15</a>, <a href="../chapters/16-coordination-avoidance.html">chapter 16</a>). You must choose a resolution rule per table, in advance:</p>
+  <table>
+    <thead><tr><th>Rule</th><th>How it works</th><th>What it loses or risks</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Last-writer-wins</strong> by HLC timestamp</td><td>Highest timestamp wins; ties broken by region id</td><td>Silently drops the other concurrent write; a node with a clock far in the future wins forever unless HLC drift is bounded and rejected (<a href='../chapters/07-time-revisited.html'>chapter 7</a>)</td><td>Idempotent state: last known profile photo, a presence flag</td></tr>
+      <tr><td><strong>Version vectors with siblings</strong> (Dynamo-style)</td><td>Keep all concurrent versions; reader or app merges</td><td>Complexity pushed to application code; sibling explosion if never merged</td><td>Data where only the app knows the merge</td></tr>
+      <tr><td><strong>CRDT merge</strong></td><td>The value type merges by construction: counters, sets (OR-Set), registers, maps</td><td>Needs the right data type; semantics like add-wins must fit the product (a removed item may reappear)</td><td>Carts, likes, membership</td></tr>
+      <tr><td><strong>Single writer per key</strong> (home-region ownership)</td><td>Only a key's home region accepts writes; others read local copies</td><td>Writes from away from home go to the home region (high latency) or fail if it is down</td><td>Per-user data, which is most data: it avoids conflicts rather than resolving them</td></tr>
+    </tbody>
+  </table>
+  <p>The best design usually avoids the question: most keys have an obvious home (a user's own settings), so give those a home region and use the strong or single-writer path; keep true multi-writer conflict resolution for the small set of tables (carts, counters) where it is natural, and use CRDT types there. Whatever you choose, state the rule in the table definition and test convergence after a partition heals.</p>
+
+  <h3>(d) Region failover: RPO, RTO and the actual steps</h3>
+  <ul>
+    <li><strong>Strong tables.</strong> No operator needed: followers in surviving regions notice the leader is gone (an election timeout, plus waiting out the old leader's read lease so a deposed leader cannot serve stale reads), elect a new leader, and continue. <strong>RPO is 0</strong> because a committed entry exists on a majority, which includes at least one survivor. <strong>RTO</strong> is the detection and election time plus lease expiry: seconds to tens of seconds. Partitions whose majority was lost stay unavailable (the placement table above says which).</li>
+    <li><strong>Async replicated tables.</strong> RPO is the replication lag at the moment of failure; promoting a replica loses the tail of writes. Record the lag, and when the old region returns, reconcile the lost tail rather than discarding it silently.</li>
+    <li><strong>Active-active tables.</strong> Nothing to fail over: clients redirect to another region. The cost is entirely in what the failed region had accepted but not yet shipped (RPO = lag), and in the merge when it returns.</li>
+    <li><strong>Client side.</strong> Traffic steering (DNS or anycast, health-checked) moves clients; clients must retry with backoff and jitter so the survivors are not stampeded (<a href="../../architecture/chapters/17-resilience.html">architecture chapter 17</a>). Survivors need <em>capacity headroom</em> for the failed region's load, which is a cost decision (N+1 at region level).</li>
+    <li><strong>Don't fail over on a flap.</strong> A flaky link can look like a region outage. Use hysteresis and prefer automatic failover only for mechanisms (like leader election) that are safe to repeat.</li>
+    <li><strong>Failback</strong> is a migration, not a switch: bring the region back as followers, catch up, then transfer leaders gradually. Rehearse it.</li>
+  </ul>
+<figure class="diagram">
+<svg viewBox="0 0 760 312" role="img" aria-label="Space-time diagram of a strong partition after the loss of its leader's region. The us-east region fails, a client write is lost, the us-west replica waits for its election timeout, requests votes from eu-west, wins, and becomes leader with a higher epoch. The client retries after the election and the write succeeds.">
+<defs><marker id="ahXS1c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahXS1cblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahXS1cgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahXS1cred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahXS1corange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahXS1cpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahXS1ccyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker></defs>
+<line x1="124" y1="70" x2="748" y2="70" class="line-thin"/>
+<text x="6" y="74" class="t-sm t-bold tc-green">Client</text>
+<line x1="124" y1="132" x2="748" y2="132" class="line-thin"/>
+<text x="6" y="136" class="t-sm t-bold tc-purple">Leader (us-east)</text>
+<line x1="124" y1="194" x2="748" y2="194" class="line-thin"/>
+<text x="6" y="198" class="t-sm t-bold tc-blue">Replica (us-west)</text>
+<line x1="124" y1="256" x2="748" y2="256" class="line-thin"/>
+<text x="6" y="260" class="t-sm t-bold tc-blue">Replica (eu-west)</text>
+<line x1="200" y1="48" x2="200" y2="288" class="line-dash s-red"/>
+<text x="200" y="42" text-anchor="middle" class="t-xs tc-red">us-east region lost</text>
+<path d="M194,126 L206,138 M194,138 L206,126" class="line s-red sw-3"/>
+<rect x="200" y="187" width="170" height="14" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="285.0" y="182" text-anchor="middle" class="t-xs tc-orange">election timeout (+ lease)</text>
+<line x1="370" y1="194" x2="420" y2="256" class="line s-blue" marker-end="url(#ahXS1cblue)"/>
+<rect x="356.4" y="211.0" width="77.2" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="395.0" y="221.0" text-anchor="middle" class="t-xs tc-blue">vote request</text>
+<line x1="430" y1="256" x2="482" y2="194" class="line s-green" marker-end="url(#ahXS1cgreen)"/>
+<rect x="439.8" y="233.0" width="32.4" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="456.0" y="243.0" text-anchor="middle" class="t-xs tc-green">vote</text>
+<circle cx="482" cy="194" r="4" class="f-purple"/>
+<text x="482" y="184" text-anchor="middle" class="t-xs tc-purple">new leader, epoch + 1</text>
+<line x1="140" y1="70" x2="167.3" y2="108.4" class="line s-red"/>
+<path d="M162.3,103.4 L172.3,113.4 M162.3,113.4 L172.3,103.4" class="line s-red sw-2"/>
+<rect x="143.0" y="95.0" width="38.0" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="162.0" y="105.0" text-anchor="middle" class="t-xs tc-red">write</text>
+<rect x="220" y="63" width="300" height="14" rx="3" class="fs-red s-red sw-2"/>
+<text x="370.0" y="58" text-anchor="middle" class="t-xs tc-red">writes fail or wait: this partition is unavailable</text>
+<line x1="540" y1="70" x2="590" y2="194" class="line s-blue" marker-end="url(#ahXS1cblue)"/>
+<rect x="529.2" y="120.0" width="71.6" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="565.0" y="130.0" text-anchor="middle" class="t-xs tc-blue">retry write</text>
+<line x1="596" y1="194" x2="650" y2="70" class="line s-green" marker-end="url(#ahXS1cgreen)"/>
+<rect x="612.4" y="120.0" width="21.2" height="14" rx="3" style="fill:var(--bg-alt)"/><text x="623.0" y="130.0" text-anchor="middle" class="t-xs tc-green">ok</text>
+</svg>
+<figcaption><strong>Failover for one strong partition.</strong> Writes are unavailable for roughly the election time (RTO); nothing committed is lost (RPO 0).</figcaption>
+</figure>
+
+  <h3>(e) Data residency</h3>
+  <ul>
+    <li><strong>Placement is a constraint, enforced by the system.</strong> A table or a row range tagged <code>EU_ONLY</code> may only have replicas in EU locations; the catalog rejects any change that would break it, and so does the rebalancer.</li>
+    <li><strong>It must also survive failover.</strong> If EU data may only live in the EU, a quorum has to exist <em>inside</em> the EU, so you need at least three failure domains there (three zones for zone failures, three EU regions or two plus a witness for region failures). Residency trades directly against availability and cost; say so.</li>
+    <li><strong>Everything derived counts:</strong> backups, logs, metrics with identifiers, caches, search indexes, CDC streams (<a href="../../data/chapters/19-streams-cdc.html">data chapter 19</a>), analytics exports and debugging dumps. A global secondary index that stores EU values elsewhere breaks the promise, so indexes follow the same placement.</li>
+    <li><strong>Cross-border access</strong> is a routing question: a non-EU service reading EU data goes to the EU region (higher latency) or sees only what the policy allows. Whether a given legal rule is satisfied is a legal question; the system's job is to make the technical guarantee checkable and auditable.</li>
+  </ul>
+
+  <h3>(f) Testing it</h3>
+  <ul>
+    <li><strong>Model the protocol.</strong> Specify replication and leadership in TLA+ and model-check small configurations (<a href="../chapters/20-formal-methods.html">chapter 20</a>, <a href="../toolbox.html#tlaplus">TLA+ card</a>).</li>
+    <li><strong>Deterministic simulation</strong> of the whole cluster (the approach of <a href="../chapters/19-testing.html">chapter 19</a>): simulated network with region-sized delays, partitions, node crashes, clock skew, disk stalls; millions of seeded runs, each reproducible.</li>
+    <li><strong>Black-box fault injection</strong> on a real cluster, Jepsen-style (<a href="../toolbox.html#jepsen">Jepsen</a>): partition regions (including <em>asymmetric</em> and <em>partial</em> partitions where A reaches C and B reaches C but A cannot reach B), kill leaders, skew clocks, and check histories with a linearizability checker for strong tables (<a href="../toolbox.html#porcupine">Porcupine</a>) and with convergence and invariant checks for active-active ones.</li>
+    <li><strong>Game days.</strong> Drain a whole region in production-like conditions on a schedule, and measure the actual RTO against the target. A failover never rehearsed is a hypothesis.</li>
+    <li><strong>Measure what users feel:</strong> p99 per operation type per region pair, not averages; staleness distribution of bounded reads; replication lag percentiles.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">7</span>Failure modes and observability</h2>
+<p class="stage-q">A region goes dark. Two regions can each see the third but not each other. One region becomes slow but not dead. A clock jumps. Replication lag grows for an hour. A bad placement change is deployed. What happens in each case?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <table>
+    <thead><tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Region lost</td><td>Strong partitions with a surviving majority re-elect; others stay down; active-active continues elsewhere</td><td>Placement that survives one region; headroom in survivors; rehearsed failover</td></tr>
+      <tr><td>Partial partition (A–B cut, both reach C)</td><td>Leader flapping: two nodes keep disrupting each other's elections</td><td>Pre-vote and CheckQuorum (<a href="../chapters/10-raft-deep.html">chapter 10</a>); leader stickiness</td></tr>
+      <tr><td>Gray failure (slow but alive region)</td><td>Quorum waits include the slow region; p99 explodes without any node being "down"</td><td>Latency-based health (slow-node ejection), hedged requests, leader moved away from degraded region</td></tr>
+      <tr><td>Clock jump or skew</td><td>Leader leases or LWW timestamps become wrong; stale reads or wrongly winning writes</td><td>Bound drift, reject HLC timestamps too far ahead, monotonic clocks for lease timing, fencing on leader epochs</td></tr>
+      <tr><td>Replication lag grows (async/active-active)</td><td>RPO silently increases; read-your-writes tokens wait longer</td><td>Alert on lag against the RPO target; apply back-pressure or fall back to synchronous for critical tables</td></tr>
+      <tr><td>Split-brain after a bad manual failover (two regions accept writes for a single-writer key)</td><td>Divergent histories, lost updates after healing</td><td>Epoch fencing in the storage layer; no manual promotion without checking the old leader is fenced</td></tr>
+      <tr><td>Cross-region bandwidth saturated</td><td>Replication slows, commits stall</td><td>Capacity planning on the 8.6 TB/day baseline; prioritise commit traffic over bulk copies</td></tr>
+      <tr><td>Bad placement or schema change</td><td>Mass data movement or a table unavailable</td><td>Staged rollout, dry-run diff of replica placement, rate-limited rebalancing, blast-radius limits (<a href="../chapters/18-multi-region.html">cells, chapter 18</a>)</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Observability.</strong> Per partition: leader location, election count, commit latency by region pair, replication lag per follower, applied-timestamp lag (the safe time for stale reads). Per table: staleness of bounded reads, conflict rate and resolution outcomes for active-active, unavailable-partition count. Per region: health as seen from the <em>other</em> regions, capacity headroom, egress. A dashboard shows each table's measured RPO and RTO against its target, and tests (stage 6f) keep those numbers honest.</p>
+</details>
+</section>
+
+<h2>Self-check rubric</h2>
+<p>Tick what your own design (before reading the answers) covered. An experienced engineer would hit most of these. Missing several is normal the first time, and worth a second try in a week.</p>
+<ul class="rubric">
+  <li>Made consistency a <strong>per-table</strong> property with named classes (strong, bounded-stale, active-active) and stated RPO/RTO for each.</li>
+  <li>Named the trade-off: no low latency <em>and</em> linearizability across continents (PACELC) and said what is refused.</li>
+  <li>Computed latencies from <strong>region round-trip times</strong>: leader leg plus nearest-majority leg, and knew the far replica is not on the critical path.</li>
+  <li>Sized cross-region traffic (about 8.6 TB/day) and the number of partitions/groups.</li>
+  <li>Designed an API with <strong>read-consistency levels</strong>, causal tokens for read-your-writes, idempotency keys and honest error codes.</li>
+  <li>Showed the placement hierarchy: catalog, partitions, replica sets with <strong>leader preference and home region in the key</strong>.</li>
+  <li>Used <strong>quorum arithmetic</strong> to choose replicas per region and spotted the two-region trap (and the witness fix).</li>
+  <li>Chose a <strong>conflict rule</strong> for active-active tables (LWW with bounded HLC, siblings, CRDT, or single writer per key) and its cost.</li>
+  <li>Described <strong>region failover</strong> step by step: detection, lease expiry, election, client steering, headroom, failback.</li>
+  <li>Treated <strong>data residency</strong> as an enforced placement constraint that includes backups, indexes and failover quorums.</li>
+  <li>Planned testing: TLA+, deterministic simulation, Jepsen-style partitions including partial ones, and region game days.</li>
+  <li>Covered gray failure, clock problems, replication lag and bad configuration changes in the failure modes.</li>
+</ul>
+<p class="studio-status" id="studio-status"></p>
+
+<h2>Saying it in an interview</h2>
+<div class="callout mentor">
+  <p class="callout-title">How a senior engineer would summarise this</p>
+  <p>"I'd make consistency a property of the table, with three classes: strong for money-like data, strong writes with bounded-stale reads for catalogues, and active-active with a named conflict rule for carts and counters. Each gets a stated RPO and RTO. Every partition is a Raft or Paxos group with replicas spread across regions; the leader lives in the home region of most of its writers, which I put in the key. A strong write costs the client's trip to the leader plus the leader's trip to its nearest majority, about 65 to 140 ms with the assumed inter-region numbers, and the farthest replica is not on the critical path. So most of the 500,000 reads a second should be bounded-stale local reads, with causal tokens for read-your-writes. Placement is quorum arithmetic: three regions, or five replicas as 2+2+1, survive a region loss, while two regions alone cannot, so I'd add a witness. Region failure for strong data is a leader election with RPO zero and an RTO of seconds, and active-active tables just redirect clients, with RPO equal to the replication lag. For conflicts I'd prefer to avoid them with a home region per key and use CRDTs only where natural; last-writer-wins needs bounded hybrid clocks. Residency is an enforced placement constraint that also covers backups, indexes and the failover quorum. And I'd test with TLA+, deterministic simulation, partial partitions and scheduled region drains."</p>
+  <p>Notice the shape: <strong>classify the data → price each class in milliseconds → place replicas and leaders by quorum arithmetic → avoid or resolve conflicts → rehearse the failure → make residency and testing part of the design.</strong></p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Consistency is a per-table choice, and the contract must say what each class gives up.</li>
+    <li>Light speed sets the budget: strong write = leader leg + nearest-majority leg; the far replica does not matter.</li>
+    <li>Place leaders near writers, put the home region in the key, and move leaders deliberately.</li>
+    <li>Quorum arithmetic decides survivable failures: two regions cannot, three or 2+2+1 can, a witness fixes the trap.</li>
+    <li>Avoid conflicts with a home region per key; use CRDTs or siblings where multiple writers are natural; LWW loses writes.</li>
+    <li>Strong-table failover has RPO 0 and an RTO of an election; async copies have RPO equal to the lag.</li>
+    <li>Residency is a placement constraint that covers every derived copy and the failover quorum.</li>
+    <li>Test with model checking, simulation, partial partitions and rehearsed region drains.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/studio.js"></script>
+</body>
+</html>

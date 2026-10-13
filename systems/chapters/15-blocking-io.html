@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blocking vs Non-blocking I/O · How Programs Run</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="sys" data-chapter="15">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Blocking vs Non-blocking I/O</h1>
+  <p class="lede">A server spends almost all of its life waiting for the network. This chapter looks at what "waiting" really means inside a program, the two ways to do it (go to sleep, or keep asking), and why neither is enough once you have thousands of connections. It sets up the event loop of the next chapter.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Every network program makes the same choice, whether or not the author knows it: when there is nothing to read yet, what does my code do? The answer decides how many clients one machine can serve, how much memory they cost, and what happens when one client is slow. Blocking calls give simple code and need one thread per connection. Non-blocking calls give you control but push the problem of "when should I look again?" onto you. Almost every high-connection server you have heard of (nginx, Node.js, Redis) exists because of that trade-off.</p>
+</div>
+
+<h2>What "blocking" means</h2>
+
+<p>Suppose a program asks the kernel for the next bytes on a socket by calling <code>recv()</code>. If the bytes have already arrived, the kernel copies them to the program and the call returns almost immediately. But what if the client is on a slow phone connection and has not sent anything yet?</p>
+
+<p>By default the answer is: <em>the call does not return</em>. The kernel marks the thread as <span class="term">blocked</span> (also called sleeping or waiting), takes it off the CPU and lets the scheduler run some other thread on that core (<a href="07-scheduling.html">chapter 7</a>). Later, when data arrives, the network interrupt wakes the kernel, the kernel finds the sleeping thread, makes it runnable again, and <code>recv()</code> finally returns. The same happens with <code>accept()</code> (waiting for a new connection), <code>send()</code> when there is no room, and <code>read()</code> on a pipe or a file. These are all <span class="term">blocking calls</span>, because they block the calling thread until the thing it asked for can happen.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 215" role="img" aria-label="Timeline of a thread calling recv. It runs, then sleeps in recv with no CPU use while other threads use the core, then runs again when data arrives.">
+    <text x="40" y="26" class="t-xs t-faint t-bold">OUR THREAD</text>
+    <rect x="40" y="36" width="90" height="38" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="85" y="59" text-anchor="middle" class="t-sm">running</text>
+    <rect x="130" y="36" width="430" height="38" rx="6" class="box2" stroke-dasharray="6 5"/>
+    <text x="345" y="59" text-anchor="middle" class="t-sm">recv() called: blocked, asleep, using no CPU</text>
+    <rect x="560" y="36" width="90" height="38" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="605" y="59" text-anchor="middle" class="t-sm">running</text>
+
+    <text x="40" y="106" class="t-xs t-faint t-bold">THE CPU CORE, MEANWHILE</text>
+    <rect x="40" y="116" width="90" height="38" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="85" y="139" text-anchor="middle" class="t-sm">our thread</text>
+    <rect x="130" y="116" width="430" height="38" rx="6" class="fs-pink s-pink sw-2"/>
+    <text x="345" y="139" text-anchor="middle" class="t-sm">other threads get the core (context switches)</text>
+    <rect x="560" y="116" width="90" height="38" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="605" y="139" text-anchor="middle" class="t-sm">our thread</text>
+
+    <line x1="130" y1="78" x2="130" y2="112" class="line-thin"/>
+    <line x1="560" y1="78" x2="560" y2="112" class="line-thin"/>
+    <text x="130" y="176" text-anchor="middle" class="t-xs t-muted">data not here yet</text>
+    <text x="560" y="176" text-anchor="middle" class="t-xs t-muted">data arrives: thread woken</text>
+    <line x1="40" y1="196" x2="700" y2="196" class="line-thin"/>
+    <text x="708" y="200" class="t-xs t-faint">time</text>
+  </svg>
+  <figcaption><strong>A blocking call from the thread's point of view.</strong> The code just calls <code>recv()</code> and, some time later, gets an answer. In between, the kernel does the waiting on its behalf, and the CPU is not wasted.</figcaption>
+</figure>
+
+<p>That is the great virtue of blocking I/O: it looks like an ordinary function call. You can write <code>data = sock.recv(1024)</code>, then the next line uses <code>data</code>, and the program reads top to bottom. A blocked thread burns no CPU time. What it does cost is <em>memory</em> (its stack, <a href="03-stack-heap.html">chapter 3</a>) and a bookkeeping entry in the kernel. And, importantly, <strong>while it is blocked it can do nothing else</strong>. It cannot answer another client, or notice that it should shut down.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a waiter assigned to one table</p>
+  <p>In the restaurant from <a href="00-start-here.html">chapter 0</a>, imagine each waiter (thread) is assigned one table (socket). The table hasn't decided yet, so the waiter stands beside it, doing nothing, until the diners finally say "we're ready to order". That is a blocking <code>recv()</code>. It's easy to understand: the waiter's whole job is one table. The cost is that you need one waiter per table, even for tables that stay quiet all night.</p>
+  <p><em>Where it breaks down:</em> a blocked thread isn't really "standing in the way". It is off the CPU entirely, so it doesn't slow other threads down; what it costs is memory and kernel bookkeeping. Also, no waiter is woken up automatically when diners are ready, whereas here the kernel does the waking for you.</p>
+</div>
+
+<h2>Where the waiting happens: socket buffers</h2>
+
+<p>Why can the kernel return data to a program that wasn't even running when the packets arrived? Because each socket has two <span class="term">buffers</span> in kernel memory (see <a href="../../networking/chapters/08-tcp.html">networking chapter 8</a> for how TCP fills them):</p>
+
+<ul>
+  <li>The <strong>receive buffer</strong> holds bytes that TCP has received and put in order, but the program hasn't read yet. <code>recv()</code> copies bytes out of it.</li>
+  <li>The <strong>send buffer</strong> holds bytes the program has written, but TCP hasn't yet sent or had acknowledged. <code>send()</code> copies bytes into it.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 240" role="img" aria-label="A process with recv and send calls, a kernel socket with a receive buffer and a send buffer, and the network. Bytes flow from the network into the receive buffer and out to the process, and from the process into the send buffer and out to the network.">
+    <defs><marker id="ahS15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="50" width="180" height="150" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="110" y="72" text-anchor="middle" class="t-sm t-bold">YOUR PROCESS</text>
+    <rect x="40" y="84" width="140" height="34" rx="8" class="box"/>
+    <text x="110" y="106" text-anchor="middle" class="t-sm mono">recv(sock)</text>
+    <rect x="40" y="136" width="140" height="34" rx="8" class="box"/>
+    <text x="110" y="158" text-anchor="middle" class="t-sm mono">send(sock, data)</text>
+
+    <rect x="270" y="50" width="300" height="150" rx="12" class="box2"/>
+    <text x="420" y="70" text-anchor="middle" class="t-sm t-bold">KERNEL: one socket</text>
+    <text x="420" y="90" text-anchor="middle" class="t-xs t-muted">receive buffer (arrived, not yet read)</text>
+    <rect x="300" y="96" width="40" height="22" class="f-yellow s-yellow"/><rect x="340" y="96" width="40" height="22" class="f-yellow s-yellow"/><rect x="380" y="96" width="40" height="22" class="f-yellow s-yellow"/>
+    <rect x="420" y="96" width="40" height="22" class="box"/><rect x="460" y="96" width="40" height="22" class="box"/><rect x="500" y="96" width="40" height="22" class="box"/>
+    <text x="420" y="148" text-anchor="middle" class="t-xs t-muted">send buffer (written, not yet sent and acknowledged)</text>
+    <rect x="300" y="154" width="40" height="22" class="f-yellow s-yellow"/><rect x="340" y="154" width="40" height="22" class="f-yellow s-yellow"/>
+    <rect x="380" y="154" width="40" height="22" class="box"/><rect x="420" y="154" width="40" height="22" class="box"/><rect x="460" y="154" width="40" height="22" class="box"/><rect x="500" y="154" width="40" height="22" class="box"/>
+
+    <rect x="630" y="50" width="110" height="150" rx="12" class="box"/>
+    <text x="685" y="120" text-anchor="middle" class="t-sm t-bold">NETWORK</text>
+    <text x="685" y="138" text-anchor="middle" class="t-xs t-muted">TCP segments</text>
+
+    <line x1="268" y1="107" x2="182" y2="107" class="line" marker-end="url(#ahS15a)"/>
+    <text x="225" y="98" text-anchor="middle" class="t-xs t-muted">read out</text>
+    <line x1="182" y1="165" x2="268" y2="165" class="line" marker-end="url(#ahS15a)"/>
+    <text x="225" y="156" text-anchor="middle" class="t-xs t-muted">write in</text>
+    <line x1="628" y1="107" x2="572" y2="107" class="line" marker-end="url(#ahS15a)"/>
+    <text x="600" y="98" text-anchor="middle" class="t-xs t-muted">arrives</text>
+    <line x1="572" y1="165" x2="628" y2="165" class="line" marker-end="url(#ahS15a)"/>
+    <text x="600" y="156" text-anchor="middle" class="t-xs t-muted">leaves</text>
+
+    <text x="380" y="226" text-anchor="middle" class="t-xs t-muted">Empty receive buffer: recv() has nothing to return. Full send buffer: send() has no room.</text>
+  </svg>
+  <figcaption><strong>Two queues per socket, both owned by the kernel.</strong> Yellow cells are bytes in flight. A program only ever talks to the buffers; the network side is handled by TCP without waking the program.</figcaption>
+</figure>
+
+<p>Now we can say precisely when a call blocks:</p>
+
+<table>
+  <thead><tr><th>Call</th><th>Blocks when…</th><th>Becomes ready when…</th></tr></thead>
+  <tbody>
+    <tr><td><code>recv()</code> / <code>read()</code></td><td>the receive buffer is empty</td><td>at least one byte arrives, or the peer closes (then it returns zero bytes, meaning end of stream)</td></tr>
+    <tr><td><code>send()</code> / <code>write()</code></td><td>the send buffer has no free space</td><td>the peer acknowledges data and space frees up</td></tr>
+    <tr><td><code>accept()</code></td><td>no completed connection is waiting in the listen queue</td><td>a client finishes the TCP handshake</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"<code>send()</code> returning means the other side got my data." It only means the kernel accepted the bytes into the send buffer. They may still be waiting to go out, or be lost on the way. Likewise <code>recv(1024)</code> does not mean "give me exactly 1024 bytes": it returns <em>whatever is there</em>, up to 1024, so even a blocking <code>recv()</code> can hand you half a message. TCP is a byte stream with no message boundaries (<a href="../../networking/chapters/08-tcp.html">networking chapter 8</a>).</p>
+</div>
+
+<h2>Non-blocking mode</h2>
+
+<p>Every socket can be switched to a different contract: <span class="term">non-blocking</span> mode. In Python that's <code>sock.setblocking(False)</code>. (The C equivalent is the <code>O_NONBLOCK</code> flag on the file descriptor, <a href="08-files.html">chapter 8</a>.) Now the kernel never puts the thread to sleep for this socket. If the call can make progress, it does. If not, it fails at once with a special error: <code>EAGAIN</code>, also spelled <code>EWOULDBLOCK</code> (on Linux and macOS these are the same value). The message means "nothing for you right now; try again later". Python turns that error into an exception called <code>BlockingIOError</code>.</p>
+
+<p>You can try this with no network and no ports at all. <code>socket.socketpair()</code> gives you two sockets already connected to each other inside the same process.</p>
+
+<pre class="terminal" data-title="nonblocking.py"><code>import socket
+
+a, b = socket.socketpair()      # two connected sockets, no ports needed
+a.setblocking(False)            # switch 'a' to non-blocking mode
+
+try:
+    a.recv(1024)                # nothing has been sent yet
+except BlockingIOError as e:
+    print("recv would block:", e)
+
+b.send(b"hello")
+print("after send:", a.recv(1024))
+
+# Fill the send buffer until the kernel says "no more room".
+b.setblocking(False)
+total = 0
+try:
+    while True:
+        total += b.send(b"x" * 4096)
+except BlockingIOError:
+    print(f"send buffer full after {total:,} bytes")</code></pre>
+
+<pre class="terminal" data-title="output (macOS)"><code>recv would block: [Errno 35] Resource temporarily unavailable
+after send: b'hello'
+send buffer full after 8,192 bytes</code></pre>
+
+<p>Your numbers will differ. On Linux the error number is 11 instead of 35, and a Unix-domain socket pair usually has a much bigger buffer than the 8 KiB macOS gave here. A real TCP socket's buffers are larger again and adjust themselves to the connection. The pattern is what matters: <strong>a call that would have slept now raises instead</strong>.</p>
+
+<p>The same applies to the other calls. A non-blocking <code>accept()</code> raises <code>BlockingIOError</code> if nobody is waiting. A non-blocking <code>send()</code> may <em>partly</em> succeed: with 100 KB to send and room for 60 KB, it returns 60,000 and you must keep the rest and try again later. (A non-blocking <code>connect()</code> is similar: it starts the handshake and reports "in progress".) This is called a <span class="term">partial write</span>, and we'll handle it properly in the next chapter.</p>
+
+<h2>Why not just keep asking?</h2>
+
+<p>With non-blocking sockets, the thread is free to do other things. The simplest way to use that freedom is a loop: try each socket, skip the ones that raise <code>BlockingIOError</code>, repeat. This is <span class="term">busy-polling</span> (or spinning). It does work. It is also wasteful, and you can measure how wasteful. The demo below waits one second for data to arrive, once by blocking and once by spinning:</p>
+
+<pre class="terminal" data-title="polling.py"><code>import socket, threading, time
+
+def run(label, busy):
+    a, b = socket.socketpair()
+    threading.Timer(1.0, lambda: b.send(b"ping")).start()   # data arrives in 1 s
+    cpu0, wall0 = time.process_time(), time.perf_counter()
+    tries = 0
+    if busy:
+        a.setblocking(False)
+        while True:
+            tries += 1
+            try:
+                a.recv(16)
+                break
+            except BlockingIOError:
+                pass                      # nothing yet: ask again, immediately
+    else:
+        a.recv(16)                        # sleeps inside the kernel until data arrives
+        tries = 1
+    cpu, wall = time.process_time() - cpu0, time.perf_counter() - wall0
+    print(f"{label:&lt;12} waited {wall:.2f}s wall, {cpu:.2f}s CPU, {tries:,} recv() calls")
+
+run("blocking", busy=False)
+run("busy-poll", busy=True)</code></pre>
+
+<pre class="terminal" data-title="output"><code>blocking     waited 1.00s wall, 0.00s CPU, 1 recv() calls
+busy-poll    waited 1.00s wall, 1.00s CPU, 2,097,832 recv() calls</code></pre>
+
+<p>Same one-second wait. The blocking version used essentially no CPU and made one system call. The spinning version kept a core at 100% and made about two million system calls, each one a trip into the kernel (<a href="04-kernel-syscalls.html">chapter 4</a>) that returned "nothing yet". With 10,000 sockets it would be far worse, since every pass has to ask about every socket. You could add <code>time.sleep(0.01)</code> between passes to cool it down, but now every event is noticed up to 10 ms late, which makes latency worse while still wasting wakeups.</p>
+
+<p>So we have two bad extremes. Blocking sleeps efficiently but can wait on only <em>one thing</em>. Polling can watch many things but burns CPU. What we want is: <strong>"put me to sleep until any one of these 10,000 sockets is ready, and tell me which."</strong> The kernel is the only party that knows when data arrives, so that has to be a system call too. That call exists in several versions (<code>select</code>, <code>poll</code>, <code>epoll</code>, <code>kqueue</code>), and it is the heart of the next chapter.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 292" role="img" aria-label="Left: three threads each asleep waiting on its own socket. Right: one event loop thread asking the kernel which of three sockets is ready, one of which has data.">
+    <defs><marker id="ahS15b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="190" y="26" text-anchor="middle" class="t-bold">Blocking: a thread per socket</text>
+    <rect x="30" y="44" width="130" height="46" rx="8" class="fs-blue s-blue sw-2"/><text x="95" y="64" text-anchor="middle" class="t-sm">thread 1</text><text x="95" y="80" text-anchor="middle" class="t-xs t-muted">asleep in recv()</text>
+    <rect x="30" y="106" width="130" height="46" rx="8" class="fs-green s-green sw-2"/><text x="95" y="126" text-anchor="middle" class="t-sm">thread 2</text><text x="95" y="142" text-anchor="middle" class="t-xs t-muted">asleep in recv()</text>
+    <rect x="30" y="168" width="130" height="46" rx="8" class="fs-pink s-pink sw-2"/><text x="95" y="188" text-anchor="middle" class="t-sm">thread 3</text><text x="95" y="204" text-anchor="middle" class="t-xs t-muted">asleep in recv()</text>
+    <rect x="230" y="44" width="110" height="46" rx="8" class="box2"/><text x="285" y="64" text-anchor="middle" class="t-sm">socket 1</text><text x="285" y="80" text-anchor="middle" class="t-xs t-muted">empty</text>
+    <rect x="230" y="106" width="110" height="46" rx="8" class="box2"/><text x="285" y="126" text-anchor="middle" class="t-sm">socket 2</text><text x="285" y="142" text-anchor="middle" class="t-xs t-muted">empty</text>
+    <rect x="230" y="168" width="110" height="46" rx="8" class="box2"/><text x="285" y="188" text-anchor="middle" class="t-sm">socket 3</text><text x="285" y="204" text-anchor="middle" class="t-xs t-muted">empty</text>
+    <line x1="162" y1="67" x2="228" y2="67" class="line" marker-end="url(#ahS15b)"/>
+    <line x1="162" y1="129" x2="228" y2="129" class="line" marker-end="url(#ahS15b)"/>
+    <line x1="162" y1="191" x2="228" y2="191" class="line" marker-end="url(#ahS15b)"/>
+    <text x="190" y="236" text-anchor="middle" class="t-sm t-faint">... and so on for every connection</text>
+    <text x="190" y="262" text-anchor="middle" class="t-xs">Simple code. Costs a stack per thread.</text>
+    <text x="190" y="278" text-anchor="middle" class="t-xs t-muted">Each thread can only wait for one thing.</text>
+
+    <line x1="380" y1="20" x2="380" y2="284" class="line-dash"/>
+
+    <text x="570" y="26" text-anchor="middle" class="t-bold">Non-blocking: one loop, many sockets</text>
+    <rect x="410" y="60" width="130" height="130" rx="12" class="fs-purple s-purple sw-2"/>
+    <text x="475" y="116" text-anchor="middle" class="t-sm t-bold">event loop</text>
+    <text x="475" y="134" text-anchor="middle" class="t-xs t-muted">one thread</text>
+    <rect x="620" y="44" width="110" height="46" rx="8" class="box2"/><text x="675" y="64" text-anchor="middle" class="t-sm">socket 1</text><text x="675" y="80" text-anchor="middle" class="t-xs t-muted">empty</text>
+    <rect x="620" y="106" width="110" height="46" rx="8" class="fs-yellow s-yellow sw-2"/><text x="675" y="126" text-anchor="middle" class="t-sm">socket 2</text><text x="675" y="142" text-anchor="middle" class="t-xs">has data</text>
+    <rect x="620" y="168" width="110" height="46" rx="8" class="box2"/><text x="675" y="188" text-anchor="middle" class="t-sm">socket 3</text><text x="675" y="204" text-anchor="middle" class="t-xs t-muted">empty</text>
+    <line x1="542" y1="105" x2="618" y2="67" class="line-thin" marker-end="url(#ahS15b)"/>
+    <line x1="542" y1="125" x2="618" y2="129" class="line" marker-end="url(#ahS15b)"/>
+    <line x1="542" y1="145" x2="618" y2="191" class="line-thin" marker-end="url(#ahS15b)"/>
+    <text x="475" y="214" text-anchor="middle" class="t-xs t-muted">asks the kernel:</text>
+    <text x="475" y="230" text-anchor="middle" class="t-xs t-muted">"which are ready?"</text>
+    <text x="570" y="262" text-anchor="middle" class="t-xs">Cheap waiting. One rule: never block the loop.</text>
+    <text x="570" y="278" text-anchor="middle" class="t-xs t-muted">Only touch sockets the kernel says are ready.</text>
+  </svg>
+  <figcaption><strong>The transition this chapter is about.</strong> On the left every connection owns a sleeping thread. On the right, a single thread hands the kernel a whole list of sockets and is told which ones need attention.</figcaption>
+</figure>
+
+<h2>The cost of one thread per connection</h2>
+
+<p>Before moving on, let's be fair to the left side of that picture, because it is the model most programmers meet first and it is perfectly good in many places. In the <span class="term">thread-per-connection</span> model, an <code>accept()</code> loop hands each new client to a new thread (or to a thread from a pool, <a href="14-queues-backpressure.html">chapter 14</a>), and that thread runs plain blocking code from start to finish. Old Apache configurations, many Java application servers, and MySQL's default connection handling all work roughly like this.</p>
+
+<p>The costs grow with the number of <em>connections</em>, not with the amount of work:</p>
+
+<ul>
+  <li><strong>Memory.</strong> Every thread has its own stack (<a href="10-threads.html">chapter 10</a>). Systems often reserve a large address range for it (Linux commonly 8 MB of virtual space; macOS 512 KB for non-main threads), though only the pages actually touched become real RAM (<a href="06-virtual-memory.html">chapter 6</a>). Even at tens of kilobytes of real memory each, 10,000 threads means hundreds of megabytes spent on connections that are mostly saying nothing.</li>
+  <li><strong>Scheduling.</strong> Each wake-up is a context switch of microseconds (<a href="07-scheduling.html">chapter 7</a>), and the kernel's scheduler has more runnable and sleeping entities to track. Threads also lose their warm CPU caches when switched out (<a href="02-memory-hierarchy.html">chapter 2</a>).</li>
+  <li><strong>Shared state needs locks.</strong> Threads share memory, so a table of "which user is on which connection" needs a lock around it (<a href="11-race-conditions.html">chapter 11</a>, <a href="12-locks.html">chapter 12</a>).</li>
+  <li><strong>Limits.</strong> Operating systems cap threads per process and per machine, and each connection also needs a file descriptor (<a href="08-files.html">chapter 8</a>).</li>
+</ul>
+
+<p>The common fix for runaway thread counts is a bounded <em>thread pool</em> with a queue in front (<a href="14-queues-backpressure.html">chapter 14</a>). That protects memory, but it exposes a sharper problem: if the pool has 200 threads and 200 clients connect and then go silent, <strong>all 200 threads are blocked on idle clients and the 201st client is not served</strong> even though the machine is doing nothing. (A deliberate attack of exactly this shape is called a slow-client or "slowloris" attack.) With blocking I/O, the number of connections you can hold and the number of threads you pay for are tied together. The event loop breaks that tie.</p>
+
+<p>A quick feel for the numbers: starting 2,000 threads that immediately block is cheap in absolute terms.</p>
+
+<pre class="terminal" data-title="output of the thread demo in Try it yourself"><code>started 2000 blocked threads in 0.09 s
+active threads: 2001</code></pre>
+
+<p>So thread-per-connection is not "broken" at a few thousand connections on a modern machine. The point is that its cost grows with idle connections, and at 100,000 or more the other design is clearly better. That is the situation of <a href="../studios/studio-01-10k-connections.html">Studio 1</a>.</p>
+
+<h2>Disk I/O is different</h2>
+
+<p>You might expect to put file reads into the same "wait for many things" system as sockets. Mostly, you can't. A regular file is always considered <em>ready</em> by <code>select</code>, <code>poll</code> and <code>kqueue</code>; <code>epoll</code> refuses to register it at all. There's no equivalent of "the receive buffer is empty, come back later", because the kernel doesn't know in advance whether your read will be served from the page cache in microseconds or need a trip to the SSD (<a href="08-files.html">chapter 8</a>, <a href="09-durability.html">chapter 9</a>). So <code>read()</code> on a file simply goes ahead, and if the data is not in RAM, the thread blocks while the disk works, <em>even if the file descriptor is in non-blocking mode</em>.</p>
+
+<p>That means a single-threaded event loop that reads files directly will freeze whenever the disk is slow. The usual remedy is the one you already know from chapter 14: hand file work to a <strong>thread pool</strong> and let the loop continue. Node.js does this through its libuv library, and Python's asyncio offers <code>run_in_executor</code> and <code>asyncio.to_thread</code> (next chapters). The newer alternative on Linux is <span class="term">io_uring</span> (since kernel 5.1): you place requests in a queue shared with the kernel, the kernel does the work, including real file I/O, and you collect completions later. It treats disk and network the same way. It's powerful, still evolving, and not available on macOS, so most systems today still use threads for disk.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Setting a file to non-blocking mode makes disk reads asynchronous." It does not. The flag is about whether the kernel should sleep waiting for <em>data that hasn't arrived</em> (sockets, pipes, terminals). A disk read that misses the page cache still blocks the thread.</p>
+</div>
+
+<h2>Try it yourself</h2>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: feel the difference</p>
+  <p>Save the two Python snippets above as <code>nonblocking.py</code> and <code>polling.py</code> (they need only Python 3, no network) and run them with <code>python3</code>. Compare the CPU time of the blocking and busy-poll versions. Then look at the limits that decide how many sockets one process can hold. These commands only read information.</p>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 nonblocking.py</span>
+recv would block: [Errno 35] Resource temporarily unavailable
+<span class="prompt">$ </span><span class="cmd">python3 polling.py</span>
+blocking     waited 1.00s wall, 0.00s CPU, 1 recv() calls
+busy-poll    waited 1.00s wall, 1.00s CPU, 2,097,832 recv() calls
+<span class="prompt">$ </span><span class="cmd">ulimit -n</span>                            <span class="cmt"># max open files (and sockets) for this shell</span>
+256
+<span class="prompt">$ </span><span class="cmd">sysctl net.inet.tcp.recvspace</span>        <span class="cmt"># macOS: default TCP receive buffer in bytes</span>
+net.inet.tcp.recvspace: 131072
+<span class="prompt">$ </span><span class="cmd">cat /proc/sys/net/ipv4/tcp_rmem</span>      <span class="cmt"># Linux: min, default, max receive buffer</span>
+4096    131072  6291456</code></pre>
+
+<p>The last two lines are typical values, not promises: your machine's will differ (the first shows macOS, the second Linux, and only one applies to you). Try making a thread demo as well:</p>
+
+<pre class="terminal" data-title="threads.py"><code>import threading
+import time
+
+stop = threading.Event()
+start = time.perf_counter()
+threads = [threading.Thread(target=stop.wait) for _ in range(2000)]
+for t in threads:
+    t.start()                       # each thread immediately blocks in stop.wait()
+print(f"started {len(threads)} blocked threads in {time.perf_counter() - start:.2f} s")
+print("active threads:", threading.active_count())
+stop.set()                          # wake them all so the program can exit
+for t in threads:
+    t.join()</code></pre>
+
+<p>On Linux you can watch the kernel's view of a process's blocked state with <code>ps -o pid,stat,wchan:20,cmd -p PID</code> (a state of <code>S</code> with a wait channel such as <code>sk_wait_data</code> means "sleeping in a socket wait"). macOS's <code>ps</code> shows <code>S</code> for sleeping too, but no wait channel you can interpret.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Distributed systems connection</p>
+  <p>A blocking call is the place where a remote failure becomes <em>your</em> thread's problem. If the peer machine crashes or the network drops silently, a blocking <code>recv()</code> with no timeout can wait for a very long time, because no packet ever arrives to wake it (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>). Every call to another machine needs a timeout, and in a thread-per-connection server a few stuck calls can use up the whole pool. That is how one slow dependency spreads into an outage across a system: the waiting threads are the contagion. The remedy, deadlines and bounded queues, appears again in chapter 14 and later chapters.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A blocking call puts the thread to sleep until the kernel can complete it; the scheduler runs other threads meanwhile, and the sleeping thread uses no CPU.</li>
+    <li>Each socket has a kernel receive buffer and send buffer. <code>recv()</code> blocks when the first is empty; <code>send()</code> blocks when the second is full.</li>
+    <li>Non-blocking mode (<code>setblocking(False)</code>) turns "would sleep" into an immediate <code>EAGAIN</code>/<code>EWOULDBLOCK</code> error (<code>BlockingIOError</code> in Python). Partial writes are normal.</li>
+    <li>Busy-polling many sockets burns CPU for nothing. What we need is one call that sleeps until any of many sockets is ready.</li>
+    <li>Thread-per-connection is simple but its cost (stacks, scheduling, locks, limits) grows with idle connections, and it ties connection count to thread count.</li>
+    <li>Regular files are always "ready", so disk work goes to a thread pool (or io_uring on Linux), not into the readiness system.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A thread calls <code>recv()</code> on a blocking socket and no data has arrived. What happens?</p>
+    <ol class="q-options">
+      <li>The call returns an empty bytes object immediately</li>
+      <li>The thread spins in a loop inside the kernel until data comes</li>
+      <li>The kernel puts the thread to sleep and runs other threads on the core until data arrives</li>
+      <li>The program crashes with an error</li>
+    </ol>
+    <div class="q-explain">A blocked thread is taken off the CPU and woken when the socket becomes readable. An empty result from <code>recv()</code> would mean the peer closed the connection (end of stream), which is something different.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">In Python, you call <code>sock.recv(1024)</code> on a non-blocking socket with an empty receive buffer. What do you get?</p>
+    <ol class="q-options">
+      <li>A <code>BlockingIOError</code> (the C-level error is EAGAIN / EWOULDBLOCK)</li>
+      <li>1024 zero bytes</li>
+      <li>The call waits up to a short default timeout, then returns</li>
+      <li>An empty bytes object</li>
+    </ol>
+    <div class="q-explain">Non-blocking calls never sleep. "Not ready" is reported as an error you are expected to handle and retry later. Empty bytes means the other side closed the connection, so confusing the two is a classic bug.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Why is busy-polling many non-blocking sockets in a tight loop a poor design?</p>
+    <ol class="q-options">
+      <li>Non-blocking sockets lose data when polled too often</li>
+      <li>It is impossible to poll more than one socket</li>
+      <li>The kernel forbids calling recv() repeatedly</li>
+      <li>It keeps a core at 100% making system calls that mostly return "nothing yet", and adding sleeps instead makes events be noticed late</li>
+    </ol>
+    <div class="q-explain">Polling works, but it trades CPU for latency. The better tool is a single system call that sleeps until <em>any</em> registered socket is ready, which is what select, poll, epoll and kqueue do.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A server uses a pool of 100 threads with blocking reads. 100 clients connect and then stay silent. What happens to the 101st client?</p>
+    <ol class="q-options">
+      <li>It is served normally because silent threads don't count</li>
+      <li>It waits (or is refused), even though the machine is nearly idle, because every thread is blocked on an idle client</li>
+      <li>The kernel automatically creates thread number 101</li>
+      <li>The first client's thread is cancelled</li>
+    </ol>
+    <div class="q-explain">With blocking I/O, a thread is tied up for as long as its connection is open and quiet. This is why idle or slow connections can exhaust a thread pool without using any CPU.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why can't a regular file be handled like a socket in an event loop?</p>
+    <ol class="q-options">
+      <li>Files are always write-protected</li>
+      <li>Files cannot have file descriptors</li>
+      <li>select/poll/kqueue always report regular files as ready (and epoll rejects them), so a read can still block on the disk; event loops send disk work to a thread pool</li>
+      <li>Disk I/O is always instantaneous</li>
+    </ol>
+    <div class="q-explain">The kernel can't tell in advance whether your file read will hit the page cache or need the SSD, so readiness notification doesn't help. Setting O_NONBLOCK on a regular file does not change that. io_uring is a Linux interface that addresses it differently.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

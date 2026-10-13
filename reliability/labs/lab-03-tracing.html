@@ -1,0 +1,936 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 3: Tracing from Scratch · Reliability &amp; Operations</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="ops" data-lab="L3">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 3: Tracing from Scratch</h1>
+  <p class="lede"><a href="../chapters/06-tracing.html">Chapter 6</a> ended with a forty-line toy tracer. In this lab you build the real machinery behind it, piece by piece, on simulated services and simulated time. You will generate trace and span ids and nest spans, carry a request's identity across service calls in a W3C <code>traceparent</code> header (and see exactly how one dropped header splits a trace in two), follow a request through a queue with span links, rebuild trace trees from spans that arrive out of order from many services with some of them missing, find a trace's critical path, and finally compare head sampling with tail sampling at the same storage budget to see which one keeps the failures.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Tracing is the signal that answers "this one request was slow; where?", and every part of it is a place where a trace can silently go wrong. One service that does not forward a header turns a request into two unrelated half-traces. A queue turns a parent-child relationship into something that is not a parent-child relationship at all. A collector that receives spans in random order, and sometimes not at all, still has to show a coherent tree and say honestly when it is not sure. And the sampler decides, before anyone knows whether the request was interesting, which traces will exist. Each of these is a few lines of code and a large amount of reasoning; writing them once, against a simulator where you can drop a header or lose a span on purpose, is how the reasoning sticks.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Services as functions, time as a number</p>
+  <p>Nothing here opens a socket or starts a thread. A "service call" is a Python function call that carries a dict of headers, so the propagation code you write is exactly what a real tracer does at a process boundary. Time is a number of milliseconds on a <code>SimClock</code> that moves only when code advances it. A parallel fan-out is simulated by running each branch from the same start time and continuing from the latest finish. All randomness (ids, queue delays, the order in which a collector hears about spans) comes from seeded generators, so a given seed always produces the same trace, and when a check names a seed you can replay it.</p>
+</div>
+
+<h2>What you'll build</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="A service graph. A gateway calls checkout, which calls inventory, pricing and payments and publishes to a queue consumed later by a fulfilment service. Every call carries a traceparent header. Every service exports finished spans to a collector on the right."><defs><marker id="ahRL3aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRL3aablue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRL3aagreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRL3aared" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRL3aaorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRL3aapurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRL3aacyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker><marker id="ahRL3aayellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+<rect x="10" y="110" width="96" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="58.0" y="134.0" text-anchor="middle" class="t-sm t-bold">gateway</text>
+<text x="58.0" y="150.0" text-anchor="middle" class="t-xs t-muted">root span</text>
+<rect x="170" y="110" width="100" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="220.0" y="134.0" text-anchor="middle" class="t-sm t-bold">checkout</text>
+<text x="220.0" y="150.0" text-anchor="middle" class="t-xs t-muted">fans out</text>
+<rect x="360" y="26" width="100" height="48" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="410.0" y="54.0" text-anchor="middle" class="t-sm t-bold">inventory</text>
+<rect x="360" y="112" width="100" height="48" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="410.0" y="132.0" text-anchor="middle" class="t-sm t-bold">pricing</text>
+<text x="410.0" y="148.0" text-anchor="middle" class="t-xs t-muted">cache lookup</text>
+<rect x="360" y="198" width="100" height="48" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="410.0" y="218.0" text-anchor="middle" class="t-sm t-bold">payments</text>
+<text x="410.0" y="234.0" text-anchor="middle" class="t-xs t-muted">db write</text>
+<rect x="170" y="238" width="100" height="44" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="220.0" y="256.0" text-anchor="middle" class="t-sm t-bold">queue</text>
+<text x="220.0" y="272.0" text-anchor="middle" class="t-xs t-muted">adds a delay</text>
+<rect x="360" y="238" width="100" height="44" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="410.0" y="256.0" text-anchor="middle" class="t-sm t-bold">fulfilment</text>
+<text x="410.0" y="272.0" text-anchor="middle" class="t-xs t-muted">consumer</text>
+<rect x="590" y="100" width="160" height="100" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="670.0" y="138.0" text-anchor="middle" class="t-sm t-bold">collector</text>
+<text x="670.0" y="154.0" text-anchor="middle" class="t-xs t-muted">spans arrive late,</text>
+<text x="670.0" y="170.0" text-anchor="middle" class="t-xs t-muted">reordered or lost</text>
+<line x1="106" y1="138" x2="168" y2="138" class="line" marker-end="url(#ahRL3aa)"/>
+<text x="138" y="100" text-anchor="middle" class="t-xs tc-orange t-bold">traceparent</text>
+<line x1="270" y1="126" x2="358" y2="58" class="line" marker-end="url(#ahRL3aa)"/>
+<line x1="270" y1="138" x2="358" y2="136" class="line" marker-end="url(#ahRL3aa)"/>
+<line x1="270" y1="150" x2="358" y2="214" class="line" marker-end="url(#ahRL3aa)"/>
+<line x1="220" y1="166" x2="220" y2="236" class="line s-purple" marker-end="url(#ahRL3aapurple)"/>
+<text x="224" y="206" text-anchor="start" class="t-xs tc-purple">headers</text>
+<line x1="270" y1="260" x2="358" y2="260" class="line s-purple" marker-end="url(#ahRL3aapurple)"/>
+<text x="314" y="250" text-anchor="middle" class="t-xs tc-purple">later</text>
+<line x1="460" y1="50" x2="588" y2="120.0" class="line-dash s-cyan" marker-end="url(#ahRL3aacyan)"/>
+<line x1="460" y1="136" x2="588" y2="145.8" class="line-dash s-cyan" marker-end="url(#ahRL3aacyan)"/>
+<line x1="460" y1="222" x2="588" y2="171.6" class="line-dash s-cyan" marker-end="url(#ahRL3aacyan)"/>
+<line x1="460" y1="260" x2="588" y2="183.0" class="line-dash s-cyan" marker-end="url(#ahRL3aacyan)"/>
+<text x="190" y="26" text-anchor="middle" class="t-xs tc-orange t-bold">M1 ids and spans</text>
+<text x="190" y="44" text-anchor="middle" class="t-xs tc-orange t-bold">M2 traceparent</text>
+<text x="190" y="62" text-anchor="middle" class="t-xs tc-orange t-bold">M3 queue and links</text>
+<text x="190" y="80" text-anchor="middle" class="t-xs tc-orange t-bold">M4 trees · M5 paths, sampling</text></svg>
+  <figcaption><strong>The system you will trace.</strong> Six services, one queue and one collector. Solid arrows carry a <code>traceparent</code> (milestone 2; through the queue, milestone 3). Dashed arrows are span exports to a collector that receives them late and out of order (milestones 4 and 5).</figcaption>
+</figure>
+
+<ol>
+  <li><strong>Ids and spans:</strong> random, never-zero hexadecimal trace and span ids, spans that nest through an ambient context, and a tracer that stamps start and end from the simulated clock, marks failures and respects the sampled flag.</li>
+  <li><strong>Context propagation:</strong> generating, parsing and validating the W3C <code>traceparent</code> header, and injecting and extracting it across simulated service calls.</li>
+  <li><strong>Queues and links:</strong> producer and consumer spans, the same message modelled as a child and as a <em>link</em>, retries, and one span that links to a batch of messages from different traces.</li>
+  <li><strong>Assembling trees:</strong> grouping spans that arrive in any order, from many services, duplicated or lost, into trees, with placeholders for missing parents.</li>
+  <li><strong>Critical path and sampling:</strong> the chain of spans that determines a trace's duration, and a head sampler against a tail sampler at the same budget.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>You need Python 3.8 or newer and nothing else (standard library only). The files are in <code>reliability/labs/code/lab03/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab03/starter.py"><code>starter.py</code></a></td><td>Your file. The data classes, the clock, the <code>World</code> of simulated services, the queue, the delivery simulator, the workload generator, the tail sampler's buffering and the renderers are given. The pieces that carry the ideas have docstrings with the rules and a <code>TODO</code> that raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><a href="code/lab03/check.py"><code>check.py</code></a></td><td>The self-check. It runs in a few seconds and, when it fails, tells you which header, span or seed.</td></tr>
+    <tr><td><a href="code/lab03/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+  </tbody>
+</table></div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd reliability/labs/code/lab03</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 3 checks against starter.py
+
+  … Milestone 1: ids and parent/child spans on simulated time: not implemented yet (TODO milestone 1: IdGenerator.trace_id)
+  … Milestone 2: W3C traceparent across simulated services: not implemented yet (TODO milestone 2: parse_traceparent)
+  … Milestone 3: async propagation through a queue, with links: not implemented yet (TODO milestone 1: Tracer.span)
+  … Milestone 4: trace trees from out-of-order spans, with missing parents: not implemented yet (TODO milestone 1: Tracer.span)
+  … Milestone 5: critical path, head vs tail sampling: not implemented yet (TODO milestone 4: assemble)
+
+0/5 milestones passing  (0.0 s)</span></code></pre>
+
+<p><code>python3 check.py solution</code> runs the reference; <code>python3 check.py 4</code> runs only milestone 4 against your file; <code>python3 check.py solution 4 2</code> replays only seed 2 of milestone 4. Later milestones build on earlier ones (the simulated services call your tracer and your <code>inject</code>), so until milestone 1 works, the later ones report the milestone-1 TODO they ran into.</p>
+
+<h3>The cast</h3>
+
+<ul>
+  <li>A <strong>span</strong> has a <code>trace_id</code>, its own <code>span_id</code>, the <code>parent_id</code> of the span that caused it (<code>None</code> for a root), a service and a name, a start and an end, a <code>kind</code>, a status, a sampled flag, attributes, and a list of <strong>links</strong>.</li>
+  <li>A <strong>SpanContext</strong> is what crosses a process boundary: trace id, span id (which becomes the receiver's parent id) and the sampled flag.</li>
+  <li>The <strong>World</strong> holds the clock, the id generator, the exported spans (<code>world.sink</code>) and one <code>Tracer</code> per service. <code>world.call(caller, service, name, work)</code> makes a client span, builds headers with your <code>inject</code>, lets the callee build its server span from whatever your <code>extract</code> returns, and runs <code>work</code>.</li>
+  <li><code>checkout_request(world)</code> is the request of the chapter-6 trace: a gateway, a checkout service that calls inventory and pricing in parallel (pricing has a cache lookup) and then payments (a database write), and optionally publishes a message to a <code>Queue</code>.</li>
+</ul>
+
+<h2>Milestone 1: ids and parent/child spans on simulated time</h2>
+
+<p>A trace is a tree of spans, and the tree is reconstructed purely from three kinds of identifier: every span in a trace shares the trace id, every span has its own span id, and every non-root span carries its parent's span id (<a href="../chapters/06-tracing.html">chapter 6</a>). Nothing else is needed, which is why the tree can be rebuilt later, from pieces, by something that never saw the request. So the first job is making identifiers well.</p>
+
+<p>The W3C format fixes their shape: a trace id is 128 bits written as 32 lowercase hexadecimal characters, a span id is 64 bits as 16, and an all-zero value is invalid in both (it is reserved to mean "none"). The ids should be random enough that collisions never happen within the system's lifetime and that a hash of the id is a fair coin, which sampling (milestone 5) relies on. A seeded generator gives you the randomness and the ability to replay a run.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 232" role="img" aria-label="A waterfall of three spans on a simulated clock. The root span handle request runs from 0 to 60 milliseconds. Its two children, db query from 10 to 30 and render from 35 to 55, have the root&#x27;s span id as their parent id and share its trace id."><defs><marker id="ahRL3ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRL3abblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRL3abgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRL3abred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRL3aborange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRL3abpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRL3abcyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker><marker id="ahRL3abyellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+<line x1="250" y1="150" x2="730" y2="150" class="line"/>
+<line x1="250.0" y1="150" x2="250.0" y2="156" class="line-thin"/>
+<text x="250.0" y="170" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="330.0" y1="150" x2="330.0" y2="156" class="line-thin"/>
+<text x="330.0" y="170" text-anchor="middle" class="t-xs t-muted">10</text>
+<line x1="410.0" y1="150" x2="410.0" y2="156" class="line-thin"/>
+<text x="410.0" y="170" text-anchor="middle" class="t-xs t-muted">20</text>
+<line x1="490.0" y1="150" x2="490.0" y2="156" class="line-thin"/>
+<text x="490.0" y="170" text-anchor="middle" class="t-xs t-muted">30</text>
+<line x1="570.0" y1="150" x2="570.0" y2="156" class="line-thin"/>
+<text x="570.0" y="170" text-anchor="middle" class="t-xs t-muted">40</text>
+<line x1="650.0" y1="150" x2="650.0" y2="156" class="line-thin"/>
+<text x="650.0" y="170" text-anchor="middle" class="t-xs t-muted">50</text>
+<line x1="730.0" y1="150" x2="730.0" y2="156" class="line-thin"/>
+<text x="730.0" y="170" text-anchor="middle" class="t-xs t-muted">60</text>
+<text x="490.0" y="190" text-anchor="middle" class="t-xs t-muted">simulated time (ms)</text>
+<text x="8" y="24" text-anchor="start" class="t-xs t-bold tc-cyan">trace 6513270e…</text>
+<rect x="250.0" y="40.0" width="480.0" height="22.0" rx="4" class="fs-orange s-orange sw-2"/>
+<text x="256.0" y="55" text-anchor="start" class="t-xs t-bold">handle request</text>
+<text x="8" y="48" text-anchor="start" class="t-xs t-muted">span 0c5c7f…</text>
+<text x="8" y="60" text-anchor="start" class="t-xs t-faint">parent: none (root)</text>
+<rect x="330.0" y="74.0" width="160.0" height="22.0" rx="4" class="fs-blue s-blue sw-2"/>
+<text x="336.0" y="89" text-anchor="start" class="t-xs t-bold">db query</text>
+<text x="22" y="82" text-anchor="start" class="t-xs t-muted">span d23f08…</text>
+<text x="22" y="94" text-anchor="start" class="t-xs t-faint">parent 0c5c7f…</text>
+<rect x="530.0" y="108.0" width="160.0" height="22.0" rx="4" class="fs-blue s-blue sw-2"/>
+<text x="536.0" y="123" text-anchor="start" class="t-xs t-bold">render</text>
+<text x="22" y="116" text-anchor="start" class="t-xs t-muted">span 1818e8…</text>
+<text x="22" y="128" text-anchor="start" class="t-xs t-faint">parent 0c5c7f…</text></svg>
+  <figcaption><strong>Spans nest on simulated time.</strong> Three spans from a <code>World</code> with seed 7: one trace id, a fresh span id each, and parent ids that rebuild the tree. The clock only moves when the code says so (<code>clock.advance(10)</code>), so every start and end is exact.</figcaption>
+</figure>
+
+<p>The tracer's next job is the <em>ambient context</em>. Within a process, a span's parent is almost always "whichever span is currently open", and forcing every function to pass it as a parameter would make instrumentation unusable, so tracers keep a stack of open spans (in a real tracer it lives in thread-local or task-local storage; chapter 6 calls this the other half of propagation). A <code>with tracer.span("name")</code> block starts a span, pushes it, and on the way out pops and finishes it, even if the block raised an exception, in which case the span ends with status <code>error</code> and the exception continues on its way. Finally, the head-sampling decision is made once, at the root, by a sampler function; every descendant inherits the flag, and spans whose flag is false are never exported.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>IdGenerator.trace_id</code> and <code>span_id</code>, <code>Tracer.start_span</code>, <code>Tracer.finish</code> and <code>Tracer.span</code>. <code>start_span</code> creates a span but does not push it; <code>finish</code> may be called once per span.</p>
+  <p class="checkpoint"><code>python3 check.py 1</code> shows milestone 1 as ✔. It checks id formats and uniqueness over 10,000 draws, that an all-zero draw is redrawn (using a scripted random source that returns zero first), nesting and exact simulated times, export order (children finish before parents), explicit parents, links stored but not parents, an exception propagating while both spans end in <code>error</code> and the stack is restored, and the sampled flag flowing from root to descendants and suppressing export.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>self.rng.getrandbits(128)</code> gives the number; <code>f"{v:032x}"</code> formats it. Loop until it is non-zero.</li>
+      <li>In <code>start_span</code>, resolve the parent first: the argument if given, else <code>self.current()</code>. With no parent at all it is a root and the sampler decides; with one, inherit the trace id, the sampled flag, and take <code>parent.span_id</code> as <code>parent_id</code>. Both <code>Span</code> and <code>SpanContext</code> have these three attributes, so one code path serves both.</li>
+      <li>In the context manager, <code>try/yield/except BaseException</code> lets you mark the error, pop the stack, finish, and re-raise.</li>
+      <li>A parent passed explicitly beats the ambient one: that is how a server span joins the caller's trace in milestone 2.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">class</span> IdGenerator:
+
+    <span class="kw">def</span> __init__(self, rng):
+        self.rng = rng
+
+    <span class="kw">def</span> trace_id(self):
+        <span class="str">"""32 lowercase hex characters (128 bits), never all zeros."""</span>
+        <span class="kw">while</span> <span class="kw">True</span>:
+            v = self.rng.getrandbits(<span class="num">128</span>)
+            <span class="kw">if</span> v:
+                <span class="kw">return</span> <span class="str">f"{v:032x}"</span>
+
+    <span class="kw">def</span> span_id(self):
+        <span class="str">"""16 lowercase hex characters (64 bits), never all zeros."""</span>
+        <span class="kw">while</span> <span class="kw">True</span>:
+            v = self.rng.getrandbits(<span class="num">64</span>)
+            <span class="kw">if</span> v:
+                <span class="kw">return</span> <span class="str">f"{v:016x}"</span>
+
+<span class="kw">def</span> start_span(self, name, parent=<span class="kw">None</span>, kind=<span class="str">"internal"</span>, links=(), attrs=<span class="kw">None</span>):
+    parent = parent <span class="kw">if</span> parent <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">else</span> self.current()
+    <span class="kw">if</span> parent <span class="kw">is</span> <span class="kw">None</span>:
+        trace_id = self.ids.trace_id()
+        parent_id, sampled = <span class="kw">None</span>, bool(self.sampler(trace_id))
+    <span class="kw">else</span>:
+        trace_id, parent_id, sampled = parent.trace_id, parent.span_id, parent.sampled
+    <span class="kw">return</span> Span(trace_id, self.ids.span_id(), parent_id, self.service, name, self.clock.now,
+                kind=kind, sampled=sampled, attrs=dict(attrs <span class="kw">or</span> {}), links=list(links))
+
+<span class="kw">def</span> finish(self, span, status=<span class="kw">None</span>):
+    <span class="kw">if</span> span.end <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        <span class="kw">raise</span> ValueError(<span class="str">"span already ended"</span>)
+    span.end = self.clock.now
+    <span class="kw">if</span> status <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        span.status = status
+    <span class="kw">if</span> span.sampled:
+        self.sink.append(span)
+
+@contextmanager
+<span class="kw">def</span> span(self, name, parent=<span class="kw">None</span>, kind=<span class="str">"internal"</span>, links=(), attrs=<span class="kw">None</span>):
+    s = self.start_span(name, parent, kind, links, attrs)
+    self.stack.append(s)
+    <span class="kw">try</span>:
+        <span class="kw">yield</span> s
+    <span class="kw">except</span> BaseException:
+        self.stack.pop()
+        self.finish(s, <span class="str">"error"</span>)
+        <span class="kw">raise</span>
+    self.stack.pop()
+    self.finish(s)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: context propagation with W3C <code>traceparent</code></h2>
+
+<p>Inside one process the stack does the job. Across processes the context has to be serialised into the request. For years every tracing system invented its own header; the W3C Trace Context recommendation replaced them with one, <code>traceparent</code>: <code>version-trace_id-parent_id-flags</code>, four lowercase-hex fields joined by dashes, 55 characters in version 00 (<a href="../chapters/06-tracing.html">chapter 6</a> draws it).</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="The W3C traceparent header split into four fields: version 00, a 32 hex digit trace id, a 16 hex digit parent id and a flags byte 01 whose lowest bit means sampled. Below, three invalid examples: an all-zero trace id, uppercase hex, and version ff."><defs><marker id="ahRL3ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRL3acblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRL3acgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRL3acred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRL3acorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRL3acpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRL3accyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker><marker id="ahRL3acyellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+<text x="60" y="24" text-anchor="start" class="t-xs t-muted">traceparent: </text>
+<rect x="60.0" y="40.0" width="22.0" height="34.0" rx="4" class="fs-orange s-orange sw-2"/>
+<text x="71.0" y="62" text-anchor="middle" class="t-sm mono">00</text>
+<text x="87.5" y="62" text-anchor="middle" class="t-sm mono">-</text>
+<rect x="93.0" y="40.0" width="352.0" height="34.0" rx="4" class="fs-cyan s-cyan sw-2"/>
+<text x="269.0" y="62" text-anchor="middle" class="t-sm mono">4bf92f3577b34da6a3ce929d0e0e4736</text>
+<text x="450.5" y="62" text-anchor="middle" class="t-sm mono">-</text>
+<rect x="456.0" y="40.0" width="176.0" height="34.0" rx="4" class="fs-blue s-blue sw-2"/>
+<text x="544.0" y="62" text-anchor="middle" class="t-sm mono">00f067aa0ba902b7</text>
+<text x="637.5" y="62" text-anchor="middle" class="t-sm mono">-</text>
+<rect x="643.0" y="40.0" width="22.0" height="34.0" rx="4" class="fs-purple s-purple sw-2"/>
+<text x="654.0" y="62" text-anchor="middle" class="t-sm mono">01</text>
+<line x1="71" y1="76" x2="71" y2="100" class="line s-orange" marker-end="url(#ahRL3acorange)"/>
+<text x="60" y="116" text-anchor="start" class="t-xs tc-orange t-bold">version: 00 (ff invalid)</text>
+<line x1="269" y1="76" x2="269" y2="134" class="line s-cyan" marker-end="url(#ahRL3accyan)"/>
+<text x="277" y="150" text-anchor="start" class="t-xs tc-cyan t-bold">trace-id: 128 bits, never all zeros</text>
+<line x1="544" y1="76" x2="544" y2="178" class="line s-blue" marker-end="url(#ahRL3acblue)"/>
+<text x="538" y="194" text-anchor="end" class="t-xs tc-blue t-bold">parent-id: the caller's span id, 64 bits, never all zeros</text>
+<line x1="654" y1="76" x2="654" y2="214" class="line s-purple" marker-end="url(#ahRL3acpurple)"/>
+<text x="660" y="230" text-anchor="end" class="t-xs tc-purple t-bold">flags: bit 0 = sampled (test the bit, not equality)</text>
+<text x="8" y="262" text-anchor="start" class="t-xs t-bold tc-red">refused:</text>
+<text x="70" y="262" class="t-xs mono">00-00000000000000000000000000000000-00f067aa0ba902b7-01</text>
+<text x="447.0" y="262" text-anchor="start" class="t-xs tc-red">all-zero trace id</text>
+<text x="70" y="284" class="t-xs mono">00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01</text>
+<text x="447.0" y="284" text-anchor="start" class="t-xs tc-red">uppercase hex</text>
+<text x="70" y="306" class="t-xs mono">ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</text>
+<text x="447.0" y="306" text-anchor="start" class="t-xs tc-red">version ff</text></svg>
+  <figcaption><strong>55 characters.</strong> The W3C example value, drawn to scale. The <em>parent-id</em> is the span id of the <em>caller</em>: the receiver makes its own span id and records this one as its parent. Below: three of the inputs <code>parse_traceparent</code> must refuse.</figcaption>
+</figure>
+
+<p>Two roles meet at the header. The <strong>sender</strong>, about to make a call, makes a client span and writes <em>that span's</em> context into the request: the receiver's parent will be the client span, not whatever span happened to be open higher up. The <strong>receiver</strong> parses the header, creates its own server span as a child of the parsed context (same trace id, new span id, <code>parent_id</code> = the header's parent-id), and uses that span's context for any calls it makes in turn. The sampled bit is the lowest bit of the flags byte, tested with a mask, because the other seven bits are reserved and a future flag must not break today's parser.</p>
+
+<p>A parser sits on an untrusted boundary, so it must be strict and must never crash. The rules the check enforces: exactly 55 characters for version 00 (no trailing data), lowercase hex only, no all-zero ids, version <code>ff</code> invalid, and a more forgiving rule for versions above 00: a future version may append more fields, but only after a dash following the four known ones. A header that fails any rule yields <code>None</code>, and the receiver simply starts a fresh trace; losing a trace is better than joining the wrong one.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>format_traceparent</code>, <code>parse_traceparent</code>, <code>inject</code> and <code>extract</code> (header names are case-insensitive). <code>parse_traceparent</code> returns a <code>SpanContext</code> or <code>None</code> and never raises.</p>
+  <p class="checkpoint"><code>python3 check.py 2</code> shows milestone 2 as ✔. It round-trips 500 random contexts, parses the W3C example, rejects 23 kinds of invalid header (including non-strings), accepts a future version with extra data, and tests the sampled bit with flag bytes <code>00 01 02 03 fe ff</code>. Then it runs one request through six services and demands a single trace id with every server span parented by its caller's client span, and finally puts a header-dropping proxy in front of pricing and demands exactly two traces.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Check the length first (at least 55), split the first 55 characters on <code>"-"</code>, and require four parts of lengths 2, 32, 16 and 2.</li>
+      <li>For hex validation, test each character against <code>set("0123456789abcdef")</code>; <code>int(x, 16)</code> would accept uppercase and underscores and a leading sign.</li>
+      <li>Version 00 must be exactly 55 characters. For higher versions, either exactly 55, or character 55 must be a dash.</li>
+      <li><code>bool(int(flags, 16) &amp; 1)</code> for the sampled flag.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> format_traceparent(ctx):
+    <span class="kw">return</span> <span class="str">f"00-{ctx.trace_id}-{ctx.span_id}-{'01' if ctx.sampled else '00'}"</span>
+
+<span class="kw">def</span> parse_traceparent(header):
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(header, str):
+        <span class="kw">return</span> <span class="kw">None</span>
+    h = header.strip(<span class="str">" \t"</span>)
+    <span class="kw">if</span> len(h) &lt; <span class="num">55</span>:
+        <span class="kw">return</span> <span class="kw">None</span>
+    parts = h[:<span class="num">55</span>].split(<span class="str">"-"</span>)
+    <span class="kw">if</span> len(parts) != <span class="num">4</span>:
+        <span class="kw">return</span> <span class="kw">None</span>
+    ver, tid, pid, flags = parts
+    hexd = set(<span class="str">"0123456789abcdef"</span>)
+    <span class="kw">for</span> field_, n <span class="kw">in</span> ((ver, <span class="num">2</span>), (tid, <span class="num">32</span>), (pid, <span class="num">16</span>), (flags, <span class="num">2</span>)):
+        <span class="kw">if</span> len(field_) != n <span class="kw">or</span> any(c <span class="kw">not</span> <span class="kw">in</span> hexd <span class="kw">for</span> c <span class="kw">in</span> field_):
+            <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">if</span> ver == <span class="str">"ff"</span> <span class="kw">or</span> tid == <span class="str">"0"</span> * <span class="num">32</span> <span class="kw">or</span> pid == <span class="str">"0"</span> * <span class="num">16</span>:
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">if</span> ver == <span class="str">"00"</span>:
+        <span class="kw">if</span> len(h) != <span class="num">55</span>:
+            <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">elif</span> len(h) &gt; <span class="num">55</span> <span class="kw">and</span> h[<span class="num">55</span>] != <span class="str">"-"</span>:
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">return</span> SpanContext(tid, pid, bool(int(flags, <span class="num">16</span>) &amp; <span class="num">1</span>))
+
+<span class="kw">def</span> inject(headers, ctx):
+    headers[<span class="str">"traceparent"</span>] = format_traceparent(ctx)
+
+<span class="kw">def</span> extract(headers):
+    <span class="kw">for</span> k, v <span class="kw">in</span> headers.items():
+        <span class="kw">if</span> k.lower() == <span class="str">"traceparent"</span>:
+            <span class="kw">return</span> parse_traceparent(v)
+    <span class="kw">return</span> <span class="kw">None</span></code></pre>
+  </details>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -c "
+import solution as m
+w = m.World(1)
+root = m.checkout_request(w)
+print('root context      ', m.format_traceparent(root.context()))
+by_id = {s.span_id: s for s in w.sink}
+for s in w.sink:
+    if s.kind == 'server' and s.service != 'gateway':
+        print(f'{s.service:10s} server span {s.span_id[:6]} has parent {s.parent_id[:6]}  =  {by_id[s.parent_id].service}:{by_id[s.parent_id].name}')
+w2 = m.World(1, drop_headers={'pricing'})
+m.checkout_request(w2)
+counts = {}
+for s in w2.sink:
+    counts[s.trace_id[:8]] = counts.get(s.trace_id[:8], 0) + 1
+print('with a header-dropping proxy in front of pricing:', counts)
+"</span>
+<span class="out">root context       00-cd613e30d8f16adf91b7584a2265b1f5-1027c4d1c386bbc4-01
+inventory  server span 612e76 has parent 78e510  =  checkout:call inventory
+pricing    server span 7ce42c has parent 35bf99  =  checkout:call pricing
+payments   server span 9b810e has parent 63ca82  =  checkout:call payments
+checkout   server span c2ce6f has parent 1e2feb  =  gateway:call checkout
+with a header-dropping proxy in front of pricing: {'cd613e30': 9, 'e4b06ce6': 2}</span></code></pre>
+
+<h2>Milestone 3: async propagation through a queue, with span links</h2>
+
+<p>A synchronous call has a clean shape: the caller waits and the callee's work nests inside the caller's span. A queue breaks that. After <code>publish</code> returns, the producer's span is over; the consumer's work happens later (here a few hundred milliseconds, in production maybe seconds or hours), perhaps in a batch, perhaps retried several times. Chapter 6 describes two representations and says neither is wrong; the lab makes you build both and see what each costs.</p>
+
+<p>The carrier is the same as for HTTP: message headers. The producer makes a <code>publish</code> span, writes <em>its</em> context into the message headers, and the consumer extracts it. What the consumer does with the extracted context is the choice:</p>
+
+<ul>
+  <li><strong>As a child.</strong> Same trace, parent is the publish span. The waterfall of the request now includes the queue wait as a long gap before the consumer's span, which is informative, and works well for one message to one consumer. The price is that the trace's duration is no longer "how long did the user wait": it includes everything that happened downstream, however much later.</li>
+  <li><strong>As a new trace with a link.</strong> The consumer starts its own trace and records a <em>link</em> to the producer's span context. A link is a reference that is not a parent. It fits where a tree is the wrong shape: a retry hours later (a new trace per attempt, each linking to the same publish span), or a consumer that processes a <em>batch</em> of 100 messages from 100 different requests (one span with 100 links). Each trace keeps a meaningful duration.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Two timelines of the same request. In child mode the consumer span begins 646 ms after the publish span ends and belongs to the same trace, so the trace is long. In linked mode the request&#x27;s trace ends with the publish and the consumer starts a new trace with a link back to the publish span."><defs><marker id="ahRL3ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRL3adblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRL3adgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRL3adred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRL3adorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRL3adpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRL3adcyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker><marker id="ahRL3adyellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+<text x="8" y="26" text-anchor="start" class="t-sm t-bold">A. child of the producer</text>
+<text x="8" y="40" text-anchor="start" class="t-xs t-muted">one trace</text>
+<rect x="120.0" y="30.0" width="41.7" height="20.0" rx="3" class="fs-blue s-blue sw-2"/>
+<text x="167.73684210526315" y="44" text-anchor="start" class="t-xs tc-blue">request 0..52 ms</text>
+<rect x="157.5" y="56.0" width="3.0" height="16.0" rx="3" class="fs-purple s-purple sw-2"/>
+<rect x="678.1" y="56.0" width="19.1" height="16.0" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="694.1080210688909" y="49" text-anchor="end" class="t-xs tc-orange t-bold">process orders (parent = publish span)</text>
+<line x1="159.3" y1="64" x2="678.1" y2="64" class="line-dash s-red" stroke-width="1.5"/>
+<text x="378.718484218656" y="90" text-anchor="middle" class="t-xs tc-red">queue wait 646 ms is inside this trace</text>
+<text x="8" y="150" text-anchor="start" class="t-sm t-bold">B. new trace + link</text>
+<text x="8" y="164" text-anchor="start" class="t-xs t-muted">two traces</text>
+<rect x="120.0" y="140.0" width="41.7" height="20.0" rx="3" class="fs-blue s-blue sw-2"/>
+<text x="167.73684210526315" y="154" text-anchor="start" class="t-xs tc-blue">trace 1: the request, 52 ms</text>
+<rect x="157.5" y="166.0" width="3.0" height="16.0" rx="3" class="fs-purple s-purple sw-2"/>
+<rect x="678.1" y="196.0" width="19.1" height="16.0" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="670.1080210688909" y="208" text-anchor="end" class="t-xs tc-orange t-bold">trace 2: process orders, 20 ms</text>
+<path d="M679.1,196 C679.1,180 188.5,190 158.5,184" class="line-dash s-purple" fill="none" stroke-width="2" marker-end="url(#ahRL3adpurple)"/>
+<text x="248.5263157894737" y="175" text-anchor="start" class="t-xs tc-purple">link: points at the publish span's context</text>
+<line x1="120" y1="262" x2="730" y2="262" class="line"/>
+<line x1="120.0" y1="262" x2="120.0" y2="268" class="line-thin"/>
+<text x="120.0" y="282" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="200.26315789473682" y1="262" x2="200.26315789473682" y2="268" class="line-thin"/>
+<text x="200.26315789473682" y="282" text-anchor="middle" class="t-xs t-muted">100</text>
+<line x1="280.52631578947364" y1="262" x2="280.52631578947364" y2="268" class="line-thin"/>
+<text x="280.52631578947364" y="282" text-anchor="middle" class="t-xs t-muted">200</text>
+<line x1="360.7894736842105" y1="262" x2="360.7894736842105" y2="268" class="line-thin"/>
+<text x="360.7894736842105" y="282" text-anchor="middle" class="t-xs t-muted">300</text>
+<line x1="441.05263157894734" y1="262" x2="441.05263157894734" y2="268" class="line-thin"/>
+<text x="441.05263157894734" y="282" text-anchor="middle" class="t-xs t-muted">400</text>
+<line x1="521.3157894736842" y1="262" x2="521.3157894736842" y2="268" class="line-thin"/>
+<text x="521.3157894736842" y="282" text-anchor="middle" class="t-xs t-muted">500</text>
+<line x1="601.578947368421" y1="262" x2="601.578947368421" y2="268" class="line-thin"/>
+<text x="601.578947368421" y="282" text-anchor="middle" class="t-xs t-muted">600</text>
+<line x1="681.8421052631579" y1="262" x2="681.8421052631579" y2="268" class="line-thin"/>
+<text x="681.8421052631579" y="282" text-anchor="middle" class="t-xs t-muted">700</text>
+<text x="425.0" y="304" text-anchor="middle" class="t-xs t-muted">simulated time (ms)</text></svg>
+  <figcaption><strong>Two ways to model a queue.</strong> Seed 3: the request is done at 52 ms, the message is delivered at 695 ms. Top: the consumer is a <em>child</em>, and one trace spans the queue wait. Bottom: the consumer starts its <em>own</em> trace and a <em>link</em> (dashed) points at the publish span.</figcaption>
+</figure>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>publish</code>, <code>consume_as_child</code>, <code>consume_linked</code> (with an optional simulated failure) and <code>consume_batch</code>. A message with no usable context (no header, or garbage) must still be processed; it simply contributes no link.</p>
+  <p class="checkpoint"><code>python3 check.py 3</code> shows milestone 3 as ✔. It checks that the message header carries the producer span's context, that child mode joins the producer's trace with the publish span as parent and a gap of at least 200 ms, that linked mode makes a new trace whose single link is the publish span (both traces stay short), that a failed attempt is an error span and its retry five seconds later links to the same publish span, and that a batch of five messages from five traces becomes one span with five links to exactly those traces.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>publish</code>: open a producer span with <code>tracer.span(..., kind="producer")</code>, <code>inject</code> from <code>ps.context()</code> (the span you are inside), put the message, advance 1 ms.</li>
+      <li>Every consumer begins with <code>world.clock.advance_to(msg.deliver_at)</code>: the consumer cannot run before the message arrives.</li>
+      <li>A linked consumer must be a <em>root</em>: pass no <code>parent</code>. Its tracer's stack is empty, so <code>start_span</code> makes a new trace; the extracted context goes in <code>links</code> instead.</li>
+      <li>For the failing attempt, raise inside the <code>with</code> block so the span ends in <code>error</code>, then catch the exception <em>outside</em> the block.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> publish(world, tracer, queue, body):
+    <span class="kw">with</span> tracer.span(<span class="str">"publish orders"</span>, kind=<span class="str">"producer"</span>) <span class="kw">as</span> ps:
+        headers = {}
+        inject(headers, ps.context())
+        queue.put(headers, body)
+        world.clock.advance(<span class="num">1</span>)
+    <span class="kw">return</span> ps
+
+<span class="kw">def</span> consume_as_child(world, tracer, msg, work_ms=<span class="num">20</span>):
+    world.clock.advance_to(msg.deliver_at)
+    <span class="kw">with</span> tracer.span(<span class="str">"process orders"</span>, parent=extract(msg.headers), kind=<span class="str">"consumer"</span>,
+                     attrs={<span class="str">"attempt"</span>: msg.attempt}) <span class="kw">as</span> s:
+        world.clock.advance(work_ms)
+    <span class="kw">return</span> s
+
+<span class="kw">def</span> consume_linked(world, tracer, msg, work_ms=<span class="num">20</span>, fail=<span class="kw">False</span>):
+    world.clock.advance_to(msg.deliver_at)
+    ctx = extract(msg.headers)
+    s = <span class="kw">None</span>
+    <span class="kw">try</span>:
+        <span class="cmt"># parent=None would fall back to the ambient span; the consumer has none, so this is a root</span>
+        <span class="kw">with</span> tracer.span(<span class="str">"process orders"</span>, kind=<span class="str">"consumer"</span>, links=[ctx] <span class="kw">if</span> ctx <span class="kw">else</span> [],
+                         attrs={<span class="str">"attempt"</span>: msg.attempt}) <span class="kw">as</span> s:
+            world.clock.advance(work_ms)
+            <span class="kw">if</span> fail:
+                <span class="kw">raise</span> RuntimeError(<span class="str">"downstream unavailable"</span>)
+    <span class="kw">except</span> RuntimeError:
+        <span class="kw">pass</span>
+    <span class="kw">return</span> s
+
+<span class="kw">def</span> consume_batch(world, tracer, msgs, work_ms=<span class="num">40</span>):
+    world.clock.advance_to(max(m.deliver_at <span class="kw">for</span> m <span class="kw">in</span> msgs))
+    links = [c <span class="kw">for</span> c <span class="kw">in</span> (extract(m.headers) <span class="kw">for</span> m <span class="kw">in</span> msgs) <span class="kw">if</span> c <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>]
+    <span class="kw">with</span> tracer.span(<span class="str">"process orders batch"</span>, kind=<span class="str">"consumer"</span>, links=links, attrs={<span class="str">"batch_size"</span>: len(msgs)}) <span class="kw">as</span> s:
+        world.clock.advance(work_ms)
+    <span class="kw">return</span> s</code></pre>
+  </details>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -c "
+import solution as m
+w = m.World(3); q = m.Queue(w)
+root = m.checkout_request(w, q)
+pub = next(s for s in w.sink if s.kind == 'producer')
+msg = q.take_all()[0]
+print('message headers:', msg.headers)
+print(f'request ends at {root.end:.0f} ms, message delivered at {msg.deliver_at:.0f} ms')
+c = m.consume_as_child(w, w.tracer('fulfilment'), msg)
+print(f'CHILD  : same trace? {c.trace_id == root.trace_id}  parent is publish span? {c.parent_id == pub.span_id}  trace lasts {m.trace_duration([s for s in w.sink if s.trace_id == root.trace_id]):.0f} ms')
+w = m.World(3); q = m.Queue(w)
+root = m.checkout_request(w, q); pub = next(s for s in w.sink if s.kind == 'producer'); msg = q.take_all()[0]
+cons = w.tracer('fulfilment')
+a1 = m.consume_linked(w, cons, msg, fail=True)
+a2 = m.consume_linked(w, cons, q.redeliver(msg, 5000))
+print(f'LINKED : attempt 1 status={a1.status}, attempt 2 starts {a2.start - a1.end:.0f} ms later; '
+      f'both link to the publish span: {a1.links == [pub.context()] == a2.links}; '
+      f'three separate traces: {len({root.trace_id, a1.trace_id, a2.trace_id}) == 3}')
+"</span>
+<span class="out">message headers: {'traceparent': '00-216363698b529b4a97b750923ceb3ffd-65aa9c8279f248b0-01'}
+request ends at 52 ms, message delivered at 695 ms
+CHILD  : same trace? True  parent is publish span? True  trace lasts 715 ms
+LINKED : attempt 1 status=error, attempt 2 starts 5000 ms later; both link to the publish span: True; three separate traces: True</span></code></pre>
+
+<h2>Milestone 4: assembling trace trees from out-of-order spans</h2>
+
+<p>So far every span was exported in the order it finished, in one list. Production is nothing like that. Each service batches its spans and ships them after a lag of its own, over a network that reorders them; two services may ship a trace's spans minutes apart; an exporter that retries delivers some spans twice; and some spans never arrive at all. The collector therefore sees a stream of spans from thousands of traces interleaved, children before parents, and has to turn it into trees <em>without knowing in advance what shape a trace has</em> or whether it is complete.</p>
+
+<p>The algorithm is a group-and-link. Group the spans by trace id (deduplicating by span id). Index them by span id. For each span, if its parent id is <code>None</code> it is a root; if its parent was received, attach it as that parent's child; if its parent id is set but the parent was <em>not</em> received, the tree has a hole, and the honest representation is a <strong>placeholder</strong>: a node standing in for the missing span, with the orphans as its children, flagged so the UI can draw it dashed and say "incomplete". Sort children by start time so that the output does not depend on the arrival order, which the check verifies against 25 random orders.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Two indented trees of the same eleven spans. The left tree is complete and each node carries its arrival rank at the collector, which is scrambled. In the right tree one span, call pricing, was never received: a dashed placeholder stands in for it and its children hang below it."><defs><marker id="ahRL3ae" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRL3aeblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRL3aegreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRL3aered" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRL3aeorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRL3aepurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRL3aecyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker><marker id="ahRL3aeyellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+<text x="8" y="18" text-anchor="start" class="t-sm t-bold">complete: #n = arrival rank</text>
+<text x="398" y="18" text-anchor="start" class="t-sm t-bold">'call pricing' never arrived</text>
+<rect x="8.0" y="26.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="40" text-anchor="middle" class="t-xs tc-cyan t-bold">#5</text>
+<text x="48" y="40" text-anchor="start" class="t-xs t-bold">POST /checkout</text>
+<text x="149.0" y="40" text-anchor="start" class="t-xs t-muted">gateway</text>
+<text x="438" y="40" text-anchor="start" class="t-xs t-bold">POST /checkout</text>
+<text x="539.0" y="40" text-anchor="start" class="t-xs t-muted">gateway</text>
+<rect x="8.0" y="51.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="65" text-anchor="middle" class="t-xs tc-cyan t-bold">#3</text>
+<text x="62" y="65" text-anchor="start" class="t-xs t-bold">call checkout</text>
+<text x="156.5" y="65" text-anchor="start" class="t-xs t-muted">gateway</text>
+<text x="452" y="65" text-anchor="start" class="t-xs t-bold">call checkout</text>
+<text x="546.5" y="65" text-anchor="start" class="t-xs t-muted">gateway</text>
+<rect x="8.0" y="76.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="90" text-anchor="middle" class="t-xs tc-cyan t-bold">#1</text>
+<text x="76" y="90" text-anchor="start" class="t-xs t-bold">POST /checkout</text>
+<text x="177.0" y="90" text-anchor="start" class="t-xs t-muted">checkout</text>
+<text x="466" y="90" text-anchor="start" class="t-xs t-bold">POST /checkout</text>
+<text x="567.0" y="90" text-anchor="start" class="t-xs t-muted">checkout</text>
+<rect x="8.0" y="101.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="115" text-anchor="middle" class="t-xs tc-cyan t-bold">#6</text>
+<text x="90" y="115" text-anchor="start" class="t-xs t-bold">call pricing</text>
+<text x="178.0" y="115" text-anchor="start" class="t-xs t-muted">checkout</text>
+<rect x="480" y="101" width="190" height="20" rx="4" fill="none" class="s-red" stroke-width="1.5" stroke-dasharray="5 3"/>
+<text x="486" y="115" text-anchor="start" class="t-xs tc-red">&lt;missing span&gt; (placeholder)</text>
+<rect x="8.0" y="126.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="140" text-anchor="middle" class="t-xs tc-cyan t-bold">#2</text>
+<text x="104" y="140" text-anchor="start" class="t-xs t-bold">GET /price</text>
+<text x="179.0" y="140" text-anchor="start" class="t-xs t-muted">pricing</text>
+<text x="494" y="140" text-anchor="start" class="t-xs t-bold tc-orange">GET /price</text>
+<text x="569.0" y="140" text-anchor="start" class="t-xs t-muted">pricing</text>
+<rect x="8.0" y="151.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="165" text-anchor="middle" class="t-xs tc-cyan t-bold">#7</text>
+<text x="118" y="165" text-anchor="start" class="t-xs t-bold">cache lookup</text>
+<text x="206.0" y="165" text-anchor="start" class="t-xs t-muted">pricing</text>
+<text x="508" y="165" text-anchor="start" class="t-xs t-bold tc-orange">cache lookup</text>
+<text x="596.0" y="165" text-anchor="start" class="t-xs t-muted">pricing</text>
+<rect x="8.0" y="176.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="190" text-anchor="middle" class="t-xs tc-cyan t-bold">#8</text>
+<text x="90" y="190" text-anchor="start" class="t-xs t-bold">call inventory</text>
+<text x="191.0" y="190" text-anchor="start" class="t-xs t-muted">checkout</text>
+<text x="480" y="190" text-anchor="start" class="t-xs t-bold">call inventory</text>
+<text x="581.0" y="190" text-anchor="start" class="t-xs t-muted">checkout</text>
+<rect x="8.0" y="201.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="215" text-anchor="middle" class="t-xs tc-cyan t-bold">#10</text>
+<text x="104" y="215" text-anchor="start" class="t-xs t-bold">GET /stock</text>
+<text x="179.0" y="215" text-anchor="start" class="t-xs t-muted">inventory</text>
+<text x="494" y="215" text-anchor="start" class="t-xs t-bold">GET /stock</text>
+<text x="569.0" y="215" text-anchor="start" class="t-xs t-muted">inventory</text>
+<rect x="8.0" y="226.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="240" text-anchor="middle" class="t-xs tc-cyan t-bold">#4</text>
+<text x="90" y="240" text-anchor="start" class="t-xs t-bold">call payments</text>
+<text x="184.5" y="240" text-anchor="start" class="t-xs t-muted">checkout</text>
+<text x="480" y="240" text-anchor="start" class="t-xs t-bold">call payments</text>
+<text x="574.5" y="240" text-anchor="start" class="t-xs t-muted">checkout</text>
+<rect x="8.0" y="251.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="265" text-anchor="middle" class="t-xs tc-cyan t-bold">#11</text>
+<text x="104" y="265" text-anchor="start" class="t-xs t-bold">POST /charge</text>
+<text x="192.0" y="265" text-anchor="start" class="t-xs t-muted">payments</text>
+<text x="494" y="265" text-anchor="start" class="t-xs t-bold">POST /charge</text>
+<text x="582.0" y="265" text-anchor="start" class="t-xs t-muted">payments</text>
+<rect x="8.0" y="276.0" width="28.0" height="20.0" rx="4" class="fs-cyan s-cyan sw-1"/>
+<text x="22" y="290" text-anchor="middle" class="t-xs tc-cyan t-bold">#9</text>
+<text x="118" y="290" text-anchor="start" class="t-xs t-bold">db write</text>
+<text x="180.0" y="290" text-anchor="start" class="t-xs t-muted">payments</text>
+<text x="508" y="290" text-anchor="start" class="t-xs t-bold">db write</text>
+<text x="570.0" y="290" text-anchor="start" class="t-xs t-muted">payments</text></svg>
+  <figcaption><strong>Arrival order is not tree order.</strong> Left: the eleven spans of one request with the rank in which a collector received them (seed 5): the root arrives fifth and a leaf first. Right: the same trace after one span was lost in transit. <code>assemble</code> hangs the orphans under a placeholder for the missing parent and marks the trace incomplete.</figcaption>
+</figure>
+
+<p>There is one honest limit, and the check states it. A tree can detect a missing <em>interior</em> span, because a surviving child names it. It cannot detect a missing <em>leaf</em>: no surviving span refers to it, so the trace looks complete, merely shorter than it should be. This is why completeness in tracing is a statistical property of the pipeline (the fraction of expected spans that arrive, measured by counters at the exporters) as much as a property of any one trace.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>assemble(spans)</code>, returning <code>{trace_id: Tree}</code> as the docstring specifies: deduplicate, prefer the copy that has an end time, one placeholder per missing parent shared by its orphans, <code>missing_parents</code> recorded, children sorted by <code>(start, span_id)</code>, input untouched.</p>
+  <p class="checkpoint"><code>python3 check.py 4</code> shows milestone 4 as ✔. For three seeds it builds twelve 13-span traces (with a queue consumer joined as a child, and every fourth payment failing), delivers them in 25 different orders (some fully shuffled), and demands the identical, correct tree each time with no cross-trace mixing. It then tests duplicate delivery, a lost interior span and a lost root, and finally drops 8% of all spans: every lost span that still had a surviving child must be reported in <code>missing_parents</code>, and traces that lost only leaves must look complete.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Two passes: first a dict <code>span_id -&gt; Span</code> per trace (this is where duplicates collapse), then create a <code>Node</code> per span and attach each to its parent's node, to a placeholder, or to the roots.</li>
+      <li>Create a placeholder lazily: <code>holes.setdefault(parent_id, Node(parent_id, None))</code>.</li>
+      <li>Sorting makes it deterministic: <code>children.sort(key=lambda n: (n.span.start, n.span_id))</code> for real nodes; roots by the same key, then placeholders by id.</li>
+      <li><code>Tree.complete</code> is a property over <code>missing_parents</code>, so you only have to fill the set.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> assemble(spans):
+    by_trace = {}
+    <span class="kw">for</span> sp <span class="kw">in</span> spans:
+        d = by_trace.setdefault(sp.trace_id, {})
+        old = d.get(sp.span_id)
+        <span class="kw">if</span> old <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> (old.end <span class="kw">is</span> <span class="kw">None</span> <span class="kw">and</span> sp.end <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>):
+            d[sp.span_id] = sp
+    out = {}
+    <span class="kw">for</span> tid, d <span class="kw">in</span> by_trace.items():
+        nodes = {sid: Node(sid, sp) <span class="kw">for</span> sid, sp <span class="kw">in</span> d.items()}
+        roots, holes = [], {}
+        <span class="kw">for</span> sid, sp <span class="kw">in</span> d.items():
+            <span class="kw">if</span> sp.parent_id <span class="kw">is</span> <span class="kw">None</span>:
+                roots.append(nodes[sid])
+            <span class="kw">elif</span> sp.parent_id <span class="kw">in</span> nodes:
+                nodes[sp.parent_id].children.append(nodes[sid])
+            <span class="kw">else</span>:
+                holes.setdefault(sp.parent_id, Node(sp.parent_id, <span class="kw">None</span>)).children.append(nodes[sid])
+        key = <span class="kw">lambda</span> n: (n.span.start, n.span_id)
+        <span class="kw">for</span> n <span class="kw">in</span> list(nodes.values()) + list(holes.values()):
+            n.children.sort(key=key)
+        roots.sort(key=key)
+        out[tid] = Tree(tid, roots + [holes[k] <span class="kw">for</span> k <span class="kw">in</span> sorted(holes)], len(d), set(holes))
+    <span class="kw">return</span> out</code></pre>
+  </details>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution 4</span>
+<span class="out">Lab 3 checks against solution.py
+
+  ✔ Milestone 4: trace trees from out-of-order spans, with missing parents
+      trace cd613e30  13 spans
+      POST /checkout                gateway   |##                                      |   52.0 ms
+        call checkout               gateway   |##                                      |   50.0 ms
+          POST /checkout            checkout  |##                                      |   48.0 ms
+            call pricing            checkout  |#                                       |   27.0 ms
+              GET /price            pricing   |#                                       |   25.0 ms
+                cache lookup        pricing   |#                                       |    2.0 ms
+            call inventory          checkout  |#                                       |   10.0 ms
+              GET /stock            inventory |#                                       |    8.0 ms
+            call payments           checkout  | #                                      |   16.0 ms
+              POST /charge          payments  | #                                      |   14.0 ms
+                db write            payments  | #                                      |   12.0 ms
+            publish orders          checkout  |  #                                     |    1.0 ms
+              process orders        fulfilment|                                       #|   20.0 ms
+      25 arrival orders x 3 seeds give identical trees; lost parents are found (31 traces flagged incomplete); 11 traces lost only leaf spans and look complete - a tree cannot see a span it never heard of
+
+1/1 milestones passing  (0.0 s)</span></code></pre>
+
+<h2>Milestone 5: the critical path, and head versus tail sampling</h2>
+
+<h3>The critical path</h3>
+
+<p>A trace answers "where did the time go?" with a waterfall, but the longest bar is not necessarily the one to fix. The request in <a href="../chapters/06-tracing.html">chapter 6</a> calls inventory and pricing in parallel; making inventory twice as fast changes nothing, because the request waits for pricing anyway. The <strong>critical path</strong> is the chain of spans that determines the total: walk backwards from the end of the root, at each point take the child that finished last, continue from that child's start, and recurse. Everything off the path has slack. A span's <strong>self time</strong> is its duration minus the time covered by its on-path children, which is the part that only this span can shorten; the self times along the path add up exactly to the trace duration.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="A waterfall of the seven spans of the chapter 6 trace. The root runs 0 to 48 ms. Call pricing, GET price, cache lookup and db write are highlighted as the critical path; call inventory and GET stock are off the path. A column on the right gives each span&#x27;s self time: 9, 2, 23, 2 and 12 milliseconds, which add up to 48."><defs><marker id="ahRL3af" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRL3afblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRL3afgreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRL3afred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRL3aforange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRL3afpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRL3afcyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker><marker id="ahRL3afyellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+<text x="8" y="36" text-anchor="start" class="t-xs t-bold">POST /checkout</text>
+<rect x="190.0" y="22.0" width="440.0" height="20.0" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="184.0" y="36" text-anchor="end" class="t-xs t-muted">48 ms</text>
+<text x="740" y="36" text-anchor="end" class="t-xs tc-orange t-bold">self 9 ms</text>
+<text x="20" y="64" text-anchor="start" class="t-xs">call inventory</text>
+<rect x="217.5" y="50.0" width="91.7" height="20.0" rx="3" class="fs-blue s-blue sw-1"/>
+<text x="315.16666666666663" y="64" text-anchor="start" class="t-xs t-muted">10 ms</text>
+<text x="32" y="92" text-anchor="start" class="t-xs">GET /stock</text>
+<rect x="226.7" y="78.0" width="73.3" height="20.0" rx="3" class="fs-blue s-blue sw-1"/>
+<text x="306.0" y="92" text-anchor="start" class="t-xs t-muted">8 ms</text>
+<text x="20" y="120" text-anchor="start" class="t-xs t-bold">call pricing</text>
+<rect x="217.5" y="106.0" width="247.5" height="20.0" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="471.0" y="120" text-anchor="start" class="t-xs t-muted">27 ms</text>
+<text x="740" y="120" text-anchor="end" class="t-xs tc-orange t-bold">self 2 ms</text>
+<text x="32" y="148" text-anchor="start" class="t-xs t-bold">GET /price</text>
+<rect x="226.7" y="134.0" width="229.2" height="20.0" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="461.8333333333333" y="148" text-anchor="start" class="t-xs t-muted">25 ms</text>
+<text x="740" y="148" text-anchor="end" class="t-xs tc-orange t-bold">self 23 ms</text>
+<text x="44" y="176" text-anchor="start" class="t-xs t-bold">cache lookup</text>
+<rect x="235.8" y="162.0" width="18.3" height="20.0" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="260.1666666666667" y="176" text-anchor="start" class="t-xs t-muted">2 ms</text>
+<text x="740" y="176" text-anchor="end" class="t-xs tc-orange t-bold">self 2 ms</text>
+<text x="20" y="204" text-anchor="start" class="t-xs t-bold">db write</text>
+<rect x="510.8" y="190.0" width="110.0" height="20.0" rx="3" class="fs-orange s-orange sw-2"/>
+<text x="504.8333333333333" y="204" text-anchor="end" class="t-xs t-muted">12 ms</text>
+<text x="740" y="204" text-anchor="end" class="t-xs tc-orange t-bold">self 12 ms</text>
+<line x1="190" y1="224" x2="630" y2="224" class="line"/>
+<line x1="190.0" y1="224" x2="190.0" y2="230" class="line-thin"/>
+<text x="190.0" y="244" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="263.3333333333333" y1="224" x2="263.3333333333333" y2="230" class="line-thin"/>
+<text x="263.3333333333333" y="244" text-anchor="middle" class="t-xs t-muted">8</text>
+<line x1="336.66666666666663" y1="224" x2="336.66666666666663" y2="230" class="line-thin"/>
+<text x="336.66666666666663" y="244" text-anchor="middle" class="t-xs t-muted">16</text>
+<line x1="410.0" y1="224" x2="410.0" y2="230" class="line-thin"/>
+<text x="410.0" y="244" text-anchor="middle" class="t-xs t-muted">24</text>
+<line x1="483.3333333333333" y1="224" x2="483.3333333333333" y2="230" class="line-thin"/>
+<text x="483.3333333333333" y="244" text-anchor="middle" class="t-xs t-muted">32</text>
+<line x1="556.6666666666667" y1="224" x2="556.6666666666667" y2="230" class="line-thin"/>
+<text x="556.6666666666667" y="244" text-anchor="middle" class="t-xs t-muted">40</text>
+<line x1="630.0" y1="224" x2="630.0" y2="230" class="line-thin"/>
+<text x="630.0" y="244" text-anchor="middle" class="t-xs t-muted">48</text>
+<text x="410.0" y="264" text-anchor="middle" class="t-xs tc-orange t-bold">time (ms): the sum of self times along the path = 9 + 2 + 23 + 2 + 12 = 48</text></svg>
+  <figcaption><strong>Longest is not the same as critical.</strong> Chapter 6's trace. Orange spans are on the critical path; inventory finishes at 13 ms, long before pricing at 30 ms, so speeding it up changes nothing. The right-hand column is each span's <em>self time</em>; along the path they add up to the 48 ms total.</figcaption>
+</figure>
+
+<h3>Sampling</h3>
+
+<p>Tracing every request is usually too expensive, so a sampler decides which traces to keep. <strong>Head sampling</strong> decides at the root, before anything is known about the request, from a draw that every service can reproduce: here a number derived from the trace id, so all services agree and the kept traces are <em>complete</em> (independent per-service coin flips at 5% would give a complete six-span trace one time in 64 million). It is stateless and free, and it keeps errors at exactly the rate it keeps everything else. <strong>Tail sampling</strong> sends every span to a collector, buffers each trace until it has been quiet for a while, and then decides with full knowledge: keep every trace with an error, keep every slow one, keep a small random baseline of the rest. It costs memory (traces in flight are roughly arrival rate times wait, by Little's law) and a stateful routing tier, and it buys the property you wanted tracing for: the failures are there.</p>
+
+<p>To compare them fairly the lab fixes a <strong>storage budget</strong> (5% of the traces) and gives each sampler the same number of stored traces. The head sampler uses a rate of 5%. The tail sampler keeps all the errors and slow traces and tops up to the budget with a baseline rate you compute from the budget, the traffic and the number of interesting traces, which in production you would know from your metrics (<a href="lab-02-metrics.html">Lab 2</a>).</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Grouped bars for head and tail sampling on 20,000 traces with a storage budget of 1000 traces. Head sampling at 5 percent keeps 0 percent of error traces and 4 percent of slow ones. Tail sampling keeps 100 percent of both and about 2.5 percent of ordinary traces."><defs><marker id="ahRL3ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRL3agblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRL3aggreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRL3agred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRL3agorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRL3agpurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRL3agcyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker><marker id="ahRL3agyellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+<text x="8" y="56" text-anchor="start" class="t-sm t-bold">error traces</text>
+<rect x="160.0" y="24.0" width="1.5" height="22.0" rx="3" class="fs-red s-red sw-2"/>
+<text x="169.5" y="39" text-anchor="start" class="t-xs t-muted">head 5%: 0.0% kept</text>
+<rect x="160.0" y="52.0" width="380.0" height="22.0" rx="3" class="fs-green s-green sw-2"/>
+<text x="548.0" y="67" text-anchor="start" class="t-xs t-muted">tail: 100.0% kept</text>
+<text x="8" y="134" text-anchor="start" class="t-sm t-bold">slow traces</text>
+<rect x="160.0" y="102.0" width="14.4" height="22.0" rx="3" class="fs-red s-red sw-2"/>
+<text x="182.35768261964736" y="117" text-anchor="start" class="t-xs t-muted">head 5%: 3.8% kept</text>
+<rect x="160.0" y="130.0" width="380.0" height="22.0" rx="3" class="fs-green s-green sw-2"/>
+<text x="548.0" y="145" text-anchor="start" class="t-xs t-muted">tail: 100.0% kept</text>
+<text x="8" y="212" text-anchor="start" class="t-sm t-bold">ordinary traces</text>
+<rect x="160.0" y="180.0" width="18.7" height="22.0" rx="3" class="fs-red s-red sw-2"/>
+<text x="186.71249038214927" y="195" text-anchor="start" class="t-xs t-muted">head 5%: 4.9% kept</text>
+<rect x="160.0" y="208.0" width="9.5" height="22.0" rx="3" class="fs-green s-green sw-2"/>
+<text x="177.47319825596307" y="223" text-anchor="start" class="t-xs t-muted">tail: 2.5% kept</text>
+<text x="160" y="256" text-anchor="start" class="t-xs tc-cyan t-bold">stored: head 975 · tail 991 (budget 1000)</text></svg>
+  <figcaption><strong>Same budget, different traces.</strong> Seed 1: 20,000 requests, 108 errors, 397 slow, storage for 1000 traces. Head sampling stored 975, tail sampling 991. Tail pays in memory: at peak it held 560 traces (3,346 spans) waiting for their last span.</figcaption>
+</figure>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Implement <code>critical_path(node)</code> (returning <code>[(span, self_ms), ...]</code> in chronological depth-first order), <code>head_keep(trace_id, rate)</code>, <code>tail_decision(spans, slow_ms, baseline_rate)</code> and <code>baseline_rate(budget, total, interesting)</code>. <code>TailSampler</code> (buffering, quiet period, peak measurement) is given and calls your <code>tail_decision</code>.</p>
+  <p class="checkpoint"><code>python3 check.py 5</code> shows milestone 5 as ✔. It reproduces chapter 6's path and self times (9, 2, 23, 2 and 12 ms for a 48 ms trace), five hand-made shapes (leaf, parallel, sequential, a child that outlives its parent), and 200 random trees on which the self times must add up to the duration. It tests the sampler's determinism, monotonicity and rate over 20,000 ids, tests each branch of <code>tail_decision</code>, and then, on three workloads of 20,000 requests and a 1,000-trace budget, demands that head and tail sampling each store within 10% of the budget, that tail sampling keeps <em>every</em> error and slow trace while head keeps under 20% of errors, that ordinary traces are kept at the baseline rate, and that the buffered traces at peak match Little's law.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>critical_path</code>: sort the children by end time, latest first; keep a child if <code>child.end &lt;= t</code> and then set <code>t = child.start</code>. A child that ends after <code>t</code> overlaps one you have taken (or outlives its parent) and is off the path. Sort the kept children by start before recursing so the output is chronological.</li>
+      <li>Self time = the span's duration minus the durations of the <em>kept</em> children.</li>
+      <li><code>head_keep</code>: the low 64 bits are the last 16 hex characters; divide by <code>2**64</code> and compare with the rate.</li>
+      <li><code>tail_decision</code> is an <code>if</code> ladder with the priority error, then slow, then baseline. "Slow" is strictly greater than the threshold.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> critical_path(node):
+    s = node.span
+    t, chain = s.end, []
+    <span class="kw">for</span> c <span class="kw">in</span> sorted(node.children, key=<span class="kw">lambda</span> c: (c.span.end, c.span.start), reverse=<span class="kw">True</span>):
+        <span class="kw">if</span> c.span.end &lt;= t + 1e-<span class="num">9</span>:
+            chain.append(c)
+            t = c.span.start
+    chain.sort(key=<span class="kw">lambda</span> c: c.span.start)
+    out = [(s, s.duration - sum(c.span.duration <span class="kw">for</span> c <span class="kw">in</span> chain))]
+    <span class="kw">for</span> c <span class="kw">in</span> chain:
+        out += critical_path(c)
+    <span class="kw">return</span> out
+
+<span class="kw">def</span> head_keep(trace_id, rate):
+    <span class="kw">return</span> int(trace_id[<span class="num">16</span>:], <span class="num">16</span>) / <span class="num">2</span> ** <span class="num">64</span> &lt; rate
+
+<span class="kw">def</span> tail_decision(spans, slow_ms, baseline_rate):
+    <span class="kw">if</span> any(s.status == <span class="str">"error"</span> <span class="kw">for</span> s <span class="kw">in</span> spans):
+        <span class="kw">return</span> <span class="str">"error"</span>
+    <span class="kw">if</span> trace_duration(spans) &gt; slow_ms:
+        <span class="kw">return</span> <span class="str">"slow"</span>
+    <span class="kw">if</span> head_keep(spans[<span class="num">0</span>].trace_id, baseline_rate):
+        <span class="kw">return</span> <span class="str">"baseline"</span>
+    <span class="kw">return</span> <span class="kw">None</span>
+
+<span class="kw">def</span> baseline_rate(budget, total, interesting):
+    <span class="kw">if</span> total &lt;= interesting:
+        <span class="kw">return</span> <span class="num">0.0</span>
+    <span class="kw">return</span> min(<span class="num">1.0</span>, max(<span class="num">0.0</span>, (budget - interesting) / (total - interesting)))</code></pre>
+  </details>
+</div>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution 5</span>
+<span class="out">Lab 3 checks against solution.py
+
+  ✔ Milestone 5: critical path, head vs tail sampling
+      seed 1: 20,000 traces (108 errors, 397 slow), budget 1000
+        head 5%   stored  975: errors kept   0.0%  slow kept   3.8%  ordinary kept  4.9%
+        tail      stored  991: errors kept 100.0%  slow kept 100.0%  ordinary kept  2.5%   (buffered at peak: 560 traces, 3346 spans)
+
+1/1 milestones passing  (4.0 s)</span></code></pre>
+
+<h2>Look under the hood</h2>
+
+<p>Two experiments make the earlier claims concrete. First, one complete trace from the simulator: the waterfall that <code>render_tree</code> draws from the spans of <code>checkout_request</code>, and the critical path computed over it.</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -c "
+import solution as m
+w = m.World(1); q = m.Queue(w)
+m.checkout_request(w, q)
+for msg in q.take_all():
+    m.consume_as_child(w, w.tracer('fulfilment'), msg)
+tree = next(iter(m.assemble(w.sink).values()))
+print(m.render_tree(tree))
+print()
+print('critical path of the request (before the queue):')
+req = tree.roots[0]          # the gateway's root span
+for s, self_ms in m.critical_path(req):
+    print(f'  {s.service:10s}{s.name:18s} self {self_ms:5.1f} ms')
+"</span>
+<span class="out">trace cd613e30  13 spans
+POST /checkout                gateway   |####                                    |   52.0 ms
+  call checkout               gateway   |####                                    |   50.0 ms
+    POST /checkout            checkout  |###                                     |   48.0 ms
+      call pricing            checkout  |##                                      |   27.0 ms
+        GET /price            pricing   |##                                      |   25.0 ms
+          cache lookup        pricing   |#                                       |    2.0 ms
+      call inventory          checkout  |#                                       |   10.0 ms
+        GET /stock            inventory |#                                       |    8.0 ms
+      call payments           checkout  |  #                                     |   16.0 ms
+        POST /charge          payments  |  #                                     |   14.0 ms
+          db write            payments  |  #                                     |   12.0 ms
+      publish orders          checkout  |   #                                    |    1.0 ms
+        process orders        fulfilment|                                      ##|   20.0 ms
+
+critical path of the request (before the queue):
+  gateway   POST /checkout     self   2.0 ms
+  gateway   call checkout      self   2.0 ms
+  checkout  POST /checkout     self   4.0 ms
+  checkout  call pricing       self   2.0 ms
+  pricing   GET /price         self  23.0 ms
+  pricing   cache lookup       self   2.0 ms
+  checkout  call payments      self   2.0 ms
+  payments  POST /charge       self   2.0 ms
+  payments  db write           self  12.0 ms
+  checkout  publish orders     self   1.0 ms</span></code></pre>
+
+<p>Reading it: the gateway's two spans (a server span and the client span for the call) wrap the whole request; the checkout service starts inventory and pricing at the same instant, so the bars begin in the same column; pricing finishes last and carries the critical path through its cache lookup; payments follows and the queue consumer arrives hundreds of milliseconds later at the far right, which is why its bar is a sliver at that scale. Notice that the sum of self times on the path is the trace's duration: that identity is the check for any critical-path implementation.</p>
+
+<p>Second, the claim that consistent head sampling gives complete traces while independent sampling gives confetti. Six services, 20,000 traces, a 5% rate, two ways of deciding:</p>
+
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -c "
+import random
+import solution as m
+rng = random.Random(1)
+n, services, rate = 20000, 6, 0.05
+ids = [f'{rng.getrandbits(128):032x}' for _ in range(n)]
+consistent = [sum(m.head_keep(t, rate) for _ in range(services)) for t in ids]       # same decision in all 6 services
+independent = [sum(rng.random() &lt; rate for _ in range(services)) for _ in ids]       # each service flips its own coin
+for name, kept in (('consistent (trace-id hash)', consistent), ('independent coin per service', independent)):
+    complete = sum(k == services for k in kept)
+    partial = sum(0 &lt; k &lt; services for k in kept)
+    print(f'{name:30s} complete traces: {complete:5d}   fragments (some spans, not all): {partial:5d}   nothing: {sum(k == 0 for k in kept):5d}')
+"</span>
+<span class="out">consistent (trace-id hash)     complete traces:  1020   fragments (some spans, not all):     0   nothing: 18980
+independent coin per service   complete traces:     0   fragments (some spans, not all):  5117   nothing: 14883</span></code></pre>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Sever a trace.</strong> Run <code>World(1, drop_headers={"payments"})</code> through <code>checkout_request</code> and print the span counts per trace id. The payments server span becomes a root of its own trace. In a real system, how would you notice that a particular hop is dropping the header before a customer complains? (Hint: count root spans whose kind is <code>server</code> and whose service is not the gateway.)</li>
+    <li><strong>Tail-sample with too short a wait.</strong> Rerun the comparison with <code>TailSampler(wait_ms=100, ...)</code> instead of 10,000. With a 10 s wait, 0 traces were kept in one piece and dropped in another; with a 100 ms wait, 391 are (the trace's last spans arrive more than 100 ms after its first, so it is decided in two pieces), and the peak buffer shrinks from 560 to 64 traces. By the lab's counting (a trace is kept if any piece is kept) recall still reads 100% for errors and 100% for slow traces, which is exactly why that metric flatters the short wait: what is <em>stored</em> is a fragment. Which traces are split, and why those? What does this say about choosing the wait window, and about trusting a recall number computed from trace ids alone?</li>
+    <li><strong>Break the flag.</strong> In <code>parse_traceparent</code> change <code>&amp; 1</code> to <code>== 1</code>. Milestone 2 names the flag bytes that now misparse. In production the first traces to show the bug are the ones from a newer library that sets another flag bit.</li>
+    <li><strong>Speed up the wrong span.</strong> On chapter 6's trace, shorten <code>call inventory</code> by 5 ms by changing its end time, rebuild the tree and rerun <code>critical_path</code>: the path is unchanged. Now shorten <code>GET /price</code> by 5 ms (and its parent's end with it): the root's end moves because the path runs through it, but only until pricing becomes faster than inventory. At what shortening does the critical path switch to the inventory branch?</li>
+  </ol>
+</div>
+
+<div class="callout vm">
+  <p class="callout-title">☁️ Take it further on real machines</p>
+  <p>Optional, and not checked. On your <a href="../../lab-machine.html">lab machine</a> (or a disposable VM), run the three-service chain as real processes (three small <code>http.server</code> programs) and have each forward the <code>traceparent</code> header you generate. Send a request through them with <code>curl -H "traceparent: 00-..."</code>, then run the OpenTelemetry Collector (or Jaeger's all-in-one image) and compare the tree it draws with the one your <code>assemble</code> produces from the three processes' logged spans. Then stop forwarding the header in the middle service and watch the real UI split the trace exactly as the simulator did.</p>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong><code>tracestate</code> and baggage.</strong> Carry the optional <code>tracestate</code> header through <code>inject</code>/<code>extract</code> (a comma-separated list of up to 32 vendor entries) and explain why a service must forward entries it does not understand.</li>
+  <li><strong>Clock skew.</strong> Give each service a clock offset so that a child appears to start before its parent. Make <code>assemble</code> and <code>critical_path</code> degrade gracefully, and discuss why a tracer should clamp or flag rather than trust other machines' clocks.</li>
+  <li><strong>Cycles.</strong> A corrupt exporter produces a span that is its own ancestor. Detect it in <code>assemble</code> and break the cycle at the earliest-starting span, marking the trace invalid.</li>
+  <li><strong>An adaptive tail sampler.</strong> Instead of computing the baseline rate offline, let the sampler adjust it every simulated minute to hit the budget as the traffic changes, and record the observed rate with each kept trace so counts can be re-weighted afterwards (a sampled trace cannot give you a rate).</li>
+  <li><strong>Per-route sampling.</strong> Give every route its own head rate so that a rare route is traced more often than a hot one, and show what that does to the "fraction of traces that are errors" statistic.</li>
+  <li><strong>Exemplars.</strong> Record the trace id of the slowest request in each histogram bucket of <a href="lab-02-metrics.html">Lab 2</a>'s library and render it in the exposition, so a latency spike on a dashboard links to a trace.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Reliability connection</p>
+  <p>This lab is chapter 6 made executable, and it is the third leg of the course's observability trio: <a href="lab-02-metrics.html">metrics</a> tell you that something is wrong cheaply and in aggregate, <a href="../chapters/05-logs-events.html">logs</a> keep per-event detail in one service, and traces join the per-request detail across services. The sampling comparison is the quantitative reason chapter 6 recommends tail rules on top of modest head sampling. The distributed-systems ideas underneath are old ones in a new place: the trace id is a correlation id that must survive every hop (and, like a fencing token, only works if every layer forwards it), and a collector assembling trees from reordered, duplicated and lost messages faces the same problems as any stream processor, which is why the architecture course's treatment of <a href="../../architecture/chapters/13-sync-async.html">synchronous and asynchronous calls</a> describes the shape tracing has to follow.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>A trace is rebuilt from three identifiers: a shared trace id, a span id per span and each span's parent id. Ids are random, fixed-width lowercase hex and never all zero.</li>
+    <li>Within a process the ambient context (a stack) supplies the parent; across processes it travels in a <code>traceparent</code> header. The sender injects its <em>client</em> span's context; the receiver makes a child of what it parsed. A strict parser returns <code>None</code> on garbage and the receiver starts a new trace; one hop that drops the header splits the trace in two.</li>
+    <li>The sampled decision is made once at the root and rides in the flags byte; the flag is a bit to be masked, not a number to be compared.</li>
+    <li>A queue is not a call. Model the consumer as a child (one long trace including the wait) or as a new trace with a link back (short traces; one span can link to many); never pretend the wait is part of the user's latency.</li>
+    <li>A collector sees spans late, reordered, duplicated and missing. Group by trace id, deduplicate by span id, link by parent id, and put a placeholder where a parent is missing. A missing leaf cannot be detected from the tree.</li>
+    <li>The critical path is the chain that determines the duration; its self times add up to the trace duration, and only spans on it are worth optimising.</li>
+    <li>At the same storage budget, head sampling keeps errors at the sample rate and tail sampling keeps all of them, paying with memory proportional to arrival rate times wait and a stateful collector tier. Baseline traces stay as an unbiased sample for what "normal" looks like.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A client span in service A calls service B. What should A write in the <code>parent-id</code> field of the outgoing <code>traceparent</code>?</p>
+    <ol class="q-options">
+      <li>The root span's id, so every service points at the root</li>
+      <li>The span id of A's client span for this call: B's server span becomes its child</li>
+      <li>A fresh random id</li>
+      <li>B's span id, once B has started</li>
+    </ol>
+    <div class="q-explain">The parent-id names the span that caused the receiver's work, which is the caller's client span. B then creates its own span id and records the header's parent-id as its parent; its own outgoing calls carry B's client span ids.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A request arrives with <code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03</code>. What does a correct parser conclude about sampling, and what does <code>...-02</code> mean?</p>
+    <ol class="q-options">
+      <li>03 is sampled; 02 is sampled too, since it is non-zero</li>
+      <li>03 is not sampled because it is not equal to 01</li>
+      <li>03 is sampled (bit 0 is set); 02 is not (only reserved bits are set)</li>
+      <li>Both are invalid because flags must be 00 or 01</li>
+    </ol>
+    <div class="q-explain">The sampled flag is the lowest bit, tested with a mask. The other bits are reserved for future use and must not change today's meaning. Comparing with <code>== 1</code> would wrongly treat 03 as unsampled.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A consumer processes one message from a queue three hours after it was published (a retry). Why is a new trace with a span link usually better than making the consumer a child of the producer's span?</p>
+    <ol class="q-options">
+      <li>The request's trace would otherwise include three hours of waiting, destroying its meaning as 'how long did this request take', and each attempt can link to the same publish span</li>
+      <li>Links are cheaper to store than parents</li>
+      <li>A child span cannot start after its parent ended</li>
+      <li>Consumers cannot read headers</li>
+    </ol>
+    <div class="q-explain">Both representations are valid. A child keeps one tree and shows the wait, but swamps the trace's own timeline for long delays, and it cannot express a batch of messages from many traces. A link keeps each trace's duration meaningful and generalises to fan-in.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A collector has received every span of a trace except one leaf (a cache lookup) and one interior span (a client call that had two children). Which loss can <code>assemble</code> detect?</p>
+    <ol class="q-options">
+      <li>Both, because the span counts do not match</li>
+      <li>The interior one: its children name a parent id that never arrived, so a placeholder fills the hole; the lost leaf is invisible because nothing refers to it</li>
+      <li>Only the leaf</li>
+      <li>Neither</li>
+    </ol>
+    <div class="q-explain">Parent ids point upward. A missing span with surviving children leaves dangling references. A missing leaf leaves none, so the trace looks complete but shorter; completeness for leaves can only be estimated from exporter-side counters.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">With a storage budget of 1,000 traces out of 20,000, 108 of which are errors, head sampling at 5% and tail sampling with a 2.5% baseline both store about 1,000 traces. What is the main difference in what they store?</p>
+    <ol class="q-options">
+      <li>Tail sampling stores more traces</li>
+      <li>Head sampling stores slower traces</li>
+      <li>Tail sampling keeps every error and slow trace (the rest is a small unbiased sample); head sampling keeps about 5% of everything, so about 5 of the 108 errors</li>
+      <li>There is no difference at the same budget</li>
+    </ol>
+    <div class="q-explain">A head sampler decides before the outcome is known, so it keeps errors at the same rate as everything else. A tail sampler decides after, spending the same budget on the traces you will actually want to read; it pays in buffered memory (about arrival rate times wait) and in a stateful collector tier.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

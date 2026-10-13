@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Observability for Checkout · Reliability &amp; Operations</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="ops" data-studio="S1">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design Observability for Checkout</h1>
+  <p class="lede">Checkout is the page where an outage costs money by the second, and it crosses six services, an external payment provider and a queue. Telemetry is cheap to switch on and expensive to live with. This studio designs what to measure, what to write down, what to trace and what to wake someone for, and does the arithmetic of what that costs.</p>
+</header>
+<div class="callout why">
+  <p class="callout-title">How a design studio works</p>
+  <p>This page is a design problem, not a chapter. At each stage there is a <strong>Your turn</strong> question. Write your answer in the notes box first (it saves in this browser), <em>then</em> open the worked answer and compare. The worked answer is not the only right design; it is one strong one with its reasoning. A rubric at the end lets you check whether you covered what an experienced engineer would. Being wrong first and then seeing why is the point. All numbers on this page are assumptions to reason with, not measurements.</p>
+</div>
+
+<div class="studio-brief">
+  <p class="brief-title">📐 The brief</p>
+  <p>You own reliability for the <strong>checkout flow</strong> of an online shop. It is made of:</p>
+  <ul>
+    <li><strong>gateway</strong> (terminates TLS, routes, authenticates), <strong>cart</strong>, <strong>pricing</strong> (prices, promotions, tax), <strong>inventory</strong> (stock reservations), <strong>payments</strong> (calls an <strong>external payment service provider</strong>, the PSP) and <strong>orders</strong> (the system of record);</li>
+    <li>a <strong>message queue</strong>: when an order is created, orders publishes an event, and an email worker sends the confirmation, usually within seconds and not in the request path;</li>
+    <li>about <strong>300 requests per second</strong> at the gateway at the daily peak, of which roughly 10 per second are order submissions; six pods per service across three availability zones;</li>
+    <li>no coherent telemetry today: each team logs free text, a few have dashboards, and the on-call engineer is paged by CPU graphs.</li>
+  </ul>
+  <p>Design the observability for it. You will use <a href="../chapters/02-slos-error-budgets.html">SLIs and error budgets</a>, <a href="../chapters/04-metrics.html">metrics and histograms</a>, <a href="../chapters/05-logs-events.html">wide events</a>, <a href="../chapters/06-tracing.html">tracing</a> and <a href="../chapters/07-alerting-oncall.html">burn-rate alerting</a>. The tools in the <a href="../toolbox.html#prometheus">toolbox</a> let you try the pieces on a laptop.</p>
+</div>
+
+<h2>Your notes</h2>
+<p>Keep a running list of decisions and numbers. Plain text is fine.</p>
+<textarea class="studio-notes" aria-label="Your design notes for this studio" placeholder="Journeys and SLOs…&#10;Metrics and labels…&#10;Log fields, trace plan, alerts…"></textarea>
+<section class="stage">
+<h2><span class="h-num">1</span>User journeys, SLIs and SLOs</h2>
+<p class="stage-q">List the journeys a customer actually cares about. For each, write the SLI as good events over valid events, say where you measure it, and choose a target. Which events are <em>valid</em>, and is a declined card a failure? One of your dependencies is a PSP whose own promise is 99.9%: what does that do to your target?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Start from what a user would complain about, not from services (<a href="../chapters/02-slos-error-budgets.html">chapter 2</a>). Four journeys cover the flow:</p>
+  <table>
+    <thead><tr><th>Journey</th><th>SLI (good / valid)</th><th>Measured at</th><th>SLO (30 days)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Browse and add to cart</strong></td><td>availability: responses that are not 5xx and not timeouts / all requests to catalogue, cart and pricing routes</td><td>gateway (load balancer) logs and metrics</td><td>99.9%</td></tr>
+      <tr><td></td><td>latency: responses faster than 300 ms / same denominator</td><td>gateway</td><td>99% under 300 ms</td></tr>
+      <tr><td><strong>Place an order</strong></td><td>success: submissions that end with an order created <em>or</em> a legitimate business refusal (out of stock, card declined) / all submissions</td><td>gateway, plus a black-box probe that places a test order every minute</td><td>99.5%</td></tr>
+      <tr><td></td><td>latency: submissions answered in under 2 s / all submissions</td><td>gateway</td><td>99% under 2 s</td></tr>
+      <tr><td><strong>Order confirmation email</strong></td><td>freshness: emails sent within 5 minutes of order creation / orders created</td><td>email worker, comparing event time with send time</td><td>99%</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>Valid and good are definitions.</strong> A declined card is the customer's card, not our failure, so it is a <em>good</em> event. A PSP timeout is a bad one. A request from our own load-test or probe traffic is excluded from the denominator (or measured separately). Write these rules down; most SLO arguments are really arguments about them.</li>
+    <li><strong>Why 99.5% for orders and not 99.9%.</strong> If the PSP is available 99.9% of the time and everything else in the path is also 99.9%, the series arithmetic of <a href="../chapters/01-availability-math.html">chapter 1</a> gives about 0.999<sup>2</sup> ≈ 99.8% (treating the rest of the path as one 99.9% component; several separate 99.9% services in series would be lower still), before the PSP's slow days. A target above what your dependencies allow is a promise you cannot keep. The design choice that lifts the ceiling is to accept the order in a <em>pending payment</em> state when the PSP is slow and finish authorization asynchronously; once that exists you can raise the target. Until then 99.5% (a 30-day budget of 0.5% of 30 × 24 h = <strong>3.6 hours</strong> of full-outage equivalent) is honest.</li>
+    <li><strong>Email is a freshness SLI,</strong> not an availability one: nobody notices a single missing email, but everybody notices an hour of silence. The queue makes it measurable as the <em>age of the oldest unprocessed message</em> as well.</li>
+    <li><strong>Per journey, not per service.</strong> Customers do not experience "pricing is up". A service-level SLO for pricing is useful as an internal target, but the page goes off for what the customer feels.</li>
+    <li><strong>Low traffic caveat.</strong> About 10 submissions per second is 3,000 in a five-minute window: enough for the short burn-rate window to be meaningful, but a quiet night has far fewer. The probe fills the gap.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">2</span>Metrics: RED, USE and histogram buckets</h2>
+<p class="stage-q">Choose the metrics per service using RED for the request-handling side and USE for the resources. Pick histogram buckets for the gateway and for payments. Which labels will you allow, and which are banned?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Apply <a href="../chapters/04-metrics.html">chapter 4</a>: outside-in for services (RED: rate, errors, duration), inside-out for resources (USE: utilisation, saturation, errors).</p>
+  <ul>
+    <li><strong>Every service (RED):</strong> <code>http_requests_total{service,route,method,code_class}</code> (counter) and <code>http_request_duration_seconds{service,route,method,code_class}</code> (histogram, which also provides the count). The <code>route</code> label is the <em>template</em> (<code>/orders/{id}</code>), never the URL.</li>
+    <li><strong>Every service (USE):</strong> CPU utilisation and CPU throttling seconds, memory working set and OOM-kill count, connection-pool in use / pool size and <em>waiters</em> (saturation), thread or event-loop lag, request concurrency in flight.</li>
+    <li><strong>Dependency clients (RED from the caller's side):</strong> <code>outbound_requests_total{dependency,code_class}</code> and its duration histogram for the PSP, the database and the cache; plus the circuit-breaker state and retry counts. These tell you whether the PSP or your side is slow.</li>
+    <li><strong>The queue:</strong> depth (gauge), <strong>age of oldest message</strong> (gauge; the saturation signal that matters), enqueue and dequeue rates, redeliveries and dead-letter count. The email worker adds a freshness histogram: <code>email_send_delay_seconds</code>.</li>
+    <li><strong>Business signals:</strong> <code>orders_created_total</code>. A drop in orders with healthy error rates is the symptom of a failure no health check saw (a broken button, an expired certificate on a script host).</li>
+  </ul>
+  <p><strong>Bucket layouts.</strong> Buckets set the accuracy of every percentile and, crucially, the accuracy of the latency SLI. Put a boundary exactly at each SLO threshold and use roughly exponential spacing elsewhere, so relative error stays constant.</p>
+<pre class="terminal" data-title="bucket choices (illustrative)"><code>gateway, browse routes (SLO threshold 0.3 s):
+  0.01, 0.025, 0.05, 0.1, 0.2, 0.3, 0.5, 1, 2.5, 5            # 10 buckets + +Inf
+gateway, order submission (SLO threshold 2 s):
+  0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5, 10                   # 2 is the SLO bound
+PSP client (provider timeout set to 8 s):
+  0.1, 0.25, 0.5, 1, 2, 4, 6, 8, 10                           # resolves the timeout cliff</code></pre>
+  <ul>
+    <li>The latency SLI is then <code>sum(rate(..._bucket{le="2"}[w])) / sum(rate(..._count[w]))</code>, an exact ratio with no interpolation, because 2 s is a bucket bound. If the bound were 1.5 s and the SLO 2 s, you would be interpolating inside a bucket and the SLI would be an estimate.</li>
+    <li>Use the same layout in every replica, or histograms cannot be summed (<a href="../chapters/04-metrics.html">chapter 4</a>: they merge by adding bucket counts). Never average per-pod p99s.</li>
+    <li><strong>Allowed labels:</strong> service, route template, method, status code class (2xx, 4xx, 5xx), region, availability zone, version, dependency name. <strong>Banned:</strong> user, cart or order id, session, raw URL, error message text, anything with unbounded values. Per-request detail belongs in the log event and the trace (stages 3 and 4).</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">3</span>Logs: one wide event per request</h2>
+<p class="stage-q">Design the canonical log event each service writes once per request. Which fields, and which must never appear? How does a log line find its trace?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>The design from <a href="../chapters/05-logs-events.html">chapter 5</a>: at the end of every request, emit <strong>one</strong> structured record that carries everything you know about it, instead of a dozen free-text lines. That wide event is what lets you ask a question you did not predict, such as "show failed order submissions for promo code X on version 41 in zone b".</p>
+<pre class="terminal" data-title="canonical event (illustrative, abridged)"><code>{
+  "ts": "2026-03-04T14:07:31.482Z", "level": "info", "msg": "request",
+  "service": "orders", "version": "2.41.0", "region": "eu-west", "az": "b", "pod": "orders-7d9c-xk2",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7", "request_id": "r-8f31c2",
+  "method": "POST", "route": "/orders", "status": 201, "outcome": "ok",
+  "duration_ms": 412, "deadline_remaining_ms": 1588, "retry_attempt": 0,
+  "db_ms": 38, "db_queries": 4, "cache_hit": false,
+  "psp_ms": 301, "psp_attempts": 1, "psp_status": "authorised",
+  "inventory_ms": 22, "reservation_id": "res-5521",
+  "cart_id": "c-2291", "order_id": "o-99172", "items": 3, "order_value_bucket": "50-100",
+  "user_hash": "u-7c1e9a", "promo": "SPRING10", "flags": ["new_tax_calc"],
+  "queue_published": true, "sample_rate": 10
+}</code></pre>
+  <ul>
+    <li><strong>High cardinality is welcome here.</strong> Order ids, user hashes, promo codes and pod names are fine in an event store and forbidden in metric labels. That is the division of labour between the two signals.</li>
+    <li><strong>Error fields:</strong> <code>outcome</code> (a small enum: ok, client_error, dependency_error, timeout, shed, internal_error), <code>error_kind</code> and a short <code>error_code</code>, and the failing dependency. One structured error, logged once where it is handled, not at every layer it passes through.</li>
+    <li><strong>The trace link.</strong> <code>trace_id</code> and <code>span_id</code> are copied from the current context into every event, so a log search jumps to the trace and the reverse. Add the same <code>request_id</code> at the gateway and propagate it, as insurance when tracing is sampled away.</li>
+    <li><strong>Must never appear:</strong> card numbers, CVV, full email addresses, street addresses, auth tokens. Use an allow-list of fields in the logging library, redact at the source and log pseudonymous user ids (<a href="../chapters/05-logs-events.html">chapter 5</a>, PII). The PSP's response is logged as status and code, not as the raw body.</li>
+    <li><strong>The worker writes one event per message,</strong> with the same trace and order ids, and the delay between enqueue and send, so the freshness SLI can also be computed from logs.</li>
+    <li><strong>Always record <code>sample_rate</code></strong> (stage 5) so counts from sampled data can be scaled back up.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">4</span>Tracing and context propagation, across the queue</h2>
+<p class="stage-q">Which spans exist for one order submission? How does the trace identity cross each hop, including the queue? Where could the chain break, and what would you do for the email path in particular?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Use the model of <a href="../chapters/06-tracing.html">chapter 6</a>: a trace is a tree of spans with a shared trace id, joined by context propagation.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 310" role="img" aria-label="The gateway calls cart, pricing, inventory, payments and orders. Payments calls an external PSP. Orders publishes to a queue and an email worker consumes it, linked back to the original trace. All services export to an OpenTelemetry collector that feeds metric, log and trace stores.">
+<defs><marker id="ahRS1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahRS1ablue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-blue"/></marker><marker id="ahRS1agreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-green"/></marker><marker id="ahRS1ared" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker><marker id="ahRS1aorange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-orange"/></marker><marker id="ahRS1apurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-purple"/></marker><marker id="ahRS1acyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-cyan"/></marker></defs>
+<rect x="10" y="110" width="110" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="65.0" y="132.0" text-anchor="middle" class="t-sm t-bold">gateway</text><text x="65.0" y="148.0" text-anchor="middle" class="t-xs t-muted">root span</text><rect x="170" y="10" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="225.0" y="36.0" text-anchor="middle" class="t-sm t-bold">cart</text><line x1="122" y1="135" x2="168" y2="32" class="line s-blue" marker-end="url(#ahRS1ablue)"/><rect x="170" y="70" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="225.0" y="96.0" text-anchor="middle" class="t-sm t-bold">pricing</text><line x1="122" y1="135" x2="168" y2="92" class="line s-blue" marker-end="url(#ahRS1ablue)"/><rect x="170" y="130" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="225.0" y="156.0" text-anchor="middle" class="t-sm t-bold">inventory</text><line x1="122" y1="135" x2="168" y2="152" class="line s-blue" marker-end="url(#ahRS1ablue)"/><rect x="170" y="190" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="225.0" y="216.0" text-anchor="middle" class="t-sm t-bold">payments</text><line x1="122" y1="135" x2="168" y2="212" class="line s-blue" marker-end="url(#ahRS1ablue)"/><rect x="170" y="250" width="110" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="225.0" y="276.0" text-anchor="middle" class="t-sm t-bold">orders</text><line x1="122" y1="135" x2="168" y2="272" class="line s-blue" marker-end="url(#ahRS1ablue)"/><rect x="400" y="190" width="120" height="44" rx="8" class="box"/><text x="460.0" y="209.0" text-anchor="middle" class="t-sm t-bold">PSP</text><text x="460.0" y="225.0" text-anchor="middle" class="t-xs t-muted">external</text><line x1="282" y1="212" x2="398" y2="212" class="line s-orange" marker-end="url(#ahRS1aorange)"/><text x="340" y="204" text-anchor="middle" class="t-xs tc-orange">HTTP</text><rect x="400" y="250" width="100" height="44" rx="8" class="fs-orange s-orange sw-2"/><text x="450.0" y="276.0" text-anchor="middle" class="t-sm t-bold">queue</text><line x1="282" y1="272" x2="398" y2="272" class="line s-orange" marker-end="url(#ahRS1aorange)"/><rect x="560" y="250" width="120" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="620.0" y="276.0" text-anchor="middle" class="t-sm t-bold">email worker</text><line x1="502" y1="272" x2="558" y2="272" class="line s-orange" marker-end="url(#ahRS1aorange)"/><text x="530" y="264" text-anchor="middle" class="t-xs tc-orange">link</text><rect x="600" y="60" width="150" height="70" rx="8" class="fs-cyan s-cyan sw-2"/><text x="675.0" y="92.0" text-anchor="middle" class="t-sm t-bold">OTel Collector</text><text x="675.0" y="108.0" text-anchor="middle" class="t-xs t-muted">tail sampling</text><line x1="300" y1="95" x2="598" y2="95" class="line s-cyan" stroke-dasharray="5 4" marker-end="url(#ahRS1acyan)"/><line x1="300" y1="32" x2="300" y2="152" class="line s-cyan"/><line x1="282" y1="32" x2="300" y2="32" class="line s-cyan"/><line x1="282" y1="92" x2="300" y2="92" class="line s-cyan"/><line x1="282" y1="152" x2="300" y2="152" class="line s-cyan"/><text x="450" y="86" text-anchor="middle" class="t-xs tc-cyan">every service exports spans (cyan)</text><rect x="600" y="150" width="150" height="28" rx="8" class="fs-cyan s-cyan sw-2"/><text x="675.0" y="168.0" text-anchor="middle" class="t-sm t-bold">metrics store</text><rect x="600" y="186" width="150" height="28" rx="8" class="fs-cyan s-cyan sw-2"/><text x="675.0" y="204.0" text-anchor="middle" class="t-sm t-bold">log / event store</text><rect x="600" y="222" width="150" height="28" rx="8" class="fs-cyan s-cyan sw-2"/><text x="675.0" y="240.0" text-anchor="middle" class="t-sm t-bold">trace store</text><line x1="675" y1="132" x2="675" y2="148" class="line s-cyan" marker-end="url(#ahRS1acyan)"/><text x="65" y="185" text-anchor="middle" class="t-xs t-muted">traceparent</text><text x="65" y="199" text-anchor="middle" class="t-xs t-muted">on every call</text>
+</svg>
+<figcaption><strong>One order submission.</strong> Blue arrows carry the <code>traceparent</code> header; orange is the asynchronous hop, joined by a span link; cyan is the telemetry path.</figcaption>
+</figure>
+  <ul>
+    <li><strong>Spans.</strong> One server span per service per request, one client span per outgoing call (database, cache, PSP, publish), all with attributes that match the log fields (<code>route</code>, <code>order_id</code>, <code>psp_status</code>). About 20 spans per order submission is a typical count, and that number drives stage 6.</li>
+    <li><strong>Propagation.</strong> Adopt the W3C <code>traceparent</code> header (<code>00-&lt;32 hex trace id&gt;-&lt;16 hex parent id&gt;-&lt;flags&gt;</code>) and use the OpenTelemetry SDK's propagator in every HTTP and gRPC client and server. The gateway starts the trace if no valid header arrives (and ignores a client's header on the public edge, so outsiders cannot force sampling).</li>
+    <li><strong>The breaks to look for.</strong> A legacy service that calls with a raw HTTP client and drops headers; a thread-pool or async hop that loses ambient context; a retry library that creates a fresh context. Each severs the tree into two traces. Test by sending one request with a known trace id and counting spans per service.</li>
+    <li><strong>Across the queue,</strong> the context must be written into the <em>message</em>. The producer's publish span injects <code>traceparent</code> into the message headers (attributes), and the worker extracts it. Then choose the relationship: a parent-child edge makes the email send part of the checkout trace, so the "trace duration" stretches to minutes and the checkout trace stays open in a tail sampler that waits for completion. A <strong>span link</strong> instead gives the worker its own short trace that points back to the producer's span. For delayed, batched or retried work, prefer the link; the checkout waterfall stays a picture of what the customer waited for.</li>
+    <li><strong>The sampled bit has to survive the hop.</strong> With a link, the worker's trace makes its own sampling decision. Add the rule "always keep a worker trace whose linked span was kept", or a kept checkout trace will point to a trace you threw away.</li>
+    <li><strong>The PSP</strong> is outside your process boundary. You cannot see its internals; the client span's duration and the provider's own request id (stored as an attribute) are the only handles, so log that id for support tickets.</li>
+    <li><strong>Exemplars</strong> on the order-latency histogram attach a trace id to a slow bucket, so a graph point links to an actual trace.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">5</span>Sampling: what you keep</h2>
+<p class="stage-q">You cannot store everything. For logs and for traces, decide what is always kept, what is sampled and at what rate, and where the decision is made. What does sampling do to your ability to count?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <ul>
+    <li><strong>Metrics are not sampled.</strong> Counters and histograms are cheap aggregates, so rates, error ratios and SLIs come from them. Sampled logs and traces can show examples; they cannot give you reliable rates unless the sample rate is recorded and applied.</li>
+    <li><strong>Logs: keep the interesting ones.</strong> Always keep errors, slow requests (over the SLO threshold), every payments and orders event (they are rare and valuable), and any request carrying a debug flag. Keep 1 in 10 of the rest, and write <code>sample_rate: 10</code> on each kept event so a count of kept events times ten approximates the truth. Make the decision in the logging library for success events and never drop errors.</li>
+    <li><strong>Traces: tail sampling in the collector.</strong> Head sampling (decide at the first span) is cheap but throws away rare errors at the sampling rate. Tail sampling waits until a trace is mostly complete and then keeps it if it has an error or is slow, plus a small random share (say 1%) as a baseline for comparison. The cost: the collector must buffer spans for the decision wait (about 30 seconds) and all spans of a trace must reach the <em>same</em> collector instance, so route by trace id.</li>
+    <li><strong>Dynamic sampling</strong> lowers the rate for noisy, healthy routes (the gateway health check) and raises it for rare ones, keeping the volume roughly proportional to information.</li>
+    <li><strong>What you lose.</strong> A rare symptom affecting 0.01% of requests is invisible in a 1% random sample but visible in an error-biased one; a sample biased towards errors cannot tell you the error <em>rate</em>. Keep the two jobs separate: metrics for "how much", events and traces for "what and why".</li>
+    <li><strong>Make it adjustable under pressure.</strong> During an incident you want to raise the kept fraction for one service or route for an hour without a deploy: put the sampling policy in collector config or a flag.</li>
+  </ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">6</span>Napkin maths: telemetry volume, cardinality and cost</h2>
+<p class="stage-q">Estimate, per day, the metric samples, log bytes and span bytes this design generates, with and without sampling. Then work out what one careless label would cost. What cardinality budget would you set?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Assumptions: 6 services × 6 pods = <strong>36 pods</strong>; 8 routes per service; three status classes; histograms with 12 bucket series plus <code>_sum</code> and <code>_count</code> = 14 series per label combination; a scrape every 15 s; the traffic below.</p>
+  <table>
+    <thead><tr><th>Signal</th><th>Arithmetic</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Metric series</strong></td><td>per pod: 8 routes × 3 classes × 14 = 336 for the duration histogram, plus about 150 runtime and resource series; × 36 pods ≈ 17,500; plus infrastructure and queue metrics ≈ 2,500</td><td>about <strong>20,000 series</strong></td></tr>
+      <tr><td></td><td>20,000 series ÷ 15 s = 1,333 samples per second; × 86,400 s = 115 million samples per day; at an assumed 1.5 bytes per sample after compression</td><td>about <strong>170 MB per day</strong>, 2.6 GB for 15 days</td></tr>
+      <tr><td><strong>Log events, unsampled</strong></td><td>events per second across services: gateway 300 + cart 150 + pricing 200 + inventory 150 + payments 30 + orders 30 = 860; × 1.5 KB per wide event = 1.29 MB/s; × 86,400</td><td>about <strong>111 GB per day</strong> raw</td></tr>
+      <tr><td><strong>Log events, sampled</strong></td><td>payments and orders kept in full: 60/s; the other 800/s keep errors and slow requests (about 2%) plus 10% of the rest: 800 × (0.02 + 0.98 × 0.1) ≈ 94/s; total 154/s × 1.5 KB × 86,400</td><td>about <strong>20 GB per day</strong>, a 5.6× reduction</td></tr>
+      <tr><td><strong>Spans, unsampled</strong></td><td>300 requests per second reach the gateway; assume about 20 spans each (generous for simple browse requests) = 6,000 spans/s; × 500 bytes = 3 MB/s; × 86,400</td><td>about <strong>260 GB per day</strong></td></tr>
+      <tr><td><strong>Spans, tail-sampled</strong></td><td>keep about 3% (errors and slow traces about 2%, plus 1% baseline): 180 spans/s × 500 B × 86,400</td><td>about <strong>7.8 GB per day</strong></td></tr>
+      <tr><td><strong>Collector buffer</strong></td><td>30 s decision wait × 6,000 spans/s × 500 B (before indexing overhead)</td><td>about 90 MB per collector tier, a small number</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Cost.</strong> Plug in your own prices; the shape is what matters. At an illustrative $0.50 per ingested GB, the unsampled logs would be about $55 a day and the sampled ones $10; unsampled spans would be about $130 a day against $4. Telemetry volume is dominated by events and spans, not metrics, and the metrics bill is dominated by <em>series count</em>, not samples.</p>
+  <p><strong>The careless label.</strong> A developer adds <code>customer_id</code> to the order-latency histogram. With 50,000 active customers per day, one pod's 336 series become 336 × 50,000 = <strong>16.8 million series</strong> (in the worst case, if each customer hit each route and status), and a Prometheus server that needs on the order of several kilobytes of memory per active series would need tens of gigabytes per pod. The scrape would time out and every dashboard and alert would go blind exactly when you needed them. (<a href="../chapters/04-metrics.html">Chapter 4</a>: series count is the product of label cardinalities.)</p>
+  <p><strong>The budget.</strong> Give each team a budget (say 5,000 series per service and 100,000 overall, which leaves 5× headroom over today's 20,000), enforce it in CI by counting series on a staging scrape, and enforce it in production with a scrape <code>sample_limit</code> per target. Alert (as a ticket) at 80% of budget. Find the offenders with <code>topk(10, count by (__name__) ({__name__=~".+"}))</code> (expensive; run it rarely) or the TSDB status page. Spend the budget on labels that answer questions you ask often; move the rest to events.</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">7</span>Dashboards: one question each</h2>
+<p class="stage-q">Sketch the dashboards. Each must answer a single question, in the order an on-call engineer asks them at 3 a.m. What goes at the top of each?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>A dashboard is a tool, not a collection. Give each one a title that is a question and arrange it so the first row answers it.</p>
+  <ol>
+    <li><strong>"Is checkout healthy right now?"</strong> The landing page. Top row: the order-submission and browse SLIs against their targets, the burn rate over 1 h and 6 h, and the remaining 30-day budget. Below: orders per minute (business signal) against the same time last week. This is the dashboard linked from every page.</li>
+    <li><strong>"Where is the time going?"</strong> Per-service RED panels in request order (gateway, orders, inventory, payments); latency as p50, p95 and p99 computed from summed histograms; an exemplar overlay linking to traces; a link to a "slowest traces in the last 15 minutes" query. Everything is split by region and version so a bad deploy shows as one line.</li>
+    <li><strong>"Is the payment provider the problem?"</strong> PSP client latency histogram, error and timeout rate, retry count against the retry budget, circuit-breaker state, and the provider's own status feed. Answering this fast stops an hour of debugging your own code.</li>
+    <li><strong>"Is the email queue keeping up?"</strong> Age of oldest message (the headline), depth, enqueue versus dequeue rate, worker count, dead letters, freshness SLI.</li>
+    <li><strong>"Is the fleet running out of something?"</strong> USE per service: CPU, throttling, memory, pool waiters, queue depth, per zone.</li>
+    <li><strong>"Is the telemetry itself alive?"</strong> Scrape success, series count against budget, collector queue drops, log pipeline lag. The observability system needs its own observability.</li>
+  </ol>
+  <p>Put the same time range and variable selectors (region, version) at the top of each, keep to a handful of panels, and give every panel a one-line description of what a bad reading means. A dashboard you cannot explain in a sentence is two dashboards. Try one in the <a href="../toolbox.html#grafana">Grafana card</a>.</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">8</span>Burn-rate alerts and runbooks</h2>
+<p class="stage-q">Write the alerts that page and the ones that only open tickets. Give thresholds and windows for the order-submission SLO of 99.5%. What does each page link to, and what does the runbook say first?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+  <p>Alert on the symptom (SLO burn), investigate causes on dashboards (<a href="../chapters/07-alerting-oncall.html">chapter 7</a>). The Workbook's starting parameters work for any SLO; the error-ratio threshold is the burn rate times the budget fraction. For a 99.5% SLO the budget fraction is 0.005.</p>
+  <table>
+    <thead><tr><th>Alert</th><th>Condition (both windows must hold)</th><th>Action</th><th>Budget used at firing</th></tr></thead>
+    <tbody>
+      <tr><td>CheckoutFastBurn</td><td>error ratio &gt; 14.4 × 0.005 = <strong>7.2%</strong> over 1 h and over 5 min</td><td>page</td><td>2%</td></tr>
+      <tr><td>CheckoutSlowBurn</td><td>error ratio &gt; 6 × 0.005 = <strong>3%</strong> over 6 h and over 30 min</td><td>page</td><td>5%</td></tr>
+      <tr><td>CheckoutBudgetLeak</td><td>error ratio &gt; 1 × 0.005 = 0.5% over 3 d and over 6 h</td><td>ticket</td><td>10%</td></tr>
+      <tr><td>EmailFreshness</td><td>oldest message age &gt; 15 min for 10 min</td><td>page (the SLI is 5 min; 15 gives slack for restarts)</td><td></td></tr>
+      <tr><td>TelemetryDown</td><td>always-firing "watchdog" alert stops arriving; or series count &gt; 80% of budget</td><td>page / ticket</td><td></td></tr>
+    </tbody>
+  </table>
+<pre class="terminal" data-title="alert rule (illustrative PromQL; not run)"><code>groups:
+- name: checkout-slo
+  rules:
+  - record: checkout:error_ratio:rate5m
+    expr: |
+      sum(rate(http_requests_total{route="/orders",method="POST",code_class="5xx"}[5m]))
+      / sum(rate(http_requests_total{route="/orders",method="POST"}[5m]))
+  - record: checkout:error_ratio:rate1h
+    expr: |
+      sum(rate(http_requests_total{route="/orders",method="POST",code_class="5xx"}[1h]))
+      / sum(rate(http_requests_total{route="/orders",method="POST"}[1h]))
+  - alert: CheckoutFastBurn
+    expr: checkout:error_ratio:rate1h &gt; (14.4 * 0.005) and checkout:error_ratio:rate5m &gt; (14.4 * 0.005)
+    for: 0m
+    labels: {severity: page}
+    annotations:
+      summary: "Order submissions burning budget at over 14x"
+      runbook_url: "https://runbooks.example.internal/checkout-fast-burn"
+      dashboard: "https://grafana.example.internal/d/checkout-health"</code></pre>
+  <p>In this form a 5xx counts as bad and everything else, including declined cards (a 402 or a 4xx class), is good. Timeouts that the gateway turns into 504 are inside 5xx. At 10 orders per second the 5-minute window holds about 3,000 requests: a 7.2% error ratio is about 216 failures, a signal and not noise. Chapter 7 shows how to test a rule against synthetic incidents before trusting it.</p>
+  <p><strong>The runbook</strong> (copy a skeleton from the <a href="../toolbox.html#runbook">toolbox</a>) opens with what the alert means in user terms, then <em>mitigations in order of speed</em>, then diagnosis:</p>
+  <ol>
+    <li>Impact: "customers cannot complete orders (or are told they failed)". Check the dashboard "Is checkout healthy right now?" and confirm in the probe.</li>
+    <li>Did anything change in the last hour? Deploys, flag flips, config. If yes and the errors started then, <strong>roll back</strong> (the deploy tool link is here) before diagnosing.</li>
+    <li>Is it one region, one zone, one version? Drain or roll back that slice.</li>
+    <li>Is it the PSP (dashboard 3)? Enable "accept as pending payment" mode via its flag; post a status update.</li>
+    <li>Otherwise: shed non-essential load (recommendations off), open an incident (<a href="../chapters/16-incident-response.html">chapter 16</a>), and page the secondary.</li>
+    <li>Evidence to save before you change anything: dashboard screenshots, five example trace ids, the deploy list.</li>
+  </ol>
+  <p>Every page must have an owner, a runbook link and a review date; prune alerts that fire without action.</p>
+</details>
+</section>
+
+<h2>Self-check rubric</h2>
+<p>Tick what your own design (before reading the answers) covered. An experienced engineer would hit most of these.</p>
+<ul class="rubric">
+  <li>Defined <strong>SLIs per user journey</strong> as good over valid events, with the rules for what counts (declined cards good, probe traffic excluded).</li>
+  <li>Chose SLO targets <strong>consistent with dependency limits</strong>, noticing that the PSP caps what the order journey can promise.</li>
+  <li>Used a <strong>freshness or queue-age SLI</strong> for the email path instead of availability.</li>
+  <li>Chose <strong>RED for services and USE for resources</strong>, plus dependency-client metrics and a business signal.</li>
+  <li>Placed <strong>histogram bucket bounds at SLO thresholds</strong>, used identical layouts everywhere and never averaged percentiles.</li>
+  <li>Designed a <strong>wide canonical event</strong> with trace id, outcome, dependency timings and sample rate, and listed what must never be logged.</li>
+  <li>Described <strong>context propagation</strong> (traceparent) at every hop and a way to test for breaks.</li>
+  <li>Handled the <strong>queue hop</strong> by injecting context in message headers and choosing a span link over a long-lived parent.</li>
+  <li>Set a <strong>sampling policy</strong> (keep errors and slow, sample the rest, record the rate) and said where tail sampling runs.</li>
+  <li>Did the <strong>telemetry volume arithmetic</strong> (series, log GB, span GB) and showed the effect of sampling.</li>
+  <li>Set a <strong>cardinality budget</strong>, banned unbounded labels, and showed what one bad label costs.</li>
+  <li>Built <strong>dashboards that each answer one question</strong>, including one for the telemetry system itself.</li>
+  <li>Wrote <strong>multi-window burn-rate alerts</strong> with thresholds computed from the SLO and runbooks that lead with mitigation.</li>
+</ul>
+<p class="studio-status" id="studio-status"></p>
+
+<h2>Saying it in an interview</h2>
+<div class="callout mentor">
+  <p class="callout-title">How a senior engineer would summarise this</p>
+  <p>"I'd start from four customer journeys and write each SLI as good over valid events, measured at the gateway plus a probe. The order SLO has to respect the payment provider's own availability, so I'd pick 99.5% and plan a pending-payment mode to earn more. For signals: RED and USE metrics with a bucket bound at every SLO threshold and a strict label budget; one wide event per request carrying the trace id for the questions I can't predict; OpenTelemetry traces with the context injected into queue messages and a span link for the email worker. I'd keep errors and slow requests, sample the rest, and tail-sample traces in the collector. The napkin maths says full-fidelity telemetry would be roughly 111 GB of logs and 260 GB of spans a day against a few hundred MB of metrics, so sampling is a cost decision, and series count is the metric to watch. Pages come only from multi-window burn rates, 14.4 over an hour and 6 over six hours, each linked to a runbook that starts with rollback."</p>
+  <p>Notice the shape: <strong>journeys → SLIs → signals chosen by question → propagation including the queue → sampling → volume and cost → dashboards → alerts and runbooks.</strong></p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Start from user journeys; define good and valid events precisely, and set targets that your dependencies allow.</li>
+    <li>Metrics answer "how much", wide events answer "which ones and why", traces answer "where did the time go". Keep each to its job.</li>
+    <li>Put a histogram bound at every SLO threshold and keep labels bounded; cardinality is the product of label values.</li>
+    <li>Carry trace context in queue messages, and use a span link for delayed or batched work.</li>
+    <li>Sample logs and traces by value (keep errors and slow), record the rate, and keep metrics unsampled.</li>
+    <li>Do the volume arithmetic early: events and spans dominate bytes, series count dominates metric cost.</li>
+    <li>Page on multi-window burn rates; link a runbook that starts with the fastest mitigation.</li>
+    <li>Monitor the telemetry pipeline too.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/studio.js"></script>
+</body>
+</html>
