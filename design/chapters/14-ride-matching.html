@@ -52,57 +52,124 @@
 
 <h2>Estimate</h2>
 <p>The key is to separate the <em>ephemeral hot data</em> (locations) from the <em>durable cold data</em> (trips). The script below computes both and also tests geohash cell sizes against driver density, which is the number that picks the index resolution. All inputs are assumptions.</p>
-<pre class="terminal" data-title="ride_napkin.py"><code>&quot;&quot;&quot;Napkin maths for ride matching. Every input is an assumption.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>writes/s ← drivers ÷ ping interval;  Mbit/s ← writes × bytes × 8</li>
+  <li>trips/s ← per day ÷ 86,400;  reads/s ← riders ÷ refresh;  match ← peak × 3</li>
+  <li>busiest city ← 3% × drivers;  nodes ← ceil(writes/s ÷ 100k)</li>
+  <li>per cell type: drivers ← area × density;  downtown ← × 10</li>
+</ol></div>
+<pre class="terminal" data-title="ride_napkin.py"><code>"""Napkin maths for ride matching: location writes, map reads, trips,
+sharding and cell sizing. Every input is an assumption."""
 import math
-drivers_online_peak = 1_000_000          # globally, at the busiest hour
-update_every_s      = 4                  # location ping interval while online
-bytes_per_update    = 60                 # id, lat, lng, heading, speed, timestamp, status (binary-ish)
-trips_per_day       = 20_000_000
-peak_factor         = 5                  # peak trips/s vs average
-riders_open_apps_peak = 3_000_000        # riders with the app open at peak, each might ask for nearby cars
-nearby_refresh_s    = 10
 
-w = drivers_online_peak / update_every_s
-print(f&quot;location writes: {drivers_online_peak:,} drivers / {update_every_s} s = {w:,.0f} writes/s  ({w*bytes_per_update*8/1e6:,.0f} Mbit/s inbound)&quot;)
-state_mb = drivers_online_peak * 100 / 1e6
-print(f&quot;latest-location table: {drivers_online_peak:,} x ~100 B = {state_mb:,.0f} MB  -&gt; fits in RAM on one machine; the issue is write rate, not size&quot;)
-history_tb_day = w * 86400 * bytes_per_update / 1e12
-print(f&quot;if we also kept every ping: {w*86400/1e9:,.1f} B rows/day = {history_tb_day:,.1f} TB/day  -&gt; an append-only log, never the serving store&quot;)
-avg_trips_s = trips_per_day / 86400
-print(f&quot;\ntrips: {trips_per_day/1e6:.0f}M/day = {avg_trips_s:,.0f}/s average, ~{avg_trips_s*peak_factor:,.0f}/s at peak (x{peak_factor})&quot;)
-q = riders_open_apps_peak / nearby_refresh_s
-print(f&quot;&#x27;cars near me&#x27; map reads: {riders_open_apps_peak/1e6:.0f}M riders / {nearby_refresh_s} s = {q:,.0f} queries/s (reads are ~{q/w:.1f}x the writes)&quot;)
-print(f&quot;matching queries (a request triggers ~3 nearest-k searches as offers fail): ~{avg_trips_s*peak_factor*3:,.0f}/s&quot;)
+SECONDS_PER_DAY = 86_400
 
-# partitioning
-cities = 400
-print(f&quot;\nshard by city/region: ~{cities} active cities; busiest-city share assumed 3% of drivers&quot;)
-big = 0.03 * drivers_online_peak
-print(f&quot;  busiest city: {big:,.0f} drivers -&gt; {big/update_every_s:,.0f} writes/s, {big*100/1e6:,.0f} MB: one in-memory node handles it with room (assume 100k updates/s per node)&quot;)
-shards_for_writes = math.ceil(w / 100_000)
-print(f&quot;  global writes need &gt;= {shards_for_writes} nodes at 100k/s each; we run ~{cities//20}+ with replicas for headroom and failover&quot;)
+# ── 1. Driver location writes ─────────────────────────────────────────
+DRIVERS_ONLINE_PEAK = 1_000_000   # globally, at the busiest hour
+UPDATE_EVERY_S = 4                # location ping interval while online
+BYTES_PER_UPDATE = 60             # id, lat, lng, heading, speed, ts, status
+BYTES_PER_LATEST_ROW = 100        # latest-location row, with overhead
 
-# cell sizing
-print(&quot;\ncell size vs candidates per cell, dense city (assume 1 driver per 0.5 km^2 average, 10x in downtown)&quot;)
-for name, km in ((&quot;geohash-5 (~4.9 km)&quot;, 4.9), (&quot;geohash-6 (~1.2 km x 0.6 km)&quot;, math.sqrt(1.2*0.6)), (&quot;H3 res 8 (edge 0.53 km, ~0.74 km^2)&quot;, 0.86)):
-    area = km*km
-    print(f&quot;  {name:&lt;38} area {area:6.2f} km^2 -&gt; avg {area/0.5:5.1f} drivers/cell, downtown {area/0.05:6.1f}&quot;)</code></pre>
+writes_per_s = DRIVERS_ONLINE_PEAK / UPDATE_EVERY_S
+inbound_mbit = writes_per_s * BYTES_PER_UPDATE * 8 / 1e6
+state_mb = DRIVERS_ONLINE_PEAK * BYTES_PER_LATEST_ROW / 1e6
+pings_per_day = writes_per_s * SECONDS_PER_DAY
+history_tb_day = pings_per_day * BYTES_PER_UPDATE / 1e12
+
+print(f"location writes: {DRIVERS_ONLINE_PEAK:,} drivers / "
+      f"{UPDATE_EVERY_S} s = {writes_per_s:,.0f} writes/s  "
+      f"({inbound_mbit:,.0f} Mbit/s inbound)")
+print(f"latest-location table: {DRIVERS_ONLINE_PEAK:,} x ~100 B "
+      f"= {state_mb:,.0f} MB")
+print("  -&gt; fits in RAM on one machine; the issue is write rate, not size")
+print(f"if we also kept every ping: {pings_per_day / 1e9:,.1f} B rows/day "
+      f"= {history_tb_day:,.1f} TB/day")
+print("  -&gt; an append-only log, never the serving store")
+
+# ── 2. Trips and read traffic ─────────────────────────────────────────
+TRIPS_PER_DAY = 20_000_000
+PEAK_FACTOR = 5                   # peak trips/s vs average
+RIDERS_OPEN_PEAK = 3_000_000      # riders with the app open at peak
+NEARBY_REFRESH_S = 10             # each refreshes its "cars near me" map
+SEARCHES_PER_REQUEST = 3          # nearest-k searches as offers fail
+
+avg_trips_s = TRIPS_PER_DAY / SECONDS_PER_DAY
+peak_trips_s = avg_trips_s * PEAK_FACTOR
+map_reads_s = RIDERS_OPEN_PEAK / NEARBY_REFRESH_S
+read_write_ratio = map_reads_s / writes_per_s
+match_queries_s = peak_trips_s * SEARCHES_PER_REQUEST
+
+print(f"\ntrips: {TRIPS_PER_DAY / 1e6:.0f}M/day = {avg_trips_s:,.0f}/s "
+      f"average, ~{peak_trips_s:,.0f}/s at peak (x{PEAK_FACTOR})")
+print(f"'cars near me' map reads: {RIDERS_OPEN_PEAK / 1e6:.0f}M riders / "
+      f"{NEARBY_REFRESH_S} s = {map_reads_s:,.0f} queries/s")
+print(f"  (reads are ~{read_write_ratio:.1f}x the writes)")
+print("matching queries (a request triggers ~3 nearest-k searches as "
+      "offers fail):")
+print(f"  ~{match_queries_s:,.0f}/s")
+
+# ── 3. Partitioning by city ───────────────────────────────────────────
+CITIES = 400
+BUSIEST_CITY_SHARE = 0.03         # share of all drivers in the busiest city
+NODE_WRITES_PER_S = 100_000       # updates/s one in-memory node absorbs
+
+busiest_drivers = BUSIEST_CITY_SHARE * DRIVERS_ONLINE_PEAK
+busiest_writes = busiest_drivers / UPDATE_EVERY_S
+busiest_mb = busiest_drivers * BYTES_PER_LATEST_ROW / 1e6
+nodes_for_writes = math.ceil(writes_per_s / NODE_WRITES_PER_S)
+
+print(f"\nshard by city/region: ~{CITIES} active cities; "
+      f"busiest-city share assumed 3% of drivers")
+print(f"  busiest city: {busiest_drivers:,.0f} drivers "
+      f"-&gt; {busiest_writes:,.0f} writes/s, {busiest_mb:,.0f} MB:")
+print("    one in-memory node handles it with room "
+      "(assume 100k updates/s per node)")
+print(f"  global writes need &gt;= {nodes_for_writes} nodes at 100k/s each; "
+      f"we run ~{CITIES // 20}+")
+print("    with replicas for headroom and failover")
+
+# ── 4. Cell size vs candidates per cell ───────────────────────────────
+DRIVERS_PER_KM2 = 1 / 0.5         # dense city average
+DOWNTOWN_FACTOR = 10              # downtown is 10x denser
+
+print("\ncell size vs candidates per cell, dense city "
+      "(assume 1 driver per 0.5 km^2")
+print("average, 10x in downtown); columns are drivers per cell")
+cell_options = (
+    ("geohash-5 (~4.9 km)", 4.9),
+    ("geohash-6 (~1.2 km x 0.6 km)", math.sqrt(1.2 * 0.6)),
+    ("H3 res 8 (edge 0.53 km, ~0.74 km^2)", 0.86),
+)
+for name, side_km in cell_options:
+    area = side_km * side_km
+    avg = area * DRIVERS_PER_KM2
+    downtown = avg * DOWNTOWN_FACTOR
+    print(f"  {name:&lt;36} area {area:6.2f} km^2 "
+          f"-&gt; avg {avg:5.1f}, downtown {downtown:6.1f}")</code></pre>
 <pre class="terminal" data-title="output"><code>location writes: 1,000,000 drivers / 4 s = 250,000 writes/s  (120 Mbit/s inbound)
-latest-location table: 1,000,000 x ~100 B = 100 MB  -&gt; fits in RAM on one machine; the issue is write rate, not size
-if we also kept every ping: 21.6 B rows/day = 1.3 TB/day  -&gt; an append-only log, never the serving store
+latest-location table: 1,000,000 x ~100 B = 100 MB
+  -&gt; fits in RAM on one machine; the issue is write rate, not size
+if we also kept every ping: 21.6 B rows/day = 1.3 TB/day
+  -&gt; an append-only log, never the serving store
 
 trips: 20M/day = 231/s average, ~1,157/s at peak (x5)
-&#x27;cars near me&#x27; map reads: 3M riders / 10 s = 300,000 queries/s (reads are ~1.2x the writes)
-matching queries (a request triggers ~3 nearest-k searches as offers fail): ~3,472/s
+&#x27;cars near me&#x27; map reads: 3M riders / 10 s = 300,000 queries/s
+  (reads are ~1.2x the writes)
+matching queries (a request triggers ~3 nearest-k searches as offers fail):
+  ~3,472/s
 
 shard by city/region: ~400 active cities; busiest-city share assumed 3% of drivers
-  busiest city: 30,000 drivers -&gt; 7,500 writes/s, 3 MB: one in-memory node handles it with room (assume 100k updates/s per node)
-  global writes need &gt;= 3 nodes at 100k/s each; we run ~20+ with replicas for headroom and failover
+  busiest city: 30,000 drivers -&gt; 7,500 writes/s, 3 MB:
+    one in-memory node handles it with room (assume 100k updates/s per node)
+  global writes need &gt;= 3 nodes at 100k/s each; we run ~20+
+    with replicas for headroom and failover
 
-cell size vs candidates per cell, dense city (assume 1 driver per 0.5 km^2 average, 10x in downtown)
-  geohash-5 (~4.9 km)                    area  24.01 km^2 -&gt; avg  48.0 drivers/cell, downtown  480.2
-  geohash-6 (~1.2 km x 0.6 km)           area   0.72 km^2 -&gt; avg   1.4 drivers/cell, downtown   14.4
-  H3 res 8 (edge 0.53 km, ~0.74 km^2)    area   0.74 km^2 -&gt; avg   1.5 drivers/cell, downtown   14.8</code></pre>
+cell size vs candidates per cell, dense city (assume 1 driver per 0.5 km^2
+average, 10x in downtown); columns are drivers per cell
+  geohash-5 (~4.9 km)                  area  24.01 km^2 -&gt; avg  48.0, downtown  480.2
+  geohash-6 (~1.2 km x 0.6 km)         area   0.72 km^2 -&gt; avg   1.4, downtown   14.4
+  H3 res 8 (edge 0.53 km, ~0.74 km^2)  area   0.74 km^2 -&gt; avg   1.5, downtown   14.8</code></pre>
 <p>Decisions from the output.</p>
 <ul>
   <li><strong>Writes are the load; size is not.</strong> A million drivers pinging every 4 seconds is 250,000 writes a second, but the latest position of all of them is only about 100 MB. That fits in RAM on one machine and rules out a relational primary as the store of record for locations: you would be paying durable-commit costs for data that is worthless in 15 seconds. <strong>Keep the latest location in memory, sharded, and let it be lossy.</strong> If a node dies, drivers re-announce themselves within one ping interval, which is the recovery procedure.</li>
@@ -114,17 +181,34 @@ cell size vs candidates per cell, dense city (assume 1 driver per 0.5 km^2 avera
 </ul>
 
 <h2>API</h2>
-<pre class="terminal" data-title="rider and driver API (shape, not exact wire format)"><code>-- driver
-POST /v1/drivers/me/status    {online: true, product_ids: [...]}
-WS   /v1/drivers/me/stream    -&gt; server pushes offers; client sends {type: "ping", lat, lng, heading, speed, ts, seq} every ~4 s
-POST /v1/offers/{offer_id}/accept    {token}          -&gt; 200 | 409 offer_expired
+<pre class="terminal" data-title="rider and driver API (shape, not exact wire format)"><code>-- ── Driver ───────────────────────────────────────────────────────────
+POST /v1/drivers/me/status
+     {online: true, product_ids: [...]}
+
+-- Server pushes offers; the client sends a ping about every 4 s
+WS   /v1/drivers/me/stream
+     client -&gt; {type: "ping", lat, lng, heading, speed, ts, seq}
+
+POST /v1/offers/{offer_id}/accept
+     {token}  -&gt; 200 | 409 offer_expired
 POST /v1/offers/{offer_id}/decline
 
--- rider
-GET  /v1/nearby?lat=..&amp;lng=..&amp;product=economy      -&gt; [{lat, lng, heading} x up to 8]  (approximate, cached ~2-5 s)
-POST /v1/quotes               {pickup, dropoff, product}  -&gt; {quote_id, price_minor, currency, surge_multiplier, expires_at, eta_s}
-POST /v1/trips                {quote_id}  Idempotency-Key: ...   -&gt; 201 {trip_id, status: "requested"}
-GET  /v1/trips/{id}          -&gt; status, driver, vehicle, eta, route so far
+-- ── Rider ────────────────────────────────────────────────────────────
+-- Approximate, cached for ~2-5 s
+GET  /v1/nearby?lat=..&amp;lng=..&amp;product=economy
+     -&gt; [{lat, lng, heading} x up to 8]
+
+POST /v1/quotes
+     {pickup, dropoff, product}
+     -&gt; {quote_id, price_minor, currency, surge_multiplier,
+         expires_at, eta_s}
+
+POST /v1/trips
+     {quote_id}   Idempotency-Key: ...
+     -&gt; 201 {trip_id, status: "requested"}
+
+GET  /v1/trips/{id}
+     -&gt; status, driver, vehicle, eta, route so far
 POST /v1/trips/{id}/cancel</code></pre>
 <p>Three API choices matter. <strong>Pings are tiny and unacknowledged-by-default</strong>: sequence numbers let the server drop out-of-order duplicates, and a missed ping costs four seconds of staleness. <strong>The quote is a contract</strong>: it carries a price, a multiplier and an expiry, and <code>POST /trips</code> references it, so the rider is never surprised by surge computed after the tap. <strong>Offers carry a token</strong> that the accept must echo, which is how a late or duplicated accept is rejected (see the lease deep dive). Trip creation is idempotent via a key, as in any API that moves money or reserves something (<a href="../../architecture/chapters/09-api-design.html">API design</a>).</p>
 
@@ -234,96 +318,222 @@ POST /v1/trips/{id}/cancel</code></pre>
 <div class="widget" id="geo-cells"></div>
 <h3>k-nearest by expanding rings</h3>
 <p>A cell grid answers "who is in this cell" in constant time. "Who are the k nearest" is a loop: search the rider's cell, then the ring of eight around it, then the ring of sixteen around that, and so on. The stopping rule is the part people get wrong. Having found k candidates in the cells searched so far is <em>not</em> enough: a driver just outside the searched block could be closer than the k-th you found. The safe rule: after searching rings 0 to r, anything unsearched is at least <code>r x (smallest cell side)</code> away from the rider, because the rider sits somewhere inside their own cell and the block extends r full cells beyond it. So stop when you hold k candidates and the k-th is closer than that bound. The widget applies exactly that rule. The script implements it and checks it against brute force.</p>
-<pre class="terminal" data-title="geo_index.py"><code>&quot;&quot;&quot;Geohash + grid index vs brute force for nearest-k drivers. Pure stdlib, deterministic.
-The index maps cell -&gt; {driver ids}; a k-nearest query searches rings of cells outward from the rider&#x27;s cell.
-Correctness rule: after searching ring r, anything unsearched is at least r * (smallest cell side) away, so stop
-only when we have k candidates and the k-th is closer than that bound.&quot;&quot;&quot;
-import math, random, time
-B32 = &quot;0123456789bcdefghjkmnpqrstuvwxyz&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>encode: bisect lng, lat, lng, … ; 5 bits per base-32 character</li>
+  <li>index: cell → drivers;  knn: add ring r = 0, 1, … until k found</li>
+  <li>stop when k-th distance ≤ r × smallest cell side</li>
+  <li>populate 60 km region, 40% downtown;  compare index to brute force</li>
+  <li>cells either side of a boundary hash differently, so search neighbours</li>
+</ol></div>
+<pre class="terminal" data-title="geo_index.py"><code>"""Geohash + grid index vs brute force for nearest-k drivers.
+Pure stdlib, deterministic apart from the timing lines. The index maps
+cell -&gt; {driver ids}; k-nearest searches rings of cells outward."""
+import math
+import os
+import random
+import time
 
-def encode(lat, lng, prec):
-    lat_r, lng_r, bits, even, h, ch = [-90.0, 90.0], [-180.0, 180.0], 0, True, &quot;&quot;, 0
-    while len(h) &lt; prec:
-        rng, v = (lng_r, lng) if even else (lat_r, lat)
+# ── 1. Geohash encoding ───────────────────────────────────────────────
+BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def encode(lat, lng, precision):
+    """Interleave longitude/latitude bisection bits, 5 bits per character."""
+    lat_range = [-90.0, 90.0]
+    lng_range = [-180.0, 180.0]
+    use_lng = True              # bits alternate: lng, lat, lng, ...
+    bit_count = 0
+    chunk = 0
+    out = ""
+    while len(out) &lt; precision:
+        if use_lng:
+            rng, value = lng_range, lng
+        else:
+            rng, value = lat_range, lat
         mid = (rng[0] + rng[1]) / 2
-        ch &lt;&lt;= 1
-        if v &gt;= mid: ch |= 1; rng[0] = mid
-        else: rng[1] = mid
-        even = not even; bits += 1
-        if bits == 5: h += B32[ch]; bits = ch = 0
-    return h
+        chunk &lt;&lt;= 1
+        if value &gt;= mid:
+            chunk |= 1
+            rng[0] = mid        # keep the upper half
+        else:
+            rng[1] = mid        # keep the lower half
+        use_lng = not use_lng
+        bit_count += 1
+        if bit_count == 5:
+            out += BASE32[chunk]
+            bit_count = 0
+            chunk = 0
+    return out
 
-def cell_size_deg(prec):
-    lng_bits = (5 * prec + 1) // 2; lat_bits = 5 * prec // 2
+
+def cell_size_deg(precision):
+    lng_bits = (5 * precision + 1) // 2
+    lat_bits = 5 * precision // 2
     return 180 / 2 ** lat_bits, 360 / 2 ** lng_bits
 
-def km(a, b):                                   # equirectangular approximation, fine at city scale
-    dlat = math.radians(b[0] - a[0]); dlng = math.radians(b[1] - a[1]) * math.cos(math.radians((a[0] + b[0]) / 2))
+
+def km(a, b):
+    """Equirectangular approximation; fine at city scale."""
+    mean_lat = math.radians((a[0] + b[0]) / 2)
+    dlat = math.radians(b[0] - a[0])
+    dlng = math.radians(b[1] - a[1]) * math.cos(mean_lat)
     return 6371 * math.hypot(dlat, dlng)
 
-PREC = 6
-DLAT, DLNG = cell_size_deg(PREC)
-class Index:
-    def __init__(self): self.cells, self.where = {}, {}
-    def update(self, did, lat, lng):
-        c = encode(lat, lng, PREC)
-        old = self.where.get(did)
-        if old and old != c: self.cells[old].discard(did)
-        self.cells.setdefault(c, set()).add(did); self.where[did] = c
-    def knn(self, lat, lng, k, pos):
-        best, searched, r = [], 0, 0
-        side_km = min(DLAT * 111.2, DLNG * 111.2 * math.cos(math.radians(lat)))
-        while True:
-            for di in range(-r, r + 1):
-                for dj in range(-r, r + 1):
-                    if max(abs(di), abs(dj)) != r: continue          # only the new ring
-                    c = encode(lat + di * DLAT, lng + dj * DLNG, PREC)
-                    for d in self.cells.get(c, ()): best.append((km((lat, lng), pos[d]), d)); searched += 1
-            best.sort(); best = best[:k]
-            if len(best) == k and best[-1][0] &lt;= r * side_km: return best, r, searched
-            r += 1
-            if r &gt; 60: return best, r, searched
 
+# ── 2. The grid index and ring search ─────────────────────────────────
+PREC = 6
+DLAT, DLNG = cell_size_deg(PREC)    # one cell's height and width, degrees
+MAX_RINGS = 60                      # safety stop for empty regions
+
+
+class Index:
+    def __init__(self):
+        self.cells = {}             # cell -&gt; set of driver ids
+        self.where = {}             # driver id -&gt; its current cell
+
+    def update(self, driver, lat, lng):
+        cell = encode(lat, lng, PREC)
+        old = self.where.get(driver)
+        if old and old != cell:
+            self.cells[old].discard(driver)     # moved: leave the old cell
+        self.cells.setdefault(cell, set()).add(driver)
+        self.where[driver] = cell
+
+    def knn(self, lat, lng, k, pos):
+        """Return (k nearest, rings searched, drivers examined)."""
+        best = []
+        examined = 0
+        ring = 0
+        side_km = min(DLAT * 111.2,
+                      DLNG * 111.2 * math.cos(math.radians(lat)))
+        while True:
+            for di in range(-ring, ring + 1):
+                for dj in range(-ring, ring + 1):
+                    if max(abs(di), abs(dj)) != ring:
+                        continue                # only the new outer ring
+                    cell = encode(lat + di * DLAT, lng + dj * DLNG, PREC)
+                    for d in self.cells.get(cell, ()):
+                        best.append((km((lat, lng), pos[d]), d))
+                        examined += 1
+            best.sort()
+            best = best[:k]
+            # Correctness: after ring r, anything unsearched is at least
+            # r * (smallest cell side) away. Stop only when we hold k
+            # candidates and the k-th is inside that bound.
+            if len(best) == k and best[-1][0] &lt;= ring * side_km:
+                return best, ring, examined
+            ring += 1
+            if ring &gt; MAX_RINGS:
+                return best, ring, examined
+
+
+# ── 3. A synthetic metro region ───────────────────────────────────────
 def populate(n, seed):
-    rnd = random.Random(seed); pos, idx = {}, Index()
-    for i in range(n):                                             # a metro region of roughly 60 km x 60 km
-        hot = rnd.random() &lt; 0.4                                   # 40% clustered downtown
-        lat = 37.77 + (rnd.gauss(0, 0.03) if hot else rnd.uniform(-0.27, 0.27))
-        lng = -122.42 + (rnd.gauss(0, 0.04) if hot else rnd.uniform(-0.33, 0.33))
-        pos[i] = (lat, lng); idx.update(i, lat, lng)
+    rnd = random.Random(seed)
+    pos = {}
+    idx = Index()
+    for i in range(n):
+        # roughly 60 km x 60 km; 40% of drivers clustered downtown
+        hot = rnd.random() &lt; 0.4
+        if hot:
+            lat = 37.77 + rnd.gauss(0, 0.03)
+        else:
+            lat = 37.77 + rnd.uniform(-0.27, 0.27)
+        if hot:
+            lng = -122.42 + rnd.gauss(0, 0.04)
+        else:
+            lng = -122.42 + rnd.uniform(-0.33, 0.33)
+        pos[i] = (lat, lng)
+        idx.update(i, lat, lng)
     return pos, idx
 
-k = 8
-qr = random.Random(11)
-queries = [(37.77 + qr.uniform(-0.2, 0.2), -122.42 + qr.uniform(-0.25, 0.25)) for _ in range(200)]
-def brute(q, pos): return sorted((km(q, p), d) for d, p in pos.items())[:k]
+
+K = 8
+N_QUERIES = 200
+N_CHECKED = 20                  # queries also answered by brute force
+query_rng = random.Random(11)
+queries = []
+for _ in range(N_QUERIES):
+    q_lat = 37.77 + query_rng.uniform(-0.2, 0.2)
+    q_lng = -122.42 + query_rng.uniform(-0.25, 0.25)
+    queries.append((q_lat, q_lng))
+
+
+def brute(q, pos):
+    return sorted((km(q, p), d) for d, p in pos.items())[:K]
+
+
+def ids(results):
+    return [d for _, d in results]
+
+
+# ── 4. Index vs brute force ───────────────────────────────────────────
 for n in (200_000, 3_000):
     pos, idx = populate(n, 7)
-    t0 = time.perf_counter(); res = [idx.knn(q[0], q[1], k, pos) for q in queries]; t1 = time.perf_counter()
-    same = sum([d for _, d in res[i][0]] == [d for _, d in brute(queries[i], pos)] for i in range(20))
-    t2 = time.perf_counter(); [brute(q, pos) for q in queries[:20]]; t3 = time.perf_counter()
-    rings = [r for _, r, _ in res]; scanned = [s for _, _, s in res]
-    print(f&quot;{n:&gt;7,} drivers, geohash-{PREC} (cell {DLAT*111.2:.2f} km tall x {DLNG*111.2*math.cos(math.radians(37.77)):.2f} km wide), {len(idx.cells):,} non-empty cells&quot;)
-    print(f&quot;   matches brute force on 20/20 sampled queries: {same == 20}&quot;)
-    print(f&quot;   rings searched: mean {sum(rings)/len(rings):.1f}, max {max(rings)};  drivers examined: mean {sum(scanned)/len(scanned):.0f} (not {n:,})&quot;)
-    print(f&quot;   grid index {(t1-t0)/len(queries)*1000:.2f} ms/query   brute force {(t3-t2)/20*1000:.1f} ms/query&quot;)
 
-print(&quot;\nencode(57.64911, 10.40744, 11) =&quot;, encode(57.64911, 10.40744, 11), &quot;(reference value from the geohash literature: u4pruydqqvj)&quot;)
-edge = (int(-122.42 / DLNG) - 1) * DLNG                               # a cell boundary in longitude
-for lng in (edge - 0.0001, edge + 0.0001):
-    print(f&quot;  lng {lng:.6f}: {encode(37.77, lng, PREC)}&quot;)
-a, b = encode(37.77, edge - 0.0001, PREC), encode(37.77, edge + 0.0001, PREC)
-print(f&quot;  those points are about {km((37.77, edge-0.0001), (37.77, edge+0.0001))*1000:.0f} m apart and share a prefix of {len(__import__(&#x27;os&#x27;).path.commonprefix([a, b]))} of {PREC} characters&quot;)</code></pre>
+    t0 = time.perf_counter()
+    res = [idx.knn(q[0], q[1], K, pos) for q in queries]
+    t1 = time.perf_counter()
+
+    same = 0
+    for i in range(N_CHECKED):
+        if ids(res[i][0]) == ids(brute(queries[i], pos)):
+            same += 1
+
+    t2 = time.perf_counter()
+    for q in queries[:N_CHECKED]:
+        brute(q, pos)
+    t3 = time.perf_counter()
+
+    rings = [r for _, r, _ in res]
+    examined = [e for _, _, e in res]
+    tall = DLAT * 111.2
+    wide = DLNG * 111.2 * math.cos(math.radians(37.77))
+    index_ms = (t1 - t0) / N_QUERIES * 1000
+    brute_ms = (t3 - t2) / N_CHECKED * 1000
+
+    print(f"{n:&gt;7,} drivers, geohash-{PREC} "
+          f"(cell {tall:.2f} km tall x {wide:.2f} km wide), "
+          f"{len(idx.cells):,} non-empty cells")
+    print(f"   matches brute force on 20/20 sampled queries: "
+          f"{same == N_CHECKED}")
+    print(f"   rings searched: mean {sum(rings) / len(rings):.1f}, "
+          f"max {max(rings)};  "
+          f"drivers examined: mean {sum(examined) / len(examined):.0f} "
+          f"(not {n:,})")
+    print(f"   grid index {index_ms:.2f} ms/query   "
+          f"brute force {brute_ms:.1f} ms/query")
+
+# ── 5. Geohash sanity check and the boundary problem ──────────────────
+ref = encode(57.64911, 10.40744, 11)
+print(f"\nencode(57.64911, 10.40744, 11) = {ref}")
+print("  (reference value from the geohash literature: u4pruydqqvj)")
+
+# Two points a few metres apart, either side of a cell boundary, get
+# different hashes: this is why a query must also search neighbour cells.
+edge = (int(-122.42 / DLNG) - 1) * DLNG     # a cell boundary in longitude
+west = edge - 0.0001
+east = edge + 0.0001
+for lng in (west, east):
+    print(f"  lng {lng:.6f}: {encode(37.77, lng, PREC)}")
+hash_w = encode(37.77, west, PREC)
+hash_e = encode(37.77, east, PREC)
+apart_m = km((37.77, west), (37.77, east)) * 1000
+shared = len(os.path.commonprefix([hash_w, hash_e]))
+print(f"  those points are about {apart_m:.0f} m apart and share a prefix "
+      f"of {shared} of {PREC} characters")</code></pre>
 <pre class="terminal" data-title="output"><code>200,000 drivers, geohash-6 (cell 0.61 km tall x 0.97 km wide), 6,025 non-empty cells
    matches brute force on 20/20 sampled queries: True
    rings searched: mean 1.0, max 1;  drivers examined: mean 375 (not 200,000)
-   grid index 0.21 ms/query   brute force 77.3 ms/query
+   grid index 0.19 ms/query   brute force 79.7 ms/query
   3,000 drivers, geohash-6 (cell 0.61 km tall x 0.97 km wide), 1,750 non-empty cells
    matches brute force on 20/20 sampled queries: True
    rings searched: mean 3.9, max 6;  drivers examined: mean 30 (not 3,000)
-   grid index 0.20 ms/query   brute force 0.8 ms/query
+   grid index 0.18 ms/query   brute force 0.8 ms/query
 
-encode(57.64911, 10.40744, 11) = u4pruydqqvj (reference value from the geohash literature: u4pruydqqvj)
+encode(57.64911, 10.40744, 11) = u4pruydqqvj
+  (reference value from the geohash literature: u4pruydqqvj)
   lng -122.420754: 9q8yy5
   lng -122.420554: 9q8yy7
   those points are about 18 m apart and share a prefix of 5 of 6 characters</code></pre>
@@ -353,83 +563,167 @@ encode(57.64911, 10.40744, 11) = u4pruydqqvj (reference value from the geohash l
   <li><strong>Accept carries the token.</strong> A driver (or a dispatcher acting for one) that was paused for longer than the lease and then tries to confirm presents an old token; the state store rejects it because the current token is newer. This is the fencing-token argument, here protecting the case where dispatcher A stalls, B re-leases the driver, and A wakes up and "accepts".</li>
 </ul>
 <p>The simulation runs many interleaved dispatchers over a small pool of popular drivers, once with the naive read-then-write and once with the lease. Every <code>yield</code> is a point where another dispatcher can run. An invariant check after each step counts the moments two live trips believe they hold the same driver.</p>
-<pre class="terminal" data-title="dispatch_lease.py"><code>&quot;&quot;&quot;Dispatch without double assignment. Many dispatcher requests run concurrently (generators interleaved by a seeded
-scheduler; every `yield` is a point where another dispatcher can run). Two ways to reserve a driver:
-  naive : read the driver&#x27;s status, then (a yield later) write &#x27;offered&#x27;. A check-then-act race.
-  lease : ONE atomic compare-and-set: status must be idle, or hold an EXPIRED lease. It sets owner, expiry and a fencing token.
-          A driver&#x27;s accept carries the token; the store rejects anything but the current token.
-Invariant checked after every step: no driver is held by two live trips at once.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>store: status, owner, expiry, token per driver;  every op atomic</li>
+  <li>lease ← if idle or expired: token ← ++seq;  naive ← read, yield, write</li>
+  <li>scheduler: each tick start a trip (p 0.6), shuffle, step each dispatcher</li>
+  <li>run both schemes on one seed;  count drivers held by two trips at once</li>
+  <li>A leases and pauses;  B leases after expiry;  A's late accept fails</li>
+</ol></div>
+<pre class="terminal" data-title="dispatch_lease.py"><code>"""Dispatch without double assignment. Dispatcher requests run concurrently
+(generators interleaved by a seeded scheduler). Compares a check-then-act
+reservation with one atomic lease plus a fencing token."""
 import random
 
+# Every `yield` below is a point where another dispatcher can run.
+#   naive : read the driver's status, then (a yield later) write 'offered'.
+#   lease : ONE atomic compare-and-set: status is idle, or holds an EXPIRED
+#           lease. It sets owner, expiry and a fencing token; the driver's
+#           accept carries the token and the store rejects any other.
+# Invariant checked after every step: no driver is held by two live trips.
+
+# ── 1. The driver-state store ─────────────────────────────────────────
 class Store:
     def __init__(self, n):
-        self.status = [&quot;idle&quot;] * n; self.owner = [None] * n; self.expires = [0.0] * n; self.token = [0] * n; self.seq = 0
-    def try_lease(self, d, trip, now, ttl):                       # atomic (one shard, single-threaded or a Lua script)
-        if self.status[d] == &quot;idle&quot; or (self.status[d] == &quot;offered&quot; and self.expires[d] &lt;= now):
-            self.seq += 1; self.status[d], self.owner[d], self.expires[d], self.token[d] = &quot;offered&quot;, trip, now + ttl, self.seq
-            return self.token[d]
-    def accept(self, d, trip, tok, now):                          # atomic; fencing: only the current token wins
-        if self.status[d] == &quot;offered&quot; and self.owner[d] == trip and self.token[d] == tok and self.expires[d] &gt; now:
-            self.status[d] = &quot;on_trip&quot;; return True
-        return False
-    def release(self, d, trip, tok):
-        if self.owner[d] == trip and self.token[d] == tok: self.status[d], self.owner[d] = &quot;idle&quot;, None
+        self.status = ["idle"] * n
+        self.owner = [None] * n
+        self.expires = [0.0] * n
+        self.token = [0] * n
+        self.seq = 0                # fencing tokens only ever increase
 
+    def try_lease(self, d, trip, now, ttl):
+        """Atomic: one shard, single-threaded, or a Lua script."""
+        free = self.status[d] == "idle"
+        lapsed = self.status[d] == "offered" and self.expires[d] &lt;= now
+        if free or lapsed:
+            self.seq += 1
+            self.status[d] = "offered"
+            self.owner[d] = trip
+            self.expires[d] = now + ttl
+            self.token[d] = self.seq
+            return self.token[d]
+        return None
+
+    def accept(self, d, trip, tok, now):
+        """Atomic. Fencing: only the current token wins."""
+        current = (self.status[d] == "offered"
+                   and self.owner[d] == trip
+                   and self.token[d] == tok
+                   and self.expires[d] &gt; now)
+        if current:
+            self.status[d] = "on_trip"
+            return True
+        return False
+
+    def release(self, d, trip, tok):
+        if self.owner[d] == trip and self.token[d] == tok:
+            self.status[d] = "idle"
+            self.owner[d] = None
+
+
+# ── 2. One dispatcher per trip, as a generator ────────────────────────
 def simulate(scheme, seed, drivers=40, trips=300, ttl=3.0):
-    rnd, st = random.Random(seed), Store(drivers)
-    holders = [set() for _ in range(drivers)]                     # which live trips believe they hold each driver
-    clock = [0.0]; stats = dict(matched=0, declined=0, timed_out=0, no_driver=0, violations=0)
+    rnd = random.Random(seed)
+    st = Store(drivers)
+    # which live trips believe they hold each driver
+    holders = [set() for _ in range(drivers)]
+    clock = [0.0]
+    stats = dict(matched=0, declined=0, timed_out=0, no_driver=0,
+                 violations=0)
+
     def check(d):
-        if len(holders[d]) &gt; 1: stats[&quot;violations&quot;] += 1
+        if len(holders[d]) &gt; 1:
+            stats["violations"] += 1
 
     def dispatcher(trip):
-        cands = sorted(range(drivers), key=lambda d: abs(d - trip % 6) + rnd.random())[:6]     # popular drivers near a hot spot
+        # popular drivers near a hot spot: everyone competes for the same few
+        cands = sorted(range(drivers),
+                       key=lambda d: abs(d - trip % 6) + rnd.random())[:6]
         for d in cands:
-            if scheme == &quot;naive&quot;:
-                seen = st.status[d]; yield                         # read ... another dispatcher may run here ...
-                if seen != &quot;idle&quot;: continue
-                st.status[d], st.owner[d] = &quot;offered&quot;, trip        # ... then write, based on a stale read
-                holders[d].add(trip); check(d); tok = 0
+            if scheme == "naive":
+                seen = st.status[d]
+                yield               # read ... another dispatcher may run ...
+                if seen != "idle":
+                    continue
+                # ... then write, based on a stale read: the race.
+                st.status[d] = "offered"
+                st.owner[d] = trip
+                holders[d].add(trip)
+                check(d)
+                tok = 0
             else:
                 tok = st.try_lease(d, trip, clock[0], ttl)
-                if not tok: continue
-                holders[d].add(trip); check(d)
-            yield                                                  # the offer is out; wait for the driver
-            r = rnd.random()
-            if r &lt; 0.55:
-                ok = True if scheme == &quot;naive&quot; else st.accept(d, trip, tok, clock[0])
-                if ok:
-                    st.status[d] = &quot;on_trip&quot;; st.owner[d] = trip; stats[&quot;matched&quot;] += 1
-                    yield from [None] * rnd.randint(5, 25)         # the trip lasts a while
-                    holders[d].discard(trip); st.status[d] = &quot;idle&quot;; st.owner[d] = None
-                    return
-            elif r &lt; 0.80: stats[&quot;declined&quot;] += 1
-            else: stats[&quot;timed_out&quot;] += 1; yield from [None] * 4   # silence until the timeout
-            holders[d].discard(trip)
-            if scheme == &quot;naive&quot;: st.status[d] = &quot;idle&quot;
-            else: st.release(d, trip, tok)
-        stats[&quot;no_driver&quot;] += 1
+                if not tok:
+                    continue
+                holders[d].add(trip)
+                check(d)
+            yield                   # the offer is out; wait for the driver
 
-    live, nxt = [], 0
-    while nxt &lt; trips or live:
+            r = rnd.random()
+            if r &lt; 0.55:            # the driver accepts
+                if scheme == "naive":
+                    ok = True
+                else:
+                    ok = st.accept(d, trip, tok, clock[0])
+                if ok:
+                    st.status[d] = "on_trip"
+                    st.owner[d] = trip
+                    stats["matched"] += 1
+                    for _ in range(rnd.randint(5, 25)):
+                        yield       # the trip lasts a while
+                    holders[d].discard(trip)
+                    st.status[d] = "idle"
+                    st.owner[d] = None
+                    return
+            elif r &lt; 0.80:
+                stats["declined"] += 1
+            else:
+                stats["timed_out"] += 1
+                for _ in range(4):
+                    yield           # silence until the timeout
+
+            holders[d].discard(trip)
+            if scheme == "naive":
+                st.status[d] = "idle"
+            else:
+                st.release(d, trip, tok)
+        stats["no_driver"] += 1
+
+    # ── 3. The seeded scheduler interleaves dispatchers ─────────────
+    live = []
+    next_trip = 0
+    while next_trip &lt; trips or live:
         clock[0] += 0.1
-        if nxt &lt; trips and rnd.random() &lt; 0.6: live.append(dispatcher(nxt)); nxt += 1
+        if next_trip &lt; trips and rnd.random() &lt; 0.6:
+            live.append(dispatcher(next_trip))
+            next_trip += 1
         rnd.shuffle(live)
         for g in live[:]:
-            try: next(g)
-            except StopIteration: live.remove(g)
+            try:
+                next(g)
+            except StopIteration:
+                live.remove(g)
     return stats
 
-print(f&quot;{&#x27;scheme&#x27;:&lt;7}{&#x27;matched&#x27;:&gt;9}{&#x27;declined&#x27;:&gt;10}{&#x27;timed out&#x27;:&gt;11}{&#x27;no driver&#x27;:&gt;11}{&#x27;double-assign events&#x27;:&gt;22}&quot;)
-for scheme in (&quot;naive&quot;, &quot;lease&quot;):
-    s = simulate(scheme, seed=5)
-    print(f&quot;{scheme:&lt;7}{s[&#x27;matched&#x27;]:&gt;9}{s[&#x27;declined&#x27;]:&gt;10}{s[&#x27;timed_out&#x27;]:&gt;11}{s[&#x27;no_driver&#x27;]:&gt;11}{s[&#x27;violations&#x27;]:&gt;22}&quot;)
 
+# ── 4. Race: naive vs lease ───────────────────────────────────────────
+print(f"{'scheme':&lt;7}{'matched':&gt;9}{'declined':&gt;10}{'timed out':&gt;11}"
+      f"{'no driver':&gt;11}{'double-assign events':&gt;22}")
+for scheme in ("naive", "lease"):
+    s = simulate(scheme, seed=5)
+    print(f"{scheme:&lt;7}{s['matched']:&gt;9}{s['declined']:&gt;10}"
+          f"{s['timed_out']:&gt;11}{s['no_driver']:&gt;11}{s['violations']:&gt;22}")
+
+# ── 5. Fencing: a paused holder cannot act on a stale lease ───────────
 st = Store(1)
-tA = st.try_lease(0, &quot;tripA&quot;, now=0.0, ttl=3.0)
-tB = st.try_lease(0, &quot;tripB&quot;, now=4.0, ttl=3.0)                    # A paused past its lease; the lease expired at t=3
-print(f&quot;\nA token={tA}, B token={tB}&quot;)
-print(&quot;A&#x27;s late accept at t=5.0:&quot;, st.accept(0, &quot;tripA&quot;, tA, 5.0), &quot;| B&#x27;s accept at t=5.0:&quot;, st.accept(0, &quot;tripB&quot;, tB, 5.0))</code></pre>
+tA = st.try_lease(0, "tripA", now=0.0, ttl=3.0)
+# A paused past its lease; the lease expired at t=3, so B takes over.
+tB = st.try_lease(0, "tripB", now=4.0, ttl=3.0)
+print(f"\nA token={tA}, B token={tB}")
+a_ok = st.accept(0, "tripA", tA, 5.0)
+b_ok = st.accept(0, "tripB", tB, 5.0)
+print("A's late accept at t=5.0:", a_ok, "| B's accept at t=5.0:", b_ok)</code></pre>
 <pre class="terminal" data-title="output"><code>scheme   matched  declined  timed out  no driver  double-assign events
 naive        222       114         89         78                   210
 lease        175        75         63        125                     0

@@ -51,62 +51,155 @@
 
 <h2>Estimate</h2>
 <p>The estimate answers four questions: how much does an hour of video cost to <em>store</em> once the ladder is encoded, how much compute does transcoding take, how much do viewers pull every day, and what the CDN hit ratio is worth in dollars. Every input is an assumption; the bitrates are illustrative H.264-class values and are not any service's real ladder. Prices are illustrative and labelled as such.</p>
-<pre class="terminal" data-title="video_napkin.py"><code>&quot;&quot;&quot;Napkin maths for video streaming: ladder storage, transcode compute, viewing egress, CDN hit ratio and cost.
-Every input is an assumption you can edit. Bitrates are illustrative H.264-class values, not any service&#x27;s real ladder.&quot;&quot;&quot;
-import math
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>rung GB/h ← (video + audio Mbit/s) × 450 ÷ 1000;  ladder ← Σ rungs</li>
+  <li>content-h ← uploads × minutes ÷ 60;  cores ← content-h × CPU-h ÷ 24</li>
+  <li>delivered GB ← viewers × hours × GB/h at mean bitrate</li>
+  <li>hit(c) ← Σ 1/rank^s over top c titles ÷ Σ over all titles  (Zipf)</li>
+  <li>cost ← delivered × $/GB;  origin ← delivered × (1 − hit)</li>
+</ol></div>
+<pre class="terminal" data-title="video_napkin.py"><code>"""Napkin maths for video streaming: ladder storage, transcode compute,
+viewing egress, CDN hit ratio and cost. Every input is an assumption.
+Bitrates are illustrative H.264-class values, not any real service's ladder."""
 
-# --- bitrate ladder: (name, video Mbit/s) ; audio added once per rung ---
-ladder = [(&quot;240p&quot;, 0.30), (&quot;360p&quot;, 0.60), (&quot;480p&quot;, 1.20), (&quot;720p&quot;, 2.50), (&quot;1080p&quot;, 5.00), (&quot;1440p&quot;, 9.00)]
-audio_mbps = 0.128
-def gb_per_hour(mbps): return mbps * 1e6 * 3600 / 8 / 1e9
+SECONDS_PER_DAY = 86_400
 
-print(&quot;storage per hour of video, per rung&quot;)
-total = 0.0
-for name, v in ladder:
-    g = gb_per_hour(v + audio_mbps); total += g
-    print(f&quot;  {name:&lt;6} {v + audio_mbps:5.2f} Mbit/s -&gt; {g:5.2f} GB&quot;)
-print(f&quot;  ladder total: {total:.2f} GB per hour of content&quot;)
-source_gb = gb_per_hour(30)                      # mezzanine / original upload, assumed ~30 Mbit/s
-print(f&quot;  original upload (~30 Mbit/s): {source_gb:.1f} GB  -&gt; keep original + ladder = {source_gb + total:.1f} GB&quot;)
-print(f&quot;  a second codec (assume 40% fewer bits for the same quality) adds {total*0.6:.1f} GB&quot;)
 
-# --- ingest ---
-uploads_per_day, avg_minutes = 500_000, 8
-hours_per_day = uploads_per_day * avg_minutes / 60
-print(f&quot;\ningest: {uploads_per_day:,} uploads/day x {avg_minutes} min = {hours_per_day:,.0f} content-hours/day&quot;)
-print(f&quot;  new storage/day: {hours_per_day*(source_gb+total)/1e6:,.2f} PB  -&gt; {hours_per_day*(source_gb+total)*365/1e6:,.0f} PB/year (before replication/erasure coding)&quot;)
-cpu_h_per_content_h = 6                           # assumption: CPU-hours to encode the whole ladder for 1 hour of video
-cores = hours_per_day * cpu_h_per_content_h / 24
-print(f&quot;  encode compute: {cpu_h_per_content_h} CPU-h per content-hour -&gt; {cores:,.0f} cores busy on average (peak ~2x: {2*cores:,.0f})&quot;)
-print(f&quot;  uploads/s average {uploads_per_day/86400:.1f}, peak ~3x {3*uploads_per_day/86400:.0f}; upload bandwidth {uploads_per_day/86400*(avg_minutes/60)*source_gb*8:.1f} Gbit/s average&quot;)
+def gb_per_hour(mbps):
+    bits_per_hour = mbps * 1e6 * 3600
+    return bits_per_hour / 8 / 1e9
 
-# --- viewing ---
-dau, hrs_per_user, avg_mbps = 100e6, 1.0, 2.5     # 2.5 Mbit/s = mean delivered bitrate across the audience
-gb_day = dau * hrs_per_user * gb_per_hour(avg_mbps)
-avg_tbps = gb_day * 1e9 * 8 / 86400 / 1e12
-print(f&quot;\nviewing: {dau/1e6:.0f}M daily viewers x {hrs_per_user} h x {avg_mbps} Mbit/s&quot;)
-print(f&quot;  delivered per day: {gb_day/1e6:,.0f} PB   average {avg_tbps:.1f} Tbit/s   evening peak (x3) {3*avg_tbps:.0f} Tbit/s&quot;)
-print(f&quot;  read:write ratio in bytes ~ {gb_day/(hours_per_day*(source_gb+total)):,.0f} : 1  (so this is a delivery problem, not a storage problem)&quot;)
-print(f&quot;  playback starts: ~{dau*5/86400:,.0f}/s avg if 5 videos/viewer/day; segment requests at 4 s segments: ~{dau*(3600/4)/86400:,.0f}/s avg&quot;)
 
-# --- popularity skew -&gt; cache hit ratio (bytes weighted equally per video: simplification) ---
-def zipf_hit(n, cached, s):
-    h = lambda k: sum(1 / (i ** s) for i in range(1, k + 1))
-    return h(cached) / h(n)
-N = 1_000_000                                      # catalogue size modelled (a sample; ratios are what matter)
-print(f&quot;\nCDN hit ratio if the edge caches the most popular x% of a {N:,}-title catalogue (Zipf popularity)&quot;)
-print(f&quot;  {&#x27;cache holds&#x27;:&lt;20}&quot; + &quot;&quot;.join(f&quot;s={s:&lt;8}&quot; for s in (0.8, 1.0, 1.2)))
+# ── 1. Storage per hour of video ──────────────────────────────────────
+# (rung name, video Mbit/s); audio is added once per rung
+LADDER = [
+    ("240p", 0.30),
+    ("360p", 0.60),
+    ("480p", 1.20),
+    ("720p", 2.50),
+    ("1080p", 5.00),
+    ("1440p", 9.00),
+]
+AUDIO_MBPS = 0.128
+SOURCE_MBPS = 30              # mezzanine / original upload, assumed
+SECOND_CODEC_SAVING = 0.4     # fewer bits for the same quality
+
+print("storage per hour of video, per rung")
+ladder_gb = 0.0
+for name, video_mbps in LADDER:
+    rung_mbps = video_mbps + AUDIO_MBPS
+    rung_gb = gb_per_hour(rung_mbps)
+    ladder_gb += rung_gb
+    print(f"  {name:&lt;6} {rung_mbps:5.2f} Mbit/s -&gt; {rung_gb:5.2f} GB")
+print(f"  ladder total: {ladder_gb:.2f} GB per hour of content")
+
+source_gb = gb_per_hour(SOURCE_MBPS)
+stored_gb = source_gb + ladder_gb          # we keep original + whole ladder
+extra_codec_gb = ladder_gb * (1 - SECOND_CODEC_SAVING)
+print(f"  original upload (~30 Mbit/s): {source_gb:.1f} GB  "
+      f"-&gt; keep original + ladder = {stored_gb:.1f} GB")
+print(f"  a second codec (assume 40% fewer bits for the same quality) "
+      f"adds {extra_codec_gb:.1f} GB")
+
+# ── 2. Ingest: storage and encode compute ─────────────────────────────
+UPLOADS_PER_DAY = 500_000
+AVG_MINUTES = 8               # minutes of video per upload
+CPU_H_PER_CONTENT_H = 6       # CPU-hours to encode the whole ladder
+PEAK_UPLOAD_FACTOR = 3        # busiest second vs the daily average
+
+content_hours = UPLOADS_PER_DAY * AVG_MINUTES / 60
+storage_pb_day = content_hours * stored_gb / 1e6
+storage_pb_year = storage_pb_day * 365
+cores = content_hours * CPU_H_PER_CONTENT_H / 24
+uploads_per_s = UPLOADS_PER_DAY / SECONDS_PER_DAY
+upload_gbit_s = uploads_per_s * (AVG_MINUTES / 60) * source_gb * 8
+
+print(f"\ningest: {UPLOADS_PER_DAY:,} uploads/day x {AVG_MINUTES} min "
+      f"= {content_hours:,.0f} content-hours/day")
+print(f"  new storage/day: {storage_pb_day:,.2f} PB  "
+      f"-&gt; {storage_pb_year:,.0f} PB/year "
+      f"(before replication/erasure coding)")
+print(f"  encode compute: {CPU_H_PER_CONTENT_H} CPU-h per content-hour "
+      f"-&gt; {cores:,.0f} cores busy on average")
+print(f"    (peak ~2x: {2 * cores:,.0f})")
+print(f"  uploads/s average {uploads_per_s:.1f}, "
+      f"peak ~3x {PEAK_UPLOAD_FACTOR * uploads_per_s:.0f}; "
+      f"upload bandwidth {upload_gbit_s:.1f} Gbit/s average")
+
+# ── 3. Viewing: egress is the real bill ───────────────────────────────
+DAILY_VIEWERS = 100e6
+HOURS_PER_VIEWER = 1.0
+DELIVERED_MBPS = 2.5          # mean delivered bitrate across the audience
+VIDEOS_PER_VIEWER = 5
+SEGMENT_S = 4                 # seconds of video per segment request
+
+delivered_gb = DAILY_VIEWERS * HOURS_PER_VIEWER * gb_per_hour(DELIVERED_MBPS)
+avg_tbps = delivered_gb * 1e9 * 8 / SECONDS_PER_DAY / 1e12
+stored_gb_day = content_hours * stored_gb
+starts_per_s = DAILY_VIEWERS * VIDEOS_PER_VIEWER / SECONDS_PER_DAY
+segments_per_s = DAILY_VIEWERS * (3600 / SEGMENT_S) / SECONDS_PER_DAY
+
+print(f"\nviewing: {DAILY_VIEWERS / 1e6:.0f}M daily viewers x "
+      f"{HOURS_PER_VIEWER} h x {DELIVERED_MBPS} Mbit/s")
+print(f"  delivered per day: {delivered_gb / 1e6:,.0f} PB   "
+      f"average {avg_tbps:.1f} Tbit/s   "
+      f"evening peak (x3) {3 * avg_tbps:.0f} Tbit/s")
+print(f"  read:write ratio in bytes ~ {delivered_gb / stored_gb_day:,.0f} : 1"
+      f"  (so this is a delivery problem,")
+print("    not a storage problem)")
+print(f"  playback starts: ~{starts_per_s:,.0f}/s avg if 5 videos/viewer/day; "
+      f"segment requests")
+print(f"    at 4 s segments: ~{segments_per_s:,.0f}/s avg")
+
+
+# ── 4. Popularity skew and the CDN hit ratio ──────────────────────────
+def zipf_hit(n_titles, cached, s):
+    """Share of requests served by caching the `cached` most popular titles."""
+    def harmonic(k):
+        return sum(1 / (i ** s) for i in range(1, k + 1))
+    return harmonic(cached) / harmonic(n_titles)
+
+
+CATALOGUE = 1_000_000         # titles modelled; only the ratios matter
+SKEWS = (0.8, 1.0, 1.2)       # Zipf exponent: higher = more concentrated
+
+print(f"\nCDN hit ratio if the edge caches the most popular x% of a "
+      f"{CATALOGUE:,}-title")
+print("catalogue (Zipf popularity)")
+print(f"  {'cache holds':&lt;20}" + "".join(f"s={s:&lt;8}" for s in SKEWS))
 for frac in (0.001, 0.01, 0.05, 0.20):
-    print(f&quot;  {frac*100:&gt;5.1f}% of titles   &quot; + &quot;&quot;.join(f&quot;{zipf_hit(N, int(N*frac), s):&lt;10.1%}&quot; for s in (0.8, 1.0, 1.2)))
+    cached = int(CATALOGUE * frac)
+    hits = "".join(f"{zipf_hit(CATALOGUE, cached, s):&lt;10.1%}" for s in SKEWS)
+    print(f"  {frac * 100:&gt;5.1f}% of titles   {hits}")
 
-# --- egress cost ---
-print(&quot;\negress cost per day for the volume above (illustrative $/GB; real prices are negotiated and tiered)&quot;)
-for label, price in ((&quot;public-cloud list-style egress&quot;, 0.05), (&quot;commodity CDN contract&quot;, 0.01), (&quot;own edge boxes (amortised)&quot;, 0.002)):
-    print(f&quot;  {label:&lt;32} ${price:&lt;6} -&gt; ${gb_day*price/1e6:&gt;8,.2f} M/day  (${gb_day*price*365/1e9:&gt;6,.2f} B/year)&quot;)
-print(&quot;\norigin egress and cost as the CDN hit ratio improves (at the $0.05/GB origin-side rate)&quot;)
+# ── 5. Egress cost, and what the hit ratio is worth ───────────────────
+PRICES = (
+    ("public-cloud list-style egress", 0.05),
+    ("commodity CDN contract", 0.01),
+    ("own edge boxes (amortised)", 0.002),
+)
+ORIGIN_PRICE = 0.05           # $/GB on the origin side
+
+print("\negress cost per day for the volume above "
+      "(illustrative $/GB;")
+print("real prices are negotiated and tiered)")
+for label, price in PRICES:
+    per_day_m = delivered_gb * price / 1e6
+    per_year_b = delivered_gb * price * 365 / 1e9
+    print(f"  {label:&lt;32} ${price:&lt;6} -&gt; ${per_day_m:&gt;8,.2f} M/day  "
+          f"(${per_year_b:&gt;6,.2f} B/year)")
+
+print("\norigin egress and cost as the CDN hit ratio improves "
+      "(at the $0.05/GB")
+print("origin-side rate)")
 for hit in (0.80, 0.90, 0.95, 0.99):
-    miss_pb = gb_day * (1 - hit) / 1e6
-    print(f&quot;  hit {hit:.0%}: origin serves {miss_pb:&gt;6.2f} PB/day = {miss_pb*1e6*1e9*8/86400/1e12:&gt;5.2f} Tbit/s average, ${miss_pb*1e6*0.05/1e6:&gt;6.2f} M/day&quot;)</code></pre>
+    # Only misses reach the origin; every extra point of hit ratio is money.
+    miss_pb = delivered_gb * (1 - hit) / 1e6
+    tbps = miss_pb * 1e6 * 1e9 * 8 / SECONDS_PER_DAY / 1e12
+    cost_m = miss_pb * 1e6 * ORIGIN_PRICE / 1e6
+    print(f"  hit {hit:.0%}: origin serves {miss_pb:&gt;6.2f} PB/day "
+          f"= {tbps:&gt;5.2f} Tbit/s average, ${cost_m:&gt;6.2f} M/day")</code></pre>
 <pre class="terminal" data-title="output"><code>storage per hour of video, per rung
   240p    0.43 Mbit/s -&gt;  0.19 GB
   360p    0.73 Mbit/s -&gt;  0.33 GB
@@ -120,27 +213,33 @@ for hit in (0.80, 0.90, 0.95, 0.99):
 
 ingest: 500,000 uploads/day x 8 min = 66,667 content-hours/day
   new storage/day: 1.48 PB  -&gt; 541 PB/year (before replication/erasure coding)
-  encode compute: 6 CPU-h per content-hour -&gt; 16,667 cores busy on average (peak ~2x: 33,333)
+  encode compute: 6 CPU-h per content-hour -&gt; 16,667 cores busy on average
+    (peak ~2x: 33,333)
   uploads/s average 5.8, peak ~3x 17; upload bandwidth 83.3 Gbit/s average
 
 viewing: 100M daily viewers x 1.0 h x 2.5 Mbit/s
   delivered per day: 112 PB   average 10.4 Tbit/s   evening peak (x3) 31 Tbit/s
-  read:write ratio in bytes ~ 76 : 1  (so this is a delivery problem, not a storage problem)
-  playback starts: ~5,787/s avg if 5 videos/viewer/day; segment requests at 4 s segments: ~1,041,667/s avg
+  read:write ratio in bytes ~ 76 : 1  (so this is a delivery problem,
+    not a storage problem)
+  playback starts: ~5,787/s avg if 5 videos/viewer/day; segment requests
+    at 4 s segments: ~1,041,667/s avg
 
-CDN hit ratio if the edge caches the most popular x% of a 1,000,000-title catalogue (Zipf popularity)
+CDN hit ratio if the edge caches the most popular x% of a 1,000,000-title
+catalogue (Zipf popularity)
   cache holds         s=0.8     s=1.0     s=1.2     
     0.1% of titles   20.7%     52.0%     82.2%     
     1.0% of titles   36.2%     68.0%     91.0%     
     5.0% of titles   52.3%     79.2%     95.1%     
    20.0% of titles   70.8%     88.8%     97.7%     
 
-egress cost per day for the volume above (illustrative $/GB; real prices are negotiated and tiered)
+egress cost per day for the volume above (illustrative $/GB;
+real prices are negotiated and tiered)
   public-cloud list-style egress   $0.05   -&gt; $    5.62 M/day  ($  2.05 B/year)
   commodity CDN contract           $0.01   -&gt; $    1.12 M/day  ($  0.41 B/year)
   own edge boxes (amortised)       $0.002  -&gt; $    0.23 M/day  ($  0.08 B/year)
 
-origin egress and cost as the CDN hit ratio improves (at the $0.05/GB origin-side rate)
+origin egress and cost as the CDN hit ratio improves (at the $0.05/GB
+origin-side rate)
   hit 80%: origin serves  22.50 PB/day =  2.08 Tbit/s average, $  1.12 M/day
   hit 90%: origin serves  11.25 PB/day =  1.04 Tbit/s average, $  0.56 M/day
   hit 95%: origin serves   5.63 PB/day =  0.52 Tbit/s average, $  0.28 M/day
@@ -157,17 +256,37 @@ origin egress and cost as the CDN hit ratio improves (at the $0.05/GB origin-sid
 </ul>
 
 <h2>API</h2>
-<pre class="terminal" data-title="upload and playback API (shape, not exact wire format)"><code>POST /v1/uploads                        {title, size_bytes, content_type, sha256?}
-                                        -&gt; 201 {upload_id, chunk_size, upload_url}
-PUT  /v1/uploads/{id}                   Content-Range: bytes 16777216-25165823/734003200   (one chunk; idempotent)
-                                        -&gt; 308 + Range: bytes=0-25165823      (resume: "I have this much")
-HEAD /v1/uploads/{id}                   -&gt; 308 + Range: bytes=0-...            (ask where to continue)
-POST /v1/uploads/{id}/complete         -&gt; 202 {video_id, status: "processing"}   (enqueues the pipeline, idempotent)
+<pre class="terminal" data-title="upload and playback API (shape, not exact wire format)"><code># ── Upload (resumable, chunked) ──────────────────────────────────────
+POST /v1/uploads
+     {title, size_bytes, content_type, sha256?}
+     -&gt; 201 {upload_id, chunk_size, upload_url}
 
-GET  /v1/videos/{id}                    -&gt; {title, owner, status, duration, poster_url, views_approx, manifest_url (signed, short-lived)}
-GET  {manifest_url}                     -&gt; master playlist (HLS .m3u8 or DASH .mpd)         [served by the CDN]
-GET  .../1080p/seg_00042.m4s            -&gt; one media segment                               [served by the CDN]
-POST /v1/videos/{id}/beacons            {events: [play, heartbeat, quality_switch, rebuffer, end]}</code></pre>
+# One chunk; idempotent (re-sending the same range is harmless)
+PUT  /v1/uploads/{id}
+     Content-Range: bytes 16777216-25165823/734003200
+     -&gt; 308 + Range: bytes=0-25165823   (resume: "I have this much")
+
+# After a dropped connection: ask where to continue
+HEAD /v1/uploads/{id}
+     -&gt; 308 + Range: bytes=0-...
+
+# Enqueues the pipeline; idempotent
+POST /v1/uploads/{id}/complete
+     -&gt; 202 {video_id, status: "processing"}
+
+# ── Playback ─────────────────────────────────────────────────────────
+GET  /v1/videos/{id}
+     -&gt; {title, owner, status, duration, poster_url, views_approx,
+         manifest_url (signed, short-lived)}
+
+# The next two are served by the CDN, not the origin API
+GET  {manifest_url}
+     -&gt; master playlist (HLS .m3u8 or DASH .mpd)
+GET  .../1080p/seg_00042.m4s
+     -&gt; one media segment
+
+POST /v1/videos/{id}/beacons
+     {events: [play, heartbeat, quality_switch, rebuffer, end]}</code></pre>
 <p>Three details are design choices. The <strong>upload is a resumable protocol</strong>: chunk uploads are idempotent (the same byte range written twice is the same bytes), the server answers a status query with what it holds, and <code>complete</code> is the only call that has a side effect beyond storage. Object stores give you the primitive (multipart, with parts that retry independently and an atomic complete: see the multipart section of <a href="08-object-storage.html">chapter 8</a>); open protocols such as <em>tus</em> and the Google resumable-upload convention put a resumable session in front of it. <strong>Playback never touches our API per segment</strong>: after one metadata call the player talks to the CDN, with a signed, expiring URL standing in for authorisation (<a href="../../security/chapters/17-data-protection.html">data protection</a>). And <strong>beacons are fire-and-forget</strong> events, batched client-side, that feed quality monitoring and counts.</p>
 
 <h2>Data model</h2>
@@ -301,55 +420,114 @@ POST /v1/videos/{id}/beacons            {events: [play, heartbeat, quality_switc
   <figcaption>Fan-out then fan-in. The wide middle is where parallelism pays; the narrow ends (probe, split, publish) are the critical path. The manifest write is the commit point: the video is invisible until it exists, exactly like the object-store manifest in chapter 8.</figcaption>
 </figure>
 <p>Run it. The simulation schedules the same one-hour video as a DAG, with different encode granularities, on different worker counts. The job costs are assumptions chosen so that the ladder totals about six CPU-hours, consistent with the estimate.</p>
-<pre class="terminal" data-title="transcode_dag.py"><code>&quot;&quot;&quot;Transcoding as a DAG of jobs, scheduled greedily on W identical workers (deterministic list scheduling).
-Job costs are in worker-seconds and are ASSUMPTIONS: encoding cost per second of video grows with resolution.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>jobs ← probe → split → encode(segment, rung) → package(rung) → manifest</li>
+  <li>while work remains: start ready jobs on free workers; jump to next finish</li>
+  <li>path(job) ← cost(job) + max path(dep) over deps</li>
+  <li>for each segment size, workers: print finish time vs path floor</li>
+</ol></div>
+<pre class="terminal" data-title="transcode_dag.py"><code>"""Transcoding as a DAG of jobs, scheduled greedily on W identical workers
+(deterministic list scheduling). Job costs are worker-seconds: ASSUMPTIONS."""
 import heapq
 
+# ── 1. Build the job graph ────────────────────────────────────────────
+# worker-seconds of encoding per second of video; grows with resolution
+COST_PER_VIDEO_S = {
+    "240p": 0.15,
+    "360p": 0.25,
+    "480p": 0.4,
+    "720p": 0.8,
+    "1080p": 1.6,
+    "1440p": 2.9,
+}
+
+
 def build(video_s, seg_s, rungs):
-    cost_per_video_s = {&quot;240p&quot;: 0.15, &quot;360p&quot;: 0.25, &quot;480p&quot;: 0.4, &quot;720p&quot;: 0.8, &quot;1080p&quot;: 1.6, &quot;1440p&quot;: 2.9}   # worker-seconds per second of video
-    jobs, deps = {}, {}
-    jobs[&quot;probe&quot;] = 5; deps[&quot;probe&quot;] = []
-    n = -(-video_s // seg_s)
-    jobs[&quot;split&quot;] = video_s * 0.01; deps[&quot;split&quot;] = [&quot;probe&quot;]       # cut at keyframes, no re-encode
-    for s in range(n):
-        for r in rungs:
-            j = f&quot;enc:{r}:{s}&quot;
-            jobs[j] = seg_s * cost_per_video_s[r]; deps[j] = [&quot;split&quot;]
-    for r in rungs:
-        jobs[f&quot;pkg:{r}&quot;] = n * 0.2; deps[f&quot;pkg:{r}&quot;] = [f&quot;enc:{r}:{s}&quot; for s in range(n)]    # write HLS/DASH segments + rung playlist
-    jobs[&quot;thumbs&quot;] = 20; deps[&quot;thumbs&quot;] = [&quot;split&quot;]
-    jobs[&quot;manifest&quot;] = 1; deps[&quot;manifest&quot;] = [f&quot;pkg:{r}&quot; for r in rungs] + [&quot;thumbs&quot;]       # master playlist: the commit point
+    """Return (jobs, deps): cost of each job and the jobs it waits for."""
+    jobs = {}
+    deps = {}
+    n_segments = -(-video_s // seg_s)          # ceiling division
+
+    jobs["probe"] = 5
+    deps["probe"] = []
+
+    jobs["split"] = video_s * 0.01             # cut at keyframes, no re-encode
+    deps["split"] = ["probe"]
+
+    for seg in range(n_segments):
+        for rung in rungs:
+            job = f"enc:{rung}:{seg}"
+            jobs[job] = seg_s * COST_PER_VIDEO_S[rung]
+            deps[job] = ["split"]
+
+    for rung in rungs:                         # write HLS/DASH segments
+        job = f"pkg:{rung}"
+        jobs[job] = n_segments * 0.2
+        deps[job] = [f"enc:{rung}:{seg}" for seg in range(n_segments)]
+
+    jobs["thumbs"] = 20
+    deps["thumbs"] = ["split"]
+
+    # The master playlist is the commit point: it waits for everything.
+    jobs["manifest"] = 1
+    deps["manifest"] = [f"pkg:{rung}" for rung in rungs] + ["thumbs"]
     return jobs, deps
 
+
+# ── 2. Schedule greedily on W workers ─────────────────────────────────
 def schedule(jobs, deps, workers):
-    done, running, t = {}, [], 0.0                     # running: heap of (finish_time, job)
-    pending = set(jobs); free = workers
+    done = {}                  # job -&gt; finish time
+    running = []               # heap of (finish_time, job)
+    pending = set(jobs)
+    free = workers
+    t = 0.0
     while pending or running:
-        ready = sorted(j for j in pending if all(d in done for d in deps[j]))
-        for j in ready:
-            if free == 0: break
-            pending.discard(j); free -= 1
-            heapq.heappush(running, (t + jobs[j], j))
-        t, j = heapq.heappop(running); done[j] = t; free += 1
+        ready = sorted(j for j in pending
+                       if all(d in done for d in deps[j]))
+        for job in ready:
+            if free == 0:
+                break
+            pending.discard(job)
+            free -= 1
+            heapq.heappush(running, (t + jobs[job], job))
+        # Jump to the next finish: time only advances when a job completes.
+        t, job = heapq.heappop(running)
+        done[job] = t
+        free += 1
     return t
 
+
+# ── 3. Critical path: the floor no worker count can beat ──────────────
 def critical_path(jobs, deps):
     memo = {}
-    def f(j):
-        if j not in memo: memo[j] = jobs[j] + max((f(d) for d in deps[j]), default=0)
-        return memo[j]
-    return max(f(j) for j in jobs)
 
-rungs = [&quot;240p&quot;, &quot;360p&quot;, &quot;480p&quot;, &quot;720p&quot;, &quot;1080p&quot;, &quot;1440p&quot;]
-video_s = 3600
-for seg_s in (600, 60, 6):
-    jobs, deps = build(video_s, seg_s, rungs)
+    def longest_to(job):
+        if job not in memo:
+            slowest_dep = max((longest_to(d) for d in deps[job]), default=0)
+            memo[job] = jobs[job] + slowest_dep
+        return memo[job]
+
+    return max(longest_to(j) for j in jobs)
+
+
+# ── 4. Sweep chunk size and worker count ──────────────────────────────
+RUNGS = ["240p", "360p", "480p", "720p", "1080p", "1440p"]
+VIDEO_S = 3600                 # one hour of video
+
+for seg_s in (600, 60, 6):     # encode unit: seconds of video per job
+    jobs, deps = build(VIDEO_S, seg_s, RUNGS)
     total = sum(jobs.values())
-    print(f&quot;critical path (infinite workers): {critical_path(jobs, deps)/60:.1f} min&quot;)
-    print(f&quot;1 hour of video, encode unit = {seg_s:&gt;3} s -&gt; {len(jobs):&gt;5} jobs, {total/3600:5.2f} CPU-hours of work&quot;)
-    for w in (1, 8, 64, 512):
-        print(f&quot;   {w:&gt;4} workers: finished in {schedule(jobs, deps, w)/60:7.1f} min&quot;)
-print(&quot;\nwith enough workers the finish time approaches the critical path; more workers cannot beat it.&quot;)</code></pre>
+    path_min = critical_path(jobs, deps) / 60
+    print(f"critical path (infinite workers): {path_min:.1f} min")
+    print(f"1 hour of video, encode unit = {seg_s:&gt;3} s "
+          f"-&gt; {len(jobs):&gt;5} jobs, {total / 3600:5.2f} CPU-hours of work")
+    for workers in (1, 8, 64, 512):
+        finish_min = schedule(jobs, deps, workers) / 60
+        print(f"   {workers:&gt;4} workers: finished in {finish_min:7.1f} min")
+print("\nwith enough workers the finish time approaches the critical path; "
+      "more workers")
+print("cannot beat it.")</code></pre>
 <pre class="terminal" data-title="output"><code>critical path (infinite workers): 29.7 min
 1 hour of video, encode unit = 600 s -&gt;    46 jobs,  6.12 CPU-hours of work
       1 workers: finished in   367.2 min
@@ -369,7 +547,8 @@ critical path (infinite workers): 3.0 min
      64 workers: finished in     8.5 min
     512 workers: finished in     3.5 min
 
-with enough workers the finish time approaches the critical path; more workers cannot beat it.</code></pre>
+with enough workers the finish time approaches the critical path; more workers
+cannot beat it.</code></pre>
 <p>Read the output. With one worker, an hour of video takes 6 hours however it is cut. With 64 workers and 10-minute chunks it still takes about 30 minutes, because the largest chunk of the slowest rung is now the critical path; cut finer and 64 workers finish in under 9 minutes. The critical path line is the floor that more workers cannot beat: probe and split at the front, the longest encode, package and publish at the back. Finer chunks lower the floor but add scheduling overhead and slightly worse compression at chunk edges (rate control has less context), so the usual range is a few seconds to a minute. A three-hour film takes the same wall-clock time if you give it three times the workers: the pipeline is horizontally scalable per video as well as across videos.</p>
 <table>
   <thead><tr><th>Choice</th><th>Options</th><th>Recommendation</th></tr></thead>
@@ -387,7 +566,8 @@ with enough workers the finish time approaches the critical path; more workers c
 <h2>Deep dive 2: segments, manifests and adaptive bitrate</h2>
 <p>Streaming protocols look exotic but the idea is plain HTTP: <strong>cut the video into small files, describe them in a text file, and let the player download them like any other web resource.</strong> There is no streaming server holding a connection per viewer. That is why a CDN works so well: a segment is a static, cacheable object.</p>
 <p>The two dominant formats are <strong>HLS</strong> (Apple's HTTP Live Streaming, specified in RFC 8216) and <strong>MPEG-DASH</strong> (an ISO standard, ISO/IEC 23009-1). They differ in manifest syntax (an <code>.m3u8</code> playlist versus an XML <code>.mpd</code>) and historically in container (MPEG-TS versus fragmented MP4). With the <em>Common Media Application Format</em> (CMAF), both can reference the same fragmented-MP4 segments, so you encode and store one set of media and publish two small manifests. The shape of an HLS master playlist:</p>
-<pre class="terminal" data-title="master.m3u8 (illustrative)"><code>#EXTM3U
+<pre class="terminal" data-title="master.m3u8 (illustrative)"><code># ── master.m3u8: one entry per rung; the player picks among them ────
+#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=5300000,AVERAGE-BANDWIDTH=4600000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
 1080p/index.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=2800000,AVERAGE-BANDWIDTH=2400000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"
@@ -395,7 +575,7 @@ with enough workers the finish time approaches the critical path; more workers c
 #EXT-X-STREAM-INF:BANDWIDTH=1400000,AVERAGE-BANDWIDTH=1200000,RESOLUTION=854x480,CODECS="avc1.64001e,mp4a.40.2"
 480p/index.m3u8
 
-# 720p/index.m3u8
+# ── 720p/index.m3u8: the segment list for one rung ───────────────────
 #EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-TARGETDURATION:4
@@ -422,54 +602,116 @@ seg_00001.m4s
 <p>Four to six seconds is the common middle (Apple's authoring guidance has long recommended about six). Live streaming pushes toward shorter segments or partial segments for latency, which is why it is a separate design. For VOD, the middle is right.</p>
 <h3>The client does the adaptation</h3>
 <p>The server has no idea how fast a viewer's network is right now; the player does. So adaptive bitrate (ABR) logic lives in the client. After each segment the player measures throughput (bytes over download time) and the playback buffer (seconds of video downloaded but not yet played), then picks the rung for the next segment. There are two families: <strong>throughput-based</strong> (pick the highest rung under a safety fraction of the estimated bandwidth) and <strong>buffer-based</strong> (pick by buffer level: big buffer, step up; small buffer, drop), the latter studied in a well-known paper by Huang and colleagues (SIGCOMM 2014). Real players blend them. The trade-off is three-way: <em>quality</em> (higher rungs), <em>stability</em> (fewer switches, which viewers notice) and <em>rebuffering</em> (the worst outcome). Here is a simplified player on a bandwidth trace with a dip:</p>
-<pre class="terminal" data-title="abr.py"><code>&quot;&quot;&quot;A throughput + buffer ABR client (simplified) over a fixed bandwidth trace. Deterministic.
-Rule: estimate throughput as an EWMA of segment download rates; pick the highest rung whose bitrate is under 0.8 x estimate;
-be conservative (drop to the lowest rung) when the buffer is under 5 s; do not step up unless the buffer is over 10 s.&quot;&quot;&quot;
-ladder = [(&quot;240p&quot;, 0.43), (&quot;360p&quot;, 0.73), (&quot;480p&quot;, 1.33), (&quot;720p&quot;, 2.63), (&quot;1080p&quot;, 5.13)]   # Mbit/s incl. audio
-SEG = 4.0                                                                                     # seconds per segment
-# bandwidth in Mbit/s for each second of wall-clock time: good, then a dip (train tunnel), then recovery
-trace = [8]*40 + [1.0]*25 + [0.3]*10 + [6]*60
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>trace ← Mbit/s per second: good, a dip, recovery;  est ← none</li>
+  <li>pick ← highest rung with bitrate ≤ 0.8 × est;  buffer rule: &lt;5 s → rung 0</li>
+  <li>download ← integrate trace until the segment arrives;  stall += overrun</li>
+  <li>est ← 0.6 × est + 0.4 × measured;  buffer += 4 s</li>
+  <li>run with and without the buffer rule</li>
+</ol></div>
+<pre class="terminal" data-title="abr.py"><code>"""A throughput + buffer ABR client (simplified) over a fixed bandwidth
+trace. Deterministic. Same trace, with and without the buffer rule."""
 
+# ── 1. Ladder and bandwidth trace ─────────────────────────────────────
+# (rung name, Mbit/s including audio)
+LADDER = [
+    ("240p", 0.43),
+    ("360p", 0.73),
+    ("480p", 1.33),
+    ("720p", 2.63),
+    ("1080p", 5.13),
+]
+SEGMENT_S = 4.0               # seconds of video per segment
+N_SEGMENTS = 30
+SAFETY = 0.8                  # only use 80% of the estimated throughput
+EWMA_OLD = 0.6                # weight of the old estimate (new gets 0.4)
+LOW_BUFFER_S = 5              # below this, fall back to the lowest rung
+STEP_UP_BUFFER_S = 10         # step up only with at least this much buffer
+
+# Mbit/s for each second of wall-clock time: good, a dip (tunnel), recovery
+TRACE = [8] * 40 + [1.0] * 25 + [0.3] * 10 + [6] * 60
+
+
+# ── 2. Choosing the next rung ─────────────────────────────────────────
+def choose_rung(est, buf, rung, use_buffer_rule):
+    if est is None:
+        return 0              # no measurement yet: start at the bottom
+    fits = [i for i, (_, mbps) in enumerate(LADDER)
+            if mbps &lt;= SAFETY * est]
+    pick = max(fits, default=0)
+    if use_buffer_rule:
+        if buf &lt; LOW_BUFFER_S:
+            pick = 0          # nearly empty: avoid any risk of a stall
+        elif pick &gt; rung and buf &lt; STEP_UP_BUFFER_S:
+            pick = rung       # do not step up on a thin cushion
+    return pick
+
+
+# ── 3. Downloading against the trace ──────────────────────────────────
+def download(t, size_mbit):
+    """Integrate the trace second by second until size_mbit is delivered."""
+    got = 0.0
+    while got &lt; size_mbit:
+        bw = TRACE[min(int(t), len(TRACE) - 1)]
+        to_next_second = 1.0 - (t % 1.0)
+        step = min(to_next_second, (size_mbit - got) / bw)
+        got += bw * step
+        t += step
+    return t
+
+
+# ── 4. The player loop ────────────────────────────────────────────────
 def simulate(use_buffer_rule):
-    t, buf, est, rung = 0.0, 0.0, None, 0
-    played_s = stall_s = 0.0
-    log, started = [], False
-    for seg in range(30):
-        # choose
-        if est is None: pick = 0
-        else:
-            pick = max([i for i, (_, b) in enumerate(ladder) if b &lt;= 0.8 * est], default=0)
-            if use_buffer_rule:
-                if buf &lt; 5: pick = 0
-                elif pick &gt; rung and buf &lt; 10: pick = rung
-        rung = pick
-        size_mbit = ladder[rung][1] * SEG
-        # download: integrate the trace until size is delivered
-        got, dl_start = 0.0, t
-        while got &lt; size_mbit:
-            bw = trace[min(int(t), len(trace)-1)]
-            step = min(1.0 - (t % 1.0), (size_mbit - got) / bw)
-            got += bw * step; t += step
+    t = 0.0                   # wall-clock seconds
+    buf = 0.0                 # seconds of video buffered
+    est = None                # EWMA throughput estimate, Mbit/s
+    rung = 0
+    stall_s = 0.0
+    started = False
+    log = []
+    for seg in range(N_SEGMENTS):
+        rung = choose_rung(est, buf, rung, use_buffer_rule)
+        size_mbit = LADDER[rung][1] * SEGMENT_S
+
+        dl_start = t
+        t = download(t, size_mbit)
         dl = t - dl_start
-        # playback drains the buffer while we download
+
         if started:
-            drain = min(buf, dl); stall = dl - drain
-            buf -= drain; stall_s += stall
-        buf += SEG
-        if not started: started = True
-        thr = size_mbit / dl
-        est = thr if est is None else 0.6 * est + 0.4 * thr
-        log.append((seg, ladder[rung][0], round(t, 1), round(buf, 1), round(thr, 2)))
+            # Playback drains the buffer while we download; any shortfall
+            # is time the viewer stared at a spinner.
+            drain = min(buf, dl)
+            stall_s += dl - drain
+            buf -= drain
+        buf += SEGMENT_S
+        started = True
+
+        measured = size_mbit / dl
+        if est is None:
+            est = measured
+        else:
+            est = EWMA_OLD * est + (1 - EWMA_OLD) * measured
+        log.append((seg, LADDER[rung][0], round(t, 1), round(buf, 1),
+                    round(measured, 2)))
     return log, stall_s
+
+
+# ── 5. Run both variants ──────────────────────────────────────────────
+RUNG_ORDER = [name for name, _ in LADDER]
 
 for flag in (False, True):
     log, stall = simulate(flag)
-    print(f&quot;\nbuffer rule {&#x27;ON &#x27; if flag else &#x27;OFF&#x27;}: rebuffering {stall:.1f} s total; rungs used: {sorted(set(r for _, r, *_ in log), key=lambda r: [x[0] for x in ladder].index(r))}&quot;)
-    print(&quot;  seg  rung   wallclock  buffer  measured Mbit/s&quot;)
+    used = sorted({row[1] for row in log}, key=RUNG_ORDER.index)
+    state = "ON " if flag else "OFF"
+    print(f"\nbuffer rule {state}: rebuffering {stall:.1f} s total;")
+    print(f"  rungs used: {used}")
+    print("  seg  rung   wallclock  buffer  measured Mbit/s")
     for row in log[:24:2]:
-        print(&quot;  %3d  %-6s %8.1f %7.1f %9.2f&quot; % row)</code></pre>
+        print("  %3d  %-6s %8.1f %7.1f %9.2f" % row)</code></pre>
 <pre class="terminal" data-title="output"><code>
-buffer rule OFF: rebuffering 3.3 s total; rungs used: [&#x27;240p&#x27;, &#x27;480p&#x27;, &#x27;720p&#x27;, &#x27;1080p&#x27;]
+buffer rule OFF: rebuffering 3.3 s total;
+  rungs used: [&#x27;240p&#x27;, &#x27;480p&#x27;, &#x27;720p&#x27;, &#x27;1080p&#x27;]
   seg  rung   wallclock  buffer  measured Mbit/s
     0  240p        0.2     4.0      8.00
     2  1080p       5.3     6.9      8.00
@@ -484,7 +726,8 @@ buffer rule OFF: rebuffering 3.3 s total; rungs used: [&#x27;240p&#x27;, &#x27;4
    20  720p       78.2     9.4      6.00
    22  720p       81.7    13.9      6.00
 
-buffer rule ON : rebuffering 0.0 s total; rungs used: [&#x27;240p&#x27;, &#x27;480p&#x27;, &#x27;720p&#x27;, &#x27;1080p&#x27;]
+buffer rule ON : rebuffering 0.0 s total;
+  rungs used: [&#x27;240p&#x27;, &#x27;480p&#x27;, &#x27;720p&#x27;, &#x27;1080p&#x27;]
   seg  rung   wallclock  buffer  measured Mbit/s
     0  240p        0.2     4.0      8.00
     2  240p        0.6    11.6      8.00
