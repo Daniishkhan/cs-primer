@@ -130,7 +130,7 @@
   function applyTheme(t) {
     document.documentElement.dataset.theme = t;
     try { localStorage.setItem("nz-theme", t); } catch (e) { /* ignore */ }
-    document.querySelectorAll(".theme-toggle .theme-name").forEach(function (n) { n.textContent = THEMES[t]; });
+    syncSettings();
     document.dispatchEvent(new CustomEvent("nz:themechange", { detail: { theme: t } }));
   }
 
@@ -140,21 +140,8 @@
   function applySketch(on) {
     document.documentElement.classList.toggle("sketch", on);
     save("nz-sketch", on);
-    document.querySelectorAll(".sketch-toggle").forEach(function (b) {
-      b.setAttribute("aria-pressed", String(on));
-      b.querySelector(".sketch-name").textContent = on ? "Hand-drawn" : "Clean";
-      b.querySelector(".sketch-icon").textContent = on ? "✎" : "▭";
-    });
+    syncSettings();
     document.dispatchEvent(new CustomEvent("nz:sketchchange", { detail: { on: on } }));
-  }
-  function sketchButton() {
-    var on = sketchOn();
-    var b = el("button", { class: "theme-toggle sketch-toggle", type: "button", title: "Diagram style: hand-drawn or clean", "aria-pressed": String(on) }, [
-      el("span", { class: "sketch-icon", "aria-hidden": "true", text: on ? "✎" : "▭" }),
-      el("span", { class: "sketch-name", text: on ? "Hand-drawn" : "Clean" })
-    ]);
-    b.addEventListener("click", function () { applySketch(!sketchOn()); });
-    return b;
   }
   function loadSketch() {
     if (!document.querySelector("figure.diagram svg, .stepper svg")) return;
@@ -167,25 +154,21 @@
   }
   // Default on; set before anything renders so labels don't change font twice.
   document.documentElement.classList.toggle("sketch", load("nz-sketch", true) !== false);
-  function themeButton() {
-    var b = el("button", { class: "theme-toggle", type: "button", title: "Switch color theme" }, [
-      el("span", { class: "theme-swatch", "aria-hidden": "true" }),
-      el("span", { class: "theme-name", text: THEMES[currentTheme()] })
-    ]);
-    b.addEventListener("click", function () {
-      applyTheme(THEME_ORDER[(THEME_ORDER.indexOf(currentTheme()) + 1) % THEME_ORDER.length]);
-    });
-    return b;
-  }
-
   /* ---------- sidebar ---------- */
 
   function buildSidebar() {
     var side = document.getElementById("sidebar");
     if (!side) return;
 
-    side.appendChild(el("a", { class: "all-courses", href: root + "/index.html", text: course ? "← All courses" : SITE }));
-    if (!course) { buildHubNav(side); return; }
+    if (!course) {
+      side.appendChild(el("a", { class: "brand", href: root + "/index.html" }, [
+        el("span", { class: "brand-mark site-mark", text: "AI" }),
+        el("span", { class: "brand-name" }, [document.createTextNode(SITE), el("small", { text: COURSES.length + " courses, from school maths" })])
+      ]));
+      buildHubNav(side);
+      return;
+    }
+    side.appendChild(el("a", { class: "all-courses", href: root + "/index.html", text: "← All courses" }));
 
     var brandName = el("span", { class: "brand-name" }, [document.createTextNode(course.title), el("small", { text: course.subtitle })]);
     side.appendChild(el("a", { class: "brand", href: courseHome(course) }, [
@@ -249,18 +232,14 @@
       '<span><span class="nav-depth intro" style="display:inline-block"></span> Quick intro</span>' +
       (course && course.spine ? '<span class="legend-elective">Dimmed: elective, off the builder spine</span>' : "") });
 
-    return el("div", { class: "sidebar-foot" }, [
-      course ? legend : null,
-      searchButton(),
-      el("a", { href: root + "/review.html", text: "🔁  Review" }),
-      el("a", { href: root + "/glossary.html", text: "📖  Glossary" }),
-      course && (course.tools || []).length ? el("a", { href: root + "/" + course.dir + "/toolbox.html", text: "🧰  Toolbox" }) : null,
-      el("a", { href: root + "/lab-machine.html", text: "🖥️  Your lab machine" }),
-      el("a", { href: root + "/curriculum.html", text: "🗺️  Curriculum map" }),
-      course ? (course.spine ? spineButton() : null) : spineButton(),
-      themeButton(),
-      sketchButton()
-    ]);
+    var foot = [course ? legend : null];
+    if (course && (course.tools || []).length) {
+      foot.push(el("a", { class: "foot-link", href: root + "/" + course.dir + "/toolbox.html" }, [
+        icon("tool"), document.createTextNode("Course toolbox")
+      ]));
+    }
+    foot = foot.filter(Boolean);
+    return foot.length ? el("div", { class: "sidebar-foot" }, foot) : document.createTextNode("");
   }
 
   /* ---------- search: ⌘K, Ctrl+K or "/" anywhere ----------
@@ -269,13 +248,6 @@
      every section heading. All words must match; titles rank first. */
 
   var searchBox = null;
-  function searchButton() {
-    var mac = /Mac|iPhone|iPad/.test(navigator.platform || "");
-    var b = el("button", { class: "theme-toggle search-toggle", type: "button", text: "🔎  Search (" + (mac ? "⌘" : "Ctrl+") + "K)" });
-    b.addEventListener("click", openSearch);
-    return b;
-  }
-
   function openSearch() {
     if (searchBox) { searchBox.hidden = false; searchBox.querySelector("input").select(); return; }
     var input = el("input", { type: "search", class: "search-input", placeholder: "Search every page and section…", "aria-label": "Search" });
@@ -346,25 +318,11 @@
 
   /* ---------- builder spine toggle ---------- */
 
-  function spineButton() {
-    var b = el("button", { class: "theme-toggle spine-toggle", type: "button",
-      title: "AI path: show only the builder spine (the chapters on the way to evolution and self-improving systems), or every chapter",
-      "aria-pressed": String(spineOnly) }, [
-      el("span", { class: "spine-icon", "aria-hidden": "true", text: spineOnly ? "◆" : "◇" }),
-      el("span", { class: "spine-name", text: spineOnly ? "Builder spine only" : "All chapters" })
-    ]);
-    b.addEventListener("click", function () { applySpine(!spineOnly); });
-    return b;
-  }
   function applySpine(on) {
     spineOnly = on;
     save("cs-spine-only", on);
     document.documentElement.classList.toggle("spine-only", on);
-    document.querySelectorAll(".spine-toggle").forEach(function (b) {
-      b.setAttribute("aria-pressed", String(on));
-      b.querySelector(".spine-name").textContent = on ? "Builder spine only" : "All chapters";
-      b.querySelector(".spine-icon").textContent = on ? "◆" : "◇";
-    });
+    syncSettings();
     var pager = document.querySelector("nav.pager");
     if (pager) pager.replaceWith(buildPager());
     refreshProgress();
@@ -384,7 +342,7 @@
 
   /* Hub and glossary: the sidebar lists the courses instead of chapters. */
   function buildHubNav(side) {
-    [["Zero to AI Systems", COURSES]].forEach(function (grp) {
+    [["Courses", COURSES]].forEach(function (grp) {
       if (!grp[1].length) return;
       var list = el("ul", { class: "nav-list" });
       grp[1].forEach(function (co) {
@@ -445,19 +403,121 @@
     }
   }
 
-  /* ---------- mobile top bar ---------- */
+  /* ---------- app bar: breadcrumb, search, site links, settings ----------
+     One sticky bar on every page, so the sidebar is only navigation. Below
+     960px the sidebar becomes a drawer opened by the menu button; below
+     1320px the site links move into the settings menu. */
 
-  function buildTopbar() {
+  var ICONS = {
+    menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+    search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+    sliders: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>',
+    tool: '<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>',
+    map: '<path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14"/>',
+    book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2zM4 19V5"/>',
+    repeat: '<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>',
+    cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+    x: '<path d="M6 6l12 12M18 6 6 18"/>'
+  };
+  function icon(name) {
+    var span = el("span", { class: "icon", "aria-hidden": "true" });
+    span.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + ICONS[name] + "</svg>";
+    return span;
+  }
+
+  var SITE_LINKS = [
+    ["curriculum.html", "Curriculum", "map"],
+    ["glossary.html", "Glossary", "book"],
+    ["review.html", "Review", "repeat"],
+    ["lab-machine.html", "Lab machine", "cpu"]
+  ];
+
+  // One segmented control: label, options [value, text, extra], current, setter.
+  function segmented(label, opts, isOn, choose) {
+    var group = el("div", { class: "seg", role: "group", "aria-label": label });
+    opts.forEach(function (o) {
+      var b = el("button", { type: "button", class: "seg-btn", "data-seg": label, "data-value": o[0] }, [o[2] || null, el("span", { text: o[1] })]);
+      b.addEventListener("click", function () { choose(o[0]); });
+      group.appendChild(b);
+    });
+    group.sync = function () {
+      Array.prototype.forEach.call(group.children, function (b) { b.setAttribute("aria-pressed", String(isOn(b.dataset.value))); });
+    };
+    return group;
+  }
+  var segs = [];
+  function syncSettings() { segs.forEach(function (g) { g.sync(); }); }
+
+  function settingsPanel() {
+    var panel = el("div", { class: "settings-panel", role: "dialog", "aria-label": "Display settings", hidden: "" });
+    function section(title, control) {
+      panel.appendChild(el("div", { class: "settings-row" }, [el("p", { class: "settings-label", text: title }), control]));
+    }
+    var themes = segmented("Theme", THEME_ORDER.map(function (t) {
+      return [t, THEMES[t].split(" ")[0], el("span", { class: "swatch swatch-" + t, "aria-hidden": "true" })];
+    }), function (v) { return currentTheme() === v; }, applyTheme);
+    var sketch = segmented("Diagrams", [["on", "Hand-drawn"], ["off", "Clean"]],
+      function (v) { return (v === "on") === sketchOn(); }, function (v) { applySketch(v === "on"); });
+    var spine = segmented("Chapters", [["all", "All"], ["spine", "Builder spine"]],
+      function (v) { return (v === "spine") === spineOnly; }, function (v) { applySpine(v === "spine"); });
+    segs.push(themes, sketch, spine);
+    section("Theme", themes);
+    section("Diagrams", sketch);
+    if (!course || course.spine) section("Chapters", spine);
+    var links = el("nav", { class: "settings-links", "aria-label": "Site" }, SITE_LINKS.map(function (l) {
+      return el("a", { href: root + "/" + l[0] }, [icon(l[2]), document.createTextNode(l[1])]);
+    }));
+    panel.appendChild(links);
+    syncSettings();
+    return panel;
+  }
+
+  function buildAppbar() {
     var col = document.querySelector(".main-col");
     if (!col) return;
-    var menu = el("button", { class: "menu-btn", type: "button", "aria-label": "Open chapter list", text: "☰" });
+    var menu = el("button", { class: "icon-btn menu-btn", type: "button", "aria-label": "Open the course menu" }, [icon("menu")]);
     menu.addEventListener("click", function () { body.classList.toggle("nav-open"); });
-    var title = current ? longLabel(current) : course ? course.title : SITE;
-    col.insertBefore(el("div", { class: "topbar" }, [menu, el("div", { class: "topbar-title", text: title }), sketchButton(), themeButton()]), col.firstChild);
+
+    var crumbs = el("nav", { class: "crumbs", "aria-label": "Breadcrumb" });
+    crumbs.appendChild(el("a", { href: root + "/index.html", class: "crumb-site", text: SITE }));
+    if (course) {
+      crumbs.appendChild(el("span", { class: "crumb-sep", "aria-hidden": "true", text: "/" }));
+      crumbs.appendChild(el("a", { href: courseHome(course), text: (course.num ? course.num + " " : "") + course.title }));
+    }
+    if (current) {
+      crumbs.appendChild(el("span", { class: "crumb-sep", "aria-hidden": "true", text: "/" }));
+      crumbs.appendChild(el("span", { class: "crumb-here", "aria-current": "page", text: longLabel(current) }));
+    }
+
+    var mac = /Mac|iPhone|iPad/.test(navigator.platform || "");
+    var search = el("button", { class: "search-trigger", type: "button", "aria-label": "Search" }, [
+      icon("search"), el("span", { class: "search-trigger-text", text: "Search" }),
+      el("kbd", { text: mac ? "⌘K" : "Ctrl K" })
+    ]);
+    search.addEventListener("click", openSearch);
+
+    var links = el("nav", { class: "appbar-links", "aria-label": "Site" }, SITE_LINKS.map(function (l) {
+      var page = l[0].replace(".html", "");
+      return el("a", { href: root + "/" + l[0], class: body.dataset.page === page ? "on" : "" , text: l[1] });
+    }));
+
+    var gear = el("button", { class: "icon-btn", type: "button", "aria-label": "Display settings", "aria-expanded": "false", "aria-haspopup": "dialog" }, [icon("sliders")]);
+    var panel = settingsPanel();
+    function setOpen(open) {
+      panel.hidden = !open;
+      gear.setAttribute("aria-expanded", String(open));
+    }
+    gear.addEventListener("click", function (e) { e.stopPropagation(); setOpen(panel.hidden); });
+    panel.addEventListener("click", function (e) { e.stopPropagation(); });
+    document.addEventListener("click", function () { setOpen(false); });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") { setOpen(false); body.classList.remove("nav-open"); } });
+
+    var bar = el("header", { class: "appbar" }, [menu, crumbs, el("div", { class: "appbar-spacer" }), search, links,
+      el("div", { class: "settings" }, [gear, panel])]);
+    col.insertBefore(bar, col.firstChild);
     var scrim = el("div", { class: "scrim" });
     scrim.addEventListener("click", function () { body.classList.remove("nav-open"); });
     body.appendChild(scrim);
-    document.addEventListener("keydown", function (e) { if (e.key === "Escape") body.classList.remove("nav-open"); });
   }
 
   /* ---------- chapter header + TOC ---------- */
@@ -930,7 +990,7 @@
     loadEquations();
     wrapTables();
     buildSidebar();
-    buildTopbar();
+    buildAppbar();
     buildChapterHead();
     buildReferenceHead();
     buildFooter();
