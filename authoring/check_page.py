@@ -235,6 +235,17 @@ def lint(path, cat, out):
                     warns.append(f"about {words} words of prose; target for {entry['depth']} is {lo} to {hi}")
     if "<pre" in src and 'data-title="output"' not in src and kind == "chapter":
         warns.append("no output blocks: chapters should show real output of code they run")
+    if "data-tex" in src or "text-align:center" in src:
+        res = subprocess.run(["node", os.path.join(ROOT, "authoring/check_tex.js"), "--json", path],
+                             capture_output=True, text=True)
+        legacy = 0
+        for r in json.loads(res.stdout or "[]"):
+            if r["msg"].startswith("HTML equation not yet converted"):
+                legacy += 1
+            else:
+                (errs if r["level"] == "ERROR" else warns).append(f'line {r["line"]}: {r["msg"]}')
+        if legacy:
+            warns.append(f"{legacy} HTML equation(s) not yet converted to data-tex (see authoring/guide.md, Equations)")
     status = "ERROR" if errs else ("WARN " if warns else "ok   ")
     out.append(f"{status} {rel}  (~{words} words)")
     for e in errs:

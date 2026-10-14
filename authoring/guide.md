@@ -296,7 +296,7 @@ Definitions are one sentence, plain, British English, no em-dashes. Use the exac
 
 - You know a lot; still, check what is checkable. Use WebSearch/WebFetch for anything dated after 2023, any number you state, spec details (MCP, A2A, OpenTelemetry), regulatory dates (EU AI Act), benchmark facts and library behaviour. The research notes in `/Users/danish/Desktop/projects/cs-refresh/research_notes/Zero to AI systems engineer curriculum/` and the report in `/Users/danish/Desktop/projects/cs-refresh/reports/Zero to AI systems engineer curriculum.md` summarise what was verified in October 2026 (with caveats); use them as leads and check the original where it matters.
 - Model names in some 2026 aggregator sources could not be verified. Avoid naming specific current model versions unless a primary source confirms them; prefer "frontier models" or a dated note.
-- Equations: use plain HTML (`<sub>`, `<sup>`, `&times;`, `&sum;`, `&radic;`, `&theta;`, `&nabla;`) inside `<p>` or a centered `<p style="text-align:center">`. No MathJax, no external scripts.
+- Equations: see section 15. Never a centred `<p style="text-align:center">` of HTML maths.
 - Derivations go in full when the chapter is deep (for example the DPO loss from the KL-regularised objective, the REINFORCE gradient, BM25's components, attention's scaling factor), with optional detail in `details.deeper`.
 
 ## 14. Before you report done
@@ -311,3 +311,47 @@ Run this checklist on every file you wrote:
 6. Scratch work lives in `$TMPDIR/<your unit id>/` (other authors share `$TMPDIR`). Remove any `__pycache__` folders you created in the site.
 
 Your final report to the coordinator must be short (under 200 words): files written, approximate word counts, anything you could not verify, any catalog change you recommend, and any widget you added. Do not paste page content into the report.
+
+## 15. Equations
+
+Readers come to this path from school mathematics. A display of Greek letters with no help is the single most reliable way to lose them, so every equation is written to be **read**, not decoded. `assets/js/equations.js` typesets maths with KaTeX (vendored, no network) and adds the interactive parts; `node authoring/check_tex.js PAGE` checks every formula (`check_page.py` runs it for you). Reference implementation: both equations in `llm-training/cases/case-01-instructgpt.html` (search for `figure class="eq"`).
+
+### Three kinds of display
+
+1. **Simple formula** (one idea, at most two operators deep, or symbols already explained nearby): typeset it, and keep the old HTML inside as the fallback shown without JavaScript.
+   ```html
+   <div class="eq-display" data-tex="\sigma(z) = \frac{1}{1 + e^{-z}}">&sigma;(z) = 1 / (1 + e<sup>&minus;z</sup>)</div>
+   ```
+2. **Worked arithmetic or a formula written in words** (`(784×128 + 128) + … = 101,770 parameters`, `throughput = 1,460 bytes ÷ 0.080 s ≈ 146 kbit/s`, `estimate ± 1.96 × standard error`): TeX adds nothing. Keep it as HTML, centred with the class instead of an inline style: `<p class="eq-plain">…</p>`.
+3. **Load-bearing equation** (any of: an expectation or average 𝔼, a sum or product over an index, three or more nested operations, or it is the equation the chapter exists to explain): a full anatomy block, `<figure class="eq">`, followed by a runnable "plug in numbers" script.
+
+Inline maths in prose is optional: `<span class="tex" data-tex="r_\theta(x, y)">r<sub>&theta;</sub>(x, y)</span>`. Use it for symbols the reader must match against a display; leave ordinary prose in HTML.
+
+### The anatomy block
+
+```html
+<figure class="eq" id="eq-SHORT-NAME">
+  <div class="eq-display" data-tex="… \htmlClass{eq-t1}{TERM} … \htmlClass{eq-t2}{TERM} …">…old HTML as fallback…</div>
+  <p class="eq-read">The whole equation in one or two plain sentences, no symbols.</p>
+  <dl class="eq-terms">
+    <div data-term="t1"><dt data-tex="TERM">fallback</dt>
+      <dd><span class="eq-type">scalar</span>What it is, in words, with its range or a typical value.</dd></div>
+    <div><dt data-tex="\pi_\phi(y \mid x)">fallback</dt>
+      <dd><span class="eq-type">probability</span>A symbol worth defining that is not coloured in the equation.</dd></div>
+  </dl>
+  <ol class="eq-steps">
+    <li data-tex="PARTIAL EXPRESSION" data-terms="t1 t2">Build-up step 1: the innermost idea first.</li>
+    <li data-tex="BIGGER EXPRESSION" data-terms="t3">Step 2 adds one operation, and says why it is there.</li>
+  </ol>
+</figure>
+```
+
+- **The reading** (`eq-read`) comes first in importance. If you cannot say the equation in one or two plain sentences, the reader cannot either.
+- **The legend** defines every symbol the reader could stumble on, including notation itself (𝔼, ∼, |, ∑, ∇, ‖·‖, log, σ). Each row starts with an `eq-type` pill naming what kind of thing it is: `scalar`, `scalar ≥ 0`, `vector (d,)`, `matrix (n, d)`, `probability`, `distribution`, `function ℝ → (0, 1)`, `index`, `average`, `sign`. Not knowing what *kind* of thing a symbol is causes most of the confusion. Give a typical value or range where you can (σ(0) = 0.5; β is usually 0.01 to 0.5).
+- **Colour terms** with `\htmlClass{eq-tN}{…}` in the display, N from 1 to 8, matching `data-term="tN"` in the legend. Colour the 3 to 7 parts the build-up talks about, not every symbol. A legend row without `data-term` is a definition with no colour.
+- **The build-up** (`eq-steps`) assembles the equation from the inside out, one operation per step, 3 to 7 steps. Each `li` has a `data-tex` (the partial expression so far; use `\ldots` for parts already shown) and `data-terms` (the colour ids this step introduces; terms not yet reached are dimmed in the display). Each caption says what the step does and **why it is there**, with a number where possible ("a gap of +2 means about 0.88").
+- **Long equations**: split over lines with `\begin{aligned} … = {} & … \\ & + … \end{aligned}` so nothing scrolls sideways at desktop width.
+- **Plug in numbers**: directly after the figure, a short sentence, a `callout idea` box, then a runnable script (`pre data-title="NAME.py"`, standard library only) that computes the equation on a few hand-picked numbers with one printed line or column per build-up step, and its real output block. Follow the code style in section 5 (≤ 80 columns, docstring, `# ── N. Title ───` banners, named constants with comments).
+- Macros available everywhere: `\E` (𝔼), `\R` (ℝ), `\KL`, `\softmax`, `\argmax`, `\argmin`. Use `\mid` for "given", `\text{…}` for words inside maths, `\operatorname{name}` for multi-letter functions.
+- Quote the source's equation faithfully (same symbols as the paper or textbook you cite), then explain it. Do not "simplify" a published equation into a different one.
+
