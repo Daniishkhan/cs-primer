@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distillation &amp; Synthetic Data · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="15">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Distillation &amp; Synthetic Data</h1>
+  <p class="lede">A large model knows more than the answers it prints: its probabilities say which wrong answers are nearly right. Distillation trains a small model on that richer signal, or on the large model's written answers, and it is how most small, cheap models get their quality. This chapter covers logit distillation, sequence-level and on-policy variants, synthetic data in general, and the failure called model collapse.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapters 10 to 14 improved a model by showing it human-written data, human comparisons or checkable rewards. All of those are expensive. A strong model can write data, grade data and label data at a fraction of the price, so a large share of the post-training data in current open recipes is machine-generated, and the distilled reasoning models of early 2025 were made exactly this way. The same move is also a trap: a student copies the teacher's mistakes, a pipeline can drain its own diversity, and some licences forbid the whole thing. After this chapter you will be able to write the distillation loss and say why it has a temperature and a T&sup2;, choose between logit, sequence-level and on-policy distillation, explain why forward and reverse KL give different students, estimate what generating a synthetic dataset costs, and describe when recursive training on model output collapses and when it does not.</p>
+</div>
+
+<h2>Why a teacher says more than a label</h2>
+
+<p>Take an image classifier and a photo of a fox. The label says "fox", which says nothing about the other four classes. The big model's output says more: it might give "dog" a few percent, "cat" a little, and "car" almost nothing. Those relative sizes tell you that foxes look more like dogs than like cars, and a model trained on the label alone never sees that structure. Hinton, Vinyals and Dean (2015), in "Distilling the Knowledge in a Neural Network", named this hidden information in the small probabilities. A <span class="term">teacher</span> is the large, already-trained model; a <span class="term">student</span> is the small model being trained to imitate it; <span class="term">distillation</span> is the training procedure that does so.</p>
+
+<p>The small probabilities are tiny at the usual softmax, so the loss barely notices them. Hinton's remedy is a <span class="term">temperature</span> T that flattens the distribution: p<sub>i</sub>(T) = exp(z<sub>i</sub>/T) / &sum;<sub>j</sub> exp(z<sub>j</sub>/T), where z are the logits (the raw scores before softmax, <a href="../../deep-learning/chapters/14-language-modelling.html">A2 chapter 14</a>). T = 1 is the ordinary softmax; larger T moves probability from the winner towards the runners-up. Run it on a made-up five-class teacher:</p>
+
+<pre class="terminal" data-title="temp.py"><code>import numpy as np
+
+def softmax(z, T=1.0):
+    z = np.asarray(z, dtype=float) / T
+    z = z - z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+def kl(p, q):
+    return float(np.sum(p * (np.log(p) - np.log(q))))
+
+classes = ["cat", "dog", "fox", "car", "ship"]
+teacher_logits = np.array([9.0, 6.5, 5.0, 0.5, -1.0])
+student_logits = np.array([8.0, 3.0, 4.5, 1.0, -0.5])
+
+print(f"{'T':&gt;3} " + " ".join(f"{c:&gt;7}" for c in classes))
+for T in (1, 2, 4, 8):
+    print(f"{T:&gt;3} " + " ".join(f"{p:7.4f}" for p in softmax(teacher_logits, T)))
+
+print()
+print("KL(teacher || student) and its gradient scale")
+for T in (1, 2, 4, 8):
+    pt, ps = softmax(teacher_logits, T), softmax(student_logits, T)
+    grad = np.abs(ps - pt).sum() / T          # |dKL/dz| summed, up to the 1/T factor
+    print(f"T={T}: KL={kl(pt, ps):.4f}  gradient size={grad:.4f}  with loss x T^2: {grad * T * T:.4f}")</code></pre>
+<pre class="terminal" data-title="output"><code>  T     cat     dog     fox     car    ship
+  1  0.9086  0.0746  0.0166  0.0002  0.0000
+  2  0.6931  0.1986  0.0938  0.0099  0.0047
+  4  0.4751  0.2543  0.1748  0.0567  0.0390
+  8  0.3367  0.2463  0.2042  0.1164  0.0965
+
+KL(teacher || student) and its gradient scale
+T=1: KL=0.1192  gradient size=0.1362  with loss x T^2: 0.1362
+T=2: KL=0.1098  gradient size=0.1354  with loss x T^2: 0.5418
+T=4: KL=0.0485  gradient size=0.0554  with loss x T^2: 0.8866
+T=8: KL=0.0152  gradient size=0.0161  with loss x T^2: 1.0314</code></pre>
+
+<p>At T = 1 the teacher is 91% sure of "cat" and gives "car" 0.02%. At T = 4 the picture is much richer: cat 48%, dog 25%, fox 17%, with car and ship still small but visible. That second distribution is what the student is asked to match. Notice also that the gradient in the middle column shrinks quickly as T grows, because softer targets differ less from the student's own softened output. Hinton's fix is to multiply the soft-target loss by T&sup2; (the last column), so that its gradient stays comparable to the hard-label loss as T changes. The full loss is</p>
+
+<p style="text-align:center">L = (1 &minus; &lambda;) &middot; CE( y, p<sub>S</sub>(1) ) + &lambda; &middot; T&sup2; &middot; KL( p<sub>T</sub>(T) &#8214; p<sub>S</sub>(T) )</p>
+
+<p>where p<sub>T</sub> is the teacher, p<sub>S</sub> the student, CE the cross-entropy with the hard label y (<a href="../../ml-foundations/chapters/14-information-theory.html">A0 on entropy and KL</a>), and &lambda; between 0 and 1 mixes the two. If there are no labels at all, &lambda; = 1 and only the teacher is needed.</p>
+
+<details class="deeper">
+  <summary>Go deeper <span class="hint">why the factor is T&sup2;</span></summary>
+  <p>Let the student's logits be z and the teacher's be v, with softened probabilities q = softmax(z/T) and p = softmax(v/T). The gradient of KL(p &#8214; q) with respect to z<sub>i</sub> is (q<sub>i</sub> &minus; p<sub>i</sub>) / T. That is already one factor of 1/T. If T is large compared with the size of the logits, exp(z<sub>i</sub>/T) &asymp; 1 + z<sub>i</sub>/T, so with N classes and logits that sum to zero, q<sub>i</sub> &asymp; (1 + z<sub>i</sub>/T)/N and p<sub>i</sub> &asymp; (1 + v<sub>i</sub>/T)/N. Subtracting gives q<sub>i</sub> &minus; p<sub>i</sub> &asymp; (z<sub>i</sub> &minus; v<sub>i</sub>) / (N T), and the whole gradient is about (z<sub>i</sub> &minus; v<sub>i</sub>) / (N T&sup2;). So at high temperature the soft loss behaves like matching logits directly with a weight that falls as 1/T&sup2;; multiplying the loss by T&sup2; cancels it. Hinton et al. make this point, and also show that matching logits (the high-T limit) is a special case of the method.</p>
+</details>
+
+<h3>A small experiment: does the soft signal help?</h3>
+
+<p>Here is a teacher-student pair you can run in a second. The task is three classes arranged as noisy spiral arms in two dimensions, hard for small models. The teacher is a 64-unit network (387 parameters); the student has 8 units (51 parameters). We train the student three ways, with the same optimiser and number of steps, and average ten random initialisations and data subsets.</p>
+
+<pre class="terminal" data-title="distill_toy.py"><code>import numpy as np
+
+def make_data(n, rng):
+    # 3 classes in 2-D, arranged as noisy interleaved arms; hard for a linear model.
+    y = rng.integers(0, 3, n)
+    t = rng.uniform(0.3, 3.0, n)
+    ang = t * 1.6 + y * 2 * np.pi / 3
+    x = np.c_[t * np.cos(ang), t * np.sin(ang)] + rng.normal(0, 0.28, (n, 2))
+    return x, y
+
+def softmax(z):
+    z = z - z.max(1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(1, keepdims=True)
+
+class MLP:
+    def __init__(self, hidden, rng):
+        self.W1 = rng.normal(0, 0.8, (2, hidden)); self.b1 = np.zeros(hidden)
+        self.W2 = rng.normal(0, 0.8, (hidden, 3)); self.b2 = np.zeros(3)
+    def logits(self, x):
+        self.h = np.tanh(x @ self.W1 + self.b1)
+        return self.h @ self.W2 + self.b2
+    def fit(self, x, target, steps, lr, T=1.0):
+        # target: probabilities (one-hot for hard labels, softened teacher for distillation)
+        for _ in range(steps):
+            p = softmax(self.logits(x) / T)
+            dz = (p - target) / (len(x) * T) * T * T      # grad of T^2 * cross-entropy wrt logits
+            dW2 = self.h.T @ dz; db2 = dz.sum(0)
+            dh = dz @ self.W2.T * (1 - self.h ** 2)
+            dW1 = x.T @ dh; db1 = dh.sum(0)
+            self.W2 -= lr * dW2; self.b2 -= lr * db2; self.W1 -= lr * dW1; self.b1 -= lr * db1
+    def acc(self, x, y):
+        return float((self.logits(x).argmax(1) == y).mean())
+
+rng = np.random.default_rng(0)
+xtr, ytr = make_data(3000, rng)
+xte, yte = make_data(3000, rng)
+
+teacher = MLP(64, np.random.default_rng(1))
+teacher.fit(xtr, np.eye(3)[ytr], 4000, 1.0)
+print(f"teacher (64 hidden units, {64*2+64+64*3+3} params): test accuracy {teacher.acc(xte, yte):.3f}")
+
+T = 3.0
+print(f"{'labelled examples':&gt;18} {'hard labels':&gt;12} {'teacher soft labels':&gt;20} {'soft labels, 3000 unlabelled':&gt;30}")
+for n in (30, 60, 120):
+    res = {"hard": [], "soft": [], "soft_big": []}
+    for seed in range(10):
+        r = np.random.default_rng(100 + seed)
+        idx = r.choice(3000, n, replace=False)
+        x, y = xtr[idx], ytr[idx]
+        s = MLP(8, np.random.default_rng(200 + seed)); s.fit(x, np.eye(3)[y], 3000, 0.5)
+        res["hard"].append(s.acc(xte, yte))
+        s = MLP(8, np.random.default_rng(200 + seed))
+        s.fit(x, softmax(teacher.logits(x) / T), 3000, 0.5, T)
+        res["soft"].append(s.acc(xte, yte))
+        s = MLP(8, np.random.default_rng(200 + seed))
+        s.fit(xtr, softmax(teacher.logits(xtr) / T), 3000, 0.5, T)   # same student, labels from the teacher on all inputs
+        res["soft_big"].append(s.acc(xte, yte))
+    print(f"{n:&gt;18} {np.mean(res['hard']):12.3f} {np.mean(res['soft']):20.3f} {np.mean(res['soft_big']):30.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>teacher (64 hidden units, 387 params): test accuracy 0.953
+ labelled examples  hard labels  teacher soft labels   soft labels, 3000 unlabelled
+                30        0.710                0.808                          0.941
+                60        0.841                0.898                          0.941
+               120        0.899                0.928                          0.941</code></pre>
+
+<p>With 30 labelled examples the student trained on hard labels reaches 71% test accuracy; the same student trained on the teacher's softened outputs for those same 30 points reaches 81%. The soft targets carry more information per example, which matters most when labels are scarce, and the gap narrows as labels grow (90% against 93% at 120). The right-hand column changes the game: the teacher labels all 3,000 training inputs, with no human labels at all, and the student reaches 94%, within about one point of the teacher. Notice what made that possible. Inputs are cheap, so a teacher turns unlabelled data into as much labelled data as you can afford. That is the economic engine of the rest of this chapter. It is also a toy: with language models the "inputs" are prompts and the "labels" are whole passages, and the student cannot always match the teacher (its capacity is limited), which is where the next sections come in.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: learning from a tutor's marking, not only the answer key</p>
+  <p>A student who sees only "B is correct" learns one fact. A student whose tutor says "B is right; C is a common slip that comes from confusing two formulas; D is absurd" learns the shape of the topic. The tutor's remarks about the wrong options are the soft probabilities, and a high temperature is the tutor speaking up about the options the answer key would never mention.</p>
+  <p><em>Where it breaks down:</em> a human tutor says why C is tempting. The teacher network gives only numbers, and they reflect its own quirks and miscalibration as much as truth. The student inherits the quirks too.</p>
+</div>
+
+<h2>Distilling a language model</h2>
+
+<p>A language model's output at each position is a distribution over the vocabulary V (<a href="../../deep-learning/chapters/14-language-modelling.html">A2 chapter 14</a>), so the loss above applies at every token. There are three common designs, and they differ in what the teacher supplies and where the training text comes from.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Three rows describing three ways to distil a language model. Logit distillation: the teacher supplies a full next-token distribution at every position of fixed text, and the student minimises KL to it. Sequence-level distillation: the teacher supplies sampled answers, and the student does ordinary supervised fine-tuning on them. On-policy distillation: the student writes text and the teacher supplies its probabilities on the student's own text, and the student minimises KL on those samples.">
+    <defs><marker id="ahLT15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="16" width="170" height="74" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="105" y="48" text-anchor="middle" class="t-sm t-bold">Logit distillation</text>
+    <text x="105" y="68" text-anchor="middle" class="t-xs">fixed text, soft targets</text>
+    <line x1="190" y1="53" x2="228" y2="53" class="line" marker-end="url(#ahLT15a)"/>
+    <rect x="230" y="16" width="240" height="74" rx="8" class="box"/>
+    <text x="350" y="46" text-anchor="middle" class="t-xs t-bold">Teacher supplies</text>
+    <text x="350" y="64" text-anchor="middle" class="t-xs">full next-token distribution</text>
+    <text x="350" y="79" text-anchor="middle" class="t-xs">at every position</text>
+    <line x1="470" y1="53" x2="508" y2="53" class="line" marker-end="url(#ahLT15a)"/>
+    <rect x="510" y="16" width="230" height="74" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="625" y="46" text-anchor="middle" class="t-xs t-bold">Student minimises</text>
+    <text x="625" y="64" text-anchor="middle" class="t-xs">KL(teacher || student)</text>
+    <text x="625" y="79" text-anchor="middle" class="t-xs">per token</text>
+
+    <rect x="20" y="108" width="170" height="74" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="105" y="140" text-anchor="middle" class="t-sm t-bold">Sequence-level</text>
+    <text x="105" y="160" text-anchor="middle" class="t-xs">text only, any teacher</text>
+    <line x1="190" y1="145" x2="228" y2="145" class="line" marker-end="url(#ahLT15a)"/>
+    <rect x="230" y="108" width="240" height="74" rx="8" class="box"/>
+    <text x="350" y="138" text-anchor="middle" class="t-xs t-bold">Teacher supplies</text>
+    <text x="350" y="156" text-anchor="middle" class="t-xs">sampled answers to prompts,</text>
+    <text x="350" y="171" text-anchor="middle" class="t-xs">optionally filtered</text>
+    <line x1="470" y1="145" x2="508" y2="145" class="line" marker-end="url(#ahLT15a)"/>
+    <rect x="510" y="108" width="230" height="74" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="625" y="138" text-anchor="middle" class="t-xs t-bold">Student trains</text>
+    <text x="625" y="156" text-anchor="middle" class="t-xs">ordinary SFT (chapter 10)</text>
+    <text x="625" y="171" text-anchor="middle" class="t-xs">on those answers</text>
+
+    <rect x="20" y="200" width="170" height="74" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="105" y="232" text-anchor="middle" class="t-sm t-bold">On-policy</text>
+    <text x="105" y="252" text-anchor="middle" class="t-xs">teacher scores student</text>
+    <line x1="190" y1="237" x2="228" y2="237" class="line" marker-end="url(#ahLT15a)"/>
+    <rect x="230" y="200" width="240" height="74" rx="8" class="box"/>
+    <text x="350" y="230" text-anchor="middle" class="t-xs t-bold">Teacher supplies</text>
+    <text x="350" y="248" text-anchor="middle" class="t-xs">its probabilities on the</text>
+    <text x="350" y="263" text-anchor="middle" class="t-xs">student's own samples</text>
+    <line x1="470" y1="237" x2="508" y2="237" class="line" marker-end="url(#ahLT15a)"/>
+    <rect x="510" y="200" width="230" height="74" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="625" y="230" text-anchor="middle" class="t-xs t-bold">Student minimises</text>
+    <text x="625" y="248" text-anchor="middle" class="t-xs">a KL on its own samples</text>
+    <text x="625" y="263" text-anchor="middle" class="t-xs">(often reverse KL)</text>
+  </svg>
+  <figcaption><strong>Three designs, three costs.</strong> Logit distillation needs the teacher's weights and the same vocabulary. Sequence-level distillation needs only text, so it works with a hosted teacher. On-policy distillation fixes a mismatch between what the student sees in training and what it generates.</figcaption>
+</figure>
+
+<h3>Logit (token-level) distillation</h3>
+
+<p>Feed the teacher and the student the same text. At each position <em>t</em>, the loss is the KL divergence between the teacher's distribution over the next token and the student's, summed over the vocabulary and averaged over positions. It uses the teacher's full opinion at every token, so it is the richest signal, and it is what Sanh et al. (2019) used for DistilBERT, a student reported to be 40% smaller and 60% faster than BERT while keeping 97% of its language understanding on their benchmark. For decoder language models, the Gemma 2 report (Gemma Team, 2024) states that the 2B and 9B models were trained with knowledge distillation instead of next-token prediction (the abstract does not give more detail than that).</p>
+
+<p>Two practical points. The two models must share a tokeniser (<a href="../../deep-learning/chapters/13-tokenisation.html">A2 chapter 13</a>), otherwise "position <em>t</em>" and "token <em>v</em>" mean different things. And the signal is large. A 128,000-token vocabulary stored in 32-bit floats is 512 KB per position; for one trillion training tokens that is 512 petabytes (an arithmetic assumption about storage, not a report from any lab). So you either run the teacher alongside the student during training, which costs a teacher forward pass for every step, or store only the top-k probabilities: with k = 32 and a 4-byte index plus a 4-byte value for each, 256 bytes per position, 256 terabytes per trillion tokens, still large but feasible.</p>
+
+<h3>Sequence-level (data) distillation</h3>
+
+<p>Kim and Rush (2016), "Sequence-Level Knowledge Distillation", for translation, proposed the simplest version: sample outputs from the teacher and train the student on them as if they were ordinary labels. For chat models this is just supervised fine-tuning (<a href="10-sft.html">chapter 10</a>) on teacher-written answers. It needs no access to probabilities, so it works with a hosted model as teacher, and with a different tokeniser. It throws away the soft information, but it keeps the whole answer, which is often what matters (the style, the structure of a proof, the step-by-step reasoning).</p>
+
+<p>The clearest recent example is DeepSeek-R1 (DeepSeek-AI, 2025). After training its reasoning model with RL (<a href="14-rlvr-grpo.html">chapter 14</a>), the authors curated about 800,000 samples and fine-tuned smaller open models on them with supervised fine-tuning only, no RL stage. The paper describes about 600,000 reasoning samples, rejection-sampled from the RL checkpoint and kept only when the answer was correct, and about 200,000 non-reasoning samples (writing, factual question answering, translation) taken in part from the DeepSeek-V3 SFT data. Their comparison on a 32B base model is the memorable number: RL applied directly to Qwen-32B-Base for over 10,000 steps reached 47.0% on AIME 2024 (pass@1), while the 32B model distilled from R1 reached 72.6%. The authors' conclusion is that distilling a stronger model into a smaller one gives better results than RL on the small model alone, with the caveat they state themselves: distillation needs the stronger teacher to exist first. <a href="../cases/case-02-deepseek-r1.html">Case 2</a> covers R1 in depth, and <a href="../cases/case-07-alpaca.html">Case 7</a> covers the earlier Alpaca experiment, where 52,000 generated instructions were enough to make a base model follow instructions and also revealed what imitation does not copy.</p>
+
+<h3>On-policy distillation and the direction of the KL</h3>
+
+<p>Training on the teacher's text has a quiet flaw. During training the student always sees prefixes the teacher wrote; at test time it sees prefixes <em>it</em> wrote, which include its own mistakes. This is the exposure-bias problem familiar from <a href="../../deep-learning/chapters/08-sequences-rnns.html">sequence models in A2</a>. Agarwal et al. (2024), in "On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes", propose Generalised Knowledge Distillation (GKD): sample sequences from the student, ask the teacher for its token probabilities on those sequences, and minimise a divergence there. They also let the divergence be something other than forward KL, because a student with limited capacity cannot always match the teacher's whole distribution. Gu et al. (2024), "MiniLLM", argue for reverse KL for the same reason and optimise it with a policy-gradient method.</p>
+
+<p>The two directions behave differently, and the toy below shows how. The teacher is a distribution over 40 "answers" with two well-separated peaks (two good, different answers). The student is a single bump with a free centre and width, so it cannot represent both peaks exactly. We search all (centre, width) pairs for the one with the smallest forward KL(teacher &#8214; student), and the one with the smallest reverse KL(student &#8214; teacher).</p>
+
+<pre class="terminal" data-title="fwdrev.py"><code>import numpy as np
+
+K = 40                                   # a 40-way "vocabulary" laid out on a line
+x = np.arange(K)
+
+def bump(mu, sd):
+    p = np.exp(-0.5 * ((x - mu) / sd) ** 2)
+    return p / p.sum()
+
+teacher = 0.5 * bump(10, 2.0) + 0.5 * bump(29, 2.0)       # two good answers, far apart
+eps = 1e-12
+
+def kl(p, q):
+    return float(np.sum(p * (np.log(p + eps) - np.log(q + eps))))
+
+best = {"forward": (9e9, None), "reverse": (9e9, None)}
+for mu in np.arange(0, K, 0.25):
+    for sd in np.arange(1.0, 14.0, 0.25):
+        q = bump(mu, sd)
+        f, r = kl(teacher, q), kl(q, teacher)           # forward = KL(teacher||student)
+        if f &lt; best["forward"][0]: best["forward"] = (f, (mu, sd, q))
+        if r &lt; best["reverse"][0]: best["reverse"] = (r, (mu, sd, q))
+
+for name in ("forward", "reverse"):
+    v, (mu, sd, q) = best[name]
+    mass_a = q[:20].sum(); mass_b = q[20:].sum()
+    between = q[16:24].sum()
+    print(f"{name:8} KL={v:6.3f}  student centre={mu:5.2f} width={sd:4.2f}  "
+          f"mass near answer A={q[5:16].sum():.2f}, near B={q[24:35].sum():.2f}, in the gap={between:.2f}")
+np.save("teacher.npy", teacher)
+np.save("fwd.npy", best["forward"][1][2]); np.save("rev.npy", best["reverse"][1][2])</code></pre>
+<pre class="terminal" data-title="output"><code>forward  KL= 0.825  student centre=19.50 width=12.50  mass near answer A=0.29, near B=0.29, in the gap=0.28
+reverse  KL= 0.693  student centre=10.00 width=2.00  mass near answer A=0.99, near B=0.00, in the gap=0.00</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="A plot over 40 possible answers. The teacher, drawn as green bars, has two peaks near answers 10 and 29. The forward-KL student, a dashed purple curve, is a low wide bump centred at 19.5 that puts about 28 percent of its mass in the gap between the peaks. The reverse-KL student, a solid blue curve, is a tall narrow bump on the left peak and ignores the right one.">
+    <line x1="70" y1="190" x2="720" y2="190" class="line"/>
+    <line x1="70" y1="30" x2="70" y2="190" class="line"/>
+    <rect x="136.6" y="189.2" width="13" height="0.8" class="f-green" opacity="0.5"/><rect x="152.9" y="186.8" width="13" height="3.2" class="f-green" opacity="0.5"/><rect x="169.1" y="180.2" width="13" height="9.8" class="f-green" opacity="0.5"/><rect x="185.4" y="166.5" width="13" height="23.5" class="f-green" opacity="0.5"/><rect x="201.6" y="146.0" width="13" height="44.0" class="f-green" opacity="0.5"/><rect x="217.9" y="126.0" width="13" height="64.0" class="f-green" opacity="0.5"/><rect x="234.1" y="117.5" width="13" height="72.5" class="f-green" opacity="0.5"/><rect x="250.4" y="126.0" width="13" height="64.0" class="f-green" opacity="0.5"/><rect x="266.6" y="146.0" width="13" height="44.0" class="f-green" opacity="0.5"/><rect x="282.9" y="166.5" width="13" height="23.5" class="f-green" opacity="0.5"/><rect x="299.1" y="180.2" width="13" height="9.8" class="f-green" opacity="0.5"/><rect x="315.4" y="186.8" width="13" height="3.2" class="f-green" opacity="0.5"/><rect x="331.6" y="189.2" width="13" height="0.8" class="f-green" opacity="0.5"/><rect x="445.4" y="189.2" width="13" height="0.8" class="f-green" opacity="0.5"/><rect x="461.6" y="186.8" width="13" height="3.2" class="f-green" opacity="0.5"/><rect x="477.9" y="180.2" width="13" height="9.8" class="f-green" opacity="0.5"/><rect x="494.1" y="166.5" width="13" height="23.5" class="f-green" opacity="0.5"/><rect x="510.4" y="146.0" width="13" height="44.0" class="f-green" opacity="0.5"/><rect x="526.6" y="126.0" width="13" height="64.0" class="f-green" opacity="0.5"/><rect x="542.9" y="117.5" width="13" height="72.5" class="f-green" opacity="0.5"/><rect x="559.1" y="126.0" width="13" height="64.0" class="f-green" opacity="0.5"/><rect x="575.4" y="146.0" width="13" height="44.0" class="f-green" opacity="0.5"/><rect x="591.6" y="166.5" width="13" height="23.5" class="f-green" opacity="0.5"/><rect x="607.9" y="180.2" width="13" height="9.8" class="f-green" opacity="0.5"/><rect x="624.1" y="186.8" width="13" height="3.2" class="f-green" opacity="0.5"/><rect x="640.4" y="189.2" width="13" height="0.8" class="f-green" opacity="0.5"/>
+    <path d="M78.1,182.3 L94.4,181.3 L110.6,180.2 L126.9,179.1 L143.1,177.9 L159.4,176.7 L175.6,175.5 L191.9,174.2 L208.1,172.9 L224.4,171.7 L240.6,170.5 L256.9,169.3 L273.1,168.2 L289.4,167.2 L305.6,166.3 L321.9,165.6 L338.1,164.9 L354.4,164.5 L370.6,164.1 L386.9,164.0 L403.1,164.0 L419.4,164.1 L435.6,164.5 L451.9,164.9 L468.1,165.6 L484.4,166.3 L500.6,167.2 L516.9,168.2 L533.1,169.3 L549.4,170.5 L565.6,171.7 L581.9,172.9 L598.1,174.2 L614.4,175.5 L630.6,176.7 L646.9,177.9 L663.1,179.1 L679.4,180.2 L695.6,181.3 L711.9,182.3" fill="none" class="line-dash s-purple sw-3"/>
+    <path d="M78.1,190.0 L94.4,190.0 L110.6,190.0 L126.9,189.7 L143.1,188.4 L159.4,183.6 L175.6,170.4 L191.9,142.9 L208.1,102.0 L224.4,62.0 L240.6,44.9 L256.9,62.0 L273.1,102.0 L289.4,142.9 L305.6,170.4 L321.9,183.6 L338.1,188.4 L354.4,189.7 L370.6,190.0 L386.9,190.0 L403.1,190.0 L419.4,190.0 L435.6,190.0 L451.9,190.0 L468.1,190.0 L484.4,190.0 L500.6,190.0 L516.9,190.0 L533.1,190.0 L549.4,190.0 L565.6,190.0 L581.9,190.0 L598.1,190.0 L614.4,190.0 L630.6,190.0 L646.9,190.0 L663.1,190.0 L679.4,190.0 L695.6,190.0 L711.9,190.0" fill="none" class="line s-blue sw-3"/>
+    <text x="395" y="220" text-anchor="middle" class="t-xs t-muted">answer index (0 to 39)</text>
+    <text x="22" y="110" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 22 110)">probability</text>
+    <text x="244" y="206" text-anchor="middle" class="t-xs tc-green t-bold">teacher peak A</text>
+    <text x="551" y="206" text-anchor="middle" class="t-xs tc-green t-bold">teacher peak B</text>
+    <text x="395" y="156" text-anchor="middle" class="t-xs tc-purple t-bold">forward KL: hedges across the gap</text>
+    <text x="330" y="52" class="t-xs tc-blue t-bold">reverse KL: commits to peak A</text>
+    <text x="395" y="250" text-anchor="middle" class="t-xs t-muted">green bars: teacher. Dashed: best forward-KL student. Solid: best reverse-KL student.</text>
+  </svg>
+  <figcaption><strong>Cover everything, or commit to one thing.</strong> A student too small to be bimodal must give something up. Forward KL punishes any teacher mass the student misses, so it spreads out and puts 28% of its probability between the peaks, on answers the teacher considers unlikely. Reverse KL punishes student mass where the teacher has none, so it picks one peak.</figcaption>
+</figure>
+
+<p>Forward KL, the standard distillation loss, is <span class="term">mode-covering</span>: wherever the teacher has probability, the student must too, or the loss explodes. Squeezed into one bump, the student spreads wide and puts 28% of its mass in the gap, on text the teacher would never write. For a language model, that is the generation that is vaguely right about everything and wrong in detail. Reverse KL is <span class="term">mode-seeking</span>: the student is punished for putting mass where the teacher has none, so it settles on one good answer and gives up the other. Its loss here is 0.693, which is ln 2: it misses half the teacher's mass exactly. MiniLLM's abstract states that reverse KL prevents the student from overestimating low-probability regions of the teacher distribution. Neither direction is right in general. For a deployed assistant, committing to one good answer is usually better than hedging; for a student that must also cover diverse outputs (for example to sample many solutions in <a href="14-rlvr-grpo.html">RLVR</a>), covering matters. You may notice that the RLHF penalty of <a href="08-ppo.html">chapter 8</a> uses the reverse direction KL(&pi; &#8214; &pi;<sub>ref</sub>) too, for the same reason: it is expressed as an expectation over the policy's own samples, which are what you can compute.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Method</th><th>Needs from the teacher</th><th>Signal per token</th><th>Main weakness</th></tr></thead>
+  <tbody>
+    <tr><td>Logit distillation (forward KL)</td><td>Weights or stored top-k probabilities; same tokeniser</td><td>Full distribution</td><td>Storage or a teacher in the loop; trains on prefixes the student would not write</td></tr>
+    <tr><td>Sequence-level (SFT on teacher text)</td><td>Only generated text</td><td>One sampled token</td><td>Copies errors and style; loses the teacher's uncertainty</td></tr>
+    <tr><td>On-policy (GKD, reverse KL)</td><td>Teacher probabilities on student samples</td><td>Full distribution on the student's own text</td><td>Teacher forward pass for every student sample; generation inside the training loop</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The TRL documentation (read October 2026) lists a <code>DistillationTrainer</code> in its stable knowledge-distillation section and a <code>GKDTrainer</code> among the experimental trainers, next to several newer on-policy variants; experimental trainers can change their interfaces between releases, so pin the library version. The distilled R1 checkpoints and the Gemma 2 report remain the best-documented public examples of the two main routes (sequence-level, and logit-level in pretraining). Which frontier models were used as teachers for which commercial small models is mostly not public.</p>
+</div>
+
+<h2>Synthetic data beyond distillation</h2>
+
+<p><span class="term">Synthetic data</span> is training data written by a model instead of a person. Distillation is one use. The others are best understood by what controls the quality of the data.</p>
+
+<ul>
+  <li><strong>Instruction data from a stronger model.</strong> Self-Instruct (Wang et al., 2022) bootstraps instructions from a model's own outputs; Alpaca applied the idea with a stronger teacher. Cheap, broad, and only as good as the teacher.</li>
+  <li><strong>Verified data.</strong> Generate many attempts, keep those that pass a check. R1's 600,000 reasoning samples were kept only when correct. The Llama 3 report (Llama Team, 2024) describes generating over 2.7 million synthetic coding examples for SFT, using execution feedback: run the generated code against tests and feed back errors for revision. Because a program does the filtering, the data can be better than the model that wrote it, which is rejection sampling from <a href="14-rlvr-grpo.html">chapter 14</a> in another role.</li>
+  <li><strong>Textbook-style data.</strong> Gunasekar et al. (2023), "Textbooks Are All You Need", trained a small code model on filtered web pages plus textbooks and exercises written by GPT-3.5, arguing that data quality can substitute for scale. The lesson is about curation, not about synthetic data being superior.</li>
+  <li><strong>Translation and rewriting.</strong> The Llama 3 report also describes translating code between programming languages and "backtranslating" (generating documentation or explanations from code) to create training pairs for capabilities with little human data.</li>
+</ul>
+
+<p>Across all of these, four controls decide whether synthetic data helps. <strong>A check that does not trust the writer</strong>: unit tests, answer matching, a second model as a judge (with the biases of <a href="13-reward-models.html">chapter 13</a>). <strong>Diversity</strong>: a model asked for 100,000 questions on its own will repeat favourite phrasings, so measure distinct n-grams and deduplicate with the MinHash pipeline of <a href="01-pretraining-data.html">chapter 1</a>. <strong>Decontamination</strong>: remove anything that matches your evaluation sets, as chapter 23 describes, because a teacher may have memorised public benchmarks and reproduce them in its "new" questions. <strong>Mixing with real data</strong>, for reasons the next section makes precise.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Producing 800,000 samples of about 1,500 tokens each is 1.2 billion output tokens (an illustrative size). At an assumed price of $1 per million output tokens that is $1,200, and at $10 it is $12,000; whichever it is, the job is an offline <a href="../../data/chapters/18-batch.html">batch process</a>, where throughput matters and latency does not. That is the regime in which the serving techniques of <a href="20-serving-engines.html">chapter 20</a> and the cost arithmetic of <a href="22-token-economics.html">chapter 22</a> pay off most. Treat the dataset as a build artefact: record the teacher, prompt, sampling settings and filters that produced it, so you can reproduce it and explain a regression later (<a href="../../design/chapters/20-ml-systems.html">Designing with ML &amp; LLMs</a>).</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Licences and terms</p>
+  <p>The teacher is someone's product. Terms of service of some hosted models, and the licences of some open-weight models, restrict using their outputs to train other models, or require attribution or naming. These terms differ by provider and change over time, so read the terms of the specific teacher before you build the pipeline, and keep a record of which teacher produced which data. I have not tried to summarise any particular provider's terms here.</p>
+</div>
+
+<h2>Model collapse</h2>
+
+<p>If models write data and new models train on it, and the web fills with model output, what happens after several rounds? Shumailov et al. (2023, published in <em>Nature</em> in 2024 as "AI models collapse when trained on recursively generated data") call the result <span class="term">model collapse</span>: training on model-generated content causes irreversible defects in which the tails of the original distribution disappear. They show it for variational autoencoders, Gaussian mixtures and language models.</p>
+
+<p>The simplest mechanism is sampling noise. A model learns a distribution from a finite sample, and a rare word that did not appear in the sample gets probability zero. The next model, trained on text written by this one, can never see it again. A rare word that did appear can still be lost by chance; a common word can be over-represented by chance. Over generations the distribution drifts and the rare tail is lost one way, because zero is a trap that nothing returns from. Here is that process in code. The "real" language has 2,000 words with Zipf-like frequencies (the n-th most common word has probability proportional to 1/n). Each generation samples 5,000 tokens from the previous model and re-estimates word frequencies. In the <em>replace</em> setting the next model sees only the new text; in the <em>accumulate</em> setting it sees the original real text plus everything generated so far. Twenty runs per setting, thirty generations each.</p>
+
+<pre class="terminal" data-title="collapse.py"><code>import numpy as np
+
+V, N, GENS, RUNS = 2000, 5000, 30, 20            # vocabulary, tokens per generation, generations, repeats
+ranks = np.arange(1, V + 1)
+truth = 1.0 / ranks; truth /= truth.sum()        # a Zipf-like "real" distribution over words
+
+def run(mode, seed):
+    rng = np.random.default_rng(seed)
+    real = rng.choice(V, N, p=truth)             # generation 0 trains on real text
+    pool = real.copy()
+    dist = np.bincount(pool, minlength=V) / len(pool)
+    alive = []
+    for g in range(GENS):
+        synth = rng.choice(V, N, p=dist)         # the model writes N tokens from what it learned
+        if mode == "replace":
+            pool = synth                          # next model sees only synthetic text
+        else:
+            pool = np.concatenate([pool, synth])  # next model sees real + all earlier synthetic text
+        dist = np.bincount(pool, minlength=V) / len(pool)
+        alive.append(int((dist &gt; 0).sum()))
+    return alive, dist
+
+print(f"real distribution: {V} words, entropy {-(truth*np.log(truth)).sum():.2f} nats")
+for mode in ("replace", "accumulate"):
+    curves = np.array([run(mode, s)[0] for s in range(RUNS)])
+    m = curves.mean(0)
+    ent = np.mean([-(d[d &gt; 0] * np.log(d[d &gt; 0])).sum() for d in (run(mode, s)[1] for s in range(RUNS))])
+    print(f"{mode:10} distinct words after generation 1, 5, 10, 20, 30: "
+          + ", ".join(f"{m[g-1]:.0f}" for g in (1, 5, 10, 20, 30))
+          + f" | entropy at gen 30: {ent:.2f} nats")
+    np.save(f"collapse_{mode}.npy", m)</code></pre>
+<pre class="terminal" data-title="output"><code>real distribution: 2000 words, entropy 5.62 nats
+replace    distinct words after generation 1, 5, 10, 20, 30: 837, 486, 335, 218, 163 | entropy at gen 30: 4.30 nats
+accumulate distinct words after generation 1, 5, 10, 20, 30: 1075, 1075, 1075, 1075, 1075 | entropy at gen 30: 5.36 nats</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="A line chart of the number of distinct words that remain over 30 generations of recursive training. In the accumulate setting the line is flat at 1,075. In the replace setting the line falls from 837 after the first generation to 163 after the thirtieth.">
+    <line x1="70" y1="180" x2="700" y2="180" class="line"/>
+    <line x1="70" y1="30" x2="70" y2="180" class="line"/>
+    <line x1="66" y1="30" x2="74" y2="30" class="line"/><text x="60" y="34" text-anchor="end" class="t-xs t-muted">1,200</text>
+    <line x1="66" y1="80" x2="74" y2="80" class="line"/><text x="60" y="84" text-anchor="end" class="t-xs t-muted">800</text>
+    <line x1="66" y1="130" x2="74" y2="130" class="line"/><text x="60" y="134" text-anchor="end" class="t-xs t-muted">400</text>
+    <text x="60" y="184" text-anchor="end" class="t-xs t-muted">0</text>
+    <path d="M70.0,45.7 L91.7,45.7 L113.4,45.7 L135.2,45.7 L156.9,45.7 L178.6,45.7 L200.3,45.7 L222.1,45.7 L243.8,45.7 L265.5,45.7 L287.2,45.7 L309.0,45.7 L330.7,45.7 L352.4,45.7 L374.1,45.7 L395.9,45.7 L417.6,45.7 L439.3,45.7 L461.0,45.7 L482.8,45.7 L504.5,45.7 L526.2,45.7 L547.9,45.7 L569.7,45.7 L591.4,45.7 L613.1,45.7 L634.8,45.7 L656.6,45.7 L678.3,45.7 L700.0,45.7" fill="none" class="line s-green sw-3"/>
+    <path d="M70.0,75.4 L91.7,92.4 L113.4,104.2 L135.2,112.5 L156.9,119.3 L178.6,124.8 L200.3,129.1 L222.1,132.5 L243.8,135.5 L265.5,138.1 L287.2,140.4 L309.0,142.3 L330.7,144.1 L352.4,145.7 L374.1,147.1 L395.9,148.4 L417.6,149.5 L439.3,150.8 L461.0,151.8 L482.8,152.8 L504.5,153.7 L526.2,154.4 L547.9,155.2 L569.7,155.9 L591.4,156.6 L613.1,157.3 L634.8,157.9 L656.6,158.6 L678.3,159.1 L700.0,159.6" fill="none" class="line s-red sw-3"/>
+    <text x="400" y="38" text-anchor="middle" class="t-xs tc-green t-bold">accumulate: real + synthetic, nothing lost (1,075 words)</text>
+    <text x="230" y="104" class="t-xs tc-red t-bold">replace: only the newest text (163 words at gen. 30)</text>
+    <text x="70" y="200" text-anchor="middle" class="t-xs t-muted">1</text><text x="385" y="200" text-anchor="middle" class="t-xs t-muted">15</text><text x="700" y="200" text-anchor="middle" class="t-xs t-muted">30</text>
+    <text x="385" y="222" text-anchor="middle" class="t-xs t-muted">generation of recursive training</text>
+    <text x="18" y="105" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 18 105)">distinct words</text>
+  </svg>
+  <figcaption><strong>The tail goes first.</strong> Average of 20 runs. Replacing the data each generation loses about 85% of the words the first sample contained within 30 generations, and the entropy falls to 4.30 nats, against 5.36 for the accumulating pool. Keeping the original real data in the pool loses nothing in this toy, because the real text still contains every word that was ever seen.</figcaption>
+</figure>
+
+<p>The accumulate line sits flat at 1,075 words, not 2,000, because even the real 5,000-token sample only contained 1,075 of the 2,000 words; the other 925 were lost at the very first estimate. That is worth taking in. In this toy the loss of the tail happens in one step, because estimating a distribution from a finite sample already loses the rare events, and every later generation inherits that loss. Gerstgrasser et al. (2024), "Is Model Collapse Inevitable?", compare exactly these two regimes and report that replacing real data with synthetic data each generation leads to collapse, while accumulating synthetic data alongside the original real data avoids it, with the test error bounded in their linear-model analysis. The best-supported reading is that collapse is a risk of <em>discarding</em> real data, not of using any synthetic data at all.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Model collapse means synthetic data is poison", and its opposite, "model collapse is a myth". Neither follows from the evidence. What the studies show is that a training set made <em>only</em> of one model's output, repeated generation after generation, loses its tails. A pipeline that keeps real data, filters synthetic data with a check the generator cannot flatter, and keeps the diversity of the mix measured can use large amounts of synthetic data, as the verified data of R1 and Llama 3 shows. Our toy is also much simpler than a real language model: it has no generalisation, so it cannot invent a word it never saw, and real models can partly recover from sampling noise. The danger is real in direction; its size in a given pipeline is something to measure.</p>
+</div>
+
+<h3>Failure modes in a distillation pipeline</h3>
+
+<ul>
+  <li><strong>The student inherits the teacher's errors, with more confidence.</strong> A student trained on wrong teacher answers learns them as facts. Filter with a verifier where you can.</li>
+  <li><strong>Imitation of style without substance.</strong> A small model can copy the tone of a strong model's answers while missing its knowledge; human raters who like the style may overrate it, which is the lesson of <a href="../cases/case-07-alpaca.html">Case 7</a>. Evaluate on tasks where style cannot help (chapter 23).</li>
+  <li><strong>Diversity loss.</strong> Repeated phrasings, a narrow set of topics, and a student that answers every question in the teacher's house style. Measure it.</li>
+  <li><strong>Hidden contamination.</strong> The teacher may have seen your test set; its synthetic questions can carry it into the student.</li>
+  <li><strong>A cap at the teacher.</strong> The student rarely exceeds the teacher on what the teacher cannot do. The exception is when a verifier filters the data, as with rejection sampling.</li>
+</ul>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Open <code>distill_toy.py</code> and change the temperature <code>T</code> from 3 to 1, then to 10. Then change the teacher's training steps from 4000 to 200, so the teacher is weak and wrong, and rerun. Finally, in <code>collapse.py</code>, raise <code>N</code> from 5000 to 50000 and compare how quickly the replace curve falls.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 distill_toy.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 collapse.py</span></code></pre>
+  <p>Questions: does the student ever beat a weak teacher it learns from? Why does a larger sample slow the collapse but not stop it? What would you add to <code>collapse.py</code> to model a pipeline that mixes 20% fresh real text into every generation?</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A teacher's probabilities carry information about wrong answers. A temperature softens them so the student can see it, and the T&sup2; factor keeps gradient sizes comparable.</li>
+    <li>Teachers turn cheap unlabelled inputs into plentiful labels. In the toy, a student labelled only by the teacher came within a point of it with no human labels at all.</li>
+    <li>Choose among logit, sequence-level and on-policy distillation by what you can get from the teacher (weights, or only text) and by the mismatch between training prefixes and generation.</li>
+    <li>Forward KL covers all the teacher's modes and can hedge into gaps; reverse KL commits to one. The right choice depends on whether you want diversity or reliability.</li>
+    <li>Synthetic data is only as good as the check on it. Verified data (tests, answer matching) can exceed its generator; unchecked data cannot.</li>
+    <li>Model collapse is the loss of distribution tails when each generation trains only on the last one's output. Keeping real data and accumulating synthetic data avoids it in the studies cited here.</li>
+    <li>Read the teacher's licence, record data provenance, and decontaminate against your evaluations.</li>
+  </ul>
+</div>
+
+<p><a href="../labs/lab-03-lora.html">Lab 3</a> trains a small adapter on supplied data, a natural place to try teacher-written data in place of human data. <a href="../studios/studio-02-reasoning-model.html">Studio 2</a> asks you to plan a small reasoning model, where the choice between RL and distillation is the central design decision. The next chapter leaves training and instead combines models that already exist, by averaging their weights.</p>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">Hinton, Vinyals and Dean, "Distilling the Knowledge in a Neural Network" (2015)</a>. The temperature, soft targets and the T&sup2; factor.</li>
+  <li><a href="https://arxiv.org/abs/1910.01108" target="_blank" rel="noopener">Sanh et al., "DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter" (2019)</a>. A clean example of logit distillation in pretraining.</li>
+  <li><a href="https://arxiv.org/abs/1606.07947" target="_blank" rel="noopener">Kim and Rush, "Sequence-Level Knowledge Distillation" (2016)</a>. Training on the teacher's sampled outputs.</li>
+  <li><a href="https://arxiv.org/abs/2306.13649" target="_blank" rel="noopener">Agarwal et al., "On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes" (2023, ICLR 2024)</a>. Generalised Knowledge Distillation.</li>
+  <li><a href="https://arxiv.org/abs/2306.08543" target="_blank" rel="noopener">Gu et al., "MiniLLM: Knowledge Distillation of Large Language Models" (2023, ICLR 2024)</a>. The case for reverse KL.</li>
+  <li><a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">DeepSeek-AI, "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning" (2025)</a>. The 800,000-sample distillation and the distillation versus RL comparison on a 32B base.</li>
+  <li><a href="https://arxiv.org/abs/2305.17493" target="_blank" rel="noopener">Shumailov et al., "The Curse of Recursion: Training on Generated Data Makes Models Forget" (2023)</a>, published in Nature in 2024 as "AI models collapse when trained on recursively generated data". Model collapse.</li>
+  <li><a href="https://arxiv.org/abs/2404.01413" target="_blank" rel="noopener">Gerstgrasser et al., "Is Model Collapse Inevitable? Breaking the Curse of Recursion by Accumulating Real and Synthetic Data" (2024)</a>. Replace versus accumulate.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A teacher's logits for three classes give probabilities 0.97, 0.02, 0.01 at T = 1. Why distil at a temperature such as T = 4?</p>
+    <ol class="q-options">
+      <li>To make the teacher more accurate</li>
+      <li>To flatten the distribution so that the relative sizes of the small probabilities contribute to the loss</li>
+      <li>To make the student's softmax sharper</li>
+      <li>To avoid needing hard labels at test time</li>
+    </ol>
+    <div class="q-explain">At T = 1 the 0.02 and 0.01 barely change the loss, so the information that class 2 is a closer confusion than class 3 is lost. Raising T spreads probability so the student is asked to reproduce those ratios. The teacher's accuracy does not change (its arg max is the same), and the student's softmax is also softened during training, not sharpened. The T&sup2; factor is the correction for the smaller gradients.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">You want to distil a hosted model whose API returns only generated text, into an open 7B model with a different tokeniser. Which approach is available?</p>
+    <ol class="q-options">
+      <li>Logit distillation with forward KL at every position</li>
+      <li>On-policy distillation with teacher probabilities on the student's samples</li>
+      <li>Any of the three, since the tokeniser does not matter</li>
+      <li>Sequence-level distillation: collect the teacher's answers (and filter them) and fine-tune the student on them</li>
+    </ol>
+    <div class="q-explain">The first two need the teacher's token probabilities, and comparing distributions over different vocabularies is meaningless. Text is the only thing both models share. This is also the method of R1's distilled models and Alpaca. Remember to check the provider's terms before doing it.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">In the bimodal toy, the best forward-KL student put 28% of its mass between the two teacher peaks, while the best reverse-KL student ignored one peak. What does this imply for a small chat model distilled with forward KL?</p>
+    <ol class="q-options">
+      <li>It may spread probability over text the teacher considers unlikely, producing hedged or blended generations</li>
+      <li>It will always choose the single most likely answer</li>
+      <li>It will have lower perplexity on the teacher's text than any other student, so it is always better</li>
+      <li>Nothing, because language models are unimodal</li>
+    </ol>
+    <div class="q-explain">Forward KL is mode-covering: it is large wherever the student gives the teacher's likely text too little mass, so a student without the capacity for every mode compromises between them. Choosing a single answer is the mode-seeking behaviour of reverse KL. Lower loss on the teacher's text does not mean better samples, and real next-token distributions are often multi-modal.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">A team trains model G1 on real text, then trains G2 on G1's output only, G3 on G2's output only, and so on. Which change most directly addresses model collapse?</p>
+    <ol class="q-options">
+      <li>Raise the sampling temperature of each generator</li>
+      <li>Train each generation for more epochs</li>
+      <li>Keep the original real data in every generation's training pool and add the synthetic data to it</li>
+      <li>Use a larger vocabulary</li>
+    </ol>
+    <div class="q-explain">Collapse comes from each generation losing the tails of the previous one's distribution, a loss that cannot be undone if the original text is discarded. Accumulating real plus synthetic data (Gerstgrasser et al., 2024) keeps the tails in the pool. A higher temperature distorts rather than restores them, and more epochs or a larger vocabulary do nothing about missing data.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">DeepSeek's 32B model distilled from R1 scored 72.6% on AIME 2024, against 47.0% for the same base trained with RL directly. What is the fairest conclusion?</p>
+    <ol class="q-options">
+      <li>RL is obsolete and distillation should always replace it</li>
+      <li>For a small model, distilling from a stronger reasoning teacher can beat running RL on the small model, but the teacher had to be created first, by large-scale RL</li>
+      <li>The two numbers are not comparable because one used a verifier</li>
+      <li>Distillation works only when the student is larger than the teacher</li>
+    </ol>
+    <div class="q-explain">The authors draw this conclusion and add the dependence on a stronger teacher themselves. It does not show RL is obsolete: the teacher came from RL. The comparison uses the same benchmark and base model, so it is a fair one, and students are normally smaller than teachers.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">Your synthetic instruction set has 200,000 examples generated by one model with no filter. Which first step best protects the quality of the student?</p>
+    <ol class="q-options">
+      <li>Train for as many epochs as possible so the student memorises the teacher</li>
+      <li>Have the same generator rate its own examples and keep the top half, with no other checks</li>
+      <li>Add more examples from the same generator to average out errors</li>
+      <li>Add a check the generator cannot flatter (tests or answer matching where possible), deduplicate, measure diversity, and decontaminate against your evaluation sets</li>
+    </ol>
+    <div class="q-explain">A self-rating shares the generator's blind spots and a larger batch of the same errors does not average them out, because the errors are systematic. Independent verification, deduplication and diversity checks, and decontamination address the four risks of the pipeline. Memorising the teacher copies its mistakes harder.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

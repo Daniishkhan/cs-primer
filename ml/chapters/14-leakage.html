@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leakage: The Silent Killer · Machine Learning &amp; Data Science</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="ml" data-chapter="14">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Leakage: The Silent Killer</h1>
+  <p class="lede">Leakage is information reaching the model during training or validation that it will not have when it is used. It produces the best-looking results you will ever see and the worst failures in production, and no metric computed on contaminated data can warn you. This chapter classifies the ways it happens, reproduces each with numbers, and builds the habits and checks that catch it.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p><a href="13-cross-validation.html">Chapter 13</a> made validation match the deployment in terms of <em>which rows</em> stay apart. Leakage is the broader failure: any path by which the answer, or something that gives the answer away, gets into the model's inputs or into the choices made about the model. It is the single most common reason a model that scored 0.98 offline scores 0.65 on its first week of real traffic, and it is hard to see because everything looks fine. Training and validation scores agree with each other, the model is stable, and the metric is glorious. Leakage also compounds: a team that builds three months of features on a leaky foundation has to unpick all of it. By the end of this chapter you will recognise the five families of leak, you will have a scan, a timeline audit and a pipeline discipline that catch most of them, and you will treat a surprisingly good result as a bug report until proven otherwise.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Running the examples</p>
+  <p>The scripts in this chapter import a small shared helper so each listing can stay short. Download <a href="code/part4/lib.py"><code>lib.py</code></a> into the same folder as the scripts you save from this page, then run them with <code>python3</code> (NumPy is the only dependency). The outputs shown were produced exactly this way.</p>
+</div>
+
+<h2>What leakage is</h2>
+
+<p>The standard definition comes from Kaufman, Rosset, Perlich and Stitelman (2012), "Leakage in Data Mining: Formulation, Detection, and Avoidance": <span class="term">leakage</span> is the introduction of information about the target that should not legitimately be available to the model at the time it is used. The wording matters. "Legitimately" and "at the time it is used" turn leakage from a property of the data into a property of the data <em>relative to a deployment</em>. A customer's final account balance is a perfectly good column; as an input to a model that predicts, in March, who will close their account in April, it is a leak. This is why <a href="02-framing-metrics.html">chapter 2</a> insisted on fixing the prediction time before anything else.</p>
+
+<p>Leakage is silent for a structural reason. The usual protection against fooling yourself is held-out data. Leakage defeats that protection, because the held-out data carries the same leak as the training data. The model finds the shortcut in training, and validation, built from the same table, contains the same shortcut. Only data from the real deployment lacks it, and by then you are in production.</p>
+
+<p>The problem is not small. Kapoor and Narayanan (2023), in "Leakage and the Reproducibility Crisis in Machine-Learning-Based Science", surveyed published research that used machine learning and found leakage errors in 17 fields, collectively affecting 329 papers; in several the reported performance fell sharply or vanished when the leak was corrected. If researchers with peer review make this mistake at that scale, a product team with a deadline will too.</p>
+
+<h2>Five families of leak</h2>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Family</th><th>What crosses the wall</th><th>Typical example</th><th>First defence</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Target leakage</strong></td><td>A feature that is a consequence or a proxy of the label</td><td>A "retention offer sent" flag, written after the customer asked to cancel</td><td>Audit when each column is recorded</td></tr>
+    <tr><td><strong>Preprocessing leakage</strong></td><td>Statistics learned from validation rows (especially their labels)</td><td>Choosing the best features, or imputing, on the whole table before splitting</td><td>Fit every learned step inside the fold</td></tr>
+    <tr><td><strong>Train-test contamination</strong></td><td>The same or near-identical examples on both sides</td><td>Duplicate records, the same patient, the same article</td><td>Deduplicate and split by entity (chapter 13)</td></tr>
+    <tr><td><strong>Temporal leakage</strong></td><td>Information from after the prediction time</td><td>A rolling average centred on the day being predicted</td><td>As-of features and time-ordered splits</td></tr>
+    <tr><td><strong>Collection artefacts</strong></td><td>Identifiers and metadata that encode how the data was gathered</td><td>Row number, file name, scanner or clinic code that tracks the label</td><td>Scan single columns; drop identifiers</td></tr>
+  </tbody>
+</table></div>
+
+<p>A sixth, quieter family is leakage through the <em>evaluation loop</em>: choosing among many models on one validation set and then reporting that set's score, which chapter 13 measured as selection bias. We will take the five in turn, each reproduced in a small experiment with a known truth so you can see how much it distorts.</p>
+
+<h2>Target leakage: a feature from after the decision</h2>
+
+<p>Every column has a time at which its value becomes known. The model's prediction also has a time. A feature is legitimate only if its value was available <em>before</em> that prediction time, in exactly the form you will have it in production. Features that violate this come in three flavours: those recorded after the event (a refund flag in a fraud table; a diagnosis code on the bill that was generated after the diagnosis), those <em>caused by</em> the outcome (a hospital orders an expensive test because the patient is already known to be sick), and those that are the label under another name (a "cancellation reason" field, or a duplicated outcome column from a join).</p>
+
+<p>Step through a concrete case. A subscription business wants to predict, at a given date, who will cancel in the next 30 days. The retention team calls customers who ask to cancel and records an <code>offer_sent</code> flag during the call.</p>
+
+<div class="widget stepper" data-autoplay-ms="4200">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One customer's timeline and the column that arrives too late</h4></div>
+  <svg viewBox="0 0 760 316" role="img" aria-label="A timeline of one customer who cancels. Events from left to right: sign up, usage and tickets, a prediction date marked by a dashed line, the decision to leave, a retention call where the offer-sent flag is written, and the account closing, which defines the label. Feature chips for tenure, tickets and logins sit before the prediction date; the offer-sent chip sits after it.">
+    <defs><marker id="ahML14a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="40" y1="170" x2="722" y2="170" class="line" marker-end="url(#ahML14a)"/>
+    <text x="722" y="156" text-anchor="end" class="t-xs t-muted">time</text>
+    <circle cx="70" cy="170" r="6" class="f-green"/>
+    <text x="70" y="192" text-anchor="middle" class="t-xs">signed up</text>
+    <line x1="130" y1="170" x2="330" y2="170" class="line s-green sw-3"/>
+    <text x="230" y="192" text-anchor="middle" class="t-xs">usage, tickets, logins</text>
+    <circle cx="430" cy="170" r="6" class="f-orange"/>
+    <text x="430" y="192" text-anchor="middle" class="t-xs">decides to leave</text>
+    <circle cx="510" cy="170" r="6" class="f-red"/>
+    <text x="510" y="210" text-anchor="middle" class="t-xs">calls to cancel</text>
+    <circle cx="640" cy="170" r="6" class="f-purple"/>
+    <text x="640" y="192" text-anchor="middle" class="t-xs">account closed</text>
+    <g data-steps="2-" data-active="2">
+      <line x1="350" y1="84" x2="350" y2="222" class="line-dash s-yellow sw-3"/>
+      <text x="350" y="76" text-anchor="middle" class="t-xs t-bold tc-yellow">prediction date T</text>
+    </g>
+    <g data-steps="3-" data-active="3">
+      <rect x="40" y="104" width="96" height="26" rx="6" class="fs-green s-green sw-2"/><text x="88" y="121" text-anchor="middle" class="t-xs">tenure</text>
+      <rect x="142" y="104" width="96" height="26" rx="6" class="fs-green s-green sw-2"/><text x="190" y="121" text-anchor="middle" class="t-xs">tickets_30d</text>
+      <rect x="244" y="104" width="96" height="26" rx="6" class="fs-green s-green sw-2"/><text x="292" y="121" text-anchor="middle" class="t-xs">logins_30d</text>
+    </g>
+    <g data-steps="4-" data-active="4">
+      <line x1="350" y1="238" x2="640" y2="238" class="line s-purple sw-2"/>
+      <line x1="350" y1="232" x2="350" y2="244" class="line s-purple sw-2"/>
+      <line x1="640" y1="232" x2="640" y2="244" class="line s-purple sw-2"/>
+      <text x="495" y="258" text-anchor="middle" class="t-xs">label: cancelled within 30 days of T? (here: yes)</text>
+    </g>
+    <g data-steps="5-" data-active="5">
+      <rect x="440" y="104" width="150" height="26" rx="6" class="fs-red s-red sw-2"/><text x="515" y="121" text-anchor="middle" class="t-xs">retention_offer_sent</text>
+      <line x1="510" y1="164" x2="510" y2="132" class="line s-red" marker-end="url(#ahML14a)"/>
+    </g>
+    <g data-steps="6" data-active="6">
+      <rect x="60" y="272" width="640" height="36" rx="8" class="fs-red s-red sw-2"/>
+      <text x="380" y="295" text-anchor="middle" class="t-xs t-bold">In training offer_sent is 1 for churners. At time T nobody has called yet: it is empty for everyone.</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>One customer's history.</strong> They sign up, use the product, eventually decide to leave, phone to cancel, and the account closes. The data warehouse records each fact with its own timestamp.</li>
+    <li><strong>Fix the prediction date T.</strong> This is the moment the model will be asked to score the customer, say the first of the month. Everything left of the line has happened; everything right of it has not.</li>
+    <li><strong>Legitimate inputs.</strong> Tenure, tickets and logins over the last 30 days are all known at T. These are what a deployed model can use.</li>
+    <li><strong>The label looks forward.</strong> "Cancelled within 30 days of T" is determined by what happens after T. Only here may the future appear, and only as the target.</li>
+    <li><strong>The leaky column.</strong> <code>retention_offer_sent</code> is written during the retention call, which is after T. In the warehouse it sits in the same table as the other features, with no sign that it comes from the future.</li>
+    <li><strong>Why it is harmful.</strong> The model finds that the flag almost perfectly separates the classes. In production, at time T, no call has happened and the flag is empty for every customer, so the model's best feature disappears. Validation could not tell, because validation rows also have the flag.</li>
+  </ol>
+</div>
+
+<p>Now measure it. The script builds a table of 6,000 customers with four honest features and the post-decision flag (set for 92% of churners and 2% of the rest). It first scans each column on its own, then trains a logistic regression with and without the flag, and finally scores the leaky model as it would run in production, with the flag empty.</p>
+
+<pre class="terminal" data-title="lk02.py"><code>"""Target leakage: a churn table with one column that is only filled in after the customer has decided to leave."""
+import numpy as np
+from lib import *
+
+rng = np.random.default_rng(22)
+N = 6000
+tenure = rng.exponential(24, N)                        # months as a customer
+spend = rng.gamma(4, 15, N)                            # monthly spend
+tickets = rng.poisson(1.2, N)                          # support tickets in the last 30 days
+logins = rng.poisson(8, N)                             # logins in the last 30 days
+z = -1.2 - 0.03 * tenure + 0.35 * tickets - 0.08 * logins + 0.004 * spend
+churn = (rng.random(N) &lt; sigmoid(z)).astype(int)
+# Retention team calls people who ask to cancel; 'offer_sent' is written DURING that call, i.e. after the decision.
+offer_sent = np.where(churn == 1, rng.random(N) &lt; 0.92, rng.random(N) &lt; 0.02).astype(float)
+names = ["tenure", "spend", "tickets_30d", "logins_30d", "retention_offer_sent"]
+X = np.c_[tenure, spend, tickets, logins, offer_sent]
+print(f"{N} customers, churn rate {churn.mean():.1%}")
+
+# Scan: how well does each column alone rank the target? (one number per feature)
+print("\nsingle-feature ROC AUC (0.5 = no signal; far from 0.5 either way = signal)")
+for j, nm in enumerate(names):
+    print(f"  {nm:&lt;22}{roc_auc(X[:, j], churn):.3f}")
+
+idx = rng.permutation(N); tr, te = idx[:4500], idx[4500:]
+def run(cols):
+    mu, sd = X[tr][:, cols].mean(0), X[tr][:, cols].std(0)
+    f = lambda A: (A[:, cols] - mu) / sd
+    b = fit_logreg(f(X[tr]), churn[tr], l2=1.0)
+    return b, f
+print("\nmodel                       offline test AUC   AUC when the column is empty (as at prediction time)")
+for label, cols in (("with retention_offer_sent", [0, 1, 2, 3, 4]), ("without it", [0, 1, 2, 3])):
+    b, f = run(cols)
+    off = roc_auc(predict_proba(b, f(X[te])), churn[te])
+    Xlive = X[te].copy(); Xlive[:, 4] = 0.0               # at prediction time no call has happened yet
+    live = roc_auc(predict_proba(b, f(Xlive)), churn[te])
+    print(f"{label:&lt;28}{off:&gt;14.3f}{live:&gt;30.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>6000 customers, churn rate 15.8%
+
+single-feature ROC AUC (0.5 = no signal; far from 0.5 either way = signal)
+  tenure                0.361
+  spend                 0.533
+  tickets_30d           0.598
+  logins_30d            0.435
+  retention_offer_sent  0.951
+
+model                       offline test AUC   AUC when the column is empty (as at prediction time)
+with retention_offer_sent            0.983                         0.676
+without it                           0.675                         0.675</code></pre>
+
+<p>Three things are visible. The scan flags <code>retention_offer_sent</code> instantly: a single column with ROC AUC 0.951 when the best honest feature manages 0.598 (and tenure 0.361, which is a 0.639 signal pointing downwards). The model with the leak reaches an offline test AUC of 0.983; without it, 0.675. And when the leak column is blanked, as it would be at time T, the "great" model falls to 0.676, no better than the honest one, and in a deployed system its probabilities would be badly off because the intercept was fitted in a world where the flag existed. The leak bought 30 points of offline AUC and zero points of real performance.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"If the feature is genuinely predictive, using it is fine." A feature can be predictive and still unusable. The question is never "does it predict the target?" but "will I have this exact value, computed this exact way, at the moment of the decision?" A column that predicts too well should raise suspicion, not pride: real predictors of human or market behaviour are rarely close to perfect.</p>
+</div>
+
+<h3>Audit every column for its clock</h3>
+
+<p>The cure is boring and effective: build a <strong>feature register</strong>, a table with one row per feature and the questions <em>where does it come from, when is it written, and can it be updated after the event?</em> Add a column for "available at prediction time: yes / no / unsure". Every "unsure" gets resolved by someone who knows the source system, because only they know that a field called <code>status</code> is overwritten when a case is closed. In pandas the as-of principle for a join looks like this (illustrative, not run here):</p>
+
+<pre class="terminal" data-title="asof_join.py (pandas, not run here)"><code>import pandas as pd
+
+# one row per (customer, prediction_date); events carry the time they were RECORDED
+features = pd.merge_asof(
+    predictions.sort_values("prediction_date"),
+    events.sort_values("recorded_at"),
+    left_on="prediction_date", right_on="recorded_at",
+    by="customer_id", direction="backward",          # only events recorded at or before the prediction date
+)</code></pre>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>The same bug appears in production as <em>train/serve skew</em>: the training pipeline reads a column from the warehouse as it stands today, while the serving path computes it from what is known now. Feature stores exist largely to make one definition serve both paths, with point-in-time correctness for training (<a href="../../design/chapters/20-ml-systems.html">designing with ML and LLMs</a>). Table lineage and data-quality checks (<a href="../../data/chapters/21-data-platforms.html">data platforms</a>) let you answer "when was this column written?" without guessing.</p>
+</div>
+
+<h2>Preprocessing leakage: learning from the validation rows</h2>
+
+<p>The second family is the most instructive because it contains no bad column at all. The mistake is in the order of operations. Any step that <em>learns something from data</em> (computing a mean to impute, a scale for standardising, a set of features to keep, a vocabulary, a PCA basis, a category-to-number encoding, a resampled class balance) is a small model with its own parameters. If those parameters are computed on all the rows before the split, information from the validation rows has reached the training features.</p>
+
+<p>For unsupervised steps like scaling the effect is often small, because a mean and a standard deviation are stable summaries. For steps that use the <em>labels</em>, the effect can be enormous. This is the example Hastie, Tibshirani and Friedman use in section 7.10.2 of <em>The Elements of Statistical Learning</em> ("The Wrong and Right Way to Do Cross-Validation"), reproduced here. There are 100 rows, 2,000 features of pure noise and coin-flip labels, so no model can honestly do better than 50%. We pick the 20 features that correlate best with the labels, then cross-validate a classifier on those 20.</p>
+
+<pre class="terminal" data-title="lk01.py"><code>"""Preprocessing leak: pick the 'best' 20 of 2,000 noise features, then cross-validate. The labels are coin flips."""
+import numpy as np
+from lib import *
+
+rng = np.random.default_rng(14)
+N, P, KEEP = 100, 2000, 20
+
+def top_features(X, y, k):
+    Xc = (X - X.mean(0)) / X.std(0)
+    corr = np.abs(Xc.T @ (y - y.mean())) / len(y)
+    return np.argsort(-corr)[:k]
+
+def accuracy(Xtr, ytr, Xte, yte):
+    b = fit_logreg(Xtr, ytr, l2=1.0, iters=12)
+    return np.mean((predict_proba(b, Xte) &gt;= 0.5) == yte)
+
+wrong, right = [], []
+for rep in range(20):
+    X = rng.normal(size=(N, P)); y = (rng.random(N) &lt; 0.5).astype(int)
+    folds = np.array_split(rng.permutation(N), 5)
+    cols_all = top_features(X, y, KEEP)                  # LEAK: selection saw every label, including the validation rows
+    a, b = [], []
+    for i in range(5):
+        tr = np.concatenate([folds[j] for j in range(5) if j != i]); va = folds[i]
+        a.append(accuracy(X[tr][:, cols_all], y[tr], X[va][:, cols_all], y[va]))
+        cols_in = top_features(X[tr], y[tr], KEEP)       # CORRECT: selection sees only the training rows of this fold
+        b.append(accuracy(X[tr][:, cols_in], y[tr], X[va][:, cols_in], y[va]))
+    wrong.append(np.mean(a)); right.append(np.mean(b))
+print("labels are coin flips, so the honest accuracy is 0.50")
+print(f"select features on all rows, then 5-fold CV : {np.mean(wrong):.3f}  (range {min(wrong):.2f} to {max(wrong):.2f} over 20 datasets)")
+print(f"select features inside each fold            : {np.mean(right):.3f}  (range {min(right):.2f} to {max(right):.2f})")</code></pre>
+<pre class="terminal" data-title="output"><code>labels are coin flips, so the honest accuracy is 0.50
+select features on all rows, then 5-fold CV : 0.837  (range 0.71 to 0.90 over 20 datasets)
+select features inside each fold            : 0.487  (range 0.36 to 0.61)</code></pre>
+
+<p>Selecting features on all the rows first gives a cross-validated accuracy of 0.837 on data that contains nothing to learn, and in individual datasets as high as 0.90. Moving the selection inside each fold brings it to 0.487, where it belongs. The logic is easy to see: with 2,000 candidates, some features correlate with the labels by chance, picking the best 20 using all labels selects exactly the lucky ones, and the validation rows' labels helped choose them.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Two pipelines. The wrong one: all rows go into a step that fits the scaler or feature selection on all rows, then are split into train and validation, then the model is fitted and scored; a red arrow shows the validation rows' labels influencing the fitted step. The right one: all rows are split first, preprocessing is fitted on train rows only, applied to validation rows, and the model is scored.">
+    <defs><marker id="ahML14b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="22" class="t-sm t-bold tc-red">Wrong: learn first, split second</text>
+    <rect x="20" y="36" width="100" height="52" rx="8" class="fs-green s-green sw-2"/>
+    <text x="70" y="66" text-anchor="middle" class="t-sm">all rows</text>
+    <rect x="160" y="36" width="210" height="52" rx="8" class="fs-red s-red sw-2"/>
+    <text x="265" y="58" text-anchor="middle" class="t-sm t-bold">fit selection / scaler</text>
+    <text x="265" y="76" text-anchor="middle" class="t-xs">on ALL rows and labels</text>
+    <rect x="410" y="36" width="160" height="52" rx="8" class="box"/>
+    <text x="490" y="58" text-anchor="middle" class="t-sm">split</text>
+    <text x="490" y="76" text-anchor="middle" class="t-xs">train | validation</text>
+    <rect x="610" y="36" width="130" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="675" y="58" text-anchor="middle" class="t-sm">fit, score</text>
+    <text x="675" y="76" text-anchor="middle" class="t-xs">looks great</text>
+    <line x1="120" y1="62" x2="158" y2="62" class="line" marker-end="url(#ahML14b)"/>
+    <line x1="370" y1="62" x2="408" y2="62" class="line" marker-end="url(#ahML14b)"/>
+    <line x1="570" y1="62" x2="608" y2="62" class="line" marker-end="url(#ahML14b)"/>
+    <text x="265" y="108" text-anchor="middle" class="t-xs tc-red">validation labels have already shaped the features</text>
+    <text x="20" y="162" class="t-sm t-bold tc-green">Right: split first, learn on train only</text>
+    <rect x="20" y="176" width="100" height="52" rx="8" class="fs-green s-green sw-2"/>
+    <text x="70" y="206" text-anchor="middle" class="t-sm">all rows</text>
+    <rect x="160" y="176" width="130" height="52" rx="8" class="box"/>
+    <text x="225" y="198" text-anchor="middle" class="t-sm">split first</text>
+    <text x="225" y="216" text-anchor="middle" class="t-xs">train | validation</text>
+    <rect x="330" y="176" width="220" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="440" y="198" text-anchor="middle" class="t-sm t-bold">fit selection / scaler</text>
+    <text x="440" y="216" text-anchor="middle" class="t-xs">on TRAIN rows only</text>
+    <rect x="590" y="176" width="150" height="52" rx="8" class="fs-green s-green sw-2"/>
+    <text x="665" y="198" text-anchor="middle" class="t-sm">apply, then score</text>
+    <text x="665" y="216" text-anchor="middle" class="t-xs">validation untouched</text>
+    <line x1="120" y1="202" x2="158" y2="202" class="line" marker-end="url(#ahML14b)"/>
+    <line x1="290" y1="202" x2="328" y2="202" class="line" marker-end="url(#ahML14b)"/>
+    <line x1="550" y1="202" x2="588" y2="202" class="line" marker-end="url(#ahML14b)"/>
+    <text x="440" y="252" text-anchor="middle" class="t-xs tc-green">repeat the whole right-hand pipeline inside every fold</text>
+    <text x="440" y="272" text-anchor="middle" class="t-xs t-muted">(a pipeline object does this automatically)</text>
+  </svg>
+  <figcaption><strong>The order of operations is the whole bug.</strong> Both pipelines contain the same steps. In the wrong one, the preprocessing step has seen the validation rows (and, for supervised steps, their labels) before validation begins.</figcaption>
+</figure>
+
+<p>In scikit-learn the fix is structural: put every learned step in a <code>Pipeline</code>, and hand the pipeline, not pre-transformed arrays, to the cross-validation function. The pipeline refits each step on the training part of each fold.</p>
+
+<pre class="terminal" data-title="pipeline_safe.py (scikit-learn, not run here)"><code>from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+
+# WRONG: the selector sees every label before cross-validation starts
+X_sel = SelectKBest(f_classif, k=20).fit_transform(X, y)
+bad = cross_val_score(LogisticRegression(), X_sel, y, cv=5)
+
+# RIGHT: selection is a step of the model, refitted inside every training fold
+pipe = make_pipeline(SimpleImputer(), StandardScaler(), SelectKBest(f_classif, k=20), LogisticRegression())
+good = cross_val_score(pipe, X, y, cv=5)</code></pre>
+
+<p>The rule generalises beyond scikit-learn: <strong>anything that has a <code>fit</code> belongs inside the fold.</strong> That includes target encoding (<a href="17-feature-engineering.html">chapter 17</a>), oversampling (<a href="15-imbalance-calibration.html">chapter 15</a>), and the choice of hyperparameters, which is the same bug one level up and is what nested cross-validation addresses.</p>
+
+<h2>Train-test contamination: the same example on both sides</h2>
+
+<p>The third family needs no cleverness from the model at all; it needs only a good memory. Duplicate or near-duplicate examples appear on both sides of the split, and the model scores them by recall. Duplicates arise from data entry, from joins that multiply rows, from scraping the same page twice, from data augmentation applied before the split, and from the grouped structure of chapter 13 (the same patient is a kind of near-duplicate).</p>
+
+<p>The script constructs the cleanest possible case. Labels are coin flips. 240 of 800 records were entered twice. A 1-nearest-neighbour classifier, which just copies the label of the closest training row, has nothing to learn but can memorise.</p>
+
+<pre class="terminal" data-title="lk03.py"><code>"""Train-test contamination: duplicated rows across the split, then adversarial validation to detect shift."""
+import numpy as np
+from lib import *
+
+rng = np.random.default_rng(33)
+
+# --- Part 1: duplicates. Labels are coin flips, so nothing can be learned; a memoriser still 'wins' if rows repeat.
+def nn1(Xtr, ytr, Xte):
+    d = ((Xte[:, None, :] - Xtr[None, :, :]) ** 2).sum(-1)
+    return ytr[d.argmin(1)]
+
+base = rng.normal(size=(800, 6)); y0 = (rng.random(800) &lt; 0.5).astype(int)
+dups = rng.choice(800, 240, replace=False)                     # 30% of records were entered twice
+X = np.vstack([base, base[dups]]); y = np.r_[y0, y0[dups]]
+gid = np.r_[np.arange(800), dups]                              # which original record each row came from
+n = len(y); perm = rng.permutation(n); te = perm[:n // 4]; tr = perm[n // 4:]
+leaky = np.mean(nn1(X[tr], y[tr], X[te]) == y[te])
+share = np.isin(gid[te], gid[tr]).mean()
+print(f"{n} rows, {len(dups)} duplicated records; labels are coin flips")
+print(f"random split: {share:.1%} of test rows have a twin in training; 1-NN accuracy {leaky:.3f}")
+ids = rng.permutation(800); test_ids = set(ids[:200])           # split by ORIGINAL record instead
+te2 = np.array([i for i in range(n) if gid[i] in test_ids]); tr2 = np.array([i for i in range(n) if gid[i] not in test_ids])
+print(f"split by record id: {np.isin(gid[te2], gid[tr2]).mean():.1%} twins; 1-NN accuracy {np.mean(nn1(X[tr2], y[tr2], X[te2]) == y[te2]):.3f}")
+
+# --- Part 2: adversarial validation. Can a classifier tell training rows from test rows?
+def table(n, month0):
+    age = rng.normal(0, 1, n)
+    amount = rng.lognormal(3, 0.6, n)
+    since = month0 + rng.uniform(0, 6, n)                       # months since launch: grows over time
+    return np.c_[age, np.log(amount), since]
+names = ["age_z", "log_amount", "months_since_launch"]
+def adv(train, test):
+    A = np.vstack([train, test]); t = np.r_[np.zeros(len(train)), np.ones(len(test))]
+    p = rng.permutation(len(t)); half = len(t) // 2
+    mu, sd = A.mean(0), A.std(0)
+    b = fit_logreg(((A - mu) / sd)[p[:half]], t[p[:half]], l2=1.0)
+    s = predict_proba(b, ((A - mu) / sd)[p[half:]])
+    return roc_auc(s, t[p[half:]].astype(int)), b[1:]
+for label, tr_m, te_m in (("random-like split (same months)", 0, 0), ("train months 0-6, test months 3-9", 0, 3)):
+    auc, coef = adv(table(3000, tr_m), table(1000, te_m))
+    W = {k: round(float(v), 2) for k, v in zip(names, coef)}
+    print(f"adversarial AUC, {label:&lt;36}: {auc:.3f}   standardised weights {W}")</code></pre>
+<pre class="terminal" data-title="output"><code>1040 rows, 240 duplicated records; labels are coin flips
+random split: 36.5% of test rows have a twin in training; 1-NN accuracy 0.681
+split by record id: 0.0% twins; 1-NN accuracy 0.492
+adversarial AUC, random-like split (same months)     : 0.478   standardised weights {'age_z': 0.06, 'log_amount': -0.07, 'months_since_launch': -0.05}
+adversarial AUC, train months 0-6, test months 3-9   : 0.863   standardised weights {'age_z': -0.07, 'log_amount': 0.13, 'months_since_launch': 2.2}</code></pre>
+
+<p>With a random split, 36.5% of the test rows have a twin in the training set and 1-nearest-neighbours scores 0.681 on labels that are pure noise (about half the twins are caught: 0.365 &times; 1.0 + 0.635 &times; 0.5 &asymp; 0.68). Splitting by the original record id leaves no twins and the accuracy returns to 0.492. The same pattern at scale is why image and text datasets are deduplicated before splitting, and why benchmark contamination, test questions appearing in a language model's training text, is a serious problem for evaluating large models (see <a href="../../evals/chapters/07-contamination.html">contamination, saturation and decay</a> and <a href="../../llm-training/chapters/23-evaluating-models.html">evaluating a model you trained</a>).</p>
+
+<p>Two practical points. Exact duplicates are easy: hash the rows (or the key columns) and count. <strong>Near-duplicates</strong> need a similarity measure: normalise text and hash n-grams, compare image embeddings, or cluster by a rounded numeric signature. And remember that the unit to keep apart is whatever the deployment will not have seen: the record, the person, the document, the session.</p>
+
+<h3>Adversarial validation: can a model tell your sets apart?</h3>
+
+<p>There is a clever generic detector for contamination and for distribution shift, used by competition participants for years. Label every training row 0 and every test row 1, throw away the real target, and train a classifier to tell them apart. If the two sets come from the same distribution, the classifier cannot do better than chance (AUC near 0.5). If it can, something systematically differs, and the classifier's weights or importances tell you which columns give it away. The second half of the script above does this for a dataset whose rows come from a launch that has been running for a while.</p>
+
+<p>When both sets cover the same months, the adversarial AUC is 0.478, chance. When the training set covers months 0 to 6 and the test set months 3 to 9, the AUC is 0.863 and one standardised weight, <code>months_since_launch</code> at 2.2, dwarfs the others. The finding is not a leak in the labelling sense, but it says "your test set is not like your training set in this column", which affects both the validity of validation and the model's behaviour in production. <a href="03-eda.html">Chapter 3</a> introduced this check for shift; here it doubles as a leak detector.</p>
+
+<h2>Temporal leakage: the future inside a feature</h2>
+
+<p>The fourth family hides inside feature construction. A rolling average, a cumulative sum, a customer's "lifetime value", a normalisation by the global maximum: each of these can quietly include rows from after the prediction time. In a time series the usual culprit is a window that is centred on the target day rather than ending before it.</p>
+
+<pre class="terminal" data-title="lk04.py"><code>"""Temporal leak in a feature: a 'rolling average' that is centred on the day being predicted."""
+import numpy as np
+
+rng = np.random.default_rng(44)
+T = 730
+level = 100 + np.cumsum(rng.normal(0, 1.0, T))               # slowly wandering demand level
+y = level + rng.normal(0, 8, T)                              # daily sales = level + noise
+W = 7
+
+centred = np.array([y[max(0, t - W // 2): t + W // 2 + 1].mean() for t in range(T)])   # uses days t-3 .. t+3 (includes t)
+trailing = np.array([y[max(0, t - W): t].mean() if t &gt; 0 else y[0] for t in range(T)])  # uses days t-7 .. t-1 only
+
+def r2_of_linear(feature, target, split=500):
+    A = np.c_[np.ones(split), feature[:split]]
+    b = np.linalg.lstsq(A, target[:split], rcond=None)[0]
+    pred = b[0] + b[1] * feature[split:]
+    return 1 - np.sum((target[split:] - pred) ** 2) / np.sum((target[split:] - target[split:].mean()) ** 2), np.sqrt(np.mean((target[split:] - pred) ** 2))
+for name, f in (("centred 7-day mean (leaks day t)", centred), ("trailing 7-day mean (days t-7..t-1)", trailing)):
+    r2, rmse = r2_of_linear(f, y)
+    print(f"{name:&lt;38} held-out R^2 {r2:.3f}   RMSE {rmse:.2f}")
+print(f"yesterday's value alone (naive baseline)   RMSE {np.sqrt(np.mean((y[501:] - y[500:-1]) ** 2)):.2f}")</code></pre>
+<pre class="terminal" data-title="output"><code>centred 7-day mean (leaks day t)       held-out R^2 0.582   RMSE 6.85
+trailing 7-day mean (days t-7..t-1)    held-out R^2 0.312   RMSE 8.79
+yesterday's value alone (naive baseline)   RMSE 10.20</code></pre>
+
+<p>A 7-day mean centred on day <i>t</i> averages days <i>t</i>&minus;3 to <i>t</i>+3, which includes the day being predicted and three days of its future. Used as a feature it achieves a held-out R<sup>2</sup> of 0.582 and a root-mean-square error (RMSE) of 6.85. The honest version, a trailing mean over days <i>t</i>&minus;7 to <i>t</i>&minus;1, gets 0.312 and 8.79, and yesterday's value alone gets 10.20. The leak is not subtle in size (about two RMSE units better than anything a real forecaster can do), but it does not announce itself: the code runs, the plot looks right, and the metric improves. The defence is to write every windowed feature with an explicit "as of" boundary and to test it: change the value of the target at day <i>t</i> and check that the feature for day <i>t</i> does not move. <a href="18-time-series.html">Chapter 18</a> returns to lag features and backtesting.</p>
+
+<h2>Collection artefacts: the dataset's own fingerprints</h2>
+
+<p>The fifth family comes from how the data was assembled, not from what it measures. A row number tells you which export a record came from; a file name or folder tells you which lab produced the image; a hospital or scanner code tells you which population you are in; a free-text note says "referred to oncology". If the collection process correlated with the label (for example, positive cases were collected first, from a specialist centre), the artefact is a shortcut that the model will find faster than the real signal. It will also fail the moment it meets data collected a different way.</p>
+
+<p>These are the leaks a systematic scan catches best. The function below scores each column alone by its ROC AUC against the target and flags any column whose AUC is far from 0.5. The demonstration table was assembled by appending two clinic exports (the first with 30% positives, the second with 5%) and keeps the export's row number and a clinic code as columns, next to two genuine, modest signals and a noise column.</p>
+
+<pre class="terminal" data-title="lk05.py"><code>"""A leak scan: score every column by how well it alone ranks the target, and flag the suspicious ones."""
+import numpy as np
+from lib import *
+
+rng = np.random.default_rng(55)
+# A table assembled by appending two exports: clinic A (older, 30% positive) then clinic B (newer, 5% positive).
+nA, nB = 1500, 3500
+y = np.r_[(rng.random(nA) &lt; 0.30), (rng.random(nB) &lt; 0.05)].astype(int)
+row_id = np.arange(nA + nB)                                  # the export's row number, kept as a column
+age = rng.normal(55, 12, nA + nB) + 4 * y                    # a genuine, modest signal
+bp = rng.normal(130, 15, nA + nB) + 6 * y                    # another
+clinic_code = np.r_[np.zeros(nA), np.ones(nB)]               # which clinic the row came from
+visit_day = rng.integers(0, 365, nA + nB)                    # noise
+names = ["row_id", "age", "systolic_bp", "clinic_code", "visit_day"]
+X = np.c_[row_id, age, bp, clinic_code, visit_day]
+
+def leak_scan(X, y, names, flag_at=0.15):
+    print(f"{'column':&lt;14}{'AUC alone':&gt;10}  {'distance from 0.5':&gt;18}  verdict")
+    for j, n in enumerate(names):
+        a = roc_auc(X[:, j], y); d = abs(a - 0.5)
+        verdict = "SUSPECT: explain it before using it" if d &gt;= flag_at else ("some signal" if d &gt;= 0.05 else "little signal")
+        print(f"{n:&lt;14}{a:&gt;10.3f}  {d:&gt;18.3f}  {verdict}")
+print(f"{len(y)} rows, {y.mean():.1%} positive")
+leak_scan(X, y, names)</code></pre>
+<pre class="terminal" data-title="output"><code>5000 rows, 13.1% positive
+column         AUC alone   distance from 0.5  verdict
+row_id             0.262               0.238  SUSPECT: explain it before using it
+age                0.587               0.087  some signal
+systolic_bp        0.604               0.104  some signal
+clinic_code        0.259               0.241  SUSPECT: explain it before using it
+visit_day          0.493               0.007  little signal</code></pre>
+
+<p>The scan separates the table into three groups. <code>row_id</code> (0.262) and <code>clinic_code</code> (0.259) are flagged: they are far stronger than the honest clinical measurements (0.587 and 0.604) and they carry no clinical meaning. The noise column sits at 0.493. The verdict word is "explain it", not "delete it": a clinic code could be legitimate if the model will always be used in these same two clinics and prevalence truly differs, but then it should be a conscious choice, documented, and the model should be tested on a third clinic. A row number is never legitimate. Flag any column that is both very predictive and has no causal story.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 292" role="img" aria-label="Paired horizontal bars comparing the leaky and honest result for four experiments. Feature selection before cross-validation: accuracy 0.837 leaky, 0.487 honest. Post-decision column in churn table: AUC 0.983 leaky, 0.675 honest. Duplicates across the split: 1-nearest-neighbour accuracy 0.681 leaky, 0.492 honest. Centred rolling mean: R squared 0.582 leaky, 0.312 honest.">
+    <line x1="250" y1="22" x2="250" y2="252" class="line-thin"/>
+    <line x1="470" y1="22" x2="470" y2="252" class="line-thin" opacity="0.3"/>
+    <line x1="690" y1="22" x2="690" y2="252" class="line-thin" opacity="0.3"/>
+    <text x="250" y="270" text-anchor="middle" class="t-xs t-faint">0</text>
+    <text x="470" y="270" text-anchor="middle" class="t-xs t-faint">0.5</text>
+    <text x="690" y="270" text-anchor="middle" class="t-xs t-faint">1.0</text>
+    <text x="240" y="48" text-anchor="end" class="t-xs t-bold">selection before CV</text>
+    <text x="240" y="62" text-anchor="end" class="t-xs t-muted">accuracy, noise labels</text>
+    <text x="240" y="108" text-anchor="end" class="t-xs t-bold">post-decision column</text>
+    <text x="240" y="122" text-anchor="end" class="t-xs t-muted">ROC AUC, churn table</text>
+    <text x="240" y="168" text-anchor="end" class="t-xs t-bold">duplicates across split</text>
+    <text x="240" y="182" text-anchor="end" class="t-xs t-muted">1-NN accuracy, noise labels</text>
+    <text x="240" y="228" text-anchor="end" class="t-xs t-bold">centred rolling mean</text>
+    <text x="240" y="242" text-anchor="end" class="t-xs t-muted">R-squared, forecasting</text>
+    <rect x="250" y="34" width="368" height="18" class="f-red" opacity="0.85"/><rect x="250" y="56" width="214" height="18" class="f-green" opacity="0.85"/>
+    <text x="624" y="48" class="t-xs t-bold">0.837</text><text x="470" y="70" class="t-xs t-bold">0.487</text>
+    <rect x="250" y="94" width="432" height="18" class="f-red" opacity="0.85"/><rect x="250" y="116" width="297" height="18" class="f-green" opacity="0.85"/>
+    <text x="688" y="108" class="t-xs t-bold">0.983</text><text x="553" y="130" class="t-xs t-bold">0.675</text>
+    <rect x="250" y="154" width="300" height="18" class="f-red" opacity="0.85"/><rect x="250" y="176" width="216" height="18" class="f-green" opacity="0.85"/>
+    <text x="556" y="168" class="t-xs t-bold">0.681</text><text x="472" y="190" class="t-xs t-bold">0.492</text>
+    <rect x="250" y="214" width="256" height="18" class="f-red" opacity="0.85"/><rect x="250" y="236" width="137" height="18" class="f-green" opacity="0.85"/>
+    <text x="512" y="228" class="t-xs t-bold">0.582</text><text x="393" y="250" class="t-xs t-bold">0.312</text>
+    <rect x="560" y="8" width="12" height="12" class="f-red"/><text x="578" y="18" class="t-xs">with the leak</text>
+    <rect x="660" y="8" width="12" height="12" class="f-green"/><text x="678" y="18" class="t-xs">honest</text>
+  </svg>
+  <figcaption><strong>Every leak makes the number better and the model no better.</strong> Values from <code>lk01.py</code>, <code>lk02.py</code>, <code>lk03.py</code> and <code>lk04.py</code>. The honest bars sit at what the data actually supports (chance, in the two noise experiments).</figcaption>
+</figure>
+
+<h2>Hunting for leaks</h2>
+
+<p>No single test catches everything, so use several, in roughly this order. Each is cheap compared with the cost of shipping a model that cannot work.</p>
+
+<ol class="steps">
+  <li><strong>Write the prediction-time sentence and the feature register.</strong> For each column: source, time written, can it change after the event, available at prediction time. This catches target and temporal leakage at the source, before any code runs.</li>
+  <li><strong>Run the single-column scan.</strong> Score every feature alone against the target (<code>lk05.py</code>). A single column with AUC beyond about 0.8, or a handful of unexplained near-perfect ones, is a suspect. Identifiers, timestamps and row numbers belong in the scan too.</li>
+  <li><strong>Read the importance ranking of a first model.</strong> If one feature dominates, ask why. <a href="16-interpretability.html">Chapter 16</a> shows how to compute it honestly. Importance is a lead, not a verdict, but leaks tend to top the list.</li>
+  <li><strong>Delete the best feature and refit.</strong> If performance collapses, you now know the model hangs on one column; make sure that column is legitimate. If it barely moves, other features carry the signal (or other leaks do).</li>
+  <li><strong>Compare random folds with honest folds.</strong> A large gap between a random-split score and a grouped or time-ordered one (as in chapter 13) says that identity or time is doing work the deployment cannot count on.</li>
+  <li><strong>Shuffle the labels and run the entire pipeline.</strong> From <a href="04-baselines.html">chapter 4</a>: with permuted labels every honest pipeline falls to chance. If yours does not, something besides the labels is carrying information. The preprocessing leak in <code>lk01.py</code> is exactly what this test exposes.</li>
+  <li><strong>Run adversarial validation</strong> between training and test (or training and the latest production data) to catch contamination and shift.</li>
+  <li><strong>Test train/serve parity.</strong> Recompute the features for a sample of historical cases through the production path, as of their prediction time, and compare with the training table. Differences are leaks or bugs.</li>
+  <li><strong>Backtest or shadow-deploy.</strong> The final detector is reality: score live traffic silently for a few weeks and compare to the offline estimate. A gap that persists after allowing for noise is a leak or a shift, and either way you want to know before launch.</li>
+</ol>
+
+<p>Notice what is missing from the list: looking at a better metric. Leaks live in the inputs and in the order of operations, not in the metric.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Leakage is now studied as a research-quality problem in its own right. Kapoor and Narayanan's survey reported 329 affected papers across 17 fields in its abstract; that is a snapshot of the literature they reviewed, not a live count, and later work will have added cases. In May 2024 the same group, with 18 co-authors, published REFORMS in <em>Science Advances</em>, a checklist of 32 questions for ML-based science that includes leakage items. For language models the same ideas apply to benchmark contamination, which A6 covers. Tooling (pipeline objects, feature stores with point-in-time joins, data-quality gates) keeps improving, but none of it replaces asking when each column is written.</p>
+</div>
+
+<h2>After you find one</h2>
+
+<p>Finding a leak is good news that feels like bad news. Treat it with some structure. First, <strong>fix it at the source</strong>: remove the column, change the join, move the preprocessing into the pipeline. A patch in the notebook leaves the next person to rediscover it. Second, <strong>rerun everything that depended on it</strong>, including comparisons between models, feature importances and any decision made from them. A leak can change which model wins (chapter 13 showed a ranking reversing). Third, <strong>restate the baseline</strong>: the honest number is probably much closer to the chapter 4 baselines than you hoped, and that is the real starting point. Fourth, <strong>learn from it</strong> in the blameless style of <a href="../../reliability/chapters/17-postmortems.html">postmortems</a>: how did the leak get through review, and what check (a scan in CI, a feature register, a pipeline template) would have stopped it? Competition organisers do exactly this; <a href="../cases/case-06-competition-leaks.html">case study 6</a> tells how row orders, IDs and timestamps decided contests, and how organisers learned to prevent it.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Take <code>lk01.py</code> and change <code>KEEP</code> (the number of selected features) from 20 to 2,000, the full set. What do the two accuracies become, and why does the gap close? Then set <code>P</code> to 20 and <code>KEEP</code> to 20. Is there still a gap? Finally, change the pipeline so the label is genuinely related to the first feature (for example <code>y = (X[:, 0] + rng.normal(size=N) &gt; 0)</code>) and see how much of the leaky estimate is real signal and how much is selection luck.</p>
+  <pre class="terminal"><span class="prompt">$</span> <span class="cmd">python3 lk01.py</span></pre>
+  <p>Then open the leak-hunt lab (<a href="../labs/lab-04-leakage-hunt.html">Lab 4</a>), which asks you to build a validation harness that catches four planted leaks.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Leakage is information the model will not legitimately have at prediction time. It is defined relative to a deployment, and held-out data cannot reveal it because the held-out data is contaminated too.</li>
+    <li>There are five families: target leakage, preprocessing leakage, train-test contamination, temporal leakage and collection artefacts. Each inflated a score here by 0.2 to 0.35 without making the model any better.</li>
+    <li>A feature is legitimate only if its value, computed the same way, exists before the prediction time. Keep a feature register and use as-of joins.</li>
+    <li>Anything with a <code>fit</code>, supervised or not, belongs inside the cross-validation fold. Selecting 20 of 2,000 noise features first gave 0.837 accuracy on coin flips; inside the fold, 0.487.</li>
+    <li>Duplicates and repeated entities let a memoriser score well on noise (0.681 with 36.5% twins); deduplicate and split by entity.</li>
+    <li>Scan single columns, compare random with honest splits, shuffle labels, run adversarial validation, check train/serve parity, and shadow-deploy. A result that is too good is a bug report until shown otherwise.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://www.doi.org/10.1145/2382577.2382579" target="_blank" rel="noopener">Kaufman, Rosset, Perlich and Stitelman, "Leakage in Data Mining: Formulation, Detection, and Avoidance" (ACM TKDD, 2012)</a>. The definition used here, a taxonomy, and a causal-graph view of leakage.</li>
+  <li><a href="https://arxiv.org/abs/2207.07048" target="_blank" rel="noopener">Kapoor and Narayanan, "Leakage and the Reproducibility Crisis in ML-based Science" (2022, published 2023)</a>. The survey of 17 fields and a taxonomy of leaks in published research.</li>
+  <li><a href="https://reforms.cs.princeton.edu/" target="_blank" rel="noopener">Kapoor et al., "REFORMS: Consensus-based Recommendations for Machine-learning-based Science" (Science Advances, 2024)</a>. A 32-question checklist and its guidance, useful as a review template for any ML project.</li>
+  <li><a href="https://hastie.su.domains/ElemStatLearn/" target="_blank" rel="noopener">Hastie, Tibshirani and Friedman, <em>The Elements of Statistical Learning</em>, section 7.10.2</a>. "The Wrong and Right Way to Do Cross-Validation", the feature-selection example reproduced in this chapter.</li>
+  <li><a href="https://scikit-learn.org/stable/common_pitfalls.html" target="_blank" rel="noopener">scikit-learn user guide, "Common pitfalls and recommended practices"</a>. Data leakage and pipelines from the library's own documentation.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A model to predict hospital readmission within 30 days of discharge uses 50 features and reaches AUC 0.97 on a held-out test set. The strongest feature is "discharge medication count", entered by the pharmacy when the patient leaves. What is the best next step?</p>
+    <ol class="q-options"><li>Publish the result, since the test set was held out properly.</li><li>Check whether each feature, especially that one, is actually available at the time the prediction will be made, and whether its value can change after discharge.</li><li>Increase the regularisation to reduce overfitting.</li><li>Collect more data to confirm the AUC.</li></ol>
+    <div class="q-explain">A held-out set shares the dataset's leaks, so a clean test split does not protect against a feature recorded at or after the decision. The right move is the timing audit. Regularisation and more data do not help with a legitimate-looking column that is simply unavailable (or different) at prediction time.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You standardise all features using the mean and standard deviation of the full dataset, then run 5-fold cross-validation. Which statement is most accurate?</p>
+    <ol class="q-options"><li>This is harmless in every case, because scaling does not use the labels.</li><li>This is the same severity as selecting features with the labels on all rows.</li><li>It cannot matter because the scaler is not a model.</li><li>It is a leak of validation information into training; the effect is often small for scaling but the habit of fitting outside the fold produces large errors for supervised steps, so use a pipeline for everything.</li></ol>
+    <div class="q-explain">Scaling uses statistics of the validation rows, so in principle validation has influenced training, though the effect is usually modest. Label-using steps are much worse (the 2,000-feature experiment). Because one cannot always tell in advance which steps matter, the safe rule is that all learned steps live inside the fold.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">The single-column scan shows <code>row_id</code> with an AUC of 0.26 against the target. What does this most likely mean?</p>
+    <ol class="q-options"><li>The rows were assembled in an order related to the label, so the row number leaks collection history.</li><li>Row number is a strong causal driver of the outcome.</li><li>The scan is faulty, because an identifier cannot have an AUC below 0.5.</li><li>The model should use row_id with its sign flipped.</li></ol>
+    <div class="q-explain">An AUC of 0.26 is as informative as 0.74 with the direction reversed. Identifiers have no causal link to outcomes, so the signal must come from how the data was assembled (for example, positives collected first or from one source). Using it would fail on any data assembled differently, so drop it and investigate the collection process.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A 1-nearest-neighbour classifier gets 0.68 accuracy on a task whose labels are provably random. Which diagnosis fits best?</p>
+    <ol class="q-options"><li>The labels are not actually random.</li><li>The model has high bias.</li><li>Many test rows have duplicates or twins in the training set, so the model is retrieving labels rather than predicting them.</li><li>Accuracy is the wrong metric for balanced classes.</li></ol>
+    <div class="q-explain">With random labels the best any honest method can do is chance. Beating chance by this much means the test rows' labels are recoverable from training, as when a third of them have an identical twin. High bias would push towards chance, not above it, and the metric is not at fault.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You build adversarial validation between your training and test sets and the classifier reaches AUC 0.86, driven by a <code>months_since_launch</code> column. What does this indicate?</p>
+    <ol class="q-options"><li>The test set is better than the training set.</li><li>The model will generalise well because the test set is easy to identify.</li><li>The sets are identical, so the validation is reliable.</li><li>The training and test data differ systematically in that column, so the validation score may not reflect behaviour on the test period, and the model may extrapolate in production.</li></ol>
+    <div class="q-explain">An adversarial AUC near 0.5 means the sets are indistinguishable; high values mean they differ, and the weights point to how. This is evidence of shift (and possibly of a leak if the column also encodes the target), not of quality. It tells you to rethink the split or the feature.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A forecasting team computes a feature "7-day average sales" with a window centred on the day to be predicted and finds it improves backtests by 25%. Which is the best response?</p>
+    <ol class="q-options"><li>Replace it with a trailing window that ends the day before, check that changing day t's sales does not change day t's feature, and recompute all comparisons.</li><li>Keep it, since the improvement is large and consistent.</li><li>Widen the window to 14 days to reduce noise.</li><li>Apply it only to the training set.</li></ol>
+    <div class="q-explain">A centred window includes the day being predicted and future days, which are unavailable when forecasting. The invariance test (perturb the target at t and see whether the feature moves) is a direct check. Widening the window or limiting it to training does not remove the future information, and keeping it would mean shipping a feature that cannot be computed live.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+</body>
+</html>

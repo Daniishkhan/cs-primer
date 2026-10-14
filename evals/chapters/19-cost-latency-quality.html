@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cost, Latency &amp; Quality Trade-offs · Evals, Guardrails &amp; Safe Operation</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="evl" data-chapter="19">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Cost, Latency &amp; Quality Trade-offs</h1>
+  <p class="lede">Every change to an AI system moves three numbers at once: how good the answers are, how long they take and what they cost. This chapter shows how to measure all three on the same test set, find the configurations that are not beaten on every axis, use routing and caching to move along that frontier, and decide, with arithmetic, what "good enough" is worth.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The earlier chapters of this course taught you to measure quality. In production, quality is never bought alone: a larger model, more retrieved passages or three votes per question all raise it, and all raise the bill and the wait. Teams that look at only one axis make two familiar mistakes. They ship the biggest model because the eval score is higher, and discover the margin is a loss on every ticket. Or they switch to the cheapest model because the invoice alarmed someone, and discover the failures cost more than the saving. After this chapter you can put a system on a quality, cost and latency chart with honest error bars, say which configurations are dominated, and defend a choice with numbers that survive the next price change.</p>
+</div>
+
+<h2>The three prices of an answer</h2>
+
+<p>An AI system charges you three prices for each answer, and you need a number for each before you can trade them.</p>
+
+<p><span class="term">Cost</span> is money per unit of useful work. The provider's price list quotes dollars per million tokens, with different rates for <span class="term">input tokens</span> (everything you send: system prompt, history, retrieved passages) and <span class="term">output tokens</span> (what the model writes). Output tokens usually cost several times more per token than input tokens, and they are produced one at a time, which is why they also dominate latency. The price of one call is:</p>
+
+<p style="text-align:center">cost<sub>call</sub> = (tokens<sub>in</sub> &times; price<sub>in</sub> + tokens<sub>out</sub> &times; price<sub>out</sub>) &divide; 1,000,000</p>
+
+<p>That is the price of a call, not of a task. An agent that answers a question in a loop (<a href="../../agents/chapters/02-tool-loop.html">Tool Calling: The Agent Loop</a>) makes several calls, and each call re-sends the growing conversation. Suppose a support agent makes six calls whose input grows from 3,000 to 8,000 tokens (3,000, 4,000, up to 8,000: 33,000 input tokens in total) and writes 300 tokens each time (1,800 in total). At an illustrative $3 per million input tokens and $15 per million output tokens, that is 33,000 &times; 3 &divide; 1,000,000 + 1,800 &times; 15 &divide; 1,000,000 = $0.099 + $0.027 = $0.126 per attempt. If the agent resolves 70% of tasks, the cost that matters is the <span class="term">cost per successful task</span>: $0.126 &divide; 0.70 = $0.18, because failed attempts are paid for too. Cost per call is the number on the price list. Cost per successful task is the number on your profit and loss account.</p>
+
+<p><span class="term">Latency</span> is the time the user waits. For a streamed answer it has two parts: the <span class="term">time to first token</span> (TTFT), which is dominated by reading the prompt, and the generation time, which is roughly the number of output tokens divided by the model's output speed (<a href="../../llm-training/chapters/18-kv-cache.html">The KV Cache &amp; the Cost of Decoding</a> explains why generation is slow per token). A system with retrieval, a reranker and two model calls adds the latency of each step in series, and what users feel is the tail, not the average (<a href="../../reliability/chapters/09-tail-latency.html">Tail Latency at Scale</a>).</p>
+
+<p><span class="term">Quality</span> is the pass rate of your eval on a test set that looks like production, with an error bar (<a href="04-eval-statistics.html">Statistics for Evals</a>). It is the one axis you cannot read off a bill, which is why this chapter sits after the evaluation chapters: without a quality number you are optimising two axes and hoping about the third.</p>
+
+<h2>The Pareto front</h2>
+
+<p>Suppose you have seven candidate configurations: three model sizes, each with and without retrieval, plus one expensive configuration that asks the large model three times and takes a vote. You run all seven on the same 400 test items and record quality, cost and latency. Configuration A <span class="term">dominates</span> configuration B if A is at least as good on every axis and strictly better on at least one. A dominated configuration should never be chosen: something else is better in every way you care about. The configurations that nobody dominates form the <span class="term">Pareto front</span> (after the economist Vilfredo Pareto), and the real decision is a choice among them.</p>
+
+<p>The script below simulates that experiment. It is a stand-in, not a measurement of any real model: each test item has a shared difficulty, each configuration has a made-up skill, and the pass probability is a logistic function of skill minus difficulty. Prices, token counts and speeds are illustrative assumptions chosen to look like a small, a mid-sized and a large model. The structure is real: the same items for every configuration, a Wilson confidence interval on each pass rate, cost per 1,000 tasks from token counts, and an explicit dominance test.</p>
+
+<pre class="terminal" data-title="pareto.py"><code>import math, random
+
+random.seed(7)
+N = 400
+difficulty = [random.gauss(0, 1) for _ in range(N)]          # one shared difficulty per test item
+
+# name: (model skill, price in/out per million tokens, prompt tokens, output tokens, ttft s, tokens/s)
+CONFIGS = {
+    "small":            (0.2, (0.20, 0.80),  900, 220, 0.30, 180),
+    "small + RAG":      (0.9, (0.20, 0.80), 3900, 220, 0.45, 180),
+    "medium":           (0.9, (1.00, 4.00),  900, 240, 0.50, 110),
+    "medium + RAG":     (1.6, (1.00, 4.00), 3900, 240, 0.80, 110),
+    "large":            (1.7, (5.00, 20.0),  900, 260, 0.90,  70),
+    "large + RAG":      (2.3, (5.00, 20.0), 3900, 260, 1.40,  70),
+    "large + RAG + 3x vote": (2.5, (5.00, 20.0), 3900 * 3, 260 * 3, 1.40, 70),
+}
+
+def passes(skill, d, rng):
+    p = 1 / (1 + math.exp(-(skill - d)))
+    return rng.random() &lt; p
+
+def wilson(k, n, z=1.96):
+    p = k / n
+    c = (p + z * z / (2 * n)) / (1 + z * z / n)
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return c - h, c + h
+
+rows = []
+for name, (skill, (pin, pout), tin, tout, ttft, tps) in CONFIGS.items():
+    rng = random.Random(name)
+    k = sum(passes(skill, d, rng) for d in difficulty)
+    lo, hi = wilson(k, N)
+    cost = (tin * pin + tout * pout) / 1e6 * 1000            # dollars per 1,000 tasks
+    lat = ttft + tout / tps                                  # seconds, ignoring queueing
+    rows.append([name, k / N, lo, hi, cost, lat])
+
+def dominated(r, others):
+    return any(o[1] &gt;= r[1] and o[4] &lt;= r[4] and o[5] &lt;= r[5] and (o[1] &gt; r[1] or o[4] &lt; r[4] or o[5] &lt; r[5])
+               for o in others if o is not r)
+
+print(f"{'config':&lt;24}{'quality':&gt;8}{'95% CI':&gt;15}{'$/1k tasks':&gt;12}{'latency s':&gt;10}  verdict")
+for r in rows:
+    v = "dominated" if dominated(r, rows) else "on the front"
+    print(f"{r[0]:&lt;24}{r[1]:&gt;8.1%}{'  [%.1f, %.1f]' % (r[2]*100, r[3]*100):&gt;15}{r[4]:&gt;12.2f}{r[5]:&gt;10.2f}  {v}")</code></pre>
+<pre class="terminal" data-title="output"><code>config                   quality         95% CI  $/1k tasks latency s  verdict
+small                      54.5%   [49.6, 59.3]        0.36      1.52  on the front
+small + RAG                67.8%   [63.0, 72.1]        0.96      1.67  on the front
+medium                     67.5%   [62.8, 71.9]        1.86      2.68  dominated
+medium + RAG               79.5%   [75.3, 83.2]        4.86      2.98  on the front
+large                      76.0%   [71.6, 79.9]        9.70      4.61  dominated
+large + RAG                86.0%   [82.3, 89.1]       24.70      5.11  on the front
+large + RAG + 3x vote      90.0%   [86.7, 92.6]       74.10     12.54  on the front</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Scatter plot of quality against cost per 1,000 tasks on a logarithmic axis for seven configurations. Five lie on the Pareto front, joined by a line rising from small at 54.5 percent and 0.36 dollars to large plus RAG plus vote at 90 percent and 74 dollars. Medium at 67.5 percent and 1.86 dollars and large at 76 percent and 9.70 dollars lie below the line and are dominated.">
+    <line x1="90" y1="210" x2="720" y2="210" class="line"/><line x1="90" y1="30" x2="90" y2="210" class="line"/>
+    <line x1="221" y1="30" x2="221" y2="210" class="line-thin"/><line x1="340" y1="30" x2="340" y2="210" class="line-thin"/><line x1="470" y1="30" x2="470" y2="210" class="line-thin"/><line x1="589" y1="30" x2="589" y2="210" class="line-thin"/><line x1="720" y1="30" x2="720" y2="210" class="line-thin"/>
+    <line x1="90" y1="170" x2="720" y2="170" class="line-thin"/><line x1="90" y1="130" x2="720" y2="130" class="line-thin"/><line x1="90" y1="90" x2="720" y2="90" class="line-thin"/><line x1="90" y1="50" x2="720" y2="50" class="line-thin"/>
+    <text x="90" y="228" text-anchor="middle" class="t-xs t-muted">$0.30</text><text x="221" y="228" text-anchor="middle" class="t-xs t-muted">$1</text><text x="340" y="228" text-anchor="middle" class="t-xs t-muted">$3</text><text x="470" y="228" text-anchor="middle" class="t-xs t-muted">$10</text><text x="589" y="228" text-anchor="middle" class="t-xs t-muted">$30</text><text x="720" y="228" text-anchor="middle" class="t-xs t-muted">$100</text>
+    <text x="82" y="214" text-anchor="end" class="t-xs t-muted">50%</text><text x="82" y="174" text-anchor="end" class="t-xs t-muted">60%</text><text x="82" y="134" text-anchor="end" class="t-xs t-muted">70%</text><text x="82" y="94" text-anchor="end" class="t-xs t-muted">80%</text><text x="82" y="54" text-anchor="end" class="t-xs t-muted">90%</text>
+    <text x="405" y="250" text-anchor="middle" class="t-xs t-muted">cost per 1,000 tasks (log scale)</text>
+    <text x="20" y="120" class="t-xs t-muted" transform="rotate(-90 20 120)" text-anchor="middle">quality (pass rate)</text>
+    <path d="M110,192 L216,139 L392,92 L568,66 L687,50" fill="none" class="s-green sw-2"/>
+    <circle cx="110" cy="192" r="6" class="f-green"/><circle cx="216" cy="139" r="6" class="f-green"/><circle cx="392" cy="92" r="6" class="f-green"/><circle cx="568" cy="66" r="6" class="f-green"/><circle cx="687" cy="50" r="6" class="f-green"/>
+    <circle cx="288" cy="140" r="6" class="f-red"/><circle cx="467" cy="106" r="6" class="f-red"/>
+    <text x="118" y="206" class="t-xs">small</text>
+    <text x="196" y="124" class="t-xs">small + RAG</text>
+    <text x="298" y="156" class="t-xs tc-red">medium (dominated)</text>
+    <text x="400" y="86" class="t-xs">medium + RAG</text>
+    <text x="478" y="122" class="t-xs tc-red">large (dominated)</text>
+    <text x="576" y="82" class="t-xs">large + RAG</text>
+    <text x="684" y="40" text-anchor="end" class="t-xs">+ 3x vote</text>
+  </svg>
+  <figcaption><strong>Medium and large are never the right choice here.</strong> Small plus retrieval matches medium on quality for half the cost and less delay, and medium plus retrieval beats large without retrieval at half the cost again. The green line is the front; the right-hand end of it is where each extra point of quality gets very expensive.</figcaption>
+</figure>
+
+<p>Read the table and the chart together. Three things are worth noticing.</p>
+<ul>
+  <li><strong>Retrieval beats model size at the low end.</strong> In this simulation, adding retrieval to the small model buys 13 points of quality for about $0.60 per 1,000 tasks, while moving from small to medium without retrieval buys the same 13 points for $1.50. Whether that holds for your task is an empirical question; the point is to ask it, instead of assuming that "bigger model" is the first lever.</li>
+  <li><strong>The front bends.</strong> From large plus retrieval to the voting configuration, quality rises four points and the cost triples, and the latency more than doubles. Whether four points are worth $49 per 1,000 tasks depends on what a failure costs, which is the last section of this chapter.</li>
+  <li><strong>Error bars decide ties.</strong> Small plus retrieval (67.8%, interval 63.0 to 72.1) and medium (67.5%, 62.8 to 71.9) are indistinguishable on 400 items. The table calls medium "dominated" because it is no better and costs more, which is the right practical call, but a 0.3-point gap is a tie, not a victory. If you need to rank configurations that are close, use the paired comparison from the statistics chapter: the same items go through both, and you test the per-item differences.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Pick the cheapest model that passes our quality bar." The bar is a single number on one test set, and a cheaper model can pass it overall while failing badly on the slice that matters: the rare, expensive, high-stakes questions. Check the candidate on every slice you named in error analysis (<a href="01-error-analysis.html">Error Analysis</a>), and set a floor per slice, not only an average. A model that is 3 points worse overall and 25 points worse on refund disputes is not 3 points worse.</p>
+</div>
+
+<h2>Where the cost goes, and the levers</h2>
+
+<p>Before reaching for routing or caching, list the levers in rough order of effort. Most of them are visible in the trace (<a href="17-observability.html">Tracing &amp; Observability for LLM Systems</a> records tokens and latency per span), so start by sorting the traces by cost and reading the top ten.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Lever</th><th>Moves</th><th>Risk to quality</th></tr></thead>
+<tbody>
+<tr><td>Shorter prompts: trim instructions, fewer examples, compact tool descriptions</td><td>Input cost, TTFT</td><td>Low if the eval is re-run; instructions removed for tidiness sometimes carried a rule</td></tr>
+<tr><td>Fewer retrieved passages or smaller chunks (<a href="../../retrieval/chapters/13-rag-end-to-end.html">RAG End to End</a>)</td><td>Input cost, TTFT</td><td>Medium: recall drops. Measure retrieval recall at the new setting</td></tr>
+<tr><td>Output limits and concise formats: a max-tokens cap, structured output instead of prose</td><td>Output cost, the largest part of generation time</td><td>Low to medium: truncated answers are failures</td></tr>
+<tr><td>Fewer calls in a loop: stop conditions, iteration budgets, a plain workflow instead of an agent (<a href="../../agents/chapters/13-workflow-patterns.html">Workflow Patterns</a>)</td><td>All three, because every call repeats the context</td><td>Medium: some tasks need the extra step</td></tr>
+<tr><td>Caching (below)</td><td>Input cost, TTFT</td><td>None for prefix caching; real for semantic caching</td></tr>
+<tr><td>Routing to a smaller model (below)</td><td>All three on the easy share</td><td>Depends on the router</td></tr>
+<tr><td>Asynchronous batch processing, where the provider offers a discounted batch tier</td><td>Cost, at the price of waiting hours</td><td>None; only for work nobody is waiting for</td></tr>
+<tr><td>Self-hosting, quantising or distilling a model (<a href="../../llm-training/chapters/19-quantisation.html">Quantisation</a>, <a href="../../llm-training/chapters/15-distillation.html">Distillation</a>)</td><td>Cost per token, sometimes latency</td><td>Medium; and you now run a GPU fleet (<a href="../../llm-training/chapters/22-token-economics.html">The Economics of a Token</a>)</td></tr>
+</tbody></table></div>
+
+<p>Two of these deserve the rest of the chapter because they change the shape of the curve rather than sliding along it: routing and caching.</p>
+
+<h2>Routing and cascades</h2>
+
+<p>Most questions in a real workload are easy. If a small model answers 70% of them correctly, paying large-model prices for all of them is waste. A <span class="term">router</span> sends each request to a model chosen by its estimated difficulty. A <span class="term">cascade</span> is a router with a specific rule: ask the cheap model first, check how confident it is, and escalate to the expensive model only if the check fails. The idea was studied by Chen, Zaharia and Zou in "FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance" (2023), who report that a learned cascade can match the best single model's performance at a fraction of its cost (the abstract says up to 98% less on their benchmarks) or improve accuracy at the same cost. Ong et al. trained routers directly from human preference data in "RouteLLM: Learning to Route LLMs with Preference Data" (2024), and report cost reductions of over 85% on MT-Bench against always using GPT-4 while keeping 95% of its quality, with smaller savings on MMLU and GSM8K. Those are the authors' figures on their benchmarks and their model pairs, not a promise for your workload.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Flow diagram of a cascade. A request goes to the small model, which returns an answer and a confidence score. A check compares confidence with a threshold. In the simulation 57 percent of requests pass the check and are answered by the small model; 43 percent fail and are escalated to the large model. Both paths end in the final answer.">
+    <defs><marker id="ahEV19a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="95" width="110" height="56" rx="8" class="fs-green s-green sw-2"/>
+    <text x="75" y="120" text-anchor="middle" class="t-sm t-bold">Request</text><text x="75" y="137" text-anchor="middle" class="t-xs t-muted">100%</text>
+    <rect x="190" y="95" width="150" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="265" y="120" text-anchor="middle" class="t-sm t-bold">Small model</text><text x="265" y="137" text-anchor="middle" class="t-xs t-muted">answer + confidence</text>
+    <rect x="400" y="95" width="140" height="56" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="470" y="120" text-anchor="middle" class="t-sm t-bold">Confidence</text><text x="470" y="137" text-anchor="middle" class="t-xs t-muted">at least 0.6?</text>
+    <rect x="600" y="30" width="140" height="56" rx="8" class="fs-green s-green sw-2"/>
+    <text x="670" y="55" text-anchor="middle" class="t-sm t-bold">Return answer</text><text x="670" y="72" text-anchor="middle" class="t-xs t-muted">57% stay here</text>
+    <rect x="400" y="180" width="140" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="470" y="205" text-anchor="middle" class="t-sm t-bold">Large model</text><text x="470" y="222" text-anchor="middle" class="t-xs t-muted">43% escalate</text>
+    <line x1="130" y1="123" x2="188" y2="123" class="line" marker-end="url(#ahEV19a)"/>
+    <line x1="340" y1="123" x2="398" y2="123" class="line" marker-end="url(#ahEV19a)"/>
+    <line x1="540" y1="110" x2="598" y2="68" class="line" marker-end="url(#ahEV19a)"/>
+    <line x1="470" y1="151" x2="470" y2="178" class="line s-orange" marker-end="url(#ahEV19a)"/>
+    <path d="M540,208 L670,208 L670,88" fill="none" class="line" marker-end="url(#ahEV19a)"/>
+    <text x="585" y="118" class="t-xs tc-green">yes</text><text x="478" y="170" class="t-xs tc-orange">no</text>
+    <text x="150" y="190" class="t-xs t-muted">small model always runs first,</text><text x="150" y="206" class="t-xs t-muted">so escalated requests pay for both</text>
+  </svg>
+  <figcaption><strong>A cascade pays for the cheap model every time and the expensive model only on doubt.</strong> The percentages are from the simulation below at a threshold of 0.6. Escalated requests also wait for both models in series, so the slow tail gets slower even as the average gets cheaper.</figcaption>
+</figure>
+
+<p>The next script simulates a cascade between the small plus retrieval and large plus retrieval configurations above. Each item has a difficulty; the small model has a confidence score that is higher on average when it is right, but noisy, which is how self-reported or classifier-based confidence behaves in practice (<a href="11-grounding-abstention.html">Grounding, Abstention &amp; Confidence</a> covers how to measure whether a confidence score is any good). It compares the cascade at four thresholds against both single models, a random router that escalates half the time, and an oracle router that knows in advance which questions the small model will get wrong, which no real router can.</p>
+
+<pre class="terminal" data-title="cascade.py"><code>import math, random
+
+random.seed(11)
+N = 2000
+SMALL_COST, LARGE_COST = 0.96, 24.70      # dollars per 1,000 tasks, from the previous table (illustrative prices)
+sig = lambda x: 1 / (1 + math.exp(-x))
+
+items = []
+for _ in range(N):
+    d = random.gauss(0, 1)
+    small_ok = random.random() &lt; sig(0.9 - d)
+    large_ok = random.random() &lt; sig(2.3 - d)
+    # the small model's self-reported confidence: higher when it is right, but noisy
+    conf = min(1.0, max(0.0, random.gauss(0.72 if small_ok else 0.45, 0.18)))
+    items.append((small_ok, large_ok, conf))
+
+def run(threshold, router="confidence"):
+    ok = esc = 0
+    for small_ok, large_ok, conf in items:
+        if router == "confidence":
+            go_large = conf &lt; threshold
+        elif router == "oracle":
+            go_large = not small_ok                       # unattainable: knows the answer in advance
+        else:
+            go_large = random.random() &lt; threshold        # random router escalating a fixed share
+        esc += go_large
+        ok += large_ok if go_large else small_ok
+    cost = SMALL_COST + (esc / N) * LARGE_COST            # the small model always runs first
+    if router == "oracle": cost = SMALL_COST + (esc / N) * LARGE_COST
+    return ok / N, esc / N, cost
+
+print(f"{'policy':&lt;28}{'quality':&gt;8}{'escalated':&gt;11}{'$/1k tasks':&gt;12}")
+print(f"{'always small':&lt;28}{sum(i[0] for i in items)/N:&gt;8.1%}{0:&gt;11.0%}{SMALL_COST:&gt;12.2f}")
+for t in (0.4, 0.5, 0.6, 0.7):
+    q, e, c = run(t)
+    print(f"{'cascade, threshold %.1f' % t:&lt;28}{q:&gt;8.1%}{e:&gt;11.0%}{c:&gt;12.2f}")
+q, e, c = run(0, "oracle");   print(f"{'oracle router (bound)':&lt;28}{q:&gt;8.1%}{e:&gt;11.0%}{c:&gt;12.2f}")
+q, e, c = run(0.50, "random"); print(f"{'random router, 50% escalate':&lt;28}{q:&gt;8.1%}{e:&gt;11.0%}{c:&gt;12.2f}")
+print(f"{'always large':&lt;28}{sum(i[1] for i in items)/N:&gt;8.1%}{1:&gt;11.0%}{LARGE_COST:&gt;12.2f}")</code></pre>
+<pre class="terminal" data-title="output"><code>policy                       quality  escalated  $/1k tasks
+always small                   68.8%         0%        0.96
+cascade, threshold 0.4         77.3%        14%        4.41
+cascade, threshold 0.5         82.5%        27%        7.59
+cascade, threshold 0.6         86.4%        43%       11.51
+cascade, threshold 0.7         88.5%        60%       15.88
+oracle router (bound)          93.2%        31%        8.65
+random router, 50% escalate    78.3%        52%       13.82
+always large                   87.0%       100%       24.70</code></pre>
+
+<p>The cascade at a threshold of 0.6 reaches 86.4%, within the noise of always-large (87.0%) for $11.51 per 1,000 tasks against $24.70. Raising the threshold to 0.7 gives 88.5% at $15.88, apparently better than always-large, which looks too good. It is, partly: the simulation draws the two models' errors independently, so there are items the large model fails and the small one gets right, and a good router harvests them. Real models fail on many of the same hard items, so expect a smaller gain than the simulation shows. The random router is the instructive comparison: it escalates about half the requests yet reaches only 78.3%, because it escalates the wrong ones. The value of a router lies in its discrimination, and the cost saving is only as good as that.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the family doctor and the specialist</p>
+  <p>A family doctor sees everyone, handles the common problems cheaply, and refers the cases that look unusual to a specialist whose time costs ten times more. The system works because the doctor is good at knowing what they do not know. A doctor who refers everybody wastes the specialist's time, and one who refers nobody misses the dangerous cases.</p>
+  <p><em>Where it breaks down:</em> a doctor's referral is a judgement made with training in spotting danger signs. A small model's confidence is a statistic that can be badly calibrated, confidently wrong on exactly the unusual cases, and it shifts when the questions change. You must measure the router like any other model, on held-out items.</p>
+</div>
+
+<p>Running a router in production adds duties:</p>
+<ul>
+  <li><strong>Evaluate the router, not only the models.</strong> Log which route each request took, and sample escalated and non-escalated traffic for review. The danger is the confident wrong answer that never escalated, so the review sample of non-escalated traffic matters most.</li>
+  <li><strong>Track the escalation rate over time.</strong> A drift in the share escalated is an early warning that the questions, the prompt or the small model changed (<a href="../../reliability/chapters/04-metrics.html">Metrics, Percentiles &amp; Histograms</a>).</li>
+  <li><strong>Put a floor on high-stakes categories.</strong> Some request types should always go to the strong model, whatever the confidence says. A rule is a legitimate router.</li>
+  <li><strong>Budget the latency.</strong> In the figure, a quarter or more of requests wait for two models in series. If the product has a latency target, the cascade has to meet it for the escalated path, not on average.</li>
+</ul>
+
+<h2>Caching</h2>
+
+<p>A <span class="term">cache</span> stores the result of work so that repeated work is free or cheap (<a href="../../systems/chapters/22-performance-engineering.html">Performance Engineering</a> covers caches in general). LLM systems have three different kinds, with very different risks.</p>
+
+<div class="cols">
+  <div class="card accent-green"><h4>Exact response cache</h4><p>Key: a hash of the full request (model, prompt, parameters). Value: the earlier answer. Safe when the request is identical and the answer does not depend on time or user. Hit rates are high for fixed prompts such as batch classification of repeated records and low for free-text chat.</p></div>
+  <div class="card accent-blue"><h4>Prompt (prefix) cache</h4><p>The provider stores the model's internal attention state for the start of your prompt, so a later request that begins with the same text skips re-reading it. The output is still freshly generated. No quality risk; you pay for cache writes and get discounted reads.</p></div>
+  <div class="card accent-orange"><h4>Semantic cache</h4><p>Key: an embedding of the question. Value: an earlier answer to a <em>similar</em> question. A hit can return a wrong answer to a question that is close in meaning but different in detail ("refund within 30 days" against "within 14 days"), and a shared cache can leak one tenant's answer to another.</p></div>
+</div>
+
+<p>Prefix caching is the one that rewards engineering attention, because long, stable prefixes are normal: a system prompt, tool definitions, a policy document, a code repository. It works because a transformer's key and value tensors for a token depend only on the tokens before it, so they can be stored and reused for any request that starts the same way (<a href="../../llm-training/chapters/18-kv-cache.html">The KV Cache</a>, and the serving-engine side in <a href="../../llm-training/chapters/20-serving-engines.html">Serving Engines</a>). The consequences for how you write prompts follow directly:</p>
+<ul>
+  <li>Put stable content first and variable content last. A timestamp, user name or request id near the top of the prompt changes every token after it and defeats the cache.</li>
+  <li>Matching is exact. A single changed character before the cache boundary, or reordered tool definitions, is a miss.</li>
+  <li>Entries expire. With a five-minute lifetime that is refreshed by each use, a prefix used once an hour is written and never read.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026: how one provider prices prefix caching</p>
+  <p>Anthropic's prompt caching documentation (read 14 October 2026) states that five-minute cache writes cost 1.25 times the base input price, one-hour writes cost 2 times, and cache reads cost 0.1 times, with a lower read multiplier on some newer models. Caching is matched on the prompt in the order tools, then system, then messages, up to a marked breakpoint, requires 100% identical content before it, and has a model-dependent minimum length. Usage fields <code>cache_creation_input_tokens</code> and <code>cache_read_input_tokens</code> tell you what happened on each request. Other providers differ: some cache automatically with no write premium, some charge a storage fee, discounts differ, and all of these change. Treat the numbers as a worked example and read your provider's current page before modelling your own bill.</p>
+</div>
+
+<p>The script below models the economics with the multipliers above (1.25 for a five-minute write, 0.1 for a read) and an illustrative $3 and $15 per million tokens. A 6,000-token stable prefix is followed by 400 variable tokens, and the model writes 300. Requests arrive at random (a Poisson process) at different rates, and each hit refreshes the five-minute lifetime.</p>
+
+<pre class="terminal" data-title="cache.py"><code>import random
+
+# Illustrative prices (assumption): $3 per million input tokens, $15 per million output tokens.
+P_IN, P_OUT = 3.0, 15.0
+WRITE, READ = 1.25, 0.10            # multipliers on the input price (5-minute cache), per Anthropic's docs
+PREFIX, VARIABLE, OUT = 6000, 400, 300
+TTL = 5.0                           # minutes; each hit refreshes it
+
+def simulate(per_minute, prefix_stable=True, n=5000, seed=3):
+    rng = random.Random(seed)
+    t, last, total_cached, total_plain, hits = 0.0, None, 0.0, 0.0, 0
+    for _ in range(n):
+        t += rng.expovariate(per_minute)                       # Poisson arrivals
+        hit = prefix_stable and last is not None and t - last &lt;= TTL
+        last = t if prefix_stable else last                    # a hit or a write both refresh the entry
+        pre = PREFIX * (READ if hit else WRITE)          # a miss still pays the write premium
+        total_cached += (pre + VARIABLE) * P_IN / 1e6 + OUT * P_OUT / 1e6
+        total_plain  += (PREFIX + VARIABLE) * P_IN / 1e6 + OUT * P_OUT / 1e6
+        hits += hit
+    return hits / n, total_cached / n * 1000, total_plain / n * 1000
+
+print(f"{'requests/min':&gt;12}{'hit rate':&gt;10}{'$/1k cached':&gt;13}{'$/1k plain':&gt;12}{'saving':&gt;8}")
+for r in (0.05, 0.1, 0.2, 0.5, 2, 10):
+    h, c, p = simulate(r)
+    print(f"{r:&gt;12}{h:&gt;10.0%}{c:&gt;13.2f}{p:&gt;12.2f}{1 - c / p:&gt;8.0%}")
+h, c, p = simulate(10, prefix_stable=False)
+print(f"\nsame 10/min, but a timestamp at the top of the prompt: hit rate {h:.0%}, ${c:.2f} vs ${p:.2f} per 1k")
+extra_write = PREFIX * (WRITE - 1) * P_IN / 1e6 * 1000
+saved_read = PREFIX * (1 - READ) * P_IN / 1e6 * 1000
+print(f"extra cost of one write: ${extra_write:.2f} per 1k; saving from one read: ${saved_read:.2f} per 1k; reads needed to repay a write: {extra_write/saved_read:.2f}")</code></pre>
+<pre class="terminal" data-title="output"><code>requests/min  hit rate  $/1k cached  $/1k plain  saving
+        0.05       22%        23.72       23.70     -0%
+         0.1       40%        19.89       23.70     16%
+         0.2       64%        14.98       23.70     37%
+         0.5       92%         9.13       23.70     61%
+           2      100%         7.51       23.70     68%
+          10      100%         7.50       23.70     68%
+
+same 10/min, but a timestamp at the top of the prompt: hit rate 0%, $28.20 vs $23.70 per 1k
+extra cost of one write: $4.50 per 1k; saving from one read: $16.20 per 1k; reads needed to repay a write: 0.28</code></pre>
+
+<p>Three results are worth remembering. At 0.05 requests a minute (one every 20 minutes) the prefix is written almost every time and caching saves nothing; it even costs slightly more. Around a request every two minutes, hit rates are high and the saving approaches its ceiling of 68%, set by the share of the bill that is the prefix. Above that rate more traffic adds nothing. And the last line shows the failure that costs real money: a timestamp at the top of the prompt made every request a miss that still paid the 25% write premium, so the "cached" system cost 19% <em>more</em> than not caching. One read repays a write (the extra cost of a write is $4.50 per 1,000 tasks and the saving from a read is $16.20), so even a prefix that is re-used a single time inside the lifetime is worth caching, but only if it is re-used.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Caching an LLM prefix is the same trade as every cache you have met: hit rate times saving against the cost of a miss and the risk of staleness or leakage. A semantic cache shared across tenants is a multi-tenancy bug waiting to happen (<a href="../../security/chapters/15-multi-tenancy.html">Multi-Tenancy &amp; Isolation</a>): key it by tenant and permission scope, exactly as retrieval is filtered (<a href="../../retrieval/chapters/12-filters-permissions.html">Filters, Metadata &amp; Permissions</a>). Latency targets and the queueing effects of a slow second model are covered in <a href="../../reliability/chapters/08-queueing-theory.html">Queueing Theory for Engineers</a> and <a href="../../reliability/chapters/09-tail-latency.html">Tail Latency at Scale</a>; the wider habit of treating efficiency as an engineering property is in <a href="../../reliability/chapters/20-cost-efficiency.html">Cost &amp; Efficiency</a>, and the design view of ML and LLM components in <a href="../../design/chapters/20-ml-systems.html">Designing with ML &amp; LLMs</a>.</p>
+</div>
+
+<h2>Latency: the other budget</h2>
+
+<p>Quality-cost charts hide latency, so give it its own budget. For the large plus retrieval configuration in the table, the 5.11 seconds is 1.4 seconds of time to first token plus 3.7 seconds of generating 260 tokens. Different levers apply to each part.</p>
+<ul>
+  <li><strong>Time to first token</strong> falls with shorter prompts, prefix caching, a smaller model and fewer sequential steps before generation starts (a reranker or a classifier in front of the model adds to it).</li>
+  <li><strong>Generation time</strong> falls with fewer output tokens, a faster model, and server-side techniques such as speculative decoding that you may get from the provider without changing your code (<a href="../../llm-training/chapters/21-speculative-decoding.html">Speculative Decoding &amp; Other Speedups</a>).</li>
+  <li><strong>Perceived latency</strong> falls with streaming: the user starts reading after the TTFT instead of after the whole answer. It does nothing for a pipeline that must finish before it can act, such as a tool-calling loop.</li>
+  <li><strong>Independent steps can run in parallel</strong>: retrieval from two indexes, a guardrail check beside the model call (<a href="15-guardrails.html">Guardrail Classifiers &amp; Content Policy</a>), several tool calls at once. The critical path in the trace waterfall shows what is worth parallelising.</li>
+</ul>
+
+<p>Set the latency target the same way as for any service, as a percentile of what users feel (<a href="../../reliability/chapters/02-slos-error-budgets.html">SLIs, SLOs &amp; Error Budgets</a>): for example "95% of answers begin streaming within 2 seconds and finish within 8". Then a configuration is not merely "slower", it either meets the objective or it does not, which turns latency from a third axis to trade into a constraint to satisfy.</p>
+
+<h2>Deciding what good enough costs</h2>
+
+<p>The Pareto front says which configurations are reasonable. It does not say which to choose, because that depends on a number the eval cannot produce: what a failure costs. A wrong answer in an internal drafting tool costs a few seconds of a person's attention. A wrong answer in a customer-facing refund flow can cost a refund, a complaint and a lost customer. A wrong answer in a medical triage tool may not be priced in dollars at all, and the right response is a human in the loop and a quality floor rather than an optimisation.</p>
+
+<p>For the cases that can be priced, the calculation is short. Total cost per 1,000 tasks is the serving cost plus the number of failures times the cost of one:</p>
+
+<p style="text-align:center">total = cost<sub>serving</sub> + 1,000 &times; (1 &minus; quality) &times; cost<sub>failure</sub></p>
+
+<p>The script applies it to the five front configurations, for four assumed failure costs. The failure cost covers what you actually pay when an answer is wrong: a human reviewer's time to catch and fix it, a refund, a support contact.</p>
+
+<pre class="terminal" data-title="goodenough.py"><code># (quality, serving $ per 1,000 tasks) for the frontier configurations from the Pareto table
+CONFIGS = {"small": (0.545, 0.36), "small+RAG": (0.678, 0.96), "med+RAG": (0.795, 4.86),
+           "large+RAG": (0.860, 24.70), "large+vote": (0.900, 74.10)}
+
+print(f"{'cost of one failed task':&lt;24}" + "".join(f"{n:&gt;12}" for n in CONFIGS) + "   best")
+for fail_cost in (0.05, 0.50, 5, 50):
+    totals = {n: cost + (1 - q) * 1000 * fail_cost for n, (q, cost) in CONFIGS.items()}
+    best = min(totals, key=totals.get)
+    print(f"{'$%.2f' % fail_cost:&lt;24}" + "".join(f"{totals[n]:&gt;12,.0f}" for n in CONFIGS) + f"   {best}")</code></pre>
+<pre class="terminal" data-title="output"><code>cost of one failed task        small   small+RAG     med+RAG   large+RAG  large+vote   best
+$0.05                             23          17          15          32          79   med+RAG
+$0.50                            228         162         107          95         124   large+RAG
+$5.00                          2,275       1,611       1,030         725         574   large+vote
+$50.00                        22,750      16,101      10,255       7,025       5,074   large+vote</code></pre>
+
+<p>The best configuration moves as the failure cost rises. When a failure costs five cents (nobody notices or cares), medium plus retrieval wins, and the large model costs twice as much in total. At fifty cents, large plus retrieval wins. At five dollars and above, the three-vote configuration wins, even though it is three times as expensive to serve, because it avoids enough failures. Notice that the cheapest model, which looks best on the invoice, is the worst choice once a failure costs fifty cents or more. The lesson is not that expensive models are better. It is that you cannot rank configurations on serving cost alone, and that the ranking depends on a business number someone has to estimate and own.</p>
+
+<p>Turn this into a decision rule you can write down and revisit:</p>
+<ol class="steps">
+  <li><strong>Set constraints first.</strong> A latency objective, a quality floor on every critical slice, and any non-negotiable (a regulated category always gets the strong model plus human review).</li>
+  <li><strong>Filter to the configurations that meet them</strong> with their lower confidence bound, not their point estimate.</li>
+  <li><strong>Among those, choose the lowest total cost</strong> using your estimated failure cost, and run the sensitivity check: would the choice change if the failure cost were half or double? If it would, the decision is fragile, and that deserves a conversation, not a guess.</li>
+  <li><strong>Record the decision with the eval version, the date and the assumptions.</strong> Prices fall, models are replaced and traffic changes; the decision decays. Re-run the comparison on a schedule and whenever a provider announces a new model, using the regression suite from <a href="18-improvement-flywheel.html">The Improvement Flywheel</a>.</li>
+</ol>
+
+<h2>Keeping the numbers honest in production</h2>
+
+<p>A trade-off decision is only as good as the measurements that feed it, so wire the three numbers into the operating loop from <a href="17-observability.html">the observability chapter</a>.</p>
+<ul>
+  <li><strong>Attach cost to the trace.</strong> Compute it from token usage and the price table at request time and store it as an attribute, along with cached-token counts. Cost per successful task, per tenant and per route then becomes a query.</li>
+  <li><strong>Alert on cost per task, not total spend.</strong> Spend rises with traffic, which is good news; cost per task rising means a prompt grew, a loop got longer or the cache stopped hitting. Also set hard per-tenant and per-request budgets, so a runaway agent loop ends at a limit instead of on the invoice (<a href="../../reliability/chapters/11-overload.html">Overload, Load Shedding &amp; Metastability</a> has the general pattern of limits that fail safe).</li>
+  <li><strong>Make cost and latency part of the release gate.</strong> A prompt change that raises quality by one point and doubles tokens should be visible in the same report as the quality change, and the gate in <a href="../labs/lab-07-regression-gate.html">Lab 7</a> can fail on any of the three.</li>
+  <li><strong>Watch the router and the cache hit rate</strong> as first-class metrics, because both fail silently: quality drifts down while the invoice looks fine.</li>
+</ul>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Save the four scripts from this chapter in one folder and run them.</p>
+<pre class="terminal"><span class="prompt">$</span> <span class="cmd">python3 pareto.py &amp;&amp; python3 cascade.py &amp;&amp; python3 cache.py &amp;&amp; python3 goodenough.py</span></pre>
+  <p>(1) In <code>cascade.py</code>, make the two models fail on the same items by drawing <code>large_ok</code> as <code>small_ok or random.random() &lt; sig(2.3 - d)</code>, so the large model never fails where the small one succeeds, and see what happens at the 0.7 threshold: does the cascade still beat always-large? (2) In <code>cache.py</code>, change <code>TTL</code> to 60 (a one-hour cache) and the write multiplier to 2.0: at which request rate does the one-hour cache start to pay? (3) In <code>goodenough.py</code>, find the failure cost at which the winner changes from <code>med+RAG</code> to <code>large+RAG</code>, by trying values between $0.05 and $0.50. Write one sentence on what business number you would need to know to pick a side.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Measure three things on the same test set: quality with an error bar, cost per successful task (not per call or per token), and latency as a percentile, split into time to first token and generation.</li>
+    <li>A configuration is dominated if another is at least as good on every axis. Drop those, treat gaps inside the error bars as ties, and choose among the Pareto front.</li>
+    <li>Look for cheap levers first: shorter prompts, fewer calls, capped outputs and retrieval settings often beat a model change. Check every candidate on the critical slices, not only the average.</li>
+    <li>Cascades and routers save money only as far as they discriminate hard from easy requests. Evaluate the router, sample the traffic that did not escalate, and expect the real gain to be smaller than a simulation with independent errors.</li>
+    <li>Prefix caching rewards stable-first prompts and steady traffic; one timestamp at the top can turn a saving into a surcharge. Semantic caches can return wrong or another tenant's answers, so key and scope them carefully.</li>
+    <li>"Good enough" is a cost calculation: serving cost plus failures times the cost of a failure, under a latency objective and quality floors. Record the assumptions and re-run the comparison as prices and models change.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2305.05176" target="_blank" rel="noopener">Chen, Zaharia and Zou, "FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance" (2023)</a>. The cascade and model-selection formulation; the abstract was fetched for this edition, the experiments were not.</li>
+  <li><a href="https://arxiv.org/abs/2406.18665" target="_blank" rel="noopener">Ong et al., "RouteLLM: Learning to Route LLMs with Preference Data" (2024)</a>. Routers trained on preference data, with the cost and quality figures quoted above (seen through the project page and a summary; the paper itself was not read in full).</li>
+  <li><a href="https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener">Anthropic, "Prompt caching" (documentation)</a>. Multipliers, minimum lengths, matching rules and usage fields as of October 2026; fetched and read, partly.</li>
+  <li><a href="https://arxiv.org/abs/2411.00640" target="_blank" rel="noopener">Miller, "Adding Error Bars to Evals: A Statistical Approach to Language Model Evaluations" (2024)</a>. Why a quality number without an interval cannot be traded against cost.</li>
+  <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (2023)</a>. The serving-side view of why cache memory limits throughput and what prefix reuse does for it.</li>
+  <li><a href="https://research.google/pubs/the-tail-at-scale/" target="_blank" rel="noopener">Dean and Barroso, "The Tail at Scale" (2013)</a>. Why percentiles, not averages, are the latency numbers to budget.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">An agent costs $0.126 per attempt and resolves 70% of tasks. A cheaper configuration costs $0.07 per attempt but resolves 35%. Which has the lower cost per successful task, and by roughly how much?</p>
+    <ol class="q-options"><li>The cheaper one, because $0.07 is lower than $0.126</li><li>The original, at about $0.18 against $0.20</li><li>They are equal, since both are paid per attempt</li><li>The original, at about $0.18 against $0.35</li></ol>
+    <div class="q-explain">Cost per successful task is cost per attempt divided by the success rate: 0.126 &divide; 0.70 = $0.18, and 0.07 &divide; 0.35 = $0.20. The cheaper configuration is still more expensive per resolved task, though only by about 11%. The $0.35 in the last option comes from dividing by 0.20 instead of 0.35. Comparing per-attempt prices ignores that failed attempts are paid for too.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">Configuration X scores 71% (interval 66 to 76) at $2 per 1,000 tasks. Configuration Y scores 73% (interval 68 to 78) at $6 per 1,000 tasks with the same latency. Test set: 400 items. What is the best statement?</p>
+    <ol class="q-options"><li>Y dominates X because its quality is higher</li><li>X dominates Y because it is cheaper and the quality difference is not significant</li><li>Neither can be chosen without more latency data</li><li>The two-point gap is inside the intervals, so run a paired comparison on the same items before paying three times as much for it</li></ol>
+    <div class="q-explain">Y is better on quality by its point estimate and worse on cost, so neither dominates strictly. The intervals overlap heavily, so the gap may be noise, but overlapping intervals do not by themselves prove a tie; the paired test on per-item differences is more powerful and settles it. Calling X dominant on non-significance alone overstates what the data show, and latency is stated as equal.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">A team adds <code>cache_control</code> to a 5,000-token system prompt that begins with "Current time: 2026-10-14 09:31:07". Traffic is steady at 20 requests a minute. Their bill goes up by about 20% instead of down. What happened?</p>
+    <ol class="q-options"><li>The timestamp changes the start of the prompt every second, so every request is a cache miss that still pays the write premium</li><li>Twenty requests a minute is too much traffic for a cache to handle</li><li>Prefix caches cost more than they save whenever the prompt is over 1,000 tokens</li><li>The provider charges for reading the cache on every request even if it misses</li></ol>
+    <div class="q-explain">Cache hits need identical content up to the marked point. A changing timestamp at the very start means nothing matches, so each request writes a new entry at 1.25 times the input price and never reads one. The fix is to move volatile content to the end of the prompt. Traffic volume helps hit rates, and long prompts are where caching pays most.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">A cascade sends a request to the large model whenever the small model's confidence is below a threshold. Offline, it matches always-large quality at half the cost. After launch, a month later, quality slips but the escalation rate has not changed. Which is the most likely explanation?</p>
+    <ol class="q-options"><li>The large model has become worse</li><li>Prices have changed, so the saving has vanished</li><li>The small model is now confidently wrong on a new kind of request, so these never escalate</li><li>The threshold is too high</li></ol>
+    <div class="q-explain">A stable escalation rate with falling quality points to the small model's confidence no longer tracking its correctness for the new traffic: the failures are not being sent upward. This is why you sample the non-escalated traffic for review. A high threshold raises escalation, and a price change would show in cost, not quality.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">For the front configurations in this chapter, at what failure cost does paying for the three-vote configuration start to look sensible, compared with large plus retrieval?</p>
+    <ol class="q-options"><li>Whenever it scores higher, regardless of price</li><li>When the extra failures it avoids (four points per 1,000 tasks is 40 failures) cost more than the extra $49 of serving cost, which is about $1.24 per failure</li><li>Never, because its cost is three times higher</li><li>Only when latency does not matter, regardless of failure cost</li></ol>
+    <div class="q-explain">The vote configuration avoids 40 failures per 1,000 tasks (90% against 86%) and costs $49.40 more, so each avoided failure must be worth more than 49.40 &divide; 40, about $1.24, to break even. That is the shape of the decision: extra serving cost against failures avoided times failure cost. It ignores the latency, which would also need to meet your objective.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A semantic cache returns a stored answer when a new question's embedding is within a similarity threshold of an earlier question's. Which risk is specific to this kind of cache, as opposed to prefix caching?</p>
+    <ol class="q-options"><li>It cannot reduce the cost of output tokens</li><li>Hits expire after five minutes</li><li>It requires the provider to keep the model's state</li><li>A question close in meaning but different in a decisive detail gets the earlier question's answer, and a shared cache can return another tenant's answer</li></ol>
+    <div class="q-explain">Semantic caches substitute a stored answer for a generated one, so a near-duplicate question with a different condition receives a wrong answer, and without tenant scoping the stored answer may contain another customer's data. Prefix caches only reuse computation on the prompt; the answer is still generated fresh. Saving output tokens is, in fact, something a semantic cache does well, which is why it is tempting.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

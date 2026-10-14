@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Durable Execution for Agents · Agents, Tools &amp; Protocols</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/agt15-crash.css">
+</head>
+<body data-root="../.." data-course="agt" data-chapter="15">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Durable Execution for Agents</h1>
+  <p class="lede">An agent that works for ten minutes, or waits three days for a manager's approval, will be interrupted: by a deploy, a crashed container, a rate limit or a closed laptop. This chapter explains how to make the interruption harmless. You will keep an event log, resume from it, make side effects safe to repeat, and pause for a human without holding a process open.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The loop in <a href="02-tool-loop.html">chapter 2</a> keeps its state in memory. That is fine for a demo and wrong for anything that sends money, email or tickets. When the process dies halfway, the memory is gone but the refund is not, and a naive restart either abandons the task or does it twice. Production agents, including the research systems in <a href="14-multi-agent.html">chapter 14</a>, resume from where an error occurred rather than restarting. After this chapter you can build that: a journal-backed loop, idempotency keys that close the dangerous window, approval gates that survive a restart, and a short list of questions to ask of any framework that claims to be "durable". <a href="../labs/lab-05-durable-agent.html">Lab 5</a> has you build it.</p>
+</div>
+
+<h2>What breaks when an agent runs for a while</h2>
+
+<p>Most software that talks to people finishes in milliseconds, so a crash costs one retry. An agent is different in three ways. It runs for <strong>minutes to hours</strong>, because every step is a model call of several seconds. It <strong>acts on the world</strong> in the middle of that time, with tools that charge cards, write files and send messages. And it sometimes <strong>waits for people</strong>, who answer in hours or days. Each property turns an ordinary interruption into a design problem.</p>
+
+<p>Interruptions are common and mundane. A rolling deploy replaces the container (the rainbow deployments in <a href="14-multi-agent.html">chapter 14</a> exist because of this). A process is killed for using too much memory. A cloud instance reserved at a discount is reclaimed. A provider returns a rate-limit error and your retry budget runs out. A person closes the tab. None needs a bug in your code.</p>
+
+<p>The cost of handling this badly has two parts: the work you pay for twice and the actions you perform twice. Take the first. Suppose a run has n steps and each step independently has probability p of the process dying during it (both numbers are assumptions for illustration). A restart from scratch repeats everything done so far. Resuming repeats at most the interrupted step. The script simulates both with a fixed seed.</p>
+
+<pre class="terminal" data-title="restart_cost.py"><code># restart_cost.py: how much work is thrown away when a run of n steps can die at any step? (p is ASSUMED)
+import random
+
+def attempts_scratch(n, p, rng):
+    """Restart from step 1 after every crash. Returns (steps executed, crashes)."""
+    executed = crashes = 0
+    while True:
+        for step in range(n):
+            executed += 1
+            if rng.random() &lt; p:
+                crashes += 1; break
+        else:
+            return executed, crashes
+
+def attempts_resume(n, p, rng):
+    """Resume at the step that was interrupted. The crashed step is repeated, nothing else."""
+    executed = crashes = done = 0
+    while done &lt; n:
+        executed += 1
+        if rng.random() &lt; p: crashes += 1
+        else: done += 1
+    return executed, crashes
+
+rng, trials = random.Random(7), 20000
+print(f"{'steps n':&gt;8}{'p(crash)':&gt;9}{'no crash':&gt;10}{'scratch: steps':&gt;16}{'resume: steps':&gt;15}{'waste ratio':&gt;13}")
+for n, p in [(10, 0.01), (40, 0.01), (40, 0.03), (100, 0.01), (100, 0.03)]:
+    s = sum(attempts_scratch(n, p, rng)[0] for _ in range(trials)) / trials
+    r = sum(attempts_resume(n, p, rng)[0] for _ in range(trials)) / trials
+    print(f"{n:&gt;8}{p:&gt;9.2f}{(1-p)**n:&gt;9.0%}{s:&gt;16.1f}{r:&gt;15.1f}{s/r:&gt;12.1f}x")</code></pre>
+<pre class="terminal" data-title="output"><code> steps n p(crash)  no crash  scratch: steps  resume: steps  waste ratio
+      10     0.01      90%            10.6           10.1         1.0x
+      40     0.01      67%            49.5           40.4         1.2x
+      40     0.03      30%            80.1           41.2         1.9x
+     100     0.01      37%           172.9          101.0         1.7x
+     100     0.03       5%           667.2          103.1         6.5x</code></pre>
+
+<p>A ten-step run barely notices. A hundred-step run with a 3% chance of dying at each step needs about 667 steps of work with restarts from scratch, against 103 when it resumes: 6.5 times the model calls, and in practice several times the bill and the wait. Agent runs are heading towards the long, many-step end of this table, and the exponent is why durable execution matters more as agents get more capable. The second cost, repeated actions, is worse than any bill, and most of this chapter is about it.</p>
+
+<h2>Three ways to survive a crash</h2>
+
+<p><span class="term">Durable execution</span> means that a program's progress is stored outside the process, so that a new process can continue where the old one stopped and finish the job exactly once as far as the outside world can tell. There are three broad designs, from weakest to strongest.</p>
+
+<dl class="terms">
+  <dt>Restart from scratch</dt>
+  <dd>Keep nothing. Run again from the first step. Correct only if every step is safe to repeat and cheap, which an agent that sends refunds is not.</dd>
+  <dt>Checkpoint</dt>
+  <dd>A <span class="term">checkpoint</span> is a saved snapshot of the agent's state (its messages, its variables, where it was) at a known point, such as the end of each step. After a crash, load the latest snapshot and continue. LangGraph's persistence works this way: a checkpointer saves graph state, and a <code>thread_id</code> picks which saved state to load.</dd>
+  <dt>Event log (journal)</dt>
+  <dd>An <span class="term">event log</span>, also called a <span class="term">journal</span>, is an append-only list of everything that happened: each model reply, each tool result, each human decision. The current state is not stored at all; it is <em>computed</em> by reading the log from the start. Temporal calls its version the Event History and describes it as the source of truth for a workflow.</dd>
+</dl>
+
+<p>Checkpoints and logs are close relatives. A checkpoint is a log that has been folded into a value; a log is a stream of checkpoints' differences. The distinction that matters for agents is what each makes easy. A checkpoint is quick to load and cheap to understand, but it records <em>where you are</em>, not <em>what was done to the world on the way</em>. A log keeps the history, so it can answer "was the refund issued?" after the fact, audit what the agent did, and rebuild state in any shape you later need. The architecture course covers the same idea as <a href="../../architecture/chapters/16-cqrs-event-sourcing.html">event sourcing</a>, and the distributed course covers why <a href="../../distributed/chapters/17-logs-exactly-once.html">logs make recovery tractable</a>. This chapter uses a log because the hardest problem, side effects, needs a record of intent.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Three boxes. On the left an agent process that holds only memory. In the middle a journal holding five numbered events: model lookup, result delivered, model refund, result refund number one, model final text. On the right the outside world: bank, email and tickets. Arrows: the process appends events to the journal and loads and replays them on start; a long arrow across the top shows side effects going from the process to the world.">
+    <defs><marker id="ahAG15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="50" width="200" height="120" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="120" y="82" text-anchor="middle" class="t-sm t-bold">Agent process</text>
+    <text x="120" y="104" text-anchor="middle" class="t-xs">rebuild messages</text>
+    <text x="120" y="122" text-anchor="middle" class="t-xs">decide, act, record</text>
+    <text x="120" y="150" text-anchor="middle" class="t-xs tc-red">memory only: lost on a crash</text>
+    <rect x="300" y="30" width="180" height="176" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="390" y="50" text-anchor="middle" class="t-sm t-bold">Journal (on disk)</text>
+    <rect x="316" y="62" width="148" height="24" rx="5" class="box"/><text x="324" y="78" class="t-xs mono">1 model: lookup(42)</text>
+    <rect x="316" y="90" width="148" height="24" rx="5" class="box"/><text x="324" y="106" class="t-xs mono">2 result: delivered</text>
+    <rect x="316" y="118" width="148" height="24" rx="5" class="box"/><text x="324" y="134" class="t-xs mono">3 model: refund(42)</text>
+    <rect x="316" y="146" width="148" height="24" rx="5" class="box"/><text x="324" y="162" class="t-xs mono">4 result: refund #1</text>
+    <rect x="316" y="174" width="148" height="24" rx="5" class="box"/><text x="324" y="190" class="t-xs mono">5 model: final text</text>
+    <rect x="560" y="50" width="180" height="120" rx="10" class="box"/>
+    <text x="650" y="82" text-anchor="middle" class="t-sm t-bold">The world</text>
+    <text x="650" y="104" text-anchor="middle" class="t-xs">bank, email, tickets</text>
+    <text x="650" y="122" text-anchor="middle" class="t-xs">database, files</text>
+    <text x="650" y="150" text-anchor="middle" class="t-xs t-muted">survives the crash</text>
+    <line x1="222" y1="94" x2="298" y2="94" class="line" marker-end="url(#ahAG15a)"/>
+    <text x="260" y="86" text-anchor="middle" class="t-xs">append</text>
+    <line x1="298" y1="146" x2="222" y2="146" class="line-dash" marker-end="url(#ahAG15a)"/>
+    <text x="260" y="164" text-anchor="middle" class="t-xs">replay</text>
+    <path d="M120,50 V18 H650 V48" class="line" marker-end="url(#ahAG15a)"/>
+    <text x="385" y="13" text-anchor="middle" class="t-xs t-muted">side effects (refund, send, write)</text>
+    <text x="380" y="236" text-anchor="middle" class="t-xs t-muted">After a crash a new process loads the journal, folds it back into messages and continues. The world is untouched.</text>
+  </svg>
+  <figcaption><strong>The journal is the state.</strong> The process keeps nothing that cannot be rebuilt from the journal, so any process can take over. The world, unlike the process, cannot be rebuilt: it needs separate care, which is the next section.</figcaption>
+</figure>
+
+<h2>A journal-backed agent loop</h2>
+
+<p>Here is the whole idea in about forty lines. The loop is the one from <a href="02-tool-loop.html">chapter 2</a>, with one change to its structure: at the top of every iteration it <em>reads the journal</em> to find out what to do next, and every decision or observation is appended to the journal <em>before</em> the loop moves on. If the journal ends with a model reply that asked for tools, the missing tool results are the next job. If it ends with a tool result, the model is asked what to do next. If it ends with a model reply that contains only text, the run is finished.</p>
+
+<p>Two design rules sit behind this code.</p>
+
+<ol class="steps">
+  <li><strong>Log the non-deterministic parts, recompute the rest.</strong> A model gives different answers when asked twice, so its reply is a fact to be recorded, not recomputed. Tool results from the world are facts too. The message list the model sees is derived: <code>rebuild</code> folds the journal into it every time. This is why a resumed run does not ask the model again about steps it has already taken.</li>
+  <li><strong>Write the event before you act on it, and fsync.</strong> <code>fsync</code> asks the operating system to flush the file to disk; without it a power cut can lose events the program believes are saved (see the <a href="../../systems/chapters/08-files.html">files and filesystems chapter</a>). An event counts only once it is durable.</li>
+</ol>
+
+<pre class="terminal" data-title="durable.py"><code># durable.py: an event-sourced agent loop. The journal file is the only state.
+import json, os
+from llm import tool_result
+
+class Crash(Exception):
+    """Stands in for a power cut, an OOM kill or a deploy."""
+
+def append(path, event):
+    with open(path, "a") as f:
+        f.write(json.dumps(event) + "\n")
+        f.flush(); os.fsync(f.fileno())          # an event counts only once it is on disk
+
+def load(path):
+    return [json.loads(line) for line in open(path)] if os.path.exists(path) else []
+
+def rebuild(task, log):
+    """Fold the journal back into the message list the model sees."""
+    msgs = [{"role": "user", "content": task}]
+    for ev in log:
+        if ev["type"] == "model":
+            msgs.append({"role": "assistant", "content": ev["content"]})
+        elif ev["type"] == "result":
+            if msgs[-1]["role"] == "assistant":
+                msgs.append({"role": "user", "content": []})
+            msgs[-1]["content"].append(tool_result(ev["id"], ev["output"]))
+    return msgs
+
+def run(task, path, model, tools, run_id="run1", use_key=True, hook=lambda phase, name: None, max_calls=6):
+    while True:
+        log = load(path)
+        last = next((e for e in reversed(log) if e["type"] == "model"), None)
+        uses = [b for b in last["content"] if b["type"] == "tool_use"] if last else []
+        if last and not uses:
+            return last["content"][0]["text"]                       # final answer
+        done = {e["id"] for e in log if e["type"] == "result"}
+        todo = [u for u in uses if u["id"] not in done]
+        if todo:                                                    # execute what the journal says is pending
+            seq = sum(e["type"] == "model" for e in log)
+            for u in todo:
+                key = f"{run_id}:{seq}:{u['id']}" if use_key else None
+                hook("before", u["name"])
+                out = tools[u["name"]](u["input"], key)             # the side effect happens here
+                hook("after", u["name"])                            # ...and the result is not yet recorded
+                append(path, {"type": "result", "id": u["id"], "output": out})
+        else:                                                       # ask the model what to do next
+            if sum(e["type"] == "model" for e in log) &gt;= max_calls:
+                raise RuntimeError("model-call budget exhausted")
+            resp = model.complete(rebuild(task, log), tools=[])
+            append(path, {"type": "model", "content": resp.content})</code></pre>
+
+<p>Notice what <code>run</code> does with the model's reply to "refund order 42": it appends the reply, including its <code>tool_use</code> block and that block's id, <em>before</em> it executes the tool. That ordering is the seed of the next section. The id the model chose is now permanent, so it can be used to name this particular attempt to refund.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the ship's logbook</p>
+  <p>A ship's officers do not trust their memories of the voyage. Every course change, reading and order goes into the logbook as it happens, and a new watch officer takes over by reading it, not by asking the previous one. If the first officer collapses mid-watch, the second still knows where the ship is and what was ordered.</p>
+  <p><em>Where it breaks down:</em> an officer writes the entry and then acts, or acts and then writes, and a log kept at sea cannot tell you whether the last order was carried out before the officer collapsed. For software that gap is the hardest case, because the world can have changed without the log knowing. The next section is about that gap.</p>
+</div>
+
+<h2>The window between doing and recording</h2>
+
+<p>The journal records what the agent <em>decided</em> and what it was <em>told</em>. It cannot atomically include what the world <em>did</em>, because the world is a different system (the same limit as in <a href="../../networking/chapters/16-failure.html">networking chapter 16</a>: you cannot tell a request that failed from a reply that was lost). Look at the two lines in <code>run</code> that matter:</p>
+
+<pre class="terminal" data-title="the dangerous window"><code>out = tools[u["name"]](u["input"], key)    # 1. the refund happens in the bank
+                                           #    ---- the process can die here ----
+append(path, {"type": "result", ...})      # 2. the journal learns about it</code></pre>
+
+<p>If the process dies between the two lines, the bank has issued the refund and the journal does not know. The restarted process reads the journal, sees a <code>refund</code> request with no result, and does the sensible thing from where it stands: runs it again. Two refunds. No choice of ordering removes this: record first and you risk a result you never produced; act first and you risk an action you never recorded. The honest guarantee a journal gives for actions is <strong>at-least-once</strong>. To get <strong>effectively-once</strong>, the repeated attempt must be recognised by the other side as a repeat.</p>
+
+<p>That is what an <span class="term">idempotency key</span> does. The caller attaches a unique string to the request; the service stores the outcome under that string and, if it sees the key again, returns the stored outcome rather than acting a second time. Stripe's API popularised the approach for payments, and the design course walks through it in <a href="../../design/cases/case-06-stripe-idempotency.html">case 6</a>; the general theory of retries is in <a href="../../networking/chapters/16-failure.html">networking chapter 16</a> and <a href="../../architecture/chapters/09-api-design.html">architecture chapter 9</a>. The agent-specific question is <em>where the key comes from</em>.</p>
+
+<ul>
+  <li>A <strong>random key generated at call time</strong> is useless: the restarted process generates a different one.</li>
+  <li>A <strong>timestamp-based key</strong> fails the same way.</li>
+  <li>A key <strong>derived from the journal</strong> works: the run's id, the position of the model event that asked for the action, and the tool-call id. All three are in the journal before the effect happens, so every attempt, in every process, computes the same key. That is the <code>f"{run_id}:{seq}:{u['id']}"</code> in the listing. Including the position matters because a model can legitimately make the same call twice in one run (two identical-looking refunds for two different reasons), and those must not collapse into one.</li>
+</ul>
+
+<div class="widget stepper" data-autoplay-ms="4200">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">A crash inside the window, and the key that closes it</h4></div>
+  <svg viewBox="0 0 760 292" role="img" aria-label="Three columns: an agent process on the left, the journal in the middle, the bank on the right. The agent records a refund request in the journal, calls the bank with key K, and the bank records refund number one. The agent is killed before it records the result, and the bank's reply is lost. A new process loads the journal, sees a refund with no result, calls the bank again with the same key, and the bank returns the first answer without refunding again. The new process then records the result.">
+    <defs><marker id="ahAG15b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <g data-steps="1-2">
+      <rect x="20" y="62" width="170" height="100" rx="10" class="fs-blue s-blue sw-2"/>
+      <text x="105" y="104" text-anchor="middle" class="t-sm t-bold">Agent process</text>
+      <text x="105" y="126" text-anchor="middle" class="t-xs">pid 311</text>
+    </g>
+    <g data-steps="3" data-active="3">
+      <rect x="20" y="62" width="170" height="100" rx="10" class="fs-red s-red sw-3"/>
+      <text x="105" y="104" text-anchor="middle" class="t-sm t-bold">Process killed</text>
+      <text x="105" y="126" text-anchor="middle" class="t-xs">pid 311: memory gone</text>
+    </g>
+    <g data-steps="4-">
+      <rect x="20" y="62" width="170" height="100" rx="10" class="fs-cyan s-cyan sw-2"/>
+      <text x="105" y="104" text-anchor="middle" class="t-sm t-bold">New process</text>
+      <text x="105" y="126" text-anchor="middle" class="t-xs">pid 402, empty memory</text>
+    </g>
+    <rect x="290" y="62" width="180" height="150" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="380" y="82" text-anchor="middle" class="t-sm t-bold">Journal</text>
+    <g data-steps="1-" data-active="1">
+      <rect x="302" y="94" width="156" height="30" rx="5" class="box"/>
+      <text x="310" y="108" class="t-xs mono">model: refund(42)</text>
+      <text x="310" y="120" class="t-xs t-muted mono">key K = run1:2:toolu_49</text>
+    </g>
+    <g data-steps="3-6">
+      <rect x="302" y="132" width="156" height="30" rx="5" class="line-dash" fill="none"/>
+      <text x="310" y="152" class="t-xs t-faint mono">result: ?  (never written)</text>
+    </g>
+    <g data-steps="4" data-active="4">
+      <text x="380" y="190" text-anchor="middle" class="t-xs tc-cyan">loaded: refund has no result</text>
+    </g>
+    <g data-steps="7" data-active="7">
+      <rect x="302" y="132" width="156" height="30" rx="5" class="box"/>
+      <text x="310" y="152" class="t-xs mono">result: refund #1</text>
+    </g>
+    <rect x="570" y="62" width="170" height="150" rx="10" class="box"/>
+    <text x="655" y="82" text-anchor="middle" class="t-sm t-bold">Bank</text>
+    <g data-steps="2-" data-active="2">
+      <rect x="582" y="94" width="146" height="30" rx="5" class="fs-orange s-orange sw-2"/>
+      <text x="590" y="108" class="t-xs mono">K: refund #1 issued</text>
+      <text x="590" y="120" class="t-xs t-muted mono">ledger entry</text>
+    </g>
+    <g data-steps="6-" data-active="6">
+      <text x="655" y="150" text-anchor="middle" class="t-xs tc-green">K seen before:</text>
+      <text x="655" y="166" text-anchor="middle" class="t-xs tc-green">same answer, no new refund</text>
+    </g>
+    <g data-steps="2" data-active="2"><path d="M105,62 V34 H655 V60" class="line" marker-end="url(#ahAG15b)"/><text x="380" y="27" text-anchor="middle" class="t-xs">refund(order 42, key K)</text></g>
+    <g data-steps="5" data-active="5"><path d="M105,62 V34 H655 V60" class="line" marker-end="url(#ahAG15b)"/><text x="380" y="27" text-anchor="middle" class="t-xs">refund(order 42, key K) again</text></g>
+    <g data-steps="3" data-active="3"><path d="M655,212 V252 H105 V164" class="line-dash s-red" marker-end="url(#ahAG15b)"/><text x="380" y="270" text-anchor="middle" class="t-xs tc-red">reply lost: nobody is listening</text></g>
+    <g data-steps="6-" data-active="6"><path d="M655,212 V252 H105 V164" class="line" marker-end="url(#ahAG15b)"/><text x="380" y="270" text-anchor="middle" class="t-xs">"refund #1"</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Intent first.</strong> The model asks for a refund of order 42. The loop appends that reply to the journal, which fixes the tool-call id, and derives the idempotency key K from the run, the position and that id.</li>
+    <li><strong>The effect.</strong> The loop calls the bank with K. The bank issues refund number 1 and stores the outcome under K.</li>
+    <li><strong>The crash.</strong> The process is killed after the bank acted and before the loop wrote the result. The journal holds the request but no result, and the bank's reply goes nowhere. This is the window.</li>
+    <li><strong>Recovery starts.</strong> A new process starts with empty memory, loads the journal, and finds a refund with no result. From its point of view the refund may or may not have happened.</li>
+    <li><strong>Repeat the call, same key.</strong> It does the safe thing: calls the bank again. K is computed from journal contents, so it is identical to the first attempt's.</li>
+    <li><strong>The bank recognises K.</strong> It finds the stored outcome and returns it without refunding again. The customer has one refund.</li>
+    <li><strong>Record and continue.</strong> The result goes into the journal. The model is called next, with exactly the messages it would have seen had nothing gone wrong.</li>
+  </ol>
+</div>
+
+<p>Now the experiment that the diagram only describes. <code>crash_demo.py</code> runs a refund task, kills the agent at two moments (just before the refund call and just after it, before the result is recorded), restarts it, and counts refunds at the bank. The "bank" is a plain object that outlives the agent, with an optional idempotency key. The model is a stateless <code>ScriptedModel</code> from <code>lab-support/llm.py</code>: its reply depends on the messages, so a restarted process can ask it again and get the right continuation.</p>
+
+<pre class="terminal" data-title="crash_demo.py"><code># crash_demo.py: kill the agent at every awkward moment, restart it, count the refunds
+import os, tempfile
+from llm import ScriptedModel, tool_use, text_of
+import durable
+
+class Bank:                                   # an external system: it outlives the agent process
+    def __init__(self): self.refunds, self.seen = [], {}
+    def refund(self, args, key):
+        if key in self.seen: return self.seen[key]           # same key: replay the first answer
+        self.refunds.append(args["order"]); out = f"refund #{len(self.refunds)} issued"
+        if key: self.seen[key] = out
+        return out
+
+def script(messages, tools, system):          # a stateless stand-in: the reply depends on the history only
+    n = sum(1 for m in messages if isinstance(m["content"], list) for b in m["content"] if b["type"] == "tool_result")
+    return [[tool_use("lookup", {"order": 42})], [tool_use("refund", {"order": 42})], "Order 42 refunded."][n]
+
+def trial(strategy, crash_phase):
+    bank, path, model_calls = Bank(), tempfile.mktemp(), 0
+    tools = {"lookup": lambda a, k: "order 42: delivered, 30.00", "refund": bank.refund}
+    state = {"armed": True}
+    def hook(phase, name):                    # crash once, around the refund
+        if state["armed"] and name == "refund" and phase == crash_phase:
+            state["armed"] = False; raise durable.Crash()
+    for attempt in range(2):                  # attempt 0 crashes; attempt 1 is the restart
+        if strategy == "restart from scratch" and attempt == 1 and os.path.exists(path): os.remove(path)
+        model = ScriptedModel(script)
+        try:
+            durable.run("Refund order 42", path, model, tools, use_key=(strategy == "journal + keys"), hook=hook)
+        except durable.Crash:
+            pass
+        model_calls += len(model.calls)
+    return len(bank.refunds), model_calls
+
+if __name__ == "__main__":
+    print(f"{'strategy':&lt;22}{'crash':&lt;22}{'refunds':&gt;8}{'model calls':&gt;13}")
+    for s in ["restart from scratch", "journal, no keys", "journal + keys"]:
+        for p, label in [("before", "before the refund"), ("after", "after, unrecorded")]:
+            r, m = trial(s, p); print(f"{s:&lt;22}{label:&lt;22}{r:&gt;8}{m:&gt;13}")</code></pre>
+<pre class="terminal" data-title="output"><code>strategy              crash                  refunds  model calls
+restart from scratch  before the refund            1            5
+restart from scratch  after, unrecorded            2            5
+journal, no keys      before the refund            1            3
+journal, no keys      after, unrecorded            2            3
+journal + keys        before the refund            1            3
+journal + keys        after, unrecorded            1            3</code></pre>
+
+<p>Read the table as a decision list. <strong>Restarting from scratch</strong> pays for five model calls instead of three, and refunds twice if the crash falls after the effect. <strong>A journal alone</strong> saves the model calls, and still refunds twice in the window, because it cannot see the refund that the dead process did. <strong>A journal plus keys</strong> is correct at both crash points. The journal and the key solve different halves of the problem, and you need both.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"If I save the conversation after every step, the agent is safe to restart." Saving messages records what the model has seen, not what the world has done. The crash window above lies <em>between</em> two saves: the effect happened, the save did not. A conversation snapshot with no idempotency discipline restarts correctly and still refunds twice. Durable state and safe side effects are two separate guarantees.</p>
+</div>
+
+<h3>Not every tool can take a key</h3>
+
+<p>An idempotency key needs cooperation from the other side. Most of the tools an agent uses fall into four groups, and the right treatment differs.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Kind of tool</th><th>Example</th><th>If repeated</th><th>What to do</th></tr></thead>
+  <tbody>
+    <tr><td>Read-only</td><td>Look up an order, search the web</td><td>Harmless, only costs time</td><td>Repeat freely. The journal lets you skip it anyway.</td></tr>
+    <tr><td>Naturally idempotent write</td><td>Set status to "shipped", PUT a file at a path</td><td>Same final state</td><td>Repeat freely. Prefer these shapes when you design tools (<a href="05-tool-design.html">chapter 5</a>).</td></tr>
+    <tr><td>Keyed write</td><td>Payment or refund API with an idempotency key</td><td>Service replays the first answer</td><td>Derive the key from the journal, as above. Pass it on every attempt.</td></tr>
+    <tr><td>Unkeyed write</td><td>Send an email, post to chat, call a legacy API</td><td>A second email, a second post</td><td>Look before you leap: check whether it already happened (search sent mail for the message id you stamped in). Otherwise say so and gate it behind a human (below).</td></tr>
+  </tbody>
+</table></div>
+
+<p>For the last group, put a deterministic marker into the effect itself (a header, a field, a subject tag containing the key) so that "did I already do this?" becomes a query. Where even that is impossible, treat the step as at-least-once, record that decision where the design is reviewed, and make duplicates cheap: an email that is a notification is tolerable twice, a wire transfer is not. When a later step fails after an irreversible one, the repair is a compensation, the saga pattern from <a href="../../architecture/chapters/15-sagas.html">architecture chapter 15</a>: a new action that cancels the earlier one's business effect, itself journalled and keyed.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Everything in this section is the track-1 material on partial failure, applied to a loop with a language model inside. The bank and the agent cannot share a transaction, so the "two generals" problem from <a href="../../networking/chapters/16-failure.html">networking chapter 16</a> appears again. The key that turns at-least-once into effectively-once is the one in <a href="../../distributed/chapters/17-logs-exactly-once.html">distributed chapter 17</a>. The journal is a write-ahead log: <a href="../../data/chapters/13-crash-recovery.html">data chapter 13</a> shows the same log-then-apply idea, with checkpoints, inside a database.</p>
+</div>
+
+<h2>Replaying code versus restoring state</h2>
+
+<p>The loop above rebuilds <em>messages</em> from the journal and lets the loop's own logic decide what to do next. That is a design choice, and the two systems most agent teams meet make it differently.</p>
+
+<p><strong>Temporal</strong> is a general durable-execution engine. In Temporal's documentation a workflow's Event History is "a complete, ordered log of everything that has already happened", and to resume a paused workflow Temporal <em>re-runs the workflow code from the beginning</em> and uses the history to steer it back to where it was. Work that touches the outside world (API calls, database queries, LLM invocations, file I/O) goes in <span class="term">activities</span>. An activity's result is stored in the history, and during replay the stored result is returned instead of running it again. The cost of this design is a rule: the workflow code must be <span class="term">deterministic</span>, meaning that given the same history it makes the same decisions. It must not read the system clock, draw random numbers or make network calls directly; it uses replay-safe versions that record their values once. Our <code>run</code> function is the same idea in miniature, and the "model reply" plays the part of an activity result.</p>
+
+<p><strong>LangGraph</strong>, a library for agent graphs, takes the checkpoint route. A checkpointer saves the graph's state as it runs; passing the same <code>thread_id</code> loads the saved state for that run, and a durable checkpointer is expected in production. Its human-in-the-loop primitive, <code>interrupt()</code>, pauses a node, saves the state and hands a value to the caller; <code>Command(resume=...)</code> with the same thread id continues, and the resume value becomes the return value of the paused <code>interrupt()</code> call. One caveat in the documentation is exactly the failure this chapter keeps returning to: on resume the node re-runs <em>from its beginning</em>, not from the line of the interrupt, so side effects before the interrupt should be idempotent or moved after it.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>Event log + replay (this chapter, Temporal)</th><th>State checkpoints (LangGraph)</th></tr></thead>
+  <tbody>
+    <tr><td>What is stored</td><td>Every decision and observation, in order</td><td>The state after each step (or super-step)</td></tr>
+    <tr><td>Resume means</td><td>Fold the log; for code-replay engines, re-run the code against the log</td><td>Load the latest state; continue at the next node</td></tr>
+    <tr><td>Constraint on your code</td><td>Replayed code must be deterministic; effects live in recorded steps</td><td>A node may re-run from its start; effects in it must be idempotent</td></tr>
+    <tr><td>Audit question "what did it do?"</td><td>Answered by the log itself</td><td>Answered by state history, if kept</td></tr>
+    <tr><td>Changing the code with runs in flight</td><td>Replay can diverge from old history: version your code</td><td>Old state may not fit a new graph shape: migrate or pin</td></tr>
+    <tr><td>Fits best</td><td>Long-lived processes, strict exactly-once care, audit</td><td>Agent graphs that need pause, resume and time travel</td></tr>
+  </tbody>
+</table></div>
+
+<p>Both designs, correctly used, give the same two guarantees: progress survives a crash, and the world is not touched twice by the same logical step. Neither gives them for free. The effect-before-record window exists in both, and the answer in both is an idempotent effect.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Durable-execution engines (Temporal is the best-documented) and graph libraries with checkpointers (LangGraph) are the two families agent teams meet most, and agent SDKs from the model labs increasingly expose some form of saved sessions or resumable runs. The statements about Temporal and LangGraph above come from their documentation as read in October 2026; both products change their APIs, defaults and hosted offerings often, so check the current pages before you copy code, and check what a "resume" feature actually guarantees about side effects. Anthropic's June 2025 post on its multi-agent Research feature says its system resumes from where an error occurred rather than restarting, and that deployments are staged gradually so running agents are not interrupted. The post does not publish an implementation.</p>
+</div>
+
+<h3>Versioning: the code changes while runs are in flight</h3>
+
+<p>A run that lasts hours will often outlive the deploy that started it. The journal then holds events produced by version 1 of the system, and version 2 reads them. Four things can quietly differ: the <strong>prompt</strong> (a resumed run now has a different system prompt from the one that produced its history), the <strong>tool definitions</strong> (a journalled call refers to an argument that version 2 renamed), the <strong>tool behaviour</strong>, and the <strong>shape of the journal events</strong> themselves. In a code-replay engine a changed order of steps can make replay diverge from history and fail; in a state-checkpoint engine an old state may not fit a new graph.</p>
+
+<p>Practical rules, all cheap to adopt on day one:</p>
+<ul>
+  <li>Write a <code>version</code> field in the first journal event: the prompt hash, the tool-schema hash and the code version.</li>
+  <li>Prefer <strong>draining</strong> to migrating: let running jobs finish on the old version while new jobs start on the new one, which is the rainbow-deployment idea from <a href="14-multi-agent.html">chapter 14</a> and the staged rollouts of <a href="../../reliability/chapters/12-deployments.html">reliability chapter 12</a>.</li>
+  <li>Make tool changes additive: add an optional argument, keep the old name working for a release (the schema-evolution habits of <a href="../../data/chapters/03-encoding.html">data chapter 3</a>).</li>
+  <li>When you must resume a job across a change, replay old events with <em>old</em> parsers and write new events in the new format.</li>
+</ul>
+
+<h2>Checkpoints, snapshots and a journal that grows</h2>
+
+<p>A journal grows with every step, and reading it from the start gets slower as the run gets longer. The standard cure from databases is a <span class="term">snapshot</span> (also called a checkpoint): periodically store the folded state together with the position in the log it covers, so recovery loads the snapshot and replays only the tail. <a href="../../data/chapters/13-crash-recovery.html">Data chapter 13</a> describes the same trick for write-ahead logs.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 190" role="img" aria-label="A row of 24 journal events. Events 1 to 18 are drawn faded and bracketed as already folded into a snapshot taken after event 18. Events 19 to 24 are drawn in colour and bracketed as the tail that is replayed on start. A dashed vertical line marks where the snapshot was taken.">
+    <rect x="68" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="94" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="120" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="146" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="172" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="198" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="224" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="250" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="276" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="302" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="328" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="354" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="380" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="406" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="432" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="458" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="484" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="510" y="56" width="22" height="30" rx="3" class="box" opacity="0.5"/>
+    <rect x="536" y="56" width="22" height="30" rx="3" class="fs-purple s-purple sw-2"/>
+    <rect x="562" y="56" width="22" height="30" rx="3" class="fs-purple s-purple sw-2"/>
+    <rect x="588" y="56" width="22" height="30" rx="3" class="fs-purple s-purple sw-2"/>
+    <rect x="614" y="56" width="22" height="30" rx="3" class="fs-purple s-purple sw-2"/>
+    <rect x="640" y="56" width="22" height="30" rx="3" class="fs-purple s-purple sw-2"/>
+    <rect x="666" y="56" width="22" height="30" rx="3" class="fs-purple s-purple sw-2"/>
+    <text x="79" y="48" text-anchor="middle" class="t-xs t-muted">1</text>
+    <text x="521" y="48" text-anchor="middle" class="t-xs t-muted">18</text>
+    <text x="547" y="48" text-anchor="middle" class="t-xs">19</text>
+    <text x="677" y="48" text-anchor="middle" class="t-xs">24</text>
+    <line x1="534" y1="30" x2="534" y2="110" class="line-dash"/>
+    <text x="534" y="22" text-anchor="middle" class="t-xs t-bold">snapshot taken here</text>
+    <path d="M68,100 H532" class="line-thin"/>
+    <text x="300" y="120" text-anchor="middle" class="t-xs t-muted">events 1 to 18: folded into snapshot S18, can be archived</text>
+    <path d="M536,100 H688" class="line-thin"/>
+    <text x="612" y="120" text-anchor="middle" class="t-xs">tail: replayed on start</text>
+    <rect x="150" y="140" width="460" height="38" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="380" y="157" text-anchor="middle" class="t-xs t-bold">S18 = messages, budget spent, pending approvals, run version</text>
+    <text x="380" y="172" text-anchor="middle" class="t-xs">recovery = load S18, then fold events 19 to 24</text>
+  </svg>
+  <figcaption><strong>Snapshot plus tail.</strong> Recovery time depends on the length of the tail, not the length of the run. Keep the old events anyway if you want an audit trail; the snapshot is an optimisation, never the only copy of what happened.</figcaption>
+</figure>
+
+<p>A subtle point for agents: <strong>context compaction is itself a decision that must be journalled.</strong> <a href="10-context-engineering.html">Chapter 10</a> describes summarising a long history into a shorter one. A summary is produced by a model, so it is not reproducible. If you replay the journal and "recompute" the summary, you get a different one, and the resumed agent now works from a different memory than the one that made the earlier decisions. Record the compaction as an event containing the summary text and which events it replaced. The same goes for anything else generated at run time that later steps depend on: a plan, a chosen random seed, a timestamp used in a decision.</p>
+
+<p>What belongs in a snapshot beyond messages? Everything a restarted process would otherwise guess: the <strong>budget</strong> already spent (steps, tokens, money), the <strong>attempt counts</strong> for each step, any <strong>pending approvals</strong>, the <strong>run version</strong>, and the identifiers of external objects the run has created (the ticket number, the draft id) so it can find them again.</p>
+
+<h2>Human approval gates</h2>
+
+<p>Some actions should not happen without a person: sending a large refund, deleting data, emailing a customer, spending past a limit. An <span class="term">approval gate</span> is a point in the run where the agent proposes an action, stops, and continues only when a human approves it. The security reasons are in <a href="19-agent-security.html">chapter 19</a> and the permission prompts in <a href="20-sandboxing.html">chapter 20</a>. The durability question is narrower: <strong>what happens to the agent while it waits?</strong></p>
+
+<p>If the agent holds a process open, it holds memory, a database connection and probably a model session, for as long as a manager takes to read an email. That cannot last a weekend, a deploy or a reboot. With a journal the answer is clean: the agent writes an <code>approval_request</code> event, <em>exits</em>, and costs nothing while it waits. The reviewer's decision is another event. Whatever process next picks up the run folds the journal, sees the decision, and goes on. The code below does exactly this for a refund over a limit of 25.00 and records what the journal looks like.</p>
+
+<pre class="terminal" data-title="approval_demo.py"><code># approval_demo.py: a refund above 25.00 waits for a human; the process exits and a later one resumes
+import hashlib, json, os, tempfile
+from llm import ScriptedModel, tool_use
+import durable
+from crash_demo import Bank, script
+
+class Paused(Exception): pass
+
+def digest(args): return hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:8]
+
+def gated(fn, path, limit):
+    def wrapped(args, key):
+        if args["amount"] &lt;= limit: return fn(args, key)
+        evs = durable.load(path)
+        verdict = next((e for e in evs if e["type"] == "approval" and e["key"] == key), None)
+        if verdict is None:
+            if not any(e["type"] == "approval_request" and e["key"] == key for e in evs):
+                durable.append(path, {"type": "approval_request", "key": key, "args": args, "hash": digest(args)})
+            raise Paused(key)
+        if verdict["hash"] != digest(args): return "error: approval was granted for different arguments"
+        if verdict["decision"] != "approve": return "refused by reviewer: " + verdict["reason"]
+        return fn(args, key)
+    return wrapped
+
+def decide(path, decision, reason="", shown=None):
+    req = [e for e in durable.load(path) if e["type"] == "approval_request"][-1]
+    durable.append(path, {"type": "approval", "key": req["key"], "decision": decision, "reason": reason,
+                          "hash": shown or req["hash"]})
+
+def attempt(path, bank):
+    tools = {"lookup": lambda a, k: "order 42: delivered, 30.00", "refund": gated(bank.refund, path, 25.00)}
+    def sc(messages, tools_, system):
+        r = script(messages, tools_, system)
+        if isinstance(r, list) and r[0]["name"] == "refund": return [tool_use("refund", {"order": 42, "amount": 30.00})]
+        if isinstance(r, str) and messages[-1]["content"][0]["content"].startswith(("error", "refused")):
+            return "I could not refund order 42: " + messages[-1]["content"][0]["content"]
+        return r
+    model = ScriptedModel(sc)
+    try: out = durable.run("Refund order 42", path, model, tools)
+    except Paused: out = "PAUSED, waiting for a human"
+    print(f"  process exits with: {out}   (model calls this process: {len(model.calls)})")
+
+bank, path = Bank(), tempfile.mktemp()
+print("process 1"); attempt(path, bank)
+print("a reviewer reads the request and approves"); decide(path, "approve")
+print("process 2, started later"); attempt(path, bank)
+print("refunds issued:", bank.refunds)
+print("journal:")
+def brief(e):
+    if e["type"] == "model":
+        b = e["content"][0]; return f"{b['name']}({json.dumps(b['input'])})" if b["type"] == "tool_use" else b["text"]
+    if e["type"] == "result": return e["output"]
+    if e["type"] == "approval_request": return f"args hash {e['hash']}"
+    return f"{e['decision']}, hash {e['hash']}"
+for i, e in enumerate(durable.load(path)):
+    print(f"  {i}  {e['type']:&lt;17}{brief(e)}")
+bank2, path2 = Bank(), tempfile.mktemp()
+print("\nsecond run: the reviewer's approval was recorded against other arguments")
+attempt(path2, bank2); decide(path2, "approve", shown="deadbeef"); attempt(path2, bank2)
+print("refunds issued:", bank2.refunds)</code></pre>
+<pre class="terminal" data-title="output"><code>process 1
+  process exits with: PAUSED, waiting for a human   (model calls this process: 2)
+a reviewer reads the request and approves
+process 2, started later
+  process exits with: Order 42 refunded.   (model calls this process: 1)
+refunds issued: [42]
+journal:
+  0  model            lookup({"order": 42})
+  1  result           order 42: delivered, 30.00
+  2  model            refund({"order": 42, "amount": 30.0})
+  3  approval_request args hash c59f39f3
+  4  approval         approve, hash c59f39f3
+  5  result           refund #1 issued
+  6  model            Order 42 refunded.
+
+second run: the reviewer's approval was recorded against other arguments
+  process exits with: PAUSED, waiting for a human   (model calls this process: 2)
+  process exits with: I could not refund order 42: error: approval was granted for different arguments   (model calls this process: 1)
+refunds issued: []</code></pre>
+
+<p>Three details in that output are the substance of a good gate.</p>
+
+<ol class="steps">
+  <li><strong>The approval is bound to the arguments.</strong> The request stores a hash of the exact arguments (<code>c59f39f3</code>), and the decision carries the hash the reviewer was shown. In the second run the decision was recorded against different arguments, so the tool refused to run and returned an error to the model. Without the binding, a prompt-injected agent could change the amount after approval, or a reviewer could approve "a refund" without knowing which. Approve the <em>action</em>, not the intent.</li>
+  <li><strong>The decision is an event, not a flag in memory.</strong> The audit trail needs to answer who approved what, when, and on which version. Add the reviewer's identity and a timestamp to the event; here they are left out to keep the listing short.</li>
+  <li><strong>The resumed process called the model once.</strong> It did not re-ask what to do about the lookup or the refund, because both were in the journal. The wait cost no tokens.</li>
+</ol>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 392" role="img" aria-label="A sequence diagram with four columns: first agent process, journal, reviewer, second agent process. The first process appends the model's refund request and an approval request with an argument hash to the journal and then exits. Later the reviewer reads the request from the journal and appends an approval carrying the same hash. Later still a second process loads the journal, checks that the hash matches, and refunds using an idempotency key.">
+    <defs><marker id="ahAG15c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="25" y="10" width="150" height="34" rx="8" class="fs-blue s-blue sw-2"/><text x="100" y="32" text-anchor="middle" class="t-sm t-bold">Process 1</text>
+    <rect x="215" y="10" width="150" height="34" rx="8" class="fs-purple s-purple sw-2"/><text x="290" y="32" text-anchor="middle" class="t-sm t-bold">Journal</text>
+    <rect x="405" y="10" width="150" height="34" rx="8" class="fs-green s-green sw-2"/><text x="480" y="32" text-anchor="middle" class="t-sm t-bold">Reviewer</text>
+    <rect x="595" y="10" width="150" height="34" rx="8" class="fs-cyan s-cyan sw-2"/><text x="670" y="32" text-anchor="middle" class="t-sm t-bold">Process 2</text>
+    <line x1="100" y1="44" x2="100" y2="372" class="line-dash"/>
+    <line x1="290" y1="44" x2="290" y2="372" class="line-dash"/>
+    <line x1="480" y1="44" x2="480" y2="372" class="line-dash"/>
+    <line x1="670" y1="44" x2="670" y2="372" class="line-dash"/>
+    <line x1="100" y1="84" x2="288" y2="84" class="line" marker-end="url(#ahAG15c)"/>
+    <text x="194" y="76" text-anchor="middle" class="t-xs">model: refund(30.00)</text>
+    <line x1="100" y1="124" x2="288" y2="124" class="line" marker-end="url(#ahAG15c)"/>
+    <text x="194" y="116" text-anchor="middle" class="t-xs">approval_request + hash</text>
+    <rect x="30" y="148" width="140" height="42" rx="6" class="fs-orange s-orange sw-2"/>
+    <text x="100" y="166" text-anchor="middle" class="t-xs t-bold">exits</text>
+    <text x="100" y="182" text-anchor="middle" class="t-xs">holds no memory</text>
+    <line x1="478" y1="226" x2="292" y2="226" class="line" marker-end="url(#ahAG15c)"/>
+    <text x="385" y="218" text-anchor="middle" class="t-xs">reads the request</text>
+    <line x1="478" y1="262" x2="292" y2="262" class="line" marker-end="url(#ahAG15c)"/>
+    <text x="385" y="254" text-anchor="middle" class="t-xs">approval + same hash</text>
+    <text x="570" y="226" text-anchor="middle" class="t-xs t-muted">minutes or days later</text>
+    <line x1="668" y1="302" x2="292" y2="302" class="line" marker-end="url(#ahAG15c)"/>
+    <text x="580" y="294" text-anchor="middle" class="t-xs">loads the journal</text>
+    <rect x="560" y="320" width="180" height="46" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="650" y="338" text-anchor="middle" class="t-xs t-bold t-dark">hash matches?</text>
+    <text x="650" y="355" text-anchor="middle" class="t-xs t-dark">refund with key</text>
+  </svg>
+  <figcaption><strong>Waiting costs nothing, because nothing is waiting.</strong> The first process leaves the proposal and its hash in the journal and exits. Any later process, possibly on a different machine after a deploy, resumes from the decision.</figcaption>
+</figure>
+
+<h3>Rules for approval gates that hold up</h3>
+
+<ul>
+  <li><strong>Show the action, not the model's summary of it.</strong> The reviewer should see the tool name and the exact arguments the tool will receive, rendered by your code. A model's description of its own action can be wrong or can be shaped by an injected instruction.</li>
+  <li><strong>Re-check preconditions on resume.</strong> Three days have passed. The order may have been refunded by another channel. The gate hands over to <em>execution</em>, and execution should read current state again before it acts, as a database re-validates a row after taking its lock.</li>
+  <li><strong>Give requests an expiry.</strong> An approval for a refund that nobody decided on for ten days should lapse into "escalate or cancel", not wait forever.</li>
+  <li><strong>Gate by risk, not by volume.</strong> A reviewer who approves two hundred requests a day clicks through all of them. Reserve the gate for actions that are irreversible or costly, and make the rest reversible (compensations) or bounded (limits).</li>
+  <li><strong>Do not put <code>interrupt</code> in a loop or in a try/except that swallows it,</strong> and keep anything before the pause idempotent. LangGraph's documentation lists these as pitfalls for the same reason: the code after a resume is not the code that ran before the pause.</li>
+  <li><strong>A denial is information.</strong> Return it to the model as a tool result (as the demo does) so it can explain, offer an alternative or stop. Do not let it retry the same call in a loop.</li>
+</ul>
+
+<h2>Retries, budgets and the step that kills the process</h2>
+
+<p>A durable agent needs the same discipline about retries as any distributed client, with two additions that come from the agent being a loop that spends money.</p>
+
+<p><strong>Retry by class of failure.</strong> A tool that times out is retried with backoff and jitter, within a cap (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>, <a href="../../architecture/chapters/17-resilience.html">architecture chapter 17</a>). A tool that returns a clear business error ("order already refunded") is not retried: it is returned to the model as a result. A model call that is rate-limited waits; one that returns malformed output may be retried once with the error attached. Each of these decisions is an event in the journal, so a restart does not reset the counters.</p>
+
+<p><strong>Budgets live in the journal.</strong> Chapter 2 gave the loop an iteration budget and a token budget. If the counter is a variable in memory, a crash resets it to zero. A task that crashes on its fortieth step restarts with forty fresh steps, and a task that triggers a crash by design (a huge tool result that exhausts memory) gets an unlimited budget. Count from the journal: <code>sum(e["type"] == "model" for e in log)</code> is what the demo's <code>max_calls</code> check does.</p>
+
+<p><strong>Poison steps.</strong> Occasionally a particular step kills the process every time: a tool result that blows memory, a parser bug on one document. A durable agent will dutifully resume into the same crash forever. Defend with an <em>attempt counter per step</em> in the journal (write "attempt 3 started" before you execute), a limit, and a policy of what to do on exceeding it: mark the run as failed, route it to a human queue and stop. This is a dead-letter queue, a pattern you may recall from the architecture course's <a href="../../architecture/chapters/14-event-driven.html">event-driven chapter</a>.</p>
+
+<p><strong>The journal is your trace.</strong> Because every model reply, tool call, result and decision is already recorded with ordering, the journal is most of what you would put in a trace (<a href="../../reliability/chapters/06-tracing.html">reliability chapter 6</a>). Add timestamps, durations and token counts to each event and you can answer "what did the agent do, how long did each step take and what did it cost?" for a run last week. It is also the raw material for the evaluations in course A6 and for debugging by replay: load a failed run's journal, change the prompt, and re-run from the point of failure with the tool results held fixed.</p>
+
+<h2>Try the failure modes</h2>
+
+<p>The explorer reproduces the experiment above as a timeline. Choose a recovery strategy and slide the crash point. The case to look at is "dies after: refund": with a journal and no key, the restart cannot tell that the refund happened.</p>
+
+<div class="widget" id="agt15-crash"></div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Copy <code>llm.py</code>, <code>durable.py</code> and <code>crash_demo.py</code> into one folder and run the experiment. Then change it three ways and predict the result before you run each.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 crash_demo.py</span>
+<span class="prompt">$</span> <span class="cmd"># 1. in script(), make the model also call "refund" a second time for a different order: do both refunds get distinct keys?</span>
+<span class="prompt">$</span> <span class="cmd"># 2. change the hook so the crash happens in "lookup" instead: which strategy wastes the most?</span>
+<span class="prompt">$</span> <span class="cmd"># 3. in durable.run, derive the key from time.time(): which table row breaks, and why?</span></code></pre>
+  <p>For the approval gate, edit the limit in <code>approval_demo.py</code> from 25.00 to 35.00 and confirm that the run no longer pauses. Then make <code>decide</code> record an approval with a mismatching hash on purpose and watch the model's final answer.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Agent runs are long, they act on the world and they sometimes wait for people. Interruptions are normal, so progress must live outside the process.</li>
+    <li>An append-only journal of model replies, tool results and human decisions lets any process rebuild the state. Log what is non-deterministic, recompute what is derived, and fsync before you move on.</li>
+    <li>Between doing an action and recording its result lies a window no ordering removes. A journal alone gives at-least-once effects; an idempotency key derived from the journal turns that into effectively-once.</li>
+    <li>Classify every tool: read-only, naturally idempotent, keyed, or unkeyed. Unkeyed writes need a way to ask "did this already happen?", a human gate, or an explicit at-least-once decision.</li>
+    <li>Temporal replays deterministic code against a recorded history; LangGraph restores checkpoints and may re-run a node from its start. Both require idempotent effects.</li>
+    <li>Version runs, journal generated artefacts such as summaries and plans, and keep budgets and attempt counts in the journal so that a crash cannot reset them.</li>
+    <li>An approval gate is an event, bound to the exact arguments by a hash, with an expiry. The agent exits while waiting and costs nothing.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://docs.temporal.io/workflows" target="_blank" rel="noopener">Temporal documentation, "Workflows"</a>. The Event History, deterministic replay, and why side effects belong in activities. Read as a clear statement of the replay model.</li>
+  <li><a href="https://docs.langchain.com/oss/python/langgraph/interrupts" target="_blank" rel="noopener">LangGraph documentation, "Interrupts"</a>. How <code>interrupt()</code>, checkpointers and thread ids implement pause and resume, including the re-run caveat.</li>
+  <li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">Anthropic Engineering, "How we built our multi-agent research system" (2025)</a>. Resuming from errors and gradual deployments for long-running agents in production.</li>
+  <li><a href="https://queue.acm.org/detail.cfm?id=2187821" target="_blank" rel="noopener">Pat Helland, "Idempotence Is Not a Medical Condition" (ACM Queue, 2012)</a>. Why messaging systems deliver at least once and how applications cope. The theory behind the keys in this chapter.</li>
+  <li>Hector Garcia-Molina and Kenneth Salem, "Sagas" (ACM SIGMOD, 1987). The original long-lived-transaction paper behind compensations; see also <a href="../../architecture/chapters/15-sagas.html">architecture chapter 15</a>.</li>
+  <li><a href="https://stripe.com/docs/api/idempotent_requests" target="_blank" rel="noopener">Stripe API documentation, "Idempotent requests"</a>. A production example of keys, stored outcomes and replayed responses.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">An agent journals every model reply and tool result. The process is killed after the payment API charged a card but before the result was written. On restart the agent repeats the call and the customer is charged twice. Which change fixes the cause?</p>
+    <ol class="q-options">
+      <li>Write the result to the journal before calling the payment API</li>
+      <li>Snapshot the whole conversation after every step instead of journalling events</li>
+      <li>Send an idempotency key derived from journal contents (run id, event position, call id) with every attempt</li>
+      <li>Ask the model on restart whether the charge happened</li>
+    </ol>
+    <div class="q-explain">The effect and the record are in two different systems, so one can happen without the other whatever the order. A key that every attempt computes identically lets the payment service recognise the repeat. Writing the result first would record an outcome that may never have occurred. A snapshot has the same window. The model only knows what its messages say, and they do not contain the answer.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">Why is the model's reply stored in the journal rather than recomputed during recovery?</p>
+    <ol class="q-options">
+      <li>Asking again may give a different reply, so the resumed run would diverge from what was actually done, and it would cost tokens</li>
+      <li>Model replies are too large to recompute quickly</li>
+      <li>Providers forbid sending the same prompt twice</li>
+      <li>Journalled replies make the model more accurate</li>
+    </ol>
+    <div class="q-explain">The reply is a non-deterministic fact: the decision that was made. If the run recomputes it, the new answer might call a different tool than the one already executed. Size and speed are secondary, there is no such provider rule, and replay does not change the model's accuracy.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A run is paused on an approval. The reviewer's decision is stored as <code>approve</code> with a flag in the web server's memory, and the server is redeployed overnight. What is the problem, and what is the fix?</p>
+    <ol class="q-options">
+      <li>No problem: flags in memory are fast, and the agent will just ask again</li>
+      <li>The reviewer should approve twice for safety</li>
+      <li>The agent should keep polling the server until it answers</li>
+      <li>The decision is lost with the process; store it as an event in durable storage, bound to the hash of the proposed arguments</li>
+    </ol>
+    <div class="q-explain">State needed after a restart must outlive the process. Asking the reviewer again is a poor experience and not a design. Polling keeps a process alive for a decision that may take days. Binding the decision to the arguments' hash also stops the approved action from being changed afterwards.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A run of 100 steps has a 3% chance of the process dying at each step. In the simulation, restarting from scratch needed about 667 steps of work and resuming needed about 103. What explains the large gap?</p>
+    <ol class="q-options">
+      <li>Resuming makes each step faster</li>
+      <li>Each crash from scratch discards all progress, and a clean 100-step run (5% chance) is rare, so the work is repeated many times; resuming repeats only the interrupted step</li>
+      <li>Restarting from scratch has a higher crash probability per step</li>
+      <li>The simulation counts model calls twice when resuming</li>
+    </ol>
+    <div class="q-explain">The per-step probability is the same in both strategies. The difference is what a crash throws away: with 3% per step, only about 5% of 100-step attempts reach the end. Resuming never loses more than one step. The gap grows quickly with n, which is why it matters more as agents run longer.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">LangGraph's documentation warns that on resume a node re-runs from its beginning, not from the interrupt call. A node sends a confirmation email and then calls <code>interrupt()</code> to ask for approval. What happens, and what should you do?</p>
+    <ol class="q-options">
+      <li>Nothing: code before the interrupt is skipped on resume</li>
+      <li>The email is sent once, because checkpoints record that it was sent</li>
+      <li>The email can be sent again on resume; move it after the interrupt, or make it idempotent</li>
+      <li>The graph raises an error and refuses to resume</li>
+    </ol>
+    <div class="q-explain">The node's earlier code executes again, and a checkpoint of state does not stop an external call. Ordering the interrupt first, or making the call safe to repeat, removes the duplicate. The same reasoning applies to any replay-based design.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">Your agent summarises its history when the context gets long. A recovered run replays the journal and re-runs the summarisation step. What is the risk, and how do you avoid it?</p>
+    <ol class="q-options">
+      <li>No risk: the summary is deterministic given the same history</li>
+      <li>A new summary may differ from the original, so the run continues from a different memory than the earlier decisions used; journal the summary as an event and reuse it</li>
+      <li>Summaries are always lost on a crash, so skip them</li>
+      <li>The journal becomes too large, so delete older events</li>
+    </ol>
+    <div class="q-explain">A summary comes from a model call and is not reproducible. Anything generated at run time that later steps depend on (summaries, plans, random seeds, timestamps) should be recorded when produced. Deleting events does not help, and skipping compaction removes a needed capability.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/agt15-crash.js"></script>
+</body>
+</html>

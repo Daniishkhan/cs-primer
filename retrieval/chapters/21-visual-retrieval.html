@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visual Document Retrieval · Retrieval, Search &amp; Document AI</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="ret" data-chapter="21">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Visual Document Retrieval</h1>
+  <p class="lede">The usual route to searching a PDF is to extract its text and index that. This chapter covers the alternative: embed a picture of the page itself, so charts, layout and tables are searchable without being converted to text first. It explains how ColPali-style models do it, what it costs, and the cases where reading the text is still the better bet.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapters 18 to 20 built a text route: parse the layout, OCR what needs it, recover tables and fields. Every stage can lose information, and some information has no text form at all: the slope of a line chart, the position of a sensor in a diagram, the red stamp over a figure. Slide decks, scanned reports and technical manuals are exactly the documents where this matters most. After this chapter you can explain how a page becomes a set of vectors, estimate what that costs in storage and compute, predict which queries it wins and which it loses, and design a test that settles the choice for your own documents instead of a benchmark's.</p>
+</div>
+
+<h2>What the text route throws away</h2>
+
+<p>Think about what a text extractor keeps of the following page: a heading, two paragraphs, a bar chart with the title "Quarterly output" and a photograph of a cracked weld with a caption. It keeps the heading and paragraphs. From the chart it may keep the title and the axis labels; the heights of the bars, which are the content, are gone. From the photograph it keeps the caption. A question such as "in which quarter did output fall?" can be answered from the page and from no text on it.</p>
+
+<p>The loss has four sources, and they compound:</p>
+<ul>
+  <li><strong>Non-text content.</strong> Charts, diagrams, photographs, maps and handwriting have no characters to extract. A captioning model can describe them, but a description of a chart is a lossy summary made before anyone knew what would be asked.</li>
+  <li><strong>Layout and emphasis.</strong> Position, size, colour and boxes carry meaning: a callout box, a struck-through price, a totals row, a warning in red.</li>
+  <li><strong>Pipeline errors.</strong> Each stage (layout, reading order, OCR, table structure) has an error rate, and the product of several stages is worse than any of them. A table recovered with a merged column is wrong before retrieval starts.</li>
+  <li><strong>Engineering and time.</strong> A multi-stage parser is a lot of machinery to build and run. The ColPali paper (Faysse et al., 2024) reports about 7.2 seconds per page to index with a conventional parsing-and-captioning pipeline, against about 0.39 seconds for its model, measured on its own hardware; whatever the exact figures on yours, the parser is the slow part of ingestion.</li>
+</ul>
+
+<h2>Embedding the page itself</h2>
+
+<p>The idea is to skip extraction and give the page, as an image, to a model that outputs vectors. A <span class="term">vision-language model</span> (<a href="../../deep-learning/chapters/21-vision-language.html">deep learning, chapter 21</a>) already does the first half: it cuts the image into a grid of small squares called <span class="term">patches</span> and encodes each into a vector that captures what is there, whether that is a letter shape, a bar, a table border or a pixel of photograph. ColPali (Faysse et al., 2024, "ColPali: Efficient Document Retrieval with Vision Language Models") builds on PaliGemma-3B, which pairs the SigLIP image encoder with the Gemma 2B language model. The page becomes 1,024 patches, each projected down to a 128-dimension vector. The query is text, run through the same model's language side to give one 128-dimension vector per query token.</p>
+
+<p>Retrieval then uses <strong>late interaction</strong>, the scoring from <a href="09-late-interaction-sparse.html">chapter 9</a>: for each query token, find the page patch it matches best (dot product), and add up those best matches. This is called MaxSim. The name ColPali is the combination: <em>Col</em> for ColBERT's scoring, <em>Pali</em> for PaliGemma. Pages whose patches collectively cover the query's tokens score high, wherever on the page those patches are.</p>
+
+<h2>A toy you can run</h2>
+
+<p>A trained page encoder cannot be run here, so the program below is a deliberately small stand-in that keeps the structure and nothing else. A page is a list of patches. A text patch holds one word, and its vector is a hashed character-trigram embedding (the stand-in embedder of <a href="07-dense-retrieval.html">chapter 7</a>). A drawing patch (a chart, a diagram, a photograph) holds no characters; a hand-written table says which concept words an image encoder would give it, to represent what a trained model learns from millions of pages. A drawing covers several patches, one per concept. Two pipelines are compared: the text route, which sees only the characters, and the visual route, which sees the drawings too. Both rank pages by MaxSim.</p>
+
+<pre class="terminal" data-title="visual.py"><code>"""Stand-in for page-image retrieval. A page is a grid of patches; each patch holds a word or a drawing."""
+import math, re, zlib
+import numpy as np
+
+DIM = 256
+def vec(text):
+    """Hashed character trigrams: a deterministic stand-in for a trained embedder."""
+    v = np.zeros(DIM)
+    t = f"  {text.lower()} "
+    for i in range(len(t) - 2):
+        v[zlib.crc32(t[i:i + 3].encode()) % DIM] += 1
+    n = np.linalg.norm(v)
+    return v / n if n else v
+
+# What a trained image encoder would learn from millions of pages, written by hand for six drawings.
+SEES = {"chart:rising": "revenue growth rising trend chart increase",
+        "chart:falling": "sales decline falling trend chart decrease",
+        "diagram:valve": "diagram valve sensor left pipe layout",
+        "photo:crack": "photo crack damage weld defect"}
+
+PAGES = {
+ "p1": "hydraulic pump maintenance schedule every 500 hours replace filter".split(),
+ "p2": "annual report region table chart:rising".split(),
+ "p3": "quarterly summary north europe chart:falling".split(),
+ "p4": "piping layout diagram:valve pump purchase order PO-88417 approved".split(),
+ "p5": "inspection weld report photo:crack purchase order PO-88471 rejected".split(),
+ "p6": "terms and conditions delivery payment thirty days notice".split(),
+ "p7": "revenue recognition policy accounting standard".split(),
+ "p8": "sales team contact list regional office".split(),
+}
+def patches(page, sees_images):
+    out = []
+    for p in PAGES[page]:
+        if p not in SEES:
+            out.append(vec(p))
+        elif sees_images:                    # a drawing covers several patches, each carrying one concept
+            out += [vec(w) for w in SEES[p].split()]
+    return out
+
+def maxsim(q_tokens, page, sees_images):
+    P = np.array(patches(page, sees_images))
+    Q = np.array([vec(t) for t in q_tokens])
+    return float((Q @ P.T).max(axis=1).sum())          # best patch for each query token, summed
+
+def rank(query, sees_images):
+    q = query.split()
+    return sorted(PAGES, key=lambda p: -maxsim(q, p, sees_images))
+
+QUERIES = [("pump maintenance schedule", "p1"), ("is revenue rising", "p2"),
+           ("sales trend falling", "p3"), ("where is the valve sensor", "p4"),
+           ("order PO-88417", "p4"), ("weld crack photo", "p5")]</code></pre>
+<pre class="terminal" data-title="run6.py"><code>from visual import *
+
+print(f"{'query':28s} {'answer':6s} {'text-only rank':15s} {'with images':12s}")
+for q, gold in QUERIES:
+    r_text, r_img = rank(q, False), rank(q, True)
+    print(f"{q:28s} {gold:6s} {r_text.index(gold) + 1:&lt;15d} {r_img.index(gold) + 1:&lt;12d}")
+
+q = "order PO-88417".split()
+print("\nexact identifier, MaxSim score (query has 2 tokens, so 2.00 is a perfect match):")
+for p in ("p4", "p5"):
+    print(f"  {p} contains {[w for w in PAGES[p] if w.startswith('PO-')][0]}: {maxsim(q, p, True):.2f}")
+print("exact token match: p4 =", int("PO-88417" in PAGES["p4"]), " p5 =", int("PO-88417" in PAGES["p5"]))</code></pre>
+<pre class="terminal" data-title="output"><code>query                        answer text-only rank  with images 
+pump maintenance schedule    p1     1               1           
+is revenue rising            p2     2               1           
+sales trend falling          p3     8               1           
+where is the valve sensor    p4     7               1           
+order PO-88417               p4     1               1           
+weld crack photo             p5     1               1           
+
+exact identifier, MaxSim score (query has 2 tokens, so 2.00 is a perfect match):
+  p4 contains PO-88417: 2.00
+  p5 contains PO-88471: 1.67
+exact token match: p4 = 1  p5 = 0</code></pre>
+
+<p>The first query is answered from text, and both routes put page p1 first. The queries about the rising revenue, the falling sales and the valve sensor are answered only from drawings. The text route finds them at rank 2, 8 and 7 of 8, which is chance plus the noise of trigram overlap; the visual route finds all three at rank 1. The identifier query and the weld query use words that are printed on their pages, so both routes cope.</p>
+
+<p>Look at the final lines, though. The query "order PO-88417" has a near-twin in page p5, which contains "PO-88471" (two digits swapped). The correct page scores a perfect 2.00. The near-miss scores 1.67, only 17% lower, because most of the trigrams of the two identifiers are shared, whereas an exact-token match separates them completely (1 against 0). This is not a defect of the toy. <strong>Dense and visual embeddings blur exact strings</strong> (part numbers, invoice numbers, clause references, names), which is why lexical matching earns its place beside them (<a href="10-hybrid-search.html">chapter 10</a>). A real page encoder has an extra problem: a part number printed in 6-point type may occupy a fraction of one patch, so the image model may not resolve its digits at all.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: two librarians</p>
+  <p>One librarian searches a typed transcript catalogue of the archive; she is fast and exact, and she has never seen a photograph or a graph, only what the transcriber chose to write about them. The other flips through the actual pages and recognises a rising line, a floor plan or a signature at a glance, but cannot reliably read small print across the room.</p>
+  <p><em>Where it breaks down:</em> the second librarian's glance is learned from examples. She is excellent on document styles resembling her training and can be badly wrong on unfamiliar ones, in ways that are hard to see because nothing is written down for you to inspect.</p>
+</div>
+
+<h2>What the model returns, and how it is trained</h2>
+
+<p>ColPali is trained with a contrastive objective of the kind in <a href="07-dense-retrieval.html">chapter 7</a>: given pairs of a query and the page that answers it, make the MaxSim score of the right page higher than that of other pages in the batch. The training pairs are queries about page images; part of the training data is synthetic, with queries generated by a language model, and the authors released the models, data and benchmark under open licences. Because scoring is per query token against per patch, the model can also show <em>where</em> it matched: the patch with the highest similarity to each query token gives a heat map over the page. That is useful for the citation problem. A text pipeline can highlight a sentence; a visual retriever can highlight a region, which you can show to a reviewer or crop for a generator.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Query tokens on the left are each connected by a line to their best matching patch in a grid of page patches on the right. The token revenue links to a patch in the title area, rising and trend link to patches inside a shaded chart region, and Asia links to a patch in a table region. A note says the page score is the sum of these best matches.">
+    <defs><marker id="ahRET21a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="22" class="t-sm t-bold">Query tokens</text>
+    <rect x="20" y="40" width="120" height="36" rx="6" class="fs-green s-green sw-2"/><text x="80" y="63" text-anchor="middle" class="t-sm mono">revenue</text>
+    <rect x="20" y="90" width="120" height="36" rx="6" class="fs-green s-green sw-2"/><text x="80" y="113" text-anchor="middle" class="t-sm mono">rising</text>
+    <rect x="20" y="140" width="120" height="36" rx="6" class="fs-green s-green sw-2"/><text x="80" y="163" text-anchor="middle" class="t-sm mono">trend</text>
+    <rect x="20" y="190" width="120" height="36" rx="6" class="fs-green s-green sw-2"/><text x="80" y="213" text-anchor="middle" class="t-sm mono">Asia</text>
+    <text x="400" y="22" class="t-sm t-bold">Page: a grid of patch vectors</text>
+    <rect x="400" y="34" width="336" height="196" rx="6" class="box"/>
+    <rect x="400" y="34" width="336" height="28" class="fs-purple s-purple"/><text x="568" y="53" text-anchor="middle" class="t-xs">title area</text>
+    <rect x="552" y="82" width="170" height="104" rx="4" class="fs-cyan s-cyan"/><text x="637" y="200" text-anchor="middle" class="t-xs">chart region</text>
+    <rect x="412" y="82" width="120" height="104" rx="4" class="fs-orange s-orange"/><text x="472" y="200" text-anchor="middle" class="t-xs">table region</text>
+    <rect x="440" y="38" width="20" height="20" class="f-yellow"/>
+    <rect x="598" y="98" width="20" height="20" class="f-yellow"/>
+    <rect x="660" y="132" width="20" height="20" class="f-yellow"/>
+    <rect x="452" y="150" width="20" height="20" class="f-yellow"/>
+    <line x1="140" y1="58" x2="438" y2="50" class="line s-yellow"/>
+    <line x1="140" y1="108" x2="596" y2="108" class="line s-yellow"/>
+    <line x1="140" y1="158" x2="658" y2="144" class="line s-yellow"/>
+    <line x1="140" y1="208" x2="450" y2="166" class="line s-yellow"/>
+    <text x="400" y="252" class="t-xs t-muted">yellow: the best patch for each token. Page score = sum of the four best matches.</text>
+  </svg>
+  <figcaption><strong>MaxSim on a page.</strong> Every query token picks its own best patch, wherever it is. The matches also say where on the page the evidence is.</figcaption>
+</figure>
+
+<h2>Two pipelines side by side</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two ingestion pipelines. Top, the text route: page image, then layout analysis and OCR, then text chunks, then a text embedder and BM25 index. A red note says charts, layout and diagrams are lost on the way. Bottom, the visual route: page image, then a page encoder that outputs patch vectors, then a multi-vector index. A green note says the image is kept as it is, and a red note says the index is much larger.">
+    <defs><marker id="ahRET21b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="20" class="t-sm t-bold">Text route</text>
+    <rect x="20" y="30" width="110" height="52" rx="8" class="fs-green s-green sw-2"/><text x="75" y="61" text-anchor="middle" class="t-sm t-bold">Page image</text>
+    <rect x="160" y="30" width="150" height="52" rx="8" class="fs-blue s-blue sw-2"/><text x="235" y="52" text-anchor="middle" class="t-sm t-bold">Layout + OCR</text><text x="235" y="70" text-anchor="middle" class="t-xs">chapters 18 to 20</text>
+    <rect x="340" y="30" width="130" height="52" rx="8" class="fs-cyan s-cyan sw-2"/><text x="405" y="61" text-anchor="middle" class="t-sm t-bold">Text chunks</text>
+    <rect x="500" y="30" width="150" height="52" rx="8" class="fs-purple s-purple sw-2"/><text x="575" y="52" text-anchor="middle" class="t-sm t-bold">Text index</text><text x="575" y="70" text-anchor="middle" class="t-xs">BM25 + embeddings</text>
+    <line x1="130" y1="56" x2="158" y2="56" class="line" marker-end="url(#ahRET21b)"/><line x1="310" y1="56" x2="338" y2="56" class="line" marker-end="url(#ahRET21b)"/><line x1="470" y1="56" x2="498" y2="56" class="line" marker-end="url(#ahRET21b)"/>
+    <text x="20" y="108" class="t-xs tc-red t-bold">loses chart shapes, diagram layout, emphasis; each stage adds its own errors</text>
+    <text x="20" y="150" class="t-sm t-bold">Visual route</text>
+    <rect x="20" y="160" width="110" height="52" rx="8" class="fs-green s-green sw-2"/><text x="75" y="191" text-anchor="middle" class="t-sm t-bold">Page image</text>
+    <rect x="160" y="160" width="150" height="52" rx="8" class="fs-blue s-blue sw-2"/><text x="235" y="182" text-anchor="middle" class="t-sm t-bold">Page encoder</text><text x="235" y="200" text-anchor="middle" class="t-xs">VLM, one pass</text>
+    <rect x="340" y="160" width="150" height="52" rx="8" class="fs-cyan s-cyan sw-2"/><text x="415" y="182" text-anchor="middle" class="t-sm t-bold">Patch vectors</text><text x="415" y="200" text-anchor="middle" class="t-xs">1,024 &times; 128</text>
+    <rect x="520" y="160" width="150" height="52" rx="8" class="fs-purple s-purple sw-2"/><text x="595" y="182" text-anchor="middle" class="t-sm t-bold">Multi-vector index</text><text x="595" y="200" text-anchor="middle" class="t-xs">MaxSim scoring</text>
+    <line x1="130" y1="186" x2="158" y2="186" class="line" marker-end="url(#ahRET21b)"/><line x1="310" y1="186" x2="338" y2="186" class="line" marker-end="url(#ahRET21b)"/><line x1="490" y1="186" x2="518" y2="186" class="line" marker-end="url(#ahRET21b)"/>
+    <text x="20" y="238" class="t-xs tc-green t-bold">keeps what the page looks like; nothing to configure per document type</text>
+    <text x="20" y="256" class="t-xs tc-red t-bold">costs: about 60 times the storage per page, fuzzy on exact strings and small print</text>
+  </svg>
+  <figcaption><strong>Where the two routes differ.</strong> The visual route has fewer stages and keeps more of the page, and pays in index size and in precision on exact text.</figcaption>
+</figure>
+
+<h2>What it costs</h2>
+
+<p>A multi-vector page is large. A single dense vector for a page, as in <a href="07-dense-retrieval.html">chapter 7</a>, might be 1,024 numbers. A page of ColPali is 1,024 vectors of 128 numbers. The next script does the arithmetic for a million pages, and for the search compute of one query done by brute force.</p>
+
+<pre class="terminal" data-title="run7.py"><code>PAGES = 1_000_000
+patches, dim, bytes_per = 1024, 128, 2          # ColPali: 1,024 patch vectors of 128 float16 numbers
+multi = patches * dim * bytes_per
+single = 1024 * 4                               # one 1,024-dimension float32 vector per page, for scale
+print(f"multi-vector page: {multi:,} bytes = {multi / 1024:.0f} KiB   -&gt;  {PAGES * multi / 1e9:,.0f} GB for {PAGES:,} pages")
+print(f"one vector/page  : {single:,} bytes =    {single / 1024:.0f} KiB   -&gt;  {PAGES * single / 1e9:,.1f} GB")
+print(f"ratio: {multi / single:.0f}x")
+
+q_tokens = 20
+flops = 2 * q_tokens * patches * dim * PAGES     # brute-force MaxSim, one query, every page
+print(f"\nbrute-force MaxSim, {q_tokens}-token query over {PAGES:,} pages: {flops / 1e12:.1f} TFLOP")
+print(f"  compute on one CPU core at an assumed 50 GFLOP/s: {flops / 50e9:,.0f} s")
+print(f"  just streaming {PAGES * multi / 1e9:,.0f} GB from memory at an assumed 100 GB/s: {PAGES * multi / 100e9:.1f} s")
+cand = 1000
+print(f"\nre-scoring only {cand} candidates from a cheap first stage: {2 * q_tokens * patches * dim * cand / 1e9:.1f} GFLOP")</code></pre>
+<pre class="terminal" data-title="output"><code>multi-vector page: 262,144 bytes = 256 KiB   -&gt;  262 GB for 1,000,000 pages
+one vector/page  : 4,096 bytes =    4 KiB   -&gt;  4.1 GB
+ratio: 64x
+
+brute-force MaxSim, 20-token query over 1,000,000 pages: 5.2 TFLOP
+  compute on one CPU core at an assumed 50 GFLOP/s: 105 s
+  just streaming 262 GB from memory at an assumed 100 GB/s: 2.6 s
+
+re-scoring only 1000 candidates from a cheap first stage: 5.2 GFLOP</code></pre>
+
+<p>The formula gives 256 KiB per page (the paper reports about 257.5 KB per page for ColPali, against about 8.6 KB for a BGE-M3 text embedding; the small difference from the formula presumably comes from how storage is counted, and the order of magnitude is what matters). A million pages is about a quarter of a terabyte of vectors, which has to sit in fast memory or be fetched quickly to rank anything. Brute-force scoring of one query against everything is five trillion operations and, more to the point, a stream of 262 GB through memory, so exhaustive MaxSim over a large corpus is out of the question. The standard answer is the one rerankers use (<a href="08-rerankers.html">chapter 8</a>): a cheap first stage proposes a thousand candidates, and MaxSim re-scores those, which is 5 GFLOP and entirely routine. The first stage can be BM25 on whatever text you have, a single-vector summary of each page, or an approximate nearest-neighbour index over the patch vectors (<a href="11-ann-indexes.html">chapter 11</a>).</p>
+
+<p>Storage can also be reduced directly. Merging neighbouring patch vectors (pooling), dropping blank patches such as margins, shrinking the dimension and quantising to fewer bits all appear in the literature and in open implementations, and all trade accuracy for size. How much accuracy they cost depends on your documents, so measure it instead of reading a number from another corpus.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>This is a memory-capacity and memory-bandwidth problem before it is a modelling problem. A scan over 262 GB is limited by how fast memory can feed the processors, the same constraint that governs the decode step of LLM serving (<a href="../../llm-training/chapters/18-kv-cache.html">the KV cache</a>) and the roofline reasoning in <a href="../../systems/chapters/21-parallelism-gpus.html">parallelism and GPUs</a>. Two-stage designs, where a cheap stage bounds the work of an expensive one, are the standard answer to the latency budgets of <a href="../../reliability/chapters/09-tail-latency.html">tail latency</a>: you pay the expensive scorer for a thousand items, not a million.</p>
+</div>
+
+<h2>When visual beats text, and when it does not</h2>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Situation</th><th>Better route</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Slide decks, infographics, posters</td><td>Visual</td><td>Meaning is carried by layout and graphics; text fragments are out of context.</td></tr>
+<tr><td>Questions answered by a chart or diagram</td><td>Visual</td><td>The answer is a shape, with no characters to extract.</td></tr>
+<tr><td>Poor scans, mixed scripts, unusual fonts</td><td>Test both</td><td>OCR may fail; a page encoder may still see the gist, or may not have seen such pages.</td></tr>
+<tr><td>Long, dense, text-only pages (legal, contracts)</td><td>Text</td><td>Small type across 1,024 patches loses detail; text is exact and cheap.</td></tr>
+<tr><td>Exact identifiers, names, clause numbers</td><td>Text (lexical)</td><td>Visual and dense vectors blur near-identical strings.</td></tr>
+<tr><td>Very large corpora, tight memory</td><td>Text, or visual with pooling and a first stage</td><td>Multi-vector pages are tens of times larger.</td></tr>
+<tr><td>Redacted or access-controlled content</td><td>Whichever you can control</td><td>A redaction must be applied to the pixels before encoding; the index then must not contain the hidden content (<a href="12-filters-permissions.html">chapter 12</a>).</td></tr>
+<tr><td>Citations to a sentence or table cell</td><td>Text, or visual then parse</td><td>Visual retrieval returns a page and a region, not a quotable string.</td></tr>
+</tbody>
+</table></div>
+
+<p>That last row points at a structural difference. Visual retrieval finds <em>pages</em>. To answer a question the generator then needs to read the page, either as an image (a VLM, which costs image tokens per page in context and shares the failure modes of <a href="19-ocr.html">chapter 19</a>) or as text produced by OCR after retrieval. Some systems therefore do visual retrieval, then parse only the top few pages with the heavy parser (<a href="19-ocr.html">chapter 19</a>), which saves most of the parsing cost while keeping a text answer to cite. Others run both indexes and fuse the results with reciprocal rank fusion, which is the safest design when you cannot yet say which route wins on which query.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <ul>
+    <li><strong>ColPali and its relatives.</strong> The original model used PaliGemma-3B. Later models in the same family replaced the backbone with other vision-language models; ColQwen2, for example, is built on Qwen2-VL-2B, limits a page to at most 768 patches and outputs 128-dimension vectors, and its adapters are published under the MIT licence (model card, read October 2026). New checkpoints appear every few months, so choose the current one from the leaderboard and re-test.</li>
+    <li><strong>ViDoRe V3</strong> (January 2026) is a larger benchmark: 10 datasets, about 26,000 pages and 3,099 human-verified queries, each available in 6 languages. Its authors report that visual retrievers beat textual ones, that late-interaction models and textual reranking help substantially, and that models still struggle with non-textual elements, open-ended queries and fine-grained visual grounding (arXiv 2601.08620).</li>
+    <li>The first ColPali paper reported 81.3 nDCG@5 on its ViDoRe benchmark against 67.0 for the best text pipeline it compared (parsing and captioning with BGE-M3). Both numbers are from the authors' own comparison and benchmark, on document types they selected.</li>
+  </ul>
+  <p>Treat the direction as established and the margin as yours to measure: on text-dense corpora, a strong text pipeline narrows or reverses the gap.</p>
+</div>
+
+<h2>Deciding for your corpus</h2>
+
+<p>The experiment that settles the question is small. Take 100 to 200 pages that represent the real corpus, including the awkward ones. Write queries for them the way users would, and label which page answers each. Tag every query with what the answer is made of: running text, a table, a chart or diagram, an identifier or exact string. Then build the text route and the visual route, and report page-level recall at 5 and nDCG@5 for each, <em>per tag</em>. The overall number will mislead you in either direction; the per-tag table tells you which route to use for which query type, and whether a hybrid of the two is worth its complexity. Add the storage per page, ingestion time per page and query latency. This is the method of <a href="05-test-collections.html">chapter 5</a>, with pages as the unit.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Page-image retrieval makes OCR and parsing unnecessary." It moves the reading from ingestion to answer time. The generator still has to read the retrieved page, and if it is a VLM it makes the reading errors of chapter 19 on a page whose text you never extracted, never indexed and cannot search. You also lose the ability to quote, to filter on extracted fields (<a href="20-tables-forms.html">chapter 20</a>) and to audit what the system thinks the page says. Visual retrieval is a different trade, not a free upgrade.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Run <code>run6.py</code>, then change <code>visual.py</code>. (1) Add a page whose only content about "revenue" is a text word, and a page whose drawing is a rising chart of something else (change its concept words). How does the ranking of "is revenue rising" change? (2) Add the identifier "PO-88418" to a page and query "order PO-88417": what is the MaxSim gap now, and what would BM25 give? (3) In <code>run7.py</code>, set the patch count to 512 and the dimension to 64, and find the storage per million pages; then compute how much a text-embedding-per-page index of the same corpus would be at 8.6 KB per page.</p>
+  <pre class="terminal"><span class="prompt">$</span> <span class="cmd">python3 run6.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 run7.py</span></pre>
+</div>
+
+<p>The case study <a href="../cases/case-06-colpali.html">ColPali: Retrieving Pages as Images</a> reads the paper and its benchmark in detail, and <a href="../studios/studio-03-document-processing.html">studio 3</a> asks you to choose between these routes under a budget.</p>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>The text route loses non-text content and layout, and compounds the errors of several stages. Visual retrieval embeds the page image directly, keeping what the page looks like.</li>
+    <li>ColPali-style models produce one vector per patch (1,024 patches of 128 numbers for ColPali) and score pages with MaxSim: each query token takes its best-matching patch, and the matches are summed.</li>
+    <li>The matches also locate evidence on the page, which supports region-level citation.</li>
+    <li>A page costs around 256 KiB of vectors, about 60 times a single dense vector, so brute-force search at scale is impractical. Use a cheap first stage with MaxSim to re-rank, and consider pooling and quantisation after measuring the loss.</li>
+    <li>Visual retrieval wins on slides, charts, diagrams and layout-heavy or poorly scanned pages. Text retrieval wins on dense text, exact identifiers, quotable citations and tight budgets.</li>
+    <li>Visual retrieval finds pages, not strings. The reading still has to happen somewhere, and hybrid designs run both routes.</li>
+    <li>Decide with a per-query-type evaluation on your own pages, not with a benchmark average.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2407.01449" target="_blank" rel="noopener">Faysse et al., "ColPali: Efficient Document Retrieval with Vision Language Models" (ICLR 2025)</a>. The model, the ViDoRe benchmark and the efficiency comparison with parsing pipelines.</li>
+  <li><a href="https://arxiv.org/abs/2601.08620" target="_blank" rel="noopener">"ViDoRe V3: A Comprehensive Evaluation of Retrieval Augmented Generation in Complex Real-World Scenarios" (2026)</a>. A larger multilingual benchmark with human-verified queries and grounding boxes.</li>
+  <li><a href="https://arxiv.org/abs/2004.12832" target="_blank" rel="noopener">Khattab and Zaharia, "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT" (2020)</a>. The late-interaction scoring that ColPali transfers to image patches.</li>
+  <li><a href="https://huggingface.co/vidore/colqwen2-v1.0" target="_blank" rel="noopener">ColQwen2 model card (vidore/colqwen2-v1.0)</a>. A model in the same family, with usage and licence details.</li>
+  <li><a href="https://arxiv.org/abs/2402.03216" target="_blank" rel="noopener">Chen et al., "BGE M3-Embedding" (2024)</a>. A multilingual text embedder used as the text-route baseline in ColPali's comparison.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A user asks "in which quarter did output fall?" and the answer is shown only by the shape of a bar chart. Why does a text-extraction pipeline usually fail?</p>
+    <ol class="q-options"><li>Text embeddings cannot represent numbers</li><li>The bar heights are not characters, so extraction keeps at most the title and axis labels and the answer is absent from the index</li><li>BM25 cannot rank pages with fewer than 100 words</li><li>OCR is too slow to run on charts</li></ol>
+    <div class="q-explain">The information is graphical. Extraction can keep the chart's text but not what the bars encode, so no text retriever can find it, however good. Speed is not the issue, and embeddings and BM25 do handle numbers; they simply were never given this one.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">In MaxSim scoring of a page, which statement is correct?</p>
+    <ol class="q-options"><li>The page vector is the average of all patch vectors, compared with the query vector</li><li>Each patch picks the query token it matches best, and the matches are summed</li><li>The query is converted into an image and compared pixel by pixel</li><li>Each query token picks the page patch it matches best, and these best matches are summed</li></ol>
+    <div class="q-explain">The maximum is taken over patches for each query token, then summed over tokens, which lets different tokens match different parts of the page. Averaging patches (option 1) would be the single-vector approach and loses this. The query is text and is not rendered.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A corpus of one million pages is to be indexed with 1,024 patch vectors of 128 float16 numbers per page. About how much memory do the vectors need?</p>
+    <ol class="q-options"><li>About 260 GB</li><li>About 26 GB</li><li>About 2.6 TB</li><li>About 4 GB</li></ol>
+    <div class="q-explain">1,024 &times; 128 &times; 2 bytes is 262,144 bytes per page, so a million pages is about 262 GB. Four gigabytes is the size of one 1,024-dimension float32 vector per page, which is the sixty-fold difference that makes multi-vector indexes expensive.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Users search a purchase-order archive mainly by exact order number, such as PO-88417. Which design is most sensible?</p>
+    <ol class="q-options"><li>Visual retrieval alone, since it is the newest approach</li><li>A dense text embedding alone, since it understands meaning</li><li>Lexical matching on extracted identifiers, optionally fused with a visual or dense route for the descriptive queries</li><li>Brute-force MaxSim over every page for each query</li></ol>
+    <div class="q-explain">Identifiers are exact strings, and the toy shows that dense and visual scores for a near-twin (PO-88471) are only slightly lower than for the true match. Lexical matching separates them cleanly. Fusing keeps the benefit of the other routes for queries that are not identifiers.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A team switches from OCR-based to page-image retrieval and reports that the system "no longer has OCR errors". What is the best response?</p>
+    <ol class="q-options"><li>Agree: with no extracted text there is nothing to get wrong</li><li>Point out that reading still happens at answer time, when a model reads the retrieved page image, and the quotability, filtering and audit of extracted text are lost</li><li>Point out that page-image retrieval cannot find any text at all</li><li>Say that image embeddings are always less accurate than text</li></ol>
+    <div class="q-explain">The reading moved, and with it the errors. Visual retrieval can find text content, so option 3 is wrong, and it often wins; option 4 overgeneralises. What changed is where the system can inspect and constrain what the page says.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">You must pick between the text route and the visual route for an archive of 80,000 mixed documents. What evaluation is most likely to give a reliable decision?</p>
+    <ol class="q-options"><li>Pick the model with the highest score on a public benchmark</li><li>Average page-level recall over 20 queries about contracts</li><li>Label 150 queries on representative pages, tag each by answer type, and compare recall and nDCG@5 per tag, plus storage and latency</li><li>Run both routes and keep the one that is faster</li></ol>
+    <div class="q-explain">Per-type results on your own pages show where each route wins, which an average hides, and cost belongs in the decision. A benchmark average describes someone else's documents; 20 queries of one type misses the others; speed alone ignores whether the right pages are found.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

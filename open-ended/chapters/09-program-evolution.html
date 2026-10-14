@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM-Guided Program Evolution · Search, Evolution &amp; Self-Improving Agents</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="oe" data-chapter="09">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>LLM-Guided Program Evolution</h1>
+  <p class="lede">What if the thing you evolve is not an answer but a program that produces answers? This chapter explains FunSearch and AlphaEvolve: a language model proposes edits to code, an automatic evaluator scores them, and a database of the best programs seeds the next round. It builds a miniature of the loop you can run, and spends as long on the evaluator as on the model, because the evaluator is where these systems succeed or fail.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>This is the chapter where the course's two halves meet. The first four chapters gave you search machinery (mutation, selection, archives) that needs a mutation operator and a way to score. For decades the operators were blind: flip a bit, nudge a number. Language models are the first mutation operator that understands <em>what it is editing</em>, and that is why evolutionary search, a 1960s idea, has recently produced new results in mathematics and in the algorithms that run data centres. If you only remember "an LLM wrote better code", you will miss the part that matters in practice: the loop works when the <em>evaluator</em> is trustworthy, cheap and graded, and fails quietly when it is not. By the end you will be able to describe FunSearch and AlphaEvolve precisely, build a small version of the loop yourself, and decide whether a problem in your own work has the right shape for it. <a href="10-evolution-frameworks.html">Chapter 10</a> looks inside the open-source frameworks that reimplement these ideas; <a href="../labs/lab-03-program-evolution.html">Lab 3</a> has you build a mini FunSearch.</p>
+</div>
+
+<h2>Why evolve programs instead of answers</h2>
+
+<p>Suppose you want a good schedule for the jobs in a data centre. You could ask a search algorithm to produce a schedule directly: a list of which job runs where and when. That list is an <em>answer</em>. It is valid for this week's jobs and tells you nothing about next week's. Now suppose the search produces instead a short <em>program</em>, a scoring rule that looks at a machine and a job and says how good a match they are. The program is the same size whether there are a hundred jobs or a million; it can be read, tested on new workloads, and shipped. The search has moved from finding a point to finding a <em>procedure</em>.</p>
+
+<p>There are four reasons this is attractive, and they recur throughout the rest of the course.</p>
+
+<ul>
+  <li><strong>Compactness and generalisation.</strong> A program that generates a solution often captures a pattern. A mathematician reading a ten-line function that builds a large combinatorial object learns something a table of the object's elements would not teach.</li>
+  <li><strong>Inspectability.</strong> A person can read the result, find the idea, and reject it if it is suspicious. A weight vector offers none of that.</li>
+  <li><strong>A natural space of mutations.</strong> Programs have structure (conditions, loops, constants) that edits can respect. An LLM trained on enormous amounts of code already has strong priors about what useful edits look like.</li>
+  <li><strong>Executability.</strong> A program can be run, and running it yields a score. That makes the whole loop automatic.</li>
+</ul>
+
+<p>The word <span class="term">program search</span> covers this whole family: the candidates are programs, the score comes from executing them, and search operates on the source text. It does not require a language model (genetic programming has existed since the 1980s), but a language model is what finally made the search space tractable.</p>
+
+<h2>The LLM as a mutation operator</h2>
+
+<p>Recall from the <a href="02-evolutionary-algorithms.html">evolutionary algorithms chapter</a> what a mutation operator is for: it takes a good solution and produces a nearby variant, hoping that some variants are better. The art is the word "nearby". Random edits to program text are almost always broken (a flipped character yields a syntax error) and when they run, they are almost always worse. Classic genetic programming handled this by working on syntax trees with carefully designed operators, but still wasted most of its evaluations.</p>
+
+<p>A code-trained language model changes the economics. Given two or three working programs as context, it can write a new one that keeps the structure, changes a coherent piece of logic, and usually runs. Its edits are drawn from patterns it has seen in millions of programs: "add a special case for an exact fit", "replace this loop with a lookup", "use a different norm". That is a very different distribution from random noise. But three costs come with it.</p>
+
+<ul>
+  <li><strong>Each mutation is expensive.</strong> A random bit flip costs nanoseconds. A model call costs seconds and a fraction of a cent or more, depending on the model (an illustrative assumption, not a measured price). A run that evaluates a million candidates is a very different undertaking from one that evaluates a thousand, and the frameworks in <a href="10-evolution-frameworks.html">chapter 10</a> exist largely to make each call count.</li>
+  <li><strong>Samples are correlated.</strong> The model has habits. Asked repeatedly for variations, it tends to produce the same few. Search needs diversity, so every system in this chapter adds machinery to keep the pool varied.</li>
+  <li><strong>The model is not trusted.</strong> It will produce plausible code that is wrong, slow, or non-terminating. The model is a source of <em>proposals</em>; nothing it says is believed until an evaluator has run it.</li>
+</ul>
+
+<p>That last point deserves emphasis because it inverts the usual story. In these systems the language model is not the discoverer. It is the generator of hypotheses, and the discovery is done by the cycle of generate, execute and select. A model that was right 1% of the time would still be useful here, as long as its 1% could be recognised.</p>
+
+<h2>The loop, and its ingredients</h2>
+
+<p>Every system in this chapter has the same skeleton. Walk through it once, then the two real systems become variations on it.</p>
+
+<dl class="terms">
+  <dt>Problem specification</dt>
+  <dd>The part a human writes: a description of the task, a program <span class="term">skeleton</span> that fixes everything except one or a few functions, and a <span class="term">seed program</span> that fills those functions with something simple and valid.</dd>
+  <dt>Evaluator</dt>
+  <dd>A program that takes a candidate, runs it, and returns one or more numbers. It is the only definition of "better" the system has. Also called the scorer or fitness function.</dd>
+  <dt>Program database</dt>
+  <dd>The store of every valid program found so far with its scores. It decides which programs are kept, which are shown to the model, and how diversity is preserved (here: islands, clusters or an archive, as in <a href="04-quality-diversity.html">quality-diversity</a>).</dd>
+  <dt>Prompt builder</dt>
+  <dd>Assembles a prompt from a few programs sampled from the database, plus instructions.</dd>
+  <dt>Sampler</dt>
+  <dd>The language model call that writes a new candidate. Many are run in parallel.</dd>
+  <dt>Sandbox</dt>
+  <dd>The isolated environment in which candidates are executed, with time and memory limits.</dd>
+</dl>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="The program evolution loop. A problem specification with skeleton, seed program and evaluator feeds a program database. The database feeds a prompt builder, which feeds several language model samplers running in parallel. They produce candidate programs which go to an evaluator in a sandbox. The evaluator returns scores. Valid programs with scores return to the database; invalid ones are discarded.">
+    <defs><marker id="ahOE09a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="20" width="170" height="70" rx="10" class="fs-green s-green sw-2"/>
+    <text x="105" y="48" text-anchor="middle" class="t-sm t-bold">Specification</text>
+    <text x="105" y="66" text-anchor="middle" class="t-xs t-muted">skeleton, seed, evaluator</text>
+    <text x="105" y="80" text-anchor="middle" class="t-xs t-muted">written by a person</text>
+    <rect x="20" y="130" width="170" height="90" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="105" y="160" text-anchor="middle" class="t-sm t-bold">Program database</text>
+    <text x="105" y="180" text-anchor="middle" class="t-xs t-muted">programs and their scores</text>
+    <text x="105" y="196" text-anchor="middle" class="t-xs t-muted">islands, clusters, archive</text>
+    <line x1="105" y1="92" x2="105" y2="128" class="line" marker-end="url(#ahOE09a)"/>
+    <text x="115" y="114" class="t-xs t-faint">seeds</text>
+    <rect x="250" y="130" width="150" height="90" rx="10" class="fs-cyan s-cyan sw-2"/>
+    <text x="325" y="160" text-anchor="middle" class="t-sm t-bold">Prompt builder</text>
+    <text x="325" y="180" text-anchor="middle" class="t-xs t-muted">a few good programs</text>
+    <text x="325" y="196" text-anchor="middle" class="t-xs t-muted">plus instructions</text>
+    <line x1="190" y1="175" x2="248" y2="175" class="line" marker-end="url(#ahOE09a)"/>
+    <text x="219" y="166" text-anchor="middle" class="t-xs t-faint">sample</text>
+    <rect x="460" y="40" width="140" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="530" y="67" text-anchor="middle" class="t-sm">LLM sampler 1</text>
+    <rect x="460" y="98" width="140" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="530" y="125" text-anchor="middle" class="t-sm">LLM sampler 2</text>
+    <rect x="460" y="156" width="140" height="44" rx="8" class="fs-blue s-blue sw-2"/><text x="530" y="183" text-anchor="middle" class="t-sm">LLM sampler 3</text>
+    <text x="530" y="222" text-anchor="middle" class="t-xs t-muted">run in parallel</text>
+    <line x1="400" y1="160" x2="458" y2="70" class="line" marker-end="url(#ahOE09a)"/>
+    <line x1="400" y1="172" x2="458" y2="122" class="line" marker-end="url(#ahOE09a)"/>
+    <line x1="400" y1="184" x2="458" y2="176" class="line" marker-end="url(#ahOE09a)"/>
+    <rect x="640" y="98" width="105" height="104" rx="10" class="fs-yellow s-yellow sw-2"/>
+    <text x="692" y="128" text-anchor="middle" class="t-sm t-bold">Evaluator</text>
+    <text x="692" y="148" text-anchor="middle" class="t-xs t-muted">sandbox,</text>
+    <text x="692" y="164" text-anchor="middle" class="t-xs t-muted">time limit,</text>
+    <text x="692" y="180" text-anchor="middle" class="t-xs t-muted">score</text>
+    <line x1="600" y1="62" x2="690" y2="96" class="line" marker-end="url(#ahOE09a)"/>
+    <line x1="600" y1="120" x2="638" y2="132" class="line" marker-end="url(#ahOE09a)"/>
+    <line x1="600" y1="178" x2="638" y2="170" class="line" marker-end="url(#ahOE09a)"/>
+    <text x="640" y="80" class="t-xs t-faint">new code</text>
+    <path d="M692,204 V292 H105 V222" class="line s-orange" marker-end="url(#ahOE09a)"/>
+    <text x="400" y="284" text-anchor="middle" class="t-xs t-muted">valid programs and their scores go back to the database</text>
+    <text x="400" y="312" text-anchor="middle" class="t-xs tc-red">crashes, timeouts and wrong outputs are discarded and never reach the database</text>
+  </svg>
+  <figcaption><strong>One loop, many parallel workers.</strong> The human supplies the left-hand box. Everything else runs automatically, and the evaluator is the only judge. The database is where diversity is preserved, which is why it gets as much design attention as the model.</figcaption>
+</figure>
+
+<h2>FunSearch: evolving one function at a time</h2>
+
+<p>FunSearch (a name made from "searching in function space") was described by Romera-Paredes and colleagues at Google DeepMind in "Mathematical discoveries from program search with large language models", announced in December 2023 and published in <em>Nature</em> 625 in 2024. Its design is a careful instance of the loop above, with several choices worth understanding.</p>
+
+<h3>A skeleton and one function to evolve</h3>
+
+<p>The user writes a program skeleton: the part that sets up the problem, calls a function, and measures the result. Only a small function is left to the model, for example a <code>priority(item, bins)</code> that scores how good it would be to put an item in each bin, or a <code>priority(vector)</code> that decides which candidate point to add to a set next. Everything around it is fixed Python. This keeps candidates short, keeps the evaluator trustworthy (the model cannot change how scoring is done) and makes every mutation a local change to a few lines.</p>
+
+<h3>Best-shot prompting</h3>
+
+<p>The prompt contains several previous programs from the database, written as numbered versions of the same function (<code>priority_v0</code>, <code>priority_v1</code>) and sorted by score so the best is last, followed by the header of the next version (<code>priority_v2</code>) for the model to complete. The paper calls this best-shot prompting. It leans on how language models behave: asked to continue a sequence of improving versions, the model tends to continue the improvement, and it can see which edits earned the higher score.</p>
+
+<h3>Islands and clusters: keeping the database diverse</h3>
+
+<p>If you always prompt with the very best programs, the database collapses onto one family of solutions and the search stalls. FunSearch borrows two ideas to avoid that. The database is split into several <span class="term">islands</span>: independent sub-populations that evolve separately, so one family of ideas cannot crowd out all others. Within an island, programs are grouped into clusters by <span class="term">signature</span>, the tuple of scores a program gets on a set of test inputs. Programs with the same signature behave the same way on those inputs. Choosing a parent is a two-stage draw: pick a cluster (with a preference for higher scores, controlled by a temperature, as in softmax sampling), then pick a program within it (with a preference for <em>shorter</em> programs, which keeps solutions simple). Periodically the weakest islands are discarded and reseeded from the strongest, so effort drifts toward what is working without ever collapsing to one lineage.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="A program database split into three islands. Each island contains three clusters, each labelled by a score signature, with one or more programs inside. An arrow shows choosing an island, then a cluster, then a short program within the cluster, and that program is sent to the prompt. A dashed arrow at the bottom shows the weakest island being reset from the strongest.">
+    <defs><marker id="ahOE09b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="30" width="215" height="170" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="127" y="52" text-anchor="middle" class="t-sm t-bold">Island 1</text>
+    <rect x="34" y="64" width="187" height="38" rx="6" class="box"/><text x="42" y="87" class="t-xs mono">sig (9, 7, 8): 2 programs</text>
+    <rect x="34" y="110" width="187" height="38" rx="6" class="box"/><text x="42" y="133" class="t-xs mono">sig (9, 9, 6): 1 program</text>
+    <rect x="34" y="156" width="187" height="38" rx="6" class="box"/><text x="42" y="179" class="t-xs mono">sig (5, 5, 5): 4 programs</text>
+
+    <rect x="262" y="30" width="215" height="170" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="369" y="52" text-anchor="middle" class="t-sm t-bold">Island 2</text>
+    <rect x="276" y="64" width="187" height="38" rx="6" class="fs-yellow s-yellow sw-2"/><text x="284" y="87" class="t-xs mono">sig (8, 8, 9): 3 programs</text>
+    <rect x="276" y="110" width="187" height="38" rx="6" class="box"/><text x="284" y="133" class="t-xs mono">sig (6, 9, 9): 1 program</text>
+    <rect x="276" y="156" width="187" height="38" rx="6" class="box"/><text x="284" y="179" class="t-xs mono">sig (4, 4, 6): 2 programs</text>
+
+    <rect x="504" y="30" width="215" height="170" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="611" y="52" text-anchor="middle" class="t-sm t-bold">Island 3</text>
+    <rect x="518" y="64" width="187" height="38" rx="6" class="box"/><text x="526" y="87" class="t-xs mono">sig (7, 8, 8): 2 programs</text>
+    <rect x="518" y="110" width="187" height="38" rx="6" class="box"/><text x="526" y="133" class="t-xs mono">sig (3, 6, 3): 5 programs</text>
+    <rect x="518" y="156" width="187" height="38" rx="6" class="box"/><text x="526" y="179" class="t-xs mono">sig (2, 2, 2): 1 program</text>
+
+    <text x="369" y="222" text-anchor="middle" class="t-xs t-bold">1. pick an island   2. pick a cluster, favouring higher scores   3. pick a program, favouring shorter ones</text>
+    <text x="369" y="240" text-anchor="middle" class="t-xs t-muted">highlighted: the cluster drawn in this example. Its chosen program goes into the next prompt.</text>
+    <path d="M611,202 V270 H127 V202" class="line-dash s-orange" marker-end="url(#ahOE09b)"/>
+    <text x="369" y="264" text-anchor="middle" class="t-xs tc-orange">now and then the weakest islands are cleared and reseeded from the best one</text>
+  </svg>
+  <figcaption><strong>The database is a diversity mechanism.</strong> A signature is a program's scores on several test inputs (the numbers shown are illustrative). Clusters stop near-identical programs from crowding each other out; islands stop one family of ideas from taking over; the preference for short programs fights bloat.</figcaption>
+</figure>
+
+<h3>What it found</h3>
+
+<p>FunSearch was applied to open problems in combinatorics and to a practical heuristic. The headline result is the <strong>cap set problem</strong>. A cap set is a set of points in the space of n-dimensional vectors with entries 0, 1 or 2 (arithmetic done modulo 3), with no three points on a straight line. In this space, three distinct points x, y, z lie on a line exactly when x + y + z = 0 modulo 3. The question is how large a cap set can be. Checking a candidate is trivial: for every pair of points, compute the third point on their line and see whether it is in the set. Finding a large one is hard. The listing makes both halves concrete, with a random greedy builder as a baseline.</p>
+
+<pre class="terminal" data-title="capset.py"><code>import itertools, random, time
+
+def is_cap_set(points, n):
+    """No three distinct points of F_3^n on a line. In F_3, x, y, z are collinear iff x + y + z = 0 (mod 3)."""
+    s = set(points)
+    for x, y in itertools.combinations(points, 2):
+        z = tuple((-a - b) % 3 for a, b in zip(x, y))     # the unique third point on the line through x and y
+        if z in s and z != x and z != y: return False
+    return len(s) == len(points)
+
+def greedy(n, seed):
+    rng = random.Random(seed)
+    space = list(itertools.product(range(3), repeat=n)); rng.shuffle(space)
+    chosen, banned = [], set()
+    for p in space:
+        if p in banned: continue
+        for q in chosen: banned.add(tuple((-a - b) % 3 for a, b in zip(p, q)))   # points that would complete a line
+        chosen.append(p)
+    return chosen
+
+for n, best_known in ((3, 9), (4, 20), (5, 45), (6, 112)):
+    t = time.time()
+    sizes = [len(greedy(n, s)) for s in range(200)]
+    assert all(is_cap_set(greedy(n, s), n) for s in range(5))
+    print(f"n={n}: 3^n={3**n:&gt;4} points, largest cap set known {best_known:&gt;3}, best of 200 greedy runs {max(sizes):&gt;3} (mean {sum(sizes)/len(sizes):5.1f})")
+print("a set with an obvious line is rejected:", is_cap_set([(0, 0), (1, 1), (2, 2)], 2))</code></pre>
+<pre class="terminal" data-title="output"><code>n=3: 3^n=  27 points, largest cap set known   9, best of 200 greedy runs   9 (mean   8.3)
+n=4: 3^n=  81 points, largest cap set known  20, best of 200 greedy runs  18 (mean  17.2)
+n=5: 3^n= 243 points, largest cap set known  45, best of 200 greedy runs  38 (mean  35.6)
+n=6: 3^n= 729 points, largest cap set known 112, best of 200 greedy runs  76 (mean  71.7)
+a set with an obvious line is rejected: False</code></pre>
+
+<p>The sizes 9, 20, 45 and 112 for n = 3 to 6 are the known maximum (proven) values; the greedy builder falls short, and increasingly so as n grows. For n = 8, the best size known before FunSearch was 496, and the DeepMind team reports that FunSearch found a cap set of size 512, as well as improved lower bounds on the asymptotic capacity of cap sets through related constructions (admissible sets). The DeepMind announcement describes this as the largest increase in cap set sizes in the past 20 years. Notice what was evolved: not the 512 points themselves but a short <code>priority</code> function that, plugged into a fixed greedy skeleton, builds them. That is the point of program search, and it is why a mathematician could read the program and find structure in it.</p>
+
+<p>The paper also evolved heuristics for <strong>online bin packing</strong> (items of various sizes arrive one at a time and must be put in a bin immediately; use as few bins as possible), reporting that the evolved rules used fewer bins than the classic first-fit and best-fit rules on the distributions they were evolved for. That is the problem for the next section.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>DeepMind published the problem-specific results as code in a public repository (<code>google-deepmind/funsearch</code>, Apache 2.0 for software and CC-BY 4.0 for other materials). The repository's <code>implementation</code> folder contains the evolutionary algorithm, the code-manipulation routines and a single-threaded pipeline, but, by its own description, <em>not</em> the language models, the sandbox or the distributed infrastructure, so the full pipeline does not run as published. If you want to run program evolution yourself, the open frameworks in the next chapter are the practical route.</p>
+</div>
+
+<h2>A mini FunSearch you can run</h2>
+
+<p>Here is the whole loop at toy scale. First the task: online bin packing with bins of capacity 100 and item sizes drawn uniformly from 20 to 60. The function to evolve is <code>priority(item, rem)</code>, where <code>rem</code> is the space left in a bin; each item goes to the feasible bin with the highest priority. First fit (earliest bin) and best fit (tightest bin) are the baselines. The total item size divided by 100 gives an unreachable lower bound on the number of bins.</p>
+
+<pre class="terminal" data-title="binpack.py"><code>import random
+
+CAP = 100
+def instance(seed, n=300):
+    rng = random.Random(seed)
+    return [rng.randint(20, 60) for _ in range(n)]       # item sizes; capacity 100
+
+def pack(items, priority):
+    """Online bin packing: each item goes to the feasible bin with the highest priority(item, remaining)."""
+    bins = []                                             # remaining capacity of each open bin
+    for it in items:
+        best, best_p = None, None
+        for i, rem in enumerate(bins):
+            if rem &gt;= it:
+                p = priority(it, rem)
+                if best_p is None or p &gt; best_p: best, best_p = i, p
+        if best is None: bins.append(CAP - it)
+        else: bins[best] -= it
+    return len(bins)
+
+def score(priority, seeds):                               # mean bins used (lower is better)
+    return sum(pack(instance(s), priority) for s in seeds) / len(seeds)
+
+first_fit = lambda it, rem: 0                             # ties -&gt; earliest bin
+best_fit  = lambda it, rem: -(rem - it)                   # tightest fit
+if __name__ == "__main__":
+    train, test = range(10), range(100, 130)
+    lower = sum(sum(instance(s)) for s in test) / len(test) / CAP
+    print("lower bound on bins (total size / 100):", round(lower, 1))
+    for name, f in (("first fit", first_fit), ("best fit", best_fit)):
+        print(f"{name:&lt;10} train {score(f, train):6.1f}   test {score(f, test):6.1f}")</code></pre>
+<pre class="terminal" data-title="output"><code>lower bound on bins (total size / 100): 120.2
+first fit  train  130.7   test  131.0
+best fit   train  130.3   test  130.8</code></pre>
+
+<p>Best fit uses about 130.8 bins on the test instances where the lower bound is 120.2. Online packing cannot reach the bound because it must commit before seeing later items, but better rules recover some of the gap. Now the search. Candidates are real Python source strings; they are compiled, run and scored. The mutation operator is a <strong>deterministic stand-in</strong>, and it is important to be clear about what that means: it is a seeded function that applies one small rewrite to the source text (add an exact-fit rule, add a rule against small leftover gaps, tune a constant, change the shape of the return expression, drop a line). It is not a language model. A real LLM would write free-form code from the same prompt; the loop around it would be identical, and it is the loop we are studying.</p>
+
+<pre class="terminal" data-title="minifun.py"><code>import random, math, re
+from binpack import score, best_fit
+
+SEED_SRC = "def priority(item, rem):\n    gap = rem - item\n    return -gap\n"
+TRAIN, TEST = range(10), range(100, 130)
+
+def compile_src(src):
+    ns = {}
+    exec(src, {"abs": abs}, ns)          # unsafe outside a sandbox: see the evaluator listing
+    return ns["priority"]
+
+def evaluate(src):
+    try:    return -score(compile_src(src), TRAIN) - 0.001 * len(src)   # fewer bins; shorter breaks ties
+    except Exception: return None                                        # broken program: no score
+
+def stand_in_llm(src, rng):
+    """Deterministic stand-in for 'write an improved version of this program'. One seeded
+    text edit per call. A real LLM would write free-form code; the loop around it is identical."""
+    lines = src.rstrip("\n").split("\n")
+    head, body, ret = lines[:2], lines[2:-1], lines[-1]
+    op = rng.choice(["exact", "dead", "tune", "shape", "drop"])
+    if op == "exact" and "    if gap == 0: return 1000" not in body:
+        body.insert(0, "    if gap == 0: return 1000")                    # prefer a perfect fit
+    elif op == "dead" and not any("gap &lt;" in ln for ln in body):
+        body.append(f"    if gap &lt; {rng.randint(1, 25)}: return -gap - {rng.choice([50, 200, 1000])}")  # shun unusable gaps
+    elif op == "tune":                                                     # nudge every integer in one line
+        i = rng.randrange(len(body) + 1)
+        nudge = lambda m: str(max(1, int(m.group()) + rng.choice([-2, -1, 1, 2])))
+        if i &lt; len(body) and "gap &lt;" in body[i]: body[i] = re.sub(r"(?&lt;=&lt; )\d+", nudge, body[i])
+        elif i == len(body): ret = re.sub(r"(?&lt;=- )\d+", nudge, ret)
+    elif op == "shape":
+        ret = rng.choice(["    return -gap", "    return -gap * gap", f"    return -abs(gap - {rng.randint(0, 40)})", f"    return -(gap % {rng.randint(10, 40)})"])
+    elif op == "drop" and body: body.pop(rng.randrange(len(body)))
+    return "\n".join(head + body + [ret]) + "\n"
+
+def run(seed, n_islands=4, steps=1500):
+    rng = random.Random(seed)
+    islands = [{SEED_SRC: evaluate(SEED_SRC)} for _ in range(n_islands)]
+    for step in range(steps):
+        isl = islands[step % n_islands]
+        progs = sorted(isl, key=isl.get, reverse=True)
+        parent = rng.choices(progs, [math.exp(8 * (isl[p] - isl[progs[0]])) for p in progs])[0]
+        child = stand_in_llm(parent, rng)
+        s = None if child in isl else evaluate(child)
+        if s is not None: isl[child] = s
+        if len(isl) &gt; 12: del isl[min(isl, key=isl.get)]                  # small islands
+        if step % 300 == 299:                                             # restart the worst island from the best program
+            top = lambda d: max(d.values())
+            worst, best = min(islands, key=top), max(islands, key=top)
+            worst.clear(); worst[max(best, key=best.get)] = top(best)
+    return max((s, p) for isl in islands for p, s in isl.items())
+
+if __name__ == "__main__":
+    print(f"best fit : train {score(best_fit, TRAIN):6.1f}  test {score(best_fit, TEST):6.1f}   (mean bins used, lower is better)")
+    for seed in range(3):
+        s, p = run(seed)
+        f = compile_src(p)
+        print(f"seed {seed}  : train {score(f, TRAIN):6.1f}  test {score(f, TEST):6.1f}")
+    print("\nbest program of the last run:\n" + p)</code></pre>
+<pre class="terminal" data-title="output"><code>best fit : train  130.3  test  130.8   (mean bins used, lower is better)
+seed 0  : train  128.4  test  129.1
+seed 1  : train  128.4  test  129.1
+seed 2  : train  128.4  test  129.1
+
+best program of the last run:
+def priority(item, rem):
+    gap = rem - item
+    if gap == 0: return 1000
+    if gap &lt; 20: return -gap - 50
+    return -abs(gap - 26)</code></pre>
+
+<p>All three seeds reach the same scores, and the program printed for the last one is worth reading, because the search found a rule a human could have reasoned out. The smallest item is 20, so a bin with fewer than 20 units left can never be used again: any leftover gap between 1 and 19 is dead space. The evolved <code>priority</code> therefore (1) loves a perfect fit (<code>gap == 0</code>), (2) strongly avoids placements that leave a dead gap of 1 to 19, and (3) otherwise prefers leaving a gap of about 26, a size that a later item can likely fill. On the 30 held-out test instances it uses 129.1 bins against best fit's 130.8, about 1.3% fewer. That is a modest gain, and an honest one: published bin-packing gains from this method are also modest in percentage terms, but at the scale of a warehouse or a cloud, small percentages are money.</p>
+
+<div class="widget stepper" data-autoplay-ms="4600">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">Two iterations of the loop on bin packing</h4></div>
+  <svg viewBox="0 0 760 360" role="img" aria-label="Two iterations of the program evolution loop on the bin-packing example. Left: the database holding versions v0 and v1 at 130.3 bins, then v2 at 129.0 and v3 at 128.4 as they are added. Middle: the prompt listing earlier versions and the header of the next. Right: the code the model writes and the evaluator's score. A text panel at the bottom describes each step.">
+    <defs><marker id="ahOE09c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="20" width="180" height="170" rx="10" class="fs-purple s-purple sw-2"/>
+    <text x="110" y="42" text-anchor="middle" class="t-sm t-bold">Database</text>
+    <text x="110" y="58" text-anchor="middle" class="t-xs t-muted">mean bins (lower is better)</text>
+    <g>
+      <rect x="34" y="70" width="152" height="26" rx="5" class="box"/><text x="44" y="88" class="t-xs mono">v0  -gap          130.3</text>
+      <rect x="34" y="100" width="152" height="26" rx="5" class="box"/><text x="44" y="118" class="t-xs mono">v1  + exact fit   130.3</text>
+    </g>
+    <g data-steps="5-" data-active="5"><rect x="34" y="130" width="152" height="26" rx="5" class="fs-green s-green sw-2"/><text x="44" y="148" class="t-xs mono">v2  + dead gap    129.0</text></g>
+    <g data-steps="6" data-active="6"><rect x="34" y="160" width="152" height="26" rx="5" class="fs-green s-green sw-2"/><text x="44" y="178" class="t-xs mono">v3  abs(gap-26)   128.4</text></g>
+
+    <g data-steps="2-3">
+      <line x1="200" y1="105" x2="248" y2="105" class="line" marker-end="url(#ahOE09c)"/>
+      <rect x="250" y="20" width="240" height="170" rx="10" class="fs-cyan s-cyan sw-2"/>
+      <text x="370" y="42" text-anchor="middle" class="t-sm t-bold">Prompt</text>
+      <text x="262" y="66" class="t-xs mono">def priority_v0(item, rem):</text>
+      <text x="262" y="82" class="t-xs mono">    ...  # 130.3 bins</text>
+      <text x="262" y="104" class="t-xs mono">def priority_v1(item, rem):</text>
+      <text x="262" y="120" class="t-xs mono">    ...  # exact fit, 130.3</text>
+      <text x="262" y="146" class="t-xs mono">def priority_v2(item, rem):</text>
+      <text x="262" y="166" class="t-xs t-muted">(model completes this)</text>
+    </g>
+    <g data-steps="6">
+      <line x1="200" y1="105" x2="248" y2="105" class="line" marker-end="url(#ahOE09c)"/>
+      <rect x="250" y="20" width="240" height="170" rx="10" class="fs-cyan s-cyan sw-2"/>
+      <text x="370" y="42" text-anchor="middle" class="t-sm t-bold">Prompt</text>
+      <text x="262" y="66" class="t-xs mono">def priority_v1(item, rem):</text>
+      <text x="262" y="82" class="t-xs mono">    ...  # exact fit, 130.3</text>
+      <text x="262" y="104" class="t-xs mono">def priority_v2(item, rem):</text>
+      <text x="262" y="120" class="t-xs mono">    ...  # dead gap, 129.0</text>
+      <text x="262" y="146" class="t-xs mono">def priority_v3(item, rem):</text>
+      <text x="262" y="166" class="t-xs t-muted">(model completes this)</text>
+    </g>
+
+    <g data-steps="3-5" data-active="3">
+      <line x1="490" y1="105" x2="528" y2="105" class="line" marker-end="url(#ahOE09c)"/>
+      <rect x="530" y="20" width="215" height="170" rx="10" class="fs-blue s-blue sw-2"/>
+      <text x="637" y="42" text-anchor="middle" class="t-sm t-bold">Candidate v2</text>
+      <text x="542" y="66" class="t-xs mono">gap = rem - item</text>
+      <text x="542" y="82" class="t-xs mono">if gap == 0: return 1000</text>
+      <text x="542" y="98" class="t-xs mono">if gap &lt; 20:</text>
+      <text x="542" y="114" class="t-xs mono">    return -gap - 50</text>
+      <text x="542" y="130" class="t-xs mono">return -gap</text>
+    </g>
+    <g data-steps="6" data-active="6">
+      <line x1="490" y1="105" x2="528" y2="105" class="line" marker-end="url(#ahOE09c)"/>
+      <rect x="530" y="20" width="215" height="170" rx="10" class="fs-blue s-blue sw-2"/>
+      <text x="637" y="42" text-anchor="middle" class="t-sm t-bold">Candidate v3</text>
+      <text x="542" y="66" class="t-xs mono">gap = rem - item</text>
+      <text x="542" y="82" class="t-xs mono">if gap == 0: return 1000</text>
+      <text x="542" y="98" class="t-xs mono">if gap &lt; 20:</text>
+      <text x="542" y="114" class="t-xs mono">    return -gap - 50</text>
+      <text x="542" y="130" class="t-xs mono">return -abs(gap - 26)</text>
+    </g>
+    <g data-steps="4-5" data-active="4">
+      <rect x="540" y="146" width="195" height="34" rx="6" class="fs-yellow s-yellow sw-2"/>
+      <text x="637" y="168" text-anchor="middle" class="t-xs t-bold">runs, valid: 129.0 bins</text>
+    </g>
+    <g data-steps="6">
+      <rect x="540" y="146" width="195" height="34" rx="6" class="fs-yellow s-yellow sw-2"/>
+      <text x="637" y="168" text-anchor="middle" class="t-xs t-bold">runs, valid: 128.4 bins</text>
+    </g>
+
+    <rect x="20" y="214" width="725" height="130" rx="10" class="box"/>
+    <g data-steps="1">
+      <text x="40" y="242" class="t-sm t-bold">The database holds two programs</text>
+      <text x="40" y="266" class="t-xs t-muted">v0 is the seed (best fit). v1 adds an exact-fit rule and scores exactly the same. It was kept anyway:</text>
+      <text x="40" y="284" class="t-xs t-muted">it is valid, it is different, and nothing yet says it will not be a useful stepping stone.</text>
+    </g>
+    <g data-steps="2">
+      <text x="40" y="242" class="t-sm t-bold">Build a prompt from sampled programs</text>
+      <text x="40" y="266" class="t-xs t-muted">Two programs are drawn and listed oldest-and-weakest first, as numbered versions of one function,</text>
+      <text x="40" y="284" class="t-xs t-muted">ending with the header of the next version. This is FunSearch's best-shot prompting.</text>
+    </g>
+    <g data-steps="3">
+      <text x="40" y="242" class="t-sm t-bold">The model writes the next version</text>
+      <text x="40" y="266" class="t-xs t-muted">In this chapter's miniature, a deterministic stand-in applies one edit: a rule against leftover gaps</text>
+      <text x="40" y="284" class="t-xs t-muted">smaller than the smallest item (20). A real LLM would write something free-form.</text>
+    </g>
+    <g data-steps="4">
+      <text x="40" y="242" class="t-sm t-bold">The evaluator runs the candidate</text>
+      <text x="40" y="266" class="t-xs t-muted">In a sandbox, with a time limit, on the ten training instances: 129.0 bins on average. Had it crashed</text>
+      <text x="40" y="284" class="t-xs t-muted">or timed out it would have been discarded here and never seen again.</text>
+    </g>
+    <g data-steps="5">
+      <text x="40" y="242" class="t-sm t-bold">A better program enters the database</text>
+      <text x="40" y="266" class="t-xs t-muted">129.0 beats 130.3. It becomes the best in its island and the preferred parent for later prompts,</text>
+      <text x="40" y="284" class="t-xs t-muted">but the older programs stay: they may seed other lineages.</text>
+    </g>
+    <g data-steps="6">
+      <text x="40" y="242" class="t-sm t-bold">Second iteration: v3 at 128.4</text>
+      <text x="40" y="266" class="t-xs t-muted">The new prompt shows v1 and v2. The next edit changes the return shape to prefer leaving a gap of 26.</text>
+      <text x="40" y="284" class="t-xs t-muted">The score improves again. All four programs were really run to get these scores; v3 is the program the run above printed.</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Start.</strong> A database with the seed and one neutral variant.</li>
+    <li><strong>Prompt.</strong> Sampled programs become numbered versions in a prompt.</li>
+    <li><strong>Generate.</strong> The mutation operator writes candidate v2.</li>
+    <li><strong>Evaluate.</strong> The sandboxed evaluator scores it: 129.0 bins.</li>
+    <li><strong>Store.</strong> The database keeps it; it is now the best.</li>
+    <li><strong>Repeat.</strong> A new prompt, a new edit, v3 at 128.4.</li>
+  </ol>
+</div>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a workshop with a fast apprentice and a strict inspector</p>
+  <p>Picture a workshop where an apprentice who has read every craft manual in the world sketches a variation on a part every few seconds, and an inspector with a measuring rig tests each sketch and writes down the result. The head of the workshop keeps a pinboard of the best sketches and hands the apprentice a few at a time. The apprentice is full of ideas and sometimes confidently wrong; the inspector is unimaginative and never wrong about the measurements. Together they improve the part. Neither could alone.</p>
+  <p><em>Where it breaks down:</em> the inspector's rig measures what it measures. If it checks weight and nobody told it to check strength, the part gets lighter and then breaks, and the pinboard fills with the lightest, weakest parts. Real evaluators have exactly that problem.</p>
+</div>
+
+<h2>The evaluator is the other half of the system</h2>
+
+<p>A paper about program evolution has a model section and results; the evaluator is usually a few lines in the setup. In practice it takes at least as much effort to get right as everything else. Five properties matter.</p>
+
+<ol class="steps">
+  <li><strong>It must be safe to run untrusted code.</strong> The candidates are text from a model. Even a well-behaved model can write an infinite loop, allocate all the memory, delete a file, or call the network. Run each candidate in a separate process or container with a wall-clock limit, a memory limit and no credentials, the pattern from <a href="../../agents/chapters/20-sandboxing.html">sandboxes and permissions</a> and the injection discussion in <a href="../../security/chapters/09-injection.html">Injection and untrusted input</a>.</li>
+  <li><strong>It must be total.</strong> Every outcome (crash, timeout, garbage return value, correct) must be mapped to a result. A single unhandled exception that kills the controller loses hours of work.</li>
+  <li><strong>It must check what it assumes.</strong> If the evaluator expects a number and a program returns something else, that has to be an error, not a lucky score. The listing below includes a candidate that returns a string; see what happens.</li>
+  <li><strong>It must be deterministic and fair.</strong> Fixed random seeds for instances, the same instances for every candidate, and separate training instances (used during search) from held-out ones (used to report), because a heuristic evolved on ten instances can overfit them. The mini FunSearch above reports train and test separately for that reason.</li>
+  <li><strong>It must be graded.</strong> A score that is only pass or fail gives the search nothing to climb. Prefer a number with many levels (bins used, runtime, error) and, where evaluation is expensive, a <span class="term">cascade</span>: a cheap first stage to reject obviously bad candidates before spending a full evaluation on them.</li>
+</ol>
+
+<pre class="terminal" data-title="sandbox_eval.py"><code>import multiprocessing as mp, time
+from binpack import score
+
+def _worker(src, q):
+    try:
+        ns = {}
+        exec(src, {"abs": abs}, ns)
+        q.put(("ok", score(ns["priority"], range(5))))
+    except Exception as e:
+        q.put(("error", f"{type(e).__name__}: {e}"))
+
+def evaluate_safely(src, timeout=2.0):
+    """Run untrusted candidate code in a separate process with a wall-clock limit."""
+    q = mp.Queue()
+    p = mp.Process(target=_worker, args=(src, q))
+    p.start(); p.join(timeout)
+    if p.is_alive():
+        p.kill(); p.join(); return ("timeout", f"killed after {timeout}s")
+    return q.get() if not q.empty() else ("crash", "no result")
+
+CANDIDATES = {
+    "good":        "def priority(item, rem):\n    return -(rem - item)\n",
+    "bug":         "def priority(item, rem):\n    return -(rem - item) / (item - item)\n",
+    "infinite":    "def priority(item, rem):\n    while True:\n        pass\n",
+    "wrong-type":  "def priority(item, rem):\n    return 'tight'\n",
+    "no-function": "x = 1\n",
+}
+if __name__ == "__main__":
+    for name, src in CANDIDATES.items():
+        t = time.time(); status, detail = evaluate_safely(src)
+        print(f"{name:&lt;12} {status:&lt;8} {detail if status != 'ok' else round(detail, 1)}   ({time.time()-t:.1f}s)")</code></pre>
+<pre class="terminal" data-title="output"><code>good         ok       129.8   (0.1s)
+bug          error    ZeroDivisionError: division by zero   (0.0s)
+infinite     timeout  killed after 2.0s   (2.0s)
+wrong-type   ok       130.2   (0.0s)
+no-function  error    KeyError: 'priority'   (0.0s)</code></pre>
+
+<p>Three of the five candidates were stopped the way they should be: the division by zero came back as an error with a message, the missing function as an error, and the infinite loop was killed after the two-second limit. The fourth result is the instructive one. The <code>wrong-type</code> candidate returns the string <code>'tight'</code> for every call. Python happily compares equal strings, no bin ever has a strictly higher "priority", and the packing degenerates to first fit, which produces a valid and perfectly respectable score of 130.2. The evaluator <em>accepted a program that does nothing meaningful</em>. In a long evolutionary run, programs like this are not harmless: if they happen to score well they are stored and become parents. The fix is one line (check that the return value is a number), but you only add it after you have seen the failure, which is why evaluator code deserves tests of its own. Running separate processes is isolation of mistakes, not a security boundary against a hostile program; for anything that matters use a container or virtual machine.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>At scale the evaluator is a job-execution service. Thousands of independent, short, CPU-heavy tasks flow through a queue to a pool of workers, results come back out of order, workers die, and the controller must neither lose a candidate nor evaluate it twice. That is the territory of <a href="../../systems/chapters/14-queues-backpressure.html">queues and backpressure</a> (the sampler must slow down if evaluators fall behind), <a href="../../reliability/chapters/09-tail-latency.html">tail latency</a> (a few slow evaluations can stall a synchronous generation, which is one reason the AlphaEvolve pipeline described below is asynchronous), and <a href="../../distributed/chapters/17-logs-exactly-once.html">at-least-once delivery with idempotent handling</a>. Evaluations are naturally idempotent if they are deterministic, which is one more reason to seed everything.</p>
+</div>
+
+<h2>AlphaEvolve: whole codebases, many evaluators</h2>
+
+<p>AlphaEvolve (Novikov et al., 2025, "AlphaEvolve: A coding agent for scientific and algorithmic discovery", announced in May 2025) keeps the loop and widens it in four ways. Where FunSearch evolved one short Python function inside a fixed skeleton, AlphaEvolve can evolve **an entire file or several regions of a codebase**, in any language the evaluator can run. The user marks the regions to change with comment markers (<code># EVOLVE-BLOCK-START</code> and <code># EVOLVE-BLOCK-END</code>); everything else stays fixed. The model usually does not rewrite the file. It returns edits as SEARCH/REPLACE blocks (match this text, replace it with that), the same diff style that coding agents use, with a full rewrite as the fallback for small programs.</p>
+
+<p>Second, <strong>the prompt is richer</strong>. It carries sampled programs with their scores, system instructions, optional problem context, rendered results of earlier evaluations and, in an optional meta-level loop, instructions that the model itself writes and that are evolved in a separate database alongside the programs (a first taste of the self-referential improvement in <a href="11-evolving-prompts.html">chapter 11</a>).</p>
+
+<p>Third, <strong>evaluation is more elaborate</strong>. Test cases are grouped into stages of increasing difficulty and a candidate has to do well on each before reaching the next, which is the cascade from above. Separate model calls can grade qualitative properties such as simplicity and either add them as scores or reject the candidate. Evaluations run asynchronously on a cluster; the paper notes that evaluating a single solution can take on the order of 100 compute-hours, so throughput matters more than latency.</p>
+
+<p>Fourth, <strong>the database and the models</strong>. The program database combines ideas from MAP-Elites (an archive that keeps good programs across different behaviours, as in <a href="04-quality-diversity.html">chapter 4</a>) and island models. The sampler is an ensemble: a fast model (Gemini Flash) generates many candidates for breadth, and a more capable one (Gemini Pro) contributes occasional higher-quality suggestions for larger jumps. The pipeline is asynchronous (controller, samplers and evaluators run concurrently and wait only on real dependencies), tuned to maximise how many ideas are tested inside a budget.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>FunSearch (2023)</th><th>AlphaEvolve (2025)</th></tr></thead>
+  <tbody>
+    <tr><td>What is evolved</td><td>One short function in a fixed skeleton</td><td>Marked regions of a whole file or codebase</td></tr>
+    <tr><td>How the model edits</td><td>Completes the next numbered version of the function</td><td>Emits SEARCH/REPLACE diffs (or whole blocks)</td></tr>
+    <tr><td>Prompt</td><td>Several past versions, sorted by score</td><td>Past programs with scores, instructions, context, evaluation results, optionally evolved meta-prompts</td></tr>
+    <tr><td>Evaluation</td><td>One scoring function, run on test inputs</td><td>Multi-stage cascade, several metrics, optional model-graded properties</td></tr>
+    <tr><td>Database</td><td>Islands, clusters by signature, preference for short programs</td><td>MAP-Elites-style archive plus islands</td></tr>
+    <tr><td>Models</td><td>A code-trained LLM (the announcement names PaLM 2)</td><td>An ensemble of a fast and a stronger Gemini model</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>What the AlphaEvolve authors report (all from Google DeepMind's announcement and paper; independent re-runs are limited because the system is not publicly released): a procedure to multiply two 4&times;4 complex-valued matrices with 48 scalar multiplications, described as the first improvement over Strassen's 1969 approach for that setting; a scheduling heuristic for Google's Borg cluster manager that continuously recovers on average 0.7% of Google's worldwide compute; a 23% speed-up of a key kernel in Gemini's architecture, linked to a 1% reduction in that model's training time; up to a 32.5% speed-up of a FlashAttention kernel implementation; and, on more than 50 open mathematical problems, rediscovery of the best known solutions in about 75% of cases and improvement on them in about 20%, including a configuration of 593 spheres in the kissing-number problem in 11 dimensions. These are the vendor's own figures. Open-source reimplementations (OpenEvolve, ShinkaEvolve; see chapter 10) have reproduced some of the smaller benchmarks. For the story as a case study, read <a href="../cases/case-04-alphaevolve.html">case study 4</a> and, for the earlier system, <a href="../cases/case-03-funsearch.html">case study 3</a>.</p>
+</div>
+
+<h2>Where the method fits, and where it does not</h2>
+
+<p>Every success above shares a shape. Before pointing a program-evolution loop at your own problem, ask these questions in order; a "no" to the first three usually ends the idea.</p>
+
+<ol class="steps">
+  <li><strong>Is there an automatic evaluator?</strong> Not a human rating, not a vague quality judgement, but code that returns a number. Kernels have runtime and correctness tests; schedulers have simulators; mathematical constructions have verifiers. Writing a poem has none.</li>
+  <li><strong>Is the evaluator cheap enough?</strong> If one evaluation takes an hour, a thousand-candidate run takes six weeks of machine time. Cascades and smaller proxy instances help. See <a href="../../ml-foundations/chapters/17-compute-costs.html">what compute costs</a> for budgeting.</li>
+  <li><strong>Can the evaluator be trusted?</strong> Chapter 15 is about the many ways it cannot. A scorer that rewards speed but not correctness will be satisfied by a program that returns early.</li>
+  <li><strong>Does the score have gradations?</strong> Search climbs differences. A problem that is "solved or not" with a vanishingly rare solved state offers no slope; add partial credit if you can.</li>
+  <li><strong>Is a better program worth the bill?</strong> Count the model calls and evaluations, price them, and compare with the value of a one or two per cent improvement in the thing being optimised. At the scale of Google's fleet a 0.7% gain is large. For a small service it may not pay for a single run.</li>
+</ol>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"The language model discovered the algorithm." The model proposed thousands of edits, nearly all of which were worse or broken; the evaluator and the database selected the few that mattered, and a person defined the problem, wrote the evaluator and decided the result was interesting. Giving all the credit to the model leads to bad engineering: you spend on a bigger model when the real bottleneck is a weak evaluator, or you trust output that was never independently checked. Equally, "it is just random search" undersells it: the model's priors make the proposals vastly better than random edits. The accurate picture is a partnership where each side covers the other's blind spot.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Put <code>binpack.py</code> and <code>minifun.py</code> in one folder and run <code>minifun.py</code>. Then (1) change the item-size range in <code>instance</code> from <code>randint(20, 60)</code> to <code>randint(10, 70)</code> and rerun: does the evolved rule still find the dead-gap idea, and does the constant 20 in the rule become wrong? Predict first. (2) Remove <code>"dead"</code> from the list of operators in <code>stand_in_llm</code> and see how far the search gets without it. (3) Evolve on the original range but report the score on instances from the new range. A heuristic evolved for one distribution being tested on another is exactly the generalisation question a real project must answer.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 minifun.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 sandbox_eval.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 capset.py</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Program search evolves procedures, not individual answers. Programs are compact, readable, reusable and executable, which makes the loop automatic.</li>
+    <li>A language model is a mutation operator with strong priors about useful code. It is expensive, correlated and untrusted: it proposes, and an evaluator disposes.</li>
+    <li>The loop has a fixed shape: specification, program database, prompt builder, parallel samplers, sandboxed evaluator, back to the database.</li>
+    <li>FunSearch evolves one function in a fixed skeleton, uses best-shot prompting, and keeps diversity with islands and signature clusters. Its headline result is a cap set of size 512 in dimension 8, up from 496.</li>
+    <li>AlphaEvolve evolves marked regions of whole codebases through diffs, with a richer prompt, a staged evaluation cascade, an archive-plus-islands database and a fast/strong model ensemble. Its reported results are the vendor's own and span mathematics and Google's infrastructure.</li>
+    <li>The evaluator must be safe, total, type-checked, deterministic and graded. A candidate that returns garbage but scores well will be stored and bred from.</li>
+    <li>The approach fits problems with a trustworthy, cheap, graded automatic score and a value that justifies the compute.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://www.nature.com/articles/s41586-023-06924-6" target="_blank" rel="noopener">Romera-Paredes et al., "Mathematical discoveries from program search with large language models" (Nature, 2024)</a>. The FunSearch paper: the method, the cap set and bin-packing results, and the ablations.</li>
+  <li><a href="https://deepmind.google/discover/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/" target="_blank" rel="noopener">DeepMind, "FunSearch: Making new discoveries in mathematical sciences using Large Language Models" (December 2023)</a>. The announcement, written for a general audience.</li>
+  <li><a href="https://github.com/google-deepmind/funsearch" target="_blank" rel="noopener">google-deepmind/funsearch</a>. Discovered programs and a partial implementation; read its README for what is and is not included.</li>
+  <li><a href="https://arxiv.org/abs/2506.13131" target="_blank" rel="noopener">Novikov et al., "AlphaEvolve: A coding agent for scientific and algorithmic discovery" (2025)</a>. The system description and all results listed above.</li>
+  <li><a href="https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/" target="_blank" rel="noopener">DeepMind, "AlphaEvolve: A Gemini-powered coding agent for designing advanced algorithms" (May 2025)</a>. The announcement with the headline figures.</li>
+  <li><a href="https://arxiv.org/abs/1504.04909" target="_blank" rel="noopener">Mouret and Clune, "Illuminating search spaces by mapping elites" (2015)</a>. The archive idea that AlphaEvolve's database builds on.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">Why does FunSearch evolve a short <code>priority</code> function inside a fixed program skeleton instead of letting the model write the entire program?</p>
+    <ol class="q-options">
+      <li>Language models cannot write more than ten lines of code</li>
+      <li>It keeps candidates short, keeps scoring code out of the model's reach, and makes each mutation a local change</li>
+      <li>It makes the evaluator unnecessary</li>
+      <li>It guarantees that every candidate is correct</li>
+    </ol>
+    <div class="q-explain">A fixed skeleton means the model cannot alter how the score is computed and edits stay small and checkable. It does not remove the need for an evaluator (option 2), guarantee correctness (option 3) or reflect a model limitation (option 0).</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">In the bin-packing run, v1 (an added exact-fit rule) scored exactly the same as v0 yet was kept, and v2 was built on it. What does this show?</p>
+    <ol class="q-options">
+      <li>The evaluator is broken, because two different programs cannot have the same score</li>
+      <li>Equal-scoring programs should always be discarded to save space</li>
+      <li>Exact-fit rules are never useful on their own</li>
+      <li>A neutral variant can be a stepping stone: it adds a distinction that a later edit can build on, which a strict "only keep improvements" rule would have thrown away</li>
+    </ol>
+    <div class="q-explain">Different programs can legitimately tie. Keeping valid, different programs preserves diversity and stepping stones, the lesson of the earlier novelty-search and quality-diversity chapters. Discarding them (option 1) would remove paths to improvement. The tie does not show exact fits are useless: they remain in the final program.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">The <code>wrong-type</code> candidate returned the string <code>'tight'</code> and received a valid score close to first fit. What is the most important lesson?</p>
+    <ol class="q-options">
+      <li>Evaluators must validate the type and range of what a candidate returns, or degenerate programs can be accepted and bred from</li>
+      <li>Python is unsuitable for evaluators</li>
+      <li>The two-second timeout was too long</li>
+      <li>Candidates that return strings should be given a higher score</li>
+    </ol>
+    <div class="q-explain">The evaluator assumed numbers; strings compared equal, so the packing silently became first fit. The fix is validation, not a language change or a different timeout. A candidate that merely behaves like the baseline deserves no bonus.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">Which feature of AlphaEvolve most directly lets it work on a real codebase rather than a single small function?</p>
+    <ol class="q-options">
+      <li>Using a larger language model than FunSearch</li>
+      <li>Replacing the evaluator with human reviewers</li>
+      <li>Marking regions to evolve and letting the model emit SEARCH/REPLACE diffs against the existing file</li>
+      <li>Removing the program database</li>
+    </ol>
+    <div class="q-explain">Edit blocks and diffs let the model change selected parts of a large file while everything else stays fixed. Model size alone does not provide that, the evaluator remains automatic, and the database (archive plus islands) is still present.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A team wants to evolve the wording of customer-support replies so customers are "happier". Using this chapter's checklist, what is the first thing to fix?</p>
+    <ol class="q-options">
+      <li>Choose a bigger model for the mutation operator</li>
+      <li>Define an automatic, trustworthy, graded evaluator, for example a validated scorer built from labelled outcomes, because "happier" has no scoring code yet</li>
+      <li>Add more islands to the database</li>
+      <li>Increase the number of parallel samplers</li>
+    </ol>
+    <div class="q-explain">Without an evaluator there is nothing to select on. Model size, islands and parallelism all improve how well a search runs against a score, not whether a score exists. Chapter 11 and chapter 18 discuss using labelled outcomes or model judges, with the risks that carries.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">Why does AlphaEvolve's pipeline run samplers and evaluators asynchronously rather than generation by generation?</p>
+    <ol class="q-options">
+      <li>Asynchronous code is always shorter</li>
+      <li>It lets the language model see the evaluation results before generating</li>
+      <li>It removes the need for a sandbox</li>
+      <li>Evaluations vary widely in duration, and waiting for the slowest in each generation would leave expensive hardware idle</li>
+    </ol>
+    <div class="q-explain">This is the straggler problem from tail-latency analysis: a synchronous step runs at the speed of its slowest member. An asynchronous controller waits only on real dependencies. It does not change what the model sees (option 1) or remove the need to isolate untrusted code.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+</body>
+</html>

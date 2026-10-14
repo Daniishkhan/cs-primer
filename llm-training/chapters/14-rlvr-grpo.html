@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RL with Verifiable Rewards &amp; GRPO · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/llm14-group.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="14">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>RL with Verifiable Rewards &amp; GRPO</h1>
+  <p class="lede">When a program can check an answer, you do not need a learned reward model or a critic. You sample several answers to the same question, check each one, and push the model towards the ones that passed. This chapter explains the verifiable-reward recipe, derives Group Relative Policy Optimisation (GRPO) and its advantage, shows where it is biased and where it has no signal, and describes how it produced the first open reasoning models.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapter 13 ended on a problem: learned rewards get exploited. The answer that dominates current practice for maths, code and other checkable tasks is to remove the learned reward altogether and use a verifier, then train with the cheapest algorithm that works. That combination is behind the reasoning models that think for thousands of tokens before answering. If you understand the group advantage, you can read a GRPO training log, spot the groups that teach nothing, choose between its variants (library defaults differ from the original paper), and say what RL on verifiable tasks does and does not add to a model. After this chapter you will be able to write a reward function and its failure cases, derive and compute the group-relative advantage, state its bias, estimate whether a run fits on one 24 GB card, and explain the pass@k debate.</p>
+</div>
+
+<h2>Rewards a program can check</h2>
+
+<p>A <span class="term">verifiable reward</span> is one computed by a program that checks the answer against ground truth, not a network that predicts what a person would think. The training method that uses it is called <span class="term">RLVR</span>, reinforcement learning with verifiable rewards, a name introduced by the Tülu 3 paper (Lambert et al., 2024), which describes it as an RL stage that obtains a constant reward when a completion is successful. Their reward is v(x, y) = &alpha; if the answer is correct and 0 otherwise, with &alpha; = 10 chosen from pilot experiments and not tuned further, inside the same KL-regularised objective as in <a href="08-ppo.html">chapter 8</a>:</p>
+
+<p style="text-align:center">maximise  E<sub>y&sim;&pi;<sub>&theta;</sub>(&middot;|x)</sub> [ v(x, y) &minus; &beta; KL( &pi;<sub>&theta;</sub>(y|x) &#8214; &pi;<sub>ref</sub>(y|x) ) ]</p>
+
+<p>Tülu 3 optimised this with PPO over about 30,000 prompts with ground-truth answers drawn from three sources: GSM8K and MATH (maths word problems with a final number or expression to compare) and prompts with precise instruction-following constraints, each of which has its own checking function. Which tasks qualify? Anything with a cheap, mostly unambiguous check:</p>
+
+<ul>
+  <li><strong>Maths with a final answer.</strong> Extract the answer from a marked place (a <code>\boxed{}</code>, an "Answer:" line) and compare.</li>
+  <li><strong>Code with tests.</strong> Run the program on unit tests and reward the fraction that pass. A compiler gives feedback on predefined test cases, as DeepSeek-R1's paper puts it for LeetCode-style problems.</li>
+  <li><strong>Format and constraints.</strong> "Answer in under 50 words", "include three bullet points", "output valid JSON matching this schema": a parser decides.</li>
+  <li><strong>Games, puzzles and simulators.</strong> Sudoku, a unit-conversion task, a SQL query whose result set can be compared with the expected one.</li>
+</ul>
+
+<p>The DeepSeek-R1 paper (DeepSeek-AI, 2025) used exactly this for its first model, R1-Zero: an <em>accuracy</em> reward (is the final answer correct? for code, do the tests pass?) plus a <em>format</em> reward that required the reasoning to be inside <code>&lt;think&gt;</code> tags. They state they used no outcome or process neural reward model, because they found a neural reward model may suffer from reward hacking in large-scale RL and because retraining it complicates the pipeline. The reward is only a few lines of code.</p>
+
+<h3>Writing the verifier is the work</h3>
+
+<p>A verifier is a specification, and a specification can have loopholes. The policy is a search procedure aimed at the loopholes (chapter 13's adversarial Goodhart), so the verifier must be tested as hard as the model. Here are two reward functions for the question "17 &times; 23", whose answer is 391, scored on six hand-written completions:</p>
+
+<pre class="terminal" data-title="verifier.py"><code>import re
+
+def strict_reward(completion: str, gold: str) -&gt; float:
+    """Reward 1.0 only if the LAST \\boxed{...} holds exactly the gold answer."""
+    boxes = re.findall(r"\\boxed\{([^{}]*)\}", completion)
+    return 1.0 if boxes and boxes[-1].strip() == gold else 0.0
+
+def lazy_reward(completion: str, gold: str) -&gt; float:
+    """A tempting shortcut: reward any completion that mentions the gold answer."""
+    return 1.0 if gold in completion else 0.0
+
+gold = "391"                      # 17 * 23
+completions = {
+    "correct":            "17*23 = 17*20 + 17*3 = 340 + 51 = 391. \\boxed{391}",
+    "wrong":              "17*23 = 17*20 + 17*3 = 340 + 41 = 381. \\boxed{381}",
+    "right, no box":      "The product is 391.",
+    "shotgun":            "It could be 381, 389, 391, 393 or 401.",
+    "changed mind":       "First I got 391, but I slipped on the carry. \\boxed{381}",
+    "box mentions answer": "\\boxed{3910}",
+}
+print(f"{'completion':22} {'strict':&gt;6} {'lazy':&gt;5}")
+for name, c in completions.items():
+    print(f"{name:22} {strict_reward(c, gold):6.1f} {lazy_reward(c, gold):5.1f}")</code></pre>
+<pre class="terminal" data-title="output"><code>completion             strict  lazy
+correct                   1.0   1.0
+wrong                     0.0   0.0
+right, no box             0.0   1.0
+shotgun                   0.0   1.0
+changed mind              0.0   1.0
+box mentions answer       0.0   1.0</code></pre>
+
+<p>The lazy verifier rewards four completions that should not be rewarded. The "shotgun" completion lists five candidate answers, one of which is right: a model that learns to hedge this way scores 1.0 on every problem whose answer it can bracket, and learns nothing about arithmetic. "Changed mind" mentions the right number and then commits to the wrong one. The strict verifier fixes these by reading only the last boxed value and requiring an exact match, and it has its own cost: the correct completion without a box gets 0, which is deliberate (the format is part of the contract, and the format reward in R1-Zero exists to teach it), but the penalty falls on correct content. Real verifiers need more: normalise equivalent forms (<code>1/2</code> and <code>0.5</code>), apply a timeout, and, for code, run the program in a sandbox, because it is untrusted code written by a model that is being rewarded for passing your tests (it can special-case the test inputs, read the test file or call out over the network).</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>A code-execution reward is a service that runs arbitrary code from a source you are deliberately training to be inventive. The controls are the ones from <a href="../../security/chapters/14-cloud-container.html">container isolation</a> and <a href="../../security/chapters/02-principles.html">least privilege</a>: no network, no host filesystem, CPU, memory and wall-clock limits, a fresh sandbox per sample, and held-out tests the policy never sees. It is also a throughput problem: tens of thousands of executions per training step, which makes the verifier fleet a <a href="../../reliability/chapters/10-load-testing-capacity.html">capacity-planning</a> item alongside the GPUs.</p>
+</div>
+
+<h2>What PPO's critic was for, and why to drop it</h2>
+
+<p>PPO needs advantages (<a href="09-value-functions.html">chapter 9</a>): for each token, how much better was this than expected? Expected is supplied by a learned value model, a second network as large as the policy. Chapter 12's memory table priced PPO at 36 bytes per parameter across its four models. For language models the critic is also hard to train (chapter 9): it must predict final reward from a half-written answer, and early on it is wrong about nearly everything.</p>
+
+<p>Chapter 7 showed that a baseline does not need to be a learned function of the state. It needs only to be something that does not depend on the action being scored. For a verifiable task there is an obvious candidate: <strong>sample several answers to the same question and use their average reward as the baseline.</strong> Shao et al. (2024, "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models") introduced this as Group Relative Policy Optimisation, a variant of PPO that improves mathematical reasoning while reducing PPO's memory use; their DeepSeekMath 7B reached 51.7 percent on the MATH benchmark without tools or voting, and 60.9 percent with self-consistency over 64 samples.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: comparing your own attempts</p>
+  <p>You are practising a puzzle with an answer key at the back. You attempt it eight different ways, check each against the key, and notice that two worked. You do not need a coach telling you how hard the puzzle is in general; the attempts themselves set the bar. Attempts better than your average on <em>this</em> puzzle get repeated, the rest get dropped. GRPO is that loop: the baseline is how your other attempts at the same question did.</p>
+  <p><em>Where it breaks down:</em> you know <em>why</em> an attempt worked and carry the idea to the next puzzle. The model only shifts probability towards the token sequences that were in the winning attempts, and on a puzzle where all eight attempts fail, you would at least change your approach, while GRPO's update for that group is exactly zero.</p>
+</div>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="Two horizontal bars of memory in bytes per parameter. PPO: policy and optimiser 16, value model and optimiser 16, reference 2, reward model 2, total 36. GRPO with beta zero: policy and optimiser 16 only, total 16. A dashed extra 2 is shown for the reference model when beta is above zero.">
+    <text x="20" y="46" class="t-sm t-bold">PPO</text><text x="20" y="62" class="t-xs t-muted">36 B / param</text>
+    <rect x="140" y="30" width="224" height="40" rx="4" class="fs-blue s-blue sw-2"/><text x="252" y="55" text-anchor="middle" class="t-xs t-bold">policy + optimiser: 16</text>
+    <rect x="364" y="30" width="224" height="40" rx="4" class="fs-purple s-purple sw-2"/><text x="476" y="55" text-anchor="middle" class="t-xs t-bold">value model + optimiser: 16</text>
+    <rect x="588" y="30" width="28" height="40" rx="4" class="fs-cyan s-cyan sw-2"/><rect x="616" y="30" width="28" height="40" rx="4" class="fs-orange s-orange sw-2"/>
+    <text x="602" y="86" text-anchor="middle" class="t-xs t-muted">ref 2</text><text x="640" y="100" text-anchor="middle" class="t-xs t-muted">reward model 2</text>
+    <text x="20" y="146" class="t-sm t-bold">GRPO</text><text x="20" y="162" class="t-xs t-muted">16 B / param</text>
+    <rect x="140" y="130" width="224" height="40" rx="4" class="fs-blue s-blue sw-2"/><text x="252" y="155" text-anchor="middle" class="t-xs t-bold">policy + optimiser: 16</text>
+    <rect x="364" y="130" width="28" height="40" rx="4" class="fs-cyan s-cyan line-dash"/>
+    <text x="440" y="155" class="t-xs t-muted">reference 2, only if &#946; &gt; 0</text>
+    <text x="440" y="190" class="t-xs t-muted">the verifier is a program, not a model in memory</text>
+  </svg>
+  <figcaption><strong>No critic, no learned reward.</strong> The bars show model-state memory per parameter with the accounting of chapters 2 and 12 (bf16 weights and gradients, fp32 master weights and Adam moments for trained models; bf16 weights for frozen ones). Dropping the value model and the reward model cuts model state by more than half; generation, which both methods need, is not shown.</figcaption>
+</figure>
+
+<h2>The GRPO objective</h2>
+
+<p>For each question <em>q</em> in a batch, sample a group of G answers o<sub>1</sub>, &hellip;, o<sub>G</sub> from the current ("old") policy and score each with the verifier to get rewards r<sub>1</sub>, &hellip;, r<sub>G</sub>. The advantage of answer <em>i</em> is its reward standardised within the group (equation 3 of the DeepSeek-R1 paper):</p>
+
+<p style="text-align:center">A&#770;<sub>i</sub> = ( r<sub>i</sub> &minus; mean(r<sub>1</sub>, &hellip;, r<sub>G</sub>) ) / std(r<sub>1</sub>, &hellip;, r<sub>G</sub>)</p>
+
+<p>Every token of answer <em>i</em> receives the same advantage A&#770;<sub>i</sub>: the verifier judges the whole answer, and GRPO does not try to say which tokens were responsible. The policy update is then PPO's clipped objective from chapter 8, with ratio &rho;<sub>i,t</sub> = &pi;<sub>&theta;</sub>(o<sub>i,t</sub> | q, o<sub>i,&lt;t</sub>) / &pi;<sub>old</sub>(o<sub>i,t</sub> | q, o<sub>i,&lt;t</sub>) for token <em>t</em> of answer <em>i</em>, plus a KL penalty to the reference, now written as a term in the loss and not folded into the reward:</p>
+
+<p style="text-align:center">J(&theta;) = E [ (1/G) &sum;<sub>i</sub> (1/|o<sub>i</sub>|) &sum;<sub>t</sub> min( &rho;<sub>i,t</sub> A&#770;<sub>i</sub>,  clip(&rho;<sub>i,t</sub>, 1&minus;&epsilon;, 1+&epsilon;) A&#770;<sub>i</sub> ) &minus; &beta; D<sub>KL</sub>( &pi;<sub>&theta;</sub> &#8214; &pi;<sub>ref</sub> ) ]</p>
+
+<p>with the KL estimated per token by D<sub>KL</sub> = &pi;<sub>ref</sub>/&pi;<sub>&theta;</sub> &minus; log(&pi;<sub>ref</sub>/&pi;<sub>&theta;</sub>) &minus; 1, which is the always-non-negative estimator "k3" that chapter 8 compared with k1 and k2. (The R1 paper writes the ratio at the level of whole answers; the DeepSeekMath paper and most libraries use the per-token form above, and TRL lets you choose between token-level and sequence-level ratios.) Four things to notice.</p>
+
+<ol class="steps">
+  <li><strong>The baseline is free.</strong> There is no value network to train, store or update. The only extra cost is generating G answers per question and not one.</li>
+  <li><strong>It is relative.</strong> The same absolute reward is a good outcome in a hard group and an ordinary one in an easy group. The advantage encodes "better than my other attempts at this question".</li>
+  <li><strong>Zero when everyone ties.</strong> If all G answers get the same reward, every A&#770;<sub>i</sub> is 0: the whole group contributes no gradient. (Division by a zero standard deviation is guarded in implementations, usually by a small constant.)</li>
+  <li><strong>The KL term can be dropped.</strong> TRL's <code>GRPOConfig</code> defaults to <code>beta=0.0</code>, and documents that in that case the reference model is not even loaded, which saves memory. The PPO clip still limits each step.</li>
+</ol>
+
+<div class="widget stepper" data-autoplay-ms="4000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One GRPO iteration for one question</h4></div>
+  <svg viewBox="0 0 760 350" role="img" aria-label="One GRPO iteration with a group of four. A prompt and the policy produce four sampled answers. A verifier gives rewards 1, 0, 0, 1. The group mean and standard deviation are both 0.5. The advantages are plus 1, minus 1, minus 1, plus 1. Finally the policy is updated with the clipped objective and a KL term.">
+    <defs><marker id="ahLT14a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <g data-steps="1-" data-active="1">
+      <rect x="20" y="30" width="140" height="56" rx="8" class="fs-green s-green sw-2"/>
+      <text x="90" y="54" text-anchor="middle" class="t-sm t-bold">Prompt q</text>
+      <text x="90" y="72" text-anchor="middle" class="t-xs t-muted">17 &#215; 23 = ?</text>
+      <rect x="20" y="150" width="140" height="56" rx="8" class="fs-purple s-purple sw-2"/>
+      <text x="90" y="174" text-anchor="middle" class="t-sm t-bold">Policy &#960;_old</text>
+      <text x="90" y="192" text-anchor="middle" class="t-xs t-muted">sample G = 4</text>
+      <line x1="90" y1="86" x2="90" y2="148" class="line" marker-end="url(#ahLT14a)"/>
+    </g>
+    <g data-steps="2-" data-active="2">
+      <path d="M160,178 H185 M185,47 V227" fill="none" class="line s-orange"/>
+      <line x1="185" y1="47" x2="208" y2="47" class="line s-orange" marker-end="url(#ahLT14a)"/>
+      <line x1="185" y1="107" x2="208" y2="107" class="line s-orange" marker-end="url(#ahLT14a)"/>
+      <line x1="185" y1="167" x2="208" y2="167" class="line s-orange" marker-end="url(#ahLT14a)"/>
+      <line x1="185" y1="227" x2="208" y2="227" class="line s-orange" marker-end="url(#ahLT14a)"/>
+      <rect x="210" y="24" width="240" height="46" rx="8" class="box"/><text x="222" y="52" class="t-xs mono">o1: 340 + 51 = 391 \boxed{391}</text>
+      <rect x="210" y="84" width="240" height="46" rx="8" class="box"/><text x="222" y="112" class="t-xs mono">o2: 340 + 41 = 381 \boxed{381}</text>
+      <rect x="210" y="144" width="240" height="46" rx="8" class="box"/><text x="222" y="172" class="t-xs mono">o3: 17 + 23 = 40 \boxed{40}</text>
+      <rect x="210" y="204" width="240" height="46" rx="8" class="box"/><text x="222" y="232" class="t-xs mono">o4: 23*17 = 391 \boxed{391}</text>
+    </g>
+    <g data-steps="3-" data-active="3">
+      <line x1="450" y1="47" x2="488" y2="47" class="line" marker-end="url(#ahLT14a)"/>
+      <line x1="450" y1="107" x2="488" y2="107" class="line" marker-end="url(#ahLT14a)"/>
+      <line x1="450" y1="167" x2="488" y2="167" class="line" marker-end="url(#ahLT14a)"/>
+      <line x1="450" y1="227" x2="488" y2="227" class="line" marker-end="url(#ahLT14a)"/>
+      <rect x="490" y="24" width="90" height="46" rx="8" class="fs-green s-green sw-2"/><text x="535" y="52" text-anchor="middle" class="t-sm t-bold">r = 1</text>
+      <rect x="490" y="84" width="90" height="46" rx="8" class="fs-red s-red sw-2"/><text x="535" y="112" text-anchor="middle" class="t-sm t-bold">r = 0</text>
+      <rect x="490" y="144" width="90" height="46" rx="8" class="fs-red s-red sw-2"/><text x="535" y="172" text-anchor="middle" class="t-sm t-bold">r = 0</text>
+      <rect x="490" y="204" width="90" height="46" rx="8" class="fs-green s-green sw-2"/><text x="535" y="232" text-anchor="middle" class="t-sm t-bold">r = 1</text>
+      <text x="535" y="14" text-anchor="middle" class="t-xs tc-blue t-bold">verifier</text>
+    </g>
+    <g data-steps="4-" data-active="4">
+      <rect x="210" y="262" width="530" height="30" rx="8" class="fs-cyan s-cyan sw-2"/>
+      <text x="475" y="282" text-anchor="middle" class="t-sm t-bold">group mean = 0.5     group std = 0.5</text>
+    </g>
+    <g data-steps="5-" data-active="5">
+      <rect x="610" y="24" width="130" height="46" rx="8" class="fs-yellow s-yellow sw-2"/><text x="675" y="52" text-anchor="middle" class="t-sm t-bold">A = +1.0</text>
+      <rect x="610" y="84" width="130" height="46" rx="8" class="fs-yellow s-yellow sw-2"/><text x="675" y="112" text-anchor="middle" class="t-sm t-bold">A = &#8722;1.0</text>
+      <rect x="610" y="144" width="130" height="46" rx="8" class="fs-yellow s-yellow sw-2"/><text x="675" y="172" text-anchor="middle" class="t-sm t-bold">A = &#8722;1.0</text>
+      <rect x="610" y="204" width="130" height="46" rx="8" class="fs-yellow s-yellow sw-2"/><text x="675" y="232" text-anchor="middle" class="t-sm t-bold">A = +1.0</text>
+      <text x="675" y="14" text-anchor="middle" class="t-xs t-bold">(r &#8722; mean) / std</text>
+    </g>
+    <g data-steps="6-" data-active="6">
+      <rect x="20" y="304" width="720" height="38" rx="8" class="fs-blue s-blue sw-2"/>
+      <text x="380" y="328" text-anchor="middle" class="t-sm t-bold">update: clipped ratio &#215; A on every token, minus &#946; &#183; KL to the reference, then new &#960;_old</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>One question, one policy.</strong> Take a prompt with a checkable answer and the current policy (the "old" policy, frozen for this iteration). Real runs use G = 8 or more answers; four fit the picture.</li>
+    <li><strong>Sample a group.</strong> Generate G answers to the same prompt at a non-zero temperature, so that they differ. This is the expensive step, and it is why a serving engine sits inside a GRPO trainer.</li>
+    <li><strong>Check each answer.</strong> The verifier returns a reward per answer: here 1 for a correct boxed answer and 0 otherwise. No model is involved.</li>
+    <li><strong>Compare with the group.</strong> Two of four were correct, so the mean is 0.5 and the standard deviation 0.5.</li>
+    <li><strong>Standardise.</strong> Correct answers get advantage +1, wrong ones &minus;1. Had only one answer been correct, it would have received +1.73 and each wrong one &minus;0.58: the rare event stands out.</li>
+    <li><strong>Update.</strong> Each token of each answer is weighted by its answer's advantage in PPO's clipped objective. Tokens of correct answers become likelier, tokens of wrong ones less likely, and the next iteration samples from the improved policy.</li>
+  </ol>
+</div>
+
+<h2>Is the group mean a valid baseline?</h2>
+
+<p>Chapter 7's guarantee was that subtracting a baseline b leaves the gradient unbiased <em>if b does not depend on the sampled action</em>. The group mean does: it contains r<sub>i</sub> itself. The effect can be computed.</p>
+
+<details class="deeper"><summary>Go deeper <span class="hint">the (G&minus;1)/G factor</span></summary>
+<p>Consider the contribution of answer <em>i</em> with advantage r<sub>i</sub> &minus; r&#772;, where r&#772; is the mean of all G rewards. Split the mean: r&#772; = r<sub>i</sub>/G + (1/G) &sum;<sub>j&ne;i</sub> r<sub>j</sub>. Then</p>
+<p style="text-align:center">E[ (r<sub>i</sub> &minus; r&#772;) &nabla; log &pi;(o<sub>i</sub>) ] = (1 &minus; 1/G) E[ r<sub>i</sub> &nabla; log &pi;(o<sub>i</sub>) ] &minus; (1/G) &sum;<sub>j&ne;i</sub> E[ r<sub>j</sub> ] &middot; E[ &nabla; log &pi;(o<sub>i</sub>) ].</p>
+<p>The second term vanishes because the other answers are independent of o<sub>i</sub> and E[&nabla; log &pi;(o)] = 0 (the identity behind every baseline argument in chapter 7). What remains is (G&minus;1)/G times the true policy gradient. The direction is right and the size is too small by 1/G: for G = 8, 12.5 percent. The fix is the <span class="term">leave-one-out</span> baseline, where answer <em>i</em> is compared with the mean of the other G&minus;1: then the baseline is independent of o<sub>i</sub> and the gradient is exactly unbiased, at the price of advantages that are larger by G/(G&minus;1). This is the baseline of RLOO (Ahmadian et al., 2024), the REINFORCE-style method in chapter 12's table.</p>
+</details>
+
+<p>A Monte Carlo check on a policy small enough to know the answer: a softmax over four answers, one of them correct, and gradient estimates averaged over 200,000 groups for each group size G.</p>
+
+<pre class="terminal" data-title="grpo_adv.py"><code>import numpy as np
+G = 8
+print(f"Advantages in a group of G={G} with binary rewards (population std)")
+print(f"{'correct':&gt;7} {'p_hat':&gt;6} {'A(correct)':&gt;11} {'A(wrong)':&gt;9} {'|A|-sum':&gt;8} | no-std: {'A(correct)':&gt;10} {'A(wrong)':&gt;9}")
+for k in range(G + 1):
+    r = np.array([1.0] * k + [0.0] * (G - k))
+    mu, sd = r.mean(), r.std()
+    if sd == 0:
+        print(f"{k:7d} {k/G:6.3f} {'0 (no signal)':&gt;11} {'':&gt;9} {0:8.2f} |")
+        continue
+    ac, aw = (1 - mu) / sd, (0 - mu) / sd
+    print(f"{k:7d} {k/G:6.3f} {ac:11.2f} {aw:9.2f} {k*abs(ac)+(G-k)*abs(aw):8.2f} | {'':8}{1-mu:10.3f} {-mu:9.3f}")
+
+# Is the group mean a valid baseline?  Compare gradients on a 4-answer softmax policy, exact vs Monte Carlo.
+rng = np.random.default_rng(0)
+logits = np.array([0.5, 0.0, -0.5, -1.0]); correct = np.array([0, 0, 1, 0.0])
+pi = np.exp(logits) / np.exp(logits).sum()
+J = pi @ correct
+true_grad = pi * (correct - J)                           # exact gradient of J w.r.t. the logits
+
+def mc(G, mode, trials=200000):
+    a = rng.choice(4, size=(trials, G), p=pi); r = correct[a]
+    if mode == "mean":   base = r.mean(axis=1, keepdims=True)
+    elif mode == "loo":  base = (r.sum(axis=1, keepdims=True) - r) / (G - 1)
+    elif mode == "none": base = 0.0
+    adv = r - base
+    onehot = np.eye(4)[a]                                 # grad of log pi(a) w.r.t. logits = onehot - pi
+    g = ((onehot - pi) * adv[..., None]).mean(axis=1).mean(axis=0)
+    return g
+print("\nexact gradient on the correct answer's logit:", round(true_grad[2], 4))
+for G_ in (2, 4, 8):
+    out = {m: mc(G_, m)[2] for m in ("none", "mean", "loo")}
+    print(f"G={G_}:  no baseline {out['none']:.4f}   group mean {out['mean']:.4f} (x{out['mean']/true_grad[2]:.3f}; (G-1)/G = {(G_-1)/G_:.3f})   leave-one-out {out['loo']:.4f} (x{out['loo']/true_grad[2]:.3f})")</code></pre>
+<pre class="terminal" data-title="output"><code>Advantages in a group of G=8 with binary rewards (population std)
+correct  p_hat  A(correct)  A(wrong)  |A|-sum | no-std: A(correct)  A(wrong)
+      0  0.000 0 (no signal)               0.00 |
+      1  0.125        2.65     -0.38     5.29 |              0.875    -0.125
+      2  0.250        1.73     -0.58     6.93 |              0.750    -0.250
+      3  0.375        1.29     -0.77     7.75 |              0.625    -0.375
+      4  0.500        1.00     -1.00     8.00 |              0.500    -0.500
+      5  0.625        0.77     -1.29     7.75 |              0.375    -0.625
+      6  0.750        0.58     -1.73     6.93 |              0.250    -0.750
+      7  0.875        0.38     -2.65     5.29 |              0.125    -0.875
+      8  1.000 0 (no signal)               0.00 |
+
+exact gradient on the correct answer's logit: 0.1394
+G=2:  no baseline 0.1397   group mean 0.0700 (x0.502; (G-1)/G = 0.500)   leave-one-out 0.1390 (x0.997)
+G=4:  no baseline 0.1395   group mean 0.1041 (x0.747; (G-1)/G = 0.750)   leave-one-out 0.1393 (x1.000)
+G=8:  no baseline 0.1389   group mean 0.1218 (x0.874; (G-1)/G = 0.875)   leave-one-out 0.1395 (x1.001)</code></pre>
+
+<p>The first table is the advantage for a group of eight at each possible count of correct answers. The second block shows that with the group mean as baseline the gradient on the correct answer's logit is 0.50, 0.75 and 0.87 of the exact value (0.139) for G = 2, 4 and 8, matching (G&minus;1)/G; the leave-one-out version recovers 1.00 in each case. In practice the bias is a constant factor that the learning rate absorbs, which is why GRPO works anyway. The std division is a more interesting choice.</p>
+
+<h3>What dividing by the standard deviation does</h3>
+
+<p>The standard deviation is not a baseline: it is a positive scale applied to one prompt's whole group, so it never changes which answers are pushed up or down, only how hard the prompt pulls compared with the others in the batch. For binary rewards with a fraction p of correct answers, the standard deviation is &radic;(p(1&minus;p)). The first table above shows the effect: with the std, a single correct answer in eight gets an advantage of +2.65 and the total pull of the group, the sum of |A|, is 5.29, close to the 8.00 of a 50-50 group; without it, the correct answer would get only +0.875. Prompts near the extremes, which the model almost always fails or almost always passes, are boosted relative to the mean-only version. Liu et al. (2025, "Understanding R1-Zero-Like Training: A Critical Perspective") argue that GRPO has an optimisation bias that artificially increases response length, especially for incorrect outputs, and propose Dr. GRPO, which removes these normalisation terms (their abstract names the length effect; their analysis also covers the std term). Their length argument concerns the 1/|o<sub>i</sub>| factor in the objective above: averaging over tokens within an answer means each token of a long wrong answer is penalised less than each token of a short wrong one.</p>
+
+<p>Try the choices yourself. Click the eight cells to mark answers correct or wrong, and compare the three rules for the same group.</p>
+
+<div class="widget" id="llm14-group">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Advantages in a group of eight</h4></div>
+  <p class="widget-help">Click a cell to toggle correct (green) and wrong (red). Start with one correct answer and read its advantage under each rule, then make all eight wrong, then four and four.</p>
+  <div class="grp-ctl">
+    <label for="grp-rule">Rule:
+      <select id="grp-rule" data-act="rule">
+        <option value="grpo">GRPO: (r &minus; mean) / std</option>
+        <option value="mean">Mean only (Dr. GRPO style)</option>
+        <option value="loo">Leave-one-out (RLOO)</option>
+      </select>
+    </label>
+  </div>
+  <div class="grp-cells"></div>
+  <svg class="grp-chart" viewBox="0 0 700 240" role="img" aria-label="Bar chart of the advantage assigned to each of eight sampled answers."></svg>
+  <p class="widget-out grp-out" aria-live="polite"></p>
+</div>
+
+<h2>Where there is no signal</h2>
+
+<p>Every advantage in a group is zero when every answer has the same reward. For a prompt on which the model's success probability is p, the chance that all G answers fail is (1 &minus; p)<sup>G</sup> and the chance that all succeed is p<sup>G</sup>. With G = 8 and p = 0.05 (a hard problem), 66 percent of groups are all wrong; with p = 0.9 (an easy one), 43 percent are all right. Either way the prompt teaches nothing that step, yet its answers still had to be generated, which is the most expensive part of the run. A prompt set must therefore be matched to the model: mostly problems the model solves sometimes, neither always nor never. The DAPO paper (Yu et al., 2025, "DAPO: An Open-Source LLM Reinforcement Learning System at Scale") makes this explicit with dynamic sampling, which keeps sampling until the batch is full of prompts with non-zero advantage; its other named changes are a higher upper clip bound (clip-higher), a token-level loss and shaping for over-long answers. With a Qwen2.5-32B base model they report 50 points on AIME 2024, and they released their training code (built on the verl framework) and a processed dataset.</p>
+
+<p>A small experiment makes the weighting visible. There are 48 prompts, each with a tabular softmax over eight candidate answers of which exactly one is correct, with starting success probabilities from 0.01 (hard) to 0.90 (easy). Each step samples 16 prompts, draws a group of 8 answers per prompt, and updates the logits by the advantage rule under test (one gradient step per batch, so the PPO ratio is 1 and the clip never fires). We compare REINFORCE with no baseline, the group mean alone, and the group mean divided by the std, averaged over 20 seeds and measured after 60 steps.</p>
+
+<pre class="terminal" data-title="grpo_toy.py"><code>import numpy as np
+K, G, B, STEPS, LR = 8, 8, 16, 60, 0.5          # answers per prompt, group size, prompts per step, steps, learning rate
+NP = 48                                           # prompts in the training set
+
+def softmax(z): e = np.exp(z - z.max(axis=-1, keepdims=True)); return e / e.sum(axis=-1, keepdims=True)
+
+def make_policy(rng):
+    # prompt i starts with probability p0 on its single correct answer (answer 0), from hard (0.01) to easy (0.9)
+    p0 = np.linspace(0.01, 0.9, NP)
+    z = np.zeros((NP, K)); z[:, 0] = np.log(p0 / (1 - p0) * (K - 1))
+    return z, p0
+
+def advantages(r, mode):
+    mu, sd = r.mean(1, keepdims=True), r.std(1, keepdims=True)
+    if mode == "none":  return r                                   # plain REINFORCE, no baseline
+    if mode == "mean":  return r - mu                              # group mean only (Dr. GRPO-style)
+    if mode == "grpo":  return np.where(sd &gt; 0, (r - mu) / np.maximum(sd, 1e-8), 0.0)
+
+def run(mode, seed):
+    rng = np.random.default_rng(seed)
+    z, p0 = make_policy(rng)
+    dead0 = None
+    for step in range(STEPS):
+        idx = rng.choice(NP, size=B, replace=False)
+        pi = softmax(z[idx])                                       # (B, K)
+        a = np.array([rng.choice(K, size=G, p=pi[b]) for b in range(B)])      # (B, G) sampled answers
+        r = (a == 0).astype(float)                                 # verifiable reward: answer 0 is the correct one
+        if step == 0: dead0 = np.mean(r.std(1) == 0)
+        A = advantages(r, mode)
+        grad = np.zeros_like(pi)
+        for b in range(B):
+            for g in range(G):
+                grad[b] += A[b, g] * (np.eye(K)[a[b, g]] - pi[b])
+        z[idx] += LR * grad / G
+    p = softmax(z)[:, 0]
+    return p, dead0
+
+print(f"{NP} prompts, G={G}, {B} prompts per step, {STEPS} steps, mean over 20 seeds")
+print(f"{'advantage':22} {'mean P(correct)':&gt;16} {'hard third':&gt;11} {'middle':&gt;8} {'easy third':&gt;11}")
+for mode, name in (("none", "no baseline"), ("mean", "group mean"), ("grpo", "group mean / std")):
+    res = np.array([run(mode, s)[0] for s in range(20)]).mean(0)
+    t = NP // 3
+    print(f"{name:22} {res.mean():16.3f} {res[:t].mean():11.3f} {res[t:2*t].mean():8.3f} {res[2*t:].mean():11.3f}")
+p0 = make_policy(None)[1]; t = NP // 3
+print(f"{'start':22} {p0.mean():16.3f} {p0[:t].mean():11.3f} {p0[t:2*t].mean():8.3f} {p0[2*t:].mean():11.3f}")
+print(f"\nfraction of groups whose 8 samples were all wrong or all right at step 0: {np.mean([run('grpo', s)[1] for s in range(20)]):.2f}")</code></pre>
+<pre class="terminal" data-title="output"><code>48 prompts, G=8, 16 prompts per step, 60 steps, mean over 20 seeds
+advantage               mean P(correct)  hard third   middle  easy third
+no baseline                       0.768       0.512    0.871       0.922
+group mean                        0.744       0.468    0.850       0.914
+group mean / std                  0.889       0.756    0.948       0.963
+start                             0.455       0.152    0.455       0.758
+
+fraction of groups whose 8 samples were all wrong or all right at step 0: 0.20</code></pre>
+
+<p>Read it with care. At step 0, 20 percent of all groups were dead (all right or all wrong). Standardising by the std learned fastest, especially on the hard third (0.15 to 0.76 against 0.47 to 0.51 for the others), because a rare success there carries an advantage of +2.65 against +0.875 without the division. But this is partly a larger effective learning rate (the std-scaled advantages are larger, with the learning rate held fixed) and the toy has no generalisation between prompts, so it shows <em>how the weighting redistributes effort</em>, not that one rule is better. Real runs differ, which is why libraries expose all of these as options.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"GRPO is a different algorithm from PPO." It is PPO's clipped objective with a different way to get the advantage: no critic, one scalar per answer from the group, and the KL moved from the reward into the loss (often set to zero). The pieces you learned in chapters 7 and 8 (policy gradient, baselines, ratio, clip, KL) are all still here. The things that are new are the sampling of a group, the group-relative advantage, and the particular failure modes that follow from them: dead groups and the length and difficulty weightings above.</p>
+</div>
+
+<h2>Running GRPO: what fits, and what to set</h2>
+
+<p>The extra cost is generation. Each iteration decodes B &times; G answers, and they are long: a reasoning model may think for thousands of tokens. Decoding is memory-bound and the KV cache for G simultaneous answers grows with their length (<a href="18-kv-cache.html">chapter 18</a>). The estimate below adds that cache to the LoRA accounting of chapter 11 for a 7B Llama 2 shape, which has no grouped-query attention and so a large cache: 0.52 MB per token. Training micro-batches are two sequences. All values are estimates.</p>
+
+<pre class="terminal" data-title="grpo_mem.py"><code># Does a GRPO run fit on a 24 GB card?  Llama-2-7B shape, rank-16 LoRA on all linear layers (estimates).
+H, L, V, FFN, P = 4096, 32, 32000, 11008, 6.74e9
+GB = 1e9
+shapes = [(H, H)] * 4 + [(H, FFN), (H, FFN), (FFN, H)]
+adapter_state = L * sum(16 * (i + o) for i, o in shapes) * 16 / GB        # fp32 weights+grads+Adam
+linear = L * sum(i * o for i, o in shapes)
+nf4_bits = 4 + 8 / 64 + 32 / (64 * 256)
+bases = {"bf16 base": 2 * P / GB, "NF4 base": (linear * nf4_bits / 8 + 2 * V * H * 2) / GB}
+kv_token = 2 * L * H * 2 / GB                                             # GB per token, bf16, no GQA
+
+def acts(seqs, seq):                                                      # gradient checkpointing
+    return (L * 2 * seq * seqs * H + 34 * seq * seqs * H + 4 * seq * seqs * V) / GB
+
+print(f"{'completion+prompt':&gt;18} {'G':&gt;3} | " + " | ".join(f"{k:&gt;10}" for k in bases) + "   (GB; 24 GB card)")
+for T in (1024, 2048, 4096):
+    for G in (4, 8, 16):
+        gen_kv = G * T * kv_token                                         # all G rollouts decoded together
+        row = []
+        for name, base in bases.items():
+            total = base + adapter_state + acts(2, T) + gen_kv + 1.5
+            row.append(f"{total:7.1f} {'ok ' if total &lt;= 24 else 'OOM'}")
+        print(f"{T:&gt;18} {G:&gt;3} | " + " | ".join(row))</code></pre>
+<pre class="terminal" data-title="output"><code> completion+prompt   G |  bf16 base |   NF4 base   (GB; 24 GB card)
+              1024   4 |    18.9 ok  |     9.2 ok 
+              1024   8 |    21.0 ok  |    11.4 ok 
+              1024  16 |    25.3 OOM |    15.7 ok 
+              2048   4 |    22.1 ok  |    12.5 ok 
+              2048   8 |    26.4 OOM |    16.8 ok 
+              2048  16 |    35.0 OOM |    25.4 OOM
+              4096   4 |    28.5 OOM |    18.9 ok 
+              4096   8 |    37.1 OOM |    27.5 OOM
+              4096  16 |    54.3 OOM |    44.7 OOM</code></pre>
+
+<p>A 7B model with a 4-bit base fits a 24 GB card for groups of 8 up to 2,048 tokens per prompt-plus-answer, and a bf16 base fits for G = 8 only at 1,024 tokens. At 4,096 tokens (modest for a reasoning model) the cache alone pushes even the 4-bit case over for G = 8. The usual responses are a smaller model, a shorter maximum completion, fewer concurrent answers, a serving engine that stores the cache more efficiently (<a href="20-serving-engines.html">chapter 20</a>), or a bigger GPU. GPU capacities are NVIDIA's (24 GB for the RTX 4090, 80 GB for the A100 and H100 SXM; see chapter 2).</p>
+
+<p>In TRL, a GRPO run needs a dataset with a prompt column, a reward function, and a config. This listing is adapted from the library's documentation and is not run here (it needs PyTorch, a GPU and a model download). The reward function receives the generated completions plus any dataset columns by name, and returns one float per completion.</p>
+
+<pre class="terminal" data-title="grpo_train.py (TRL, not run here)"><code>import re
+from datasets import load_dataset
+from trl import GRPOConfig, GRPOTrainer
+
+def reward_func(completions, ground_truth, **kwargs):
+    """1.0 if the content of the last \boxed{...} equals the dataset's ground_truth, else 0.0."""
+    out = []
+    for c, gt in zip(completions, ground_truth):
+        boxes = re.findall(r"\\boxed\{(.*?)\}", c)
+        out.append(1.0 if boxes and boxes[-1].strip() == gt else 0.0)
+    return out
+
+dataset = load_dataset("my-org/math-prompts", split="train")   # columns: prompt, ground_truth
+
+args = GRPOConfig(
+    output_dir="grpo-out",
+    num_generations=8,        # G: answers per prompt
+    max_completion_length=1024,
+    beta=0.0,                 # no KL term, so the reference model is not loaded
+    epsilon=0.2,
+    loss_type="dapo",         # the library default; "dr_grpo" removes length and std terms
+    scale_rewards="group",    # divide by the group std (False: mean only)
+    use_vllm=True,            # generate with vLLM (colocated by default in TRL v1)
+)
+trainer = GRPOTrainer(model="Qwen/Qwen2.5-0.5B-Instruct", args=args,
+                      reward_funcs=reward_func, train_dataset=dataset)
+trainer.train()</code></pre>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>TRL v1.0.0 was released on 31 March 2026. Its main-branch documentation, read in October 2026, lists these <code>GRPOConfig</code> defaults: <code>num_generations=8</code>, <code>beta=0.0</code> (reference model not loaded), <code>epsilon=0.2</code>, <code>epsilon_high=None</code> (the docs cite DAPO's recommendation of 0.28), <code>scale_rewards="group"</code> (also <code>"batch"</code> or <code>False</code>), <code>loss_type="dapo"</code> (other documented values include <code>"dr_grpo"</code> and <code>"sapo"</code>), <code>importance_sampling_level="token"</code> (or <code>"sequence"</code>) and <code>use_vllm=False</code>. I could not confirm from the part of the page I read whether a plain original-GRPO value is also listed. The lesson is that "GRPO" now names a family whose defaults have moved from the original paper, so a hyperparameter copied from a paper can mean something different in a library. Read the loss definition in your version before comparing runs. Libraries such as verl and others implement the same ideas with different defaults.</p>
+</div>
+
+<h2>What reinforcement learning on verifiable rewards produced</h2>
+
+<p>DeepSeek-R1-Zero (DeepSeek-AI, 2025) applied GRPO directly to a pretrained base model, with no SFT stage and the two rule-based rewards above. The paper reports that its average pass@1 on the AIME 2024 competition problems rose during RL from 15.6 percent to 71.0 percent, and to 86.7 percent with majority voting over samples. It reports that the model learned, unprompted, to allocate more thinking time by re-evaluating its earlier steps, and shows an intermediate checkpoint that stops mid-solution with "Wait, wait. Wait." which the authors call an "aha moment". R1-Zero also had poor readability and mixed languages, so the released DeepSeek-R1 added a small cold-start SFT stage on thousands of long chain-of-thought examples, a multi-stage pipeline, and finally distillation of the reasoning ability into smaller dense models. The paper was later published in <em>Nature</em> (2025). <a href="../cases/case-02-deepseek-r1.html">Case study C2</a> goes through it, and <a href="15-distillation.html">chapter 15</a> covers the distillation step.</p>
+
+<h3>Does RL teach new skills, or sharpen old ones?</h3>
+
+<p>Pass@1 is the chance that one sample is right. <span class="term">Pass@k</span> is the chance that at least one of k samples is right: it measures what the model <em>can</em> do given many attempts, not what it does on the first. The unbiased estimator (Chen et al., 2021) from n samples with c correct is 1 &minus; C(n&minus;c, k)/C(n, k). Yue et al. (2025, "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?") report that RLVR-trained models beat their base models at k = 1 but that base models reach higher pass@k when k is large, and conclude that the observed reasoning is bounded by the base model and that the training setups did not elicit fundamentally new reasoning patterns; they find that distillation from a teacher can. That is one study's reading, and others have argued the opposite with longer training or different data, so treat it as an open question, not a settled one.</p>
+
+<p>The mechanism in the claim is easy to simulate. Take 2,000 prompts whose base success probabilities are spread out (many small but not zero). Model "RL" as sharpening: each prompt's log-odds are doubled and shifted up. This is a deliberately crude toy with no claim to represent any real model: it only shows how pass@1 and pass@k can disagree.</p>
+
+<pre class="terminal" data-title="passk.py"><code>import numpy as np
+from math import comb
+rng = np.random.default_rng(0)
+
+def pass_at_k(n, c, k):                 # unbiased estimator of Chen et al. (2021): 1 - C(n-c, k) / C(n, k)
+    return 1.0 if n - c &lt; k else 1.0 - comb(n - c, k) / comb(n, k)
+
+# 2,000 prompts; base-model success probabilities are spread out, many small but not zero
+p_base = rng.beta(0.35, 0.9, size=2000)
+logit = lambda p: np.log(p / (1 - p))
+# toy "RL sharpening": push each prompt's log-odds away from the middle (scale 2.0, shift +2.0)
+# prompts the model solves sometimes get solved more often; prompts at p ~ 1e-4 stay unsolved
+p_rl = 1 / (1 + np.exp(-(2.0 * logit(np.clip(p_base, 1e-9, 1 - 1e-9)) + 2.0)))
+
+print(f"{'k':&gt;4} {'base pass@k':&gt;12} {'RL pass@k':&gt;10}")
+for k in (1, 4, 16, 64, 256, 1024):
+    b = np.mean(1 - (1 - p_base) ** k); r = np.mean(1 - (1 - p_rl) ** k)
+    print(f"{k:4d} {b:12.3f} {r:10.3f}")
+
+# the estimator on real samples: n = 256 draws per prompt, c correct
+n = 256
+c = rng.binomial(n, p_base[:300])
+est = np.mean([pass_at_k(n, ci, 16) for ci in c]); exact = np.mean(1 - (1 - p_base[:300]) ** 16)
+print(f"\nunbiased pass@16 from {n} samples on 300 prompts = {est:.3f}   (exact for those prompts: {exact:.3f})")</code></pre>
+<pre class="terminal" data-title="output"><code>   k  base pass@k  RL pass@k
+   1        0.284      0.400
+   4        0.503      0.529
+  16        0.675      0.622
+  64        0.792      0.691
+ 256        0.874      0.750
+1024        0.926      0.805
+
+unbiased pass@16 from 256 samples on 300 prompts = 0.714   (exact for those prompts: 0.717)</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Line chart of pass at k against k from 1 to 1024 on a logarithmic scale. The sharpened RL model starts higher (0.40 against 0.28) at k equal 1. The curves cross between k equals 4 and 16, and the base model is higher at large k (0.93 against 0.80 at k equals 1024).">
+    <line x1="70" y1="240" x2="730" y2="240" class="line-thin"/><line x1="70" y1="40" x2="70" y2="240" class="line-thin"/>
+    <polyline points="100,183.2 220,139.4 340,105 460,81.6 580,65.2 700,54.8" fill="none" class="s-blue" stroke-width="3"/>
+    <polyline points="100,160 220,134.2 340,115.6 460,101.8 580,90 700,79" fill="none" class="s-orange" stroke-width="3"/>
+    <circle cx="100" cy="183.2" r="5" class="f-blue"/><circle cx="220" cy="139.4" r="5" class="f-blue"/><circle cx="340" cy="105" r="5" class="f-blue"/><circle cx="460" cy="81.6" r="5" class="f-blue"/><circle cx="580" cy="65.2" r="5" class="f-blue"/><circle cx="700" cy="54.8" r="5" class="f-blue"/>
+    <circle cx="100" cy="160" r="5" class="f-orange"/><circle cx="220" cy="134.2" r="5" class="f-orange"/><circle cx="340" cy="115.6" r="5" class="f-orange"/><circle cx="460" cy="101.8" r="5" class="f-orange"/><circle cx="580" cy="90" r="5" class="f-orange"/><circle cx="700" cy="79" r="5" class="f-orange"/>
+    <text x="100" y="262" text-anchor="middle" class="t-xs t-muted">k = 1</text><text x="220" y="262" text-anchor="middle" class="t-xs t-muted">4</text><text x="340" y="262" text-anchor="middle" class="t-xs t-muted">16</text><text x="460" y="262" text-anchor="middle" class="t-xs t-muted">64</text><text x="580" y="262" text-anchor="middle" class="t-xs t-muted">256</text><text x="700" y="262" text-anchor="middle" class="t-xs t-muted">1024</text>
+    <text x="400" y="288" text-anchor="middle" class="t-xs t-muted">number of attempts k (log scale)</text>
+    <text x="62" y="244" text-anchor="end" class="t-xs t-muted">0</text><text x="62" y="144" text-anchor="end" class="t-xs t-muted">0.5</text><text x="62" y="44" text-anchor="end" class="t-xs t-muted">1</text>
+    <text x="120" y="212" class="t-sm t-bold tc-blue">base model</text>
+    <text x="120" y="146" class="t-sm t-bold tc-orange">after RL (toy sharpening)</text>
+  </svg>
+  <figcaption><strong>Better on the first try, narrower on the hundredth.</strong> In this toy, sharpening raises pass@1 from 0.28 to 0.40 and lowers pass@1024 from 0.93 to 0.80, because the prompts the base model solved only rarely are pushed further towards never. Real models may behave differently; the point is that pass@1 alone cannot distinguish "learned something new" from "concentrated what it already had".</figcaption>
+</figure>
+
+<p>Which metric you care about depends on the use. A product that makes one attempt wants pass@1, and sharpening is exactly what it needs. A system that can sample many candidates and verify them (best-of-n with a checker, test-time search) benefits from the base model's breadth. The honest summary is that RLVR reliably improves single-attempt reliability on the kinds of tasks it trains on; whether it also extends what the model can solve at all is contested.</p>
+
+<h2>Failure modes to watch</h2>
+
+<ul>
+  <li><strong>Verifier loopholes.</strong> See the shotgun answer. Audit the reward by sampling high-reward completions and reading them, and keep a held-out checker the policy cannot see.</li>
+  <li><strong>Format without substance.</strong> A format reward is easy to earn. If it is weighted too heavily, or if the base model already follows the format, reward rises while accuracy does not. Log the two components separately.</li>
+  <li><strong>Length drift.</strong> Average completion length growing steadily can be real (more thinking), a bias in the loss normalisation (the Dr. GRPO critique), or an artefact of truncation. Track length by correct and incorrect answers separately.</li>
+  <li><strong>Collapse of diversity.</strong> As the policy sharpens, its answers become alike, groups become dead, and exploration stops. The DAPO authors motivate raising the upper clip bound (<code>epsilon_high</code>) as a way to let low-probability tokens grow; watch the policy's entropy in the logs.</li>
+  <li><strong>The wrong prompts.</strong> A dataset that is too easy or too hard gives mostly dead groups. Log the fraction of groups with non-zero reward variance and filter your prompts by measured base-model pass rate before you start.</li>
+  <li><strong>Training on the test.</strong> Prompts from public benchmarks contaminate later evaluation. Keep evaluation sets out of the training pool (<a href="23-evaluating-models.html">chapter 23</a>).</li>
+</ul>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Open <code>grpo_toy.py</code> and change the group size <code>G</code> from 8 to 2, 4 and 16, keeping everything else. Print the fraction of dead groups at step 0 from the last line of output each time. Then double <code>STEPS</code> to 120 and compare the three advantage rules again. Finally, run <code>grpo_adv.py</code> after changing <code>G</code> at the top to 4.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 grpo_toy.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 grpo_adv.py</span></code></pre>
+  <p>Questions: how does the dead-group fraction depend on G (use your formula (1&minus;p)<sup>G</sup> + p<sup>G</sup>)? Why might a larger group cost more than it saves? At what point do the three rules stop differing?</p>
+</div>
+
+<p><a href="../labs/lab-04-dpo-grpo.html">Lab 4</a> has you implement the GRPO loss and the DPO loss on a toy policy with a verifiable reward, and <a href="../studios/studio-02-reasoning-model.html">Studio 2</a> asks you to plan a small reasoning model: which base, which rewards, how much compute and how you will catch reward hacking.</p>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A verifiable reward is computed by a program (answer match, unit tests, format check). RLVR (Tülu 3) and R1-Zero use such rewards instead of a learned reward model, partly to avoid the reward hacking of chapter 13.</li>
+    <li>The verifier is a specification with loopholes: test it against shotgun answers, changed minds and format tricks, and sandbox code execution.</li>
+    <li>GRPO replaces PPO's value model with a baseline from a group of G answers to the same prompt: A<sub>i</sub> = (r<sub>i</sub> &minus; mean) / std, the same for every token of answer <em>i</em>, inside PPO's clipped objective with an optional KL term.</li>
+    <li>With binary rewards, a lone success in eight gets +2.65 with the std division and +0.875 without; a group with identical rewards gets exactly zero and teaches nothing (66 percent of groups at p = 0.05, G = 8).</li>
+    <li>The group mean includes the sample, so the gradient is (G&minus;1)/G of the truth (checked numerically); leave-one-out (RLOO) removes the bias. Dr. GRPO and DAPO adjust the length and std normalisation.</li>
+    <li>R1-Zero went from 15.6 to 71.0 percent pass@1 on AIME 2024 with rule-based rewards. Whether RLVR adds new capability or sharpens existing capability (pass@k) is debated.</li>
+    <li>Cost is generation: KV cache for G long answers sets the limit on a 24 GB card long before the optimiser does.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">Shao et al., "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models" (2024)</a>. Where GRPO was introduced.</li>
+  <li><a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">DeepSeek-AI, "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning" (2025)</a>. R1-Zero and R1: rewards, the GRPO equations, the aha moment, distillation.</li>
+  <li><a href="https://arxiv.org/abs/2411.15124" target="_blank" rel="noopener">Lambert et al., "Tulu 3: Pushing Frontiers in Open Language Model Post-Training" (2024)</a>. The RLVR objective and its data and recipe.</li>
+  <li><a href="https://arxiv.org/abs/2503.20783" target="_blank" rel="noopener">Liu et al., "Understanding R1-Zero-Like Training: A Critical Perspective" (2025)</a>. The optimisation bias in GRPO and Dr. GRPO.</li>
+  <li><a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">Yu et al., "DAPO: An Open-Source LLM Reinforcement Learning System at Scale" (2025)</a>. Dynamic sampling, clip-higher, token-level loss, and an open training system.</li>
+  <li><a href="https://arxiv.org/abs/2504.13837" target="_blank" rel="noopener">Yue et al., "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?" (2025)</a>. The pass@k argument.</li>
+  <li><a href="https://arxiv.org/abs/2402.14740" target="_blank" rel="noopener">Ahmadian et al., "Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs" (2024)</a>. RLOO and the case for simpler baselines.</li>
+  <li><a href="https://huggingface.co/docs/trl/main/en/grpo_trainer" target="_blank" rel="noopener">Hugging Face, TRL documentation: GRPO Trainer</a>. Reward function interface, loss types and defaults (read October 2026).</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">A group of 8 answers has exactly one correct answer (reward 1) and seven wrong ones (reward 0). Using (r &minus; mean) / std with the population standard deviation, what advantage does the correct answer get?</p>
+    <ol class="q-options">
+      <li>About 0.88</li>
+      <li>Exactly 1.0</li>
+      <li>About 2.65</li>
+      <li>About 7.0</li>
+    </ol>
+    <div class="q-explain">The mean is 1/8 = 0.125 and the standard deviation is &radic;(0.125 &times; 0.875) = 0.331, so A = (1 &minus; 0.125) / 0.331 = 2.65. The value 0.875 (rounded to 0.88) is the advantage without the std division. The seven wrong answers each get &minus;0.38.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">On a hard prompt, all 8 sampled answers are wrong. What does GRPO learn from this group in this step, and what helps?</p>
+    <ol class="q-options">
+      <li>Nothing, since every advantage is zero; filter such prompts, or choose prompts the model solves sometimes</li>
+      <li>It pushes all eight answers down equally, which is useful</li>
+      <li>It pushes the most likely answer up</li>
+      <li>It raises the KL penalty automatically</li>
+    </ol>
+    <div class="q-explain">All rewards equal the group mean, so each advantage is zero and the group contributes no gradient (apart from any KL term, if used). The cost of generating the eight answers is still paid. Matching the prompt set to the model's ability, or dynamic sampling that skips dead groups, recovers the lost efficiency.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">With the group mean (including the sample itself) as the baseline and G = 4, the expected gradient is what fraction of the true policy gradient?</p>
+    <ol class="q-options">
+      <li>1.0, since any baseline is unbiased</li>
+      <li>0.75</li>
+      <li>0.5</li>
+      <li>0.25</li>
+    </ol>
+    <div class="q-explain">The factor is (G&minus;1)/G = 3/4. A baseline is unbiased only if it does not depend on the sample being scored, and the group mean contains it. The simulation gave 0.747 for G = 4. Leave-one-out brings the factor back to 1.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">Which component of PPO-based RLHF does GRPO remove, and what replaces it?</p>
+    <ol class="q-options">
+      <li>The reference model, replaced by the old policy</li>
+      <li>The clip, replaced by a larger learning rate</li>
+      <li>The value model (critic), replaced by a baseline from the rewards of other answers to the same prompt</li>
+      <li>The policy, replaced by the reward model</li>
+    </ol>
+    <div class="q-explain">GRPO estimates the baseline from group scores and so avoids a critic as large as the policy. The clip stays, and the reference model is optional (<code>beta=0</code> in TRL by default), but that is a setting, not what defines GRPO.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">Your maths reward gives 1.0 whenever the gold answer string appears anywhere in the completion. After a few hundred steps average reward is 0.9 but held-out accuracy is flat. What most likely happened?</p>
+    <ol class="q-options">
+      <li>The KL penalty is too large</li>
+      <li>The group size is too small</li>
+      <li>The model forgot how to do arithmetic</li>
+      <li>The policy learned to list many candidate answers so that the gold one appears, which the lazy verifier rewards</li>
+    </ol>
+    <div class="q-explain">A containment check can be satisfied by hedging, as the "shotgun" completion shows. The proxy rises while the true skill does not. Use an exact match on a marked final answer, test the verifier against adversarial completions, and track a held-out strict score.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">After RLVR training, a model has higher pass@1 than its base but lower pass@256 on the same problems. Which interpretation is best supported?</p>
+    <ol class="q-options">
+      <li>RL concentrated probability on solutions the base could already produce, improving single-attempt reliability while narrowing coverage; which metric matters depends on whether you can sample and verify many attempts</li>
+      <li>RL taught the model entirely new capabilities, so pass@256 must be a measurement error</li>
+      <li>The verifier was too strict</li>
+      <li>Pass@k is meaningless for reasoning models</li>
+    </ol>
+    <div class="q-explain">This pattern is what sharpening predicts, and it is the pattern reported by Yue et al. (2025), though whether it is general is debated. It does not show RL adds nothing: for a one-attempt product, higher pass@1 is the gain you want. Pass@k is well defined and informative about coverage.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/llm14-group.js"></script>
+</body>
+</html>

@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 5: A Durable Agent · Agents, Tools &amp; Protocols</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="agt" data-lab="L5">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+<header class="chapter-head">
+  <h1>Lab 5: A Durable Agent</h1>
+  <p class="lede"><a href="../chapters/15-durable-execution.html">Chapter 15</a> argued that an agent which sends money and email must keep its state outside the process, and that a journal alone is not enough: between doing something and writing it down there is a window that no ordering closes. Arguments about windows are easy to nod along to and hard to get right, so in this lab you build the thing and then try to break it. You write an event-sourced agent loop on an append-only JSONL file, give every tool call an idempotency key that every attempt recomputes identically, add a human approval gate that survives a restart, and survive a crash injector that kills the process at every moment where a process can be killed. The checker does not sample a few crashes. It counts the crash points and kills your agent at each one in turn.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Almost every demonstration of an agent that "resumes after failure" kills it once, at a convenient moment, and watches it carry on. The bugs live at the inconvenient moments: after the bank moved the money and before the journal heard about it, halfway through writing a line to disk, or between two tool calls in the same model reply. They are also the bugs that cost money, because the symptom is a customer refunded twice. Here the inconvenient moments are enumerated for you, so a mistake that survives your own testing still fails the check, and you see exactly which crash point exposed it. You will also meet three details that chapters tend to wave at: a <span class="term">torn write</span> (a line half on disk when the power went), the identical tool call made twice in one run (so a tool-call id alone is not a safe name for an attempt), and the difference between a step that is <em>waiting</em> and a step that is <em>failing</em>. The same skills apply to any long-running job that touches the outside world: <a href="../../architecture/chapters/15-sagas.html">sagas</a>, payment pipelines, data migrations. The model in the loop only makes the log more important, because a model's reply cannot be recomputed.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Deterministic, offline, standard library only</p>
+  <p>No network, no real model and no real clock. The "bank" and the "mailer" are plain Python objects in <code>fixtures.py</code> that outlive each agent process and record what really happened; the model is a stand-in that depends only on the messages it is shown. A crash is an exception, <code>Crash</code>, raised by an <code>Injector</code> at the <em>n</em>th crash point (Milestones 3 and 4 try every <em>n</em>) or at random from a seeded generator (Milestone 5). A failure prints the crash point or the seed, and <code>python3 check.py solution 5 12</code> replays milestone 5 with seed 12 alone. The whole check runs in well under a second on a laptop. Python 3.9 or newer. <code>llm.py</code> is the shared stand-in model module, copied unchanged.</p>
+</div>
+
+<h2>What you'll build</h2>
+<figure class="diagram">
+<svg viewBox="0 0 760 290" role="img" aria-label="Two agent processes, the second started after the first was killed, share a journal file and a world of services. Process 1 appends events to the journal with an fsync. Process 2 loads the journal and resumes. The journal lists the model, result and further events and ends in a torn line left by the crash. Both processes call tools in the world, a bank and a mailer, and every call carries an idempotency key; each service keeps a store of keys it has seen."><defs><marker id="ahAG-L5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+  <rect x="20" y="24" width="190" height="84" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="115" y="50" text-anchor="middle" class="t-sm t-bold">process 1</text>
+  <text x="115" y="68" text-anchor="middle" class="t-xs t-muted">run(): load, next_step, act</text>
+  <text x="115" y="92" text-anchor="middle" class="t-xs tc-red t-bold">killed at a crash point</text>
+  <rect x="20" y="150" width="190" height="84" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="115" y="176" text-anchor="middle" class="t-sm t-bold">process 2</text>
+  <text x="115" y="194" text-anchor="middle" class="t-xs t-muted">fresh memory, same code</text>
+  <text x="115" y="218" text-anchor="middle" class="t-xs t-bold">resumes from the journal</text>
+  <rect x="300" y="24" width="190" height="210" rx="8" class="fs-purple s-purple sw-2"/>
+  <text x="395" y="46" text-anchor="middle" class="t-sm t-bold">journal.jsonl</text>
+  <text x="312" y="74" class="t-xs mono">1 model lookup_order</text>
+  <text x="312" y="94" class="t-xs mono">2 result order 42 ...</text>
+  <text x="312" y="114" class="t-xs mono">3 model refund</text>
+  <text x="312" y="134" class="t-xs mono">4 result refund #1</text>
+  <text x="312" y="154" class="t-xs mono">5 model send_email</text>
+  <text x="312" y="176" class="t-xs mono tc-red">6 {"type": "res</text>
+  <text x="395" y="204" text-anchor="middle" class="t-xs t-muted">append-only, one line each</text>
+  <text x="395" y="220" text-anchor="middle" class="t-xs tc-red">line 6 is a torn write</text>
+  <line x1="212" y1="66" x2="298" y2="66" class="line s-orange sw-2" marker-end="url(#ahAG-L5a)"/>
+  <text x="255" y="58" text-anchor="middle" class="t-xs">append</text>
+  <line x1="298" y1="192" x2="212" y2="192" class="line s-orange sw-2" marker-end="url(#ahAG-L5a)"/>
+  <text x="255" y="184" text-anchor="middle" class="t-xs">load</text>
+  <rect x="570" y="24" width="170" height="210" rx="8" class="box"/>
+  <text x="655" y="46" text-anchor="middle" class="t-sm t-bold">the world</text>
+  <rect x="582" y="58" width="146" height="82" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="655" y="82" text-anchor="middle" class="t-sm t-bold">bank</text>
+  <text x="655" y="100" text-anchor="middle" class="t-xs t-muted">refund(args, key)</text>
+  <text x="655" y="122" text-anchor="middle" class="t-xs t-bold">seen: key to answer</text>
+  <rect x="582" y="150" width="146" height="72" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="655" y="174" text-anchor="middle" class="t-sm t-bold">mailer</text>
+  <text x="655" y="192" text-anchor="middle" class="t-xs t-muted">send_email(args, key)</text>
+  <text x="655" y="212" text-anchor="middle" class="t-xs t-bold">seen: key to answer</text>
+  <path d="M115,236 L115,262 L655,262 L655,236" class="line s-green sw-2" fill="none" marker-end="url(#ahAG-L5a)"/>
+  <text x="385" y="254" text-anchor="middle" class="t-xs">every tool call carries its idempotency key: run1:2:toolu_058d8554ee</text>
+</svg>
+  <figcaption><strong>Two processes, one file, one world.</strong> Process 1 dies; process 2 starts with empty memory and learns everything from the journal (purple). The world (the bank and mailer) cannot be rewound, so a repeated call has to be recognised by its key. Red marks the failure: the last journal line is half written.</figcaption>
+</figure>
+
+<p>Here is what the finished agent does when the process dies at the worst possible moment: the instant after the bank has moved the money and before the journal has been told. This is a real run of your finished code, found by asking the injector for crash point 17 of 35 (<code>refund:after</code>). Process 1 dies with three events in the journal. Process 2 reads them, finds a refund with no result, makes the call again with the same key, and the bank answers without moving money a second time.</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 demo.py solution</span>
+<span class="out">crash point 17 of 35: refund:after
+status=done  restarts=1  model calls over both processes=4
+journal when process 1 died (3 events):
+  0  model   lookup_order({"order": 42})
+  1  result  order 42: delivered, paid 30.00
+  2  model   refund({"order": 42, "amount": 20.0})
+journal at the end (7 events):
+  0  model   lookup_order({"order": 42})
+  1  result  order 42: delivered, paid 30.00
+  2  model   refund({"order": 42, "amount": 20.0})
+  3  result  refund #1 issued: 20.00 for order 42
+  4  model   send_email({"to": "customer-42@example.com", "subject": "Refund for order 42"})
+  5  result  email #1 sent to customer-42@example.com
+  6  model   Order 42 refunded and customer emailed.
+bank: [(42, 20.0, 'run1:2:toolu_058d8554ee')]
+executions: [('lookup_order', '1'), ('refund', '2'), ('refund', '2'), ('send_email', '3')]</span></code></pre>
+<p>Read the transcript against the journal. The refund appears twice in <code>executions</code> (the second attempt was made by process 2) and once in the bank, because both attempts carried the key <code>run1:2:toolu_058d8554ee</code>. The model was asked four times in total, not five: the reply that process 1 had already journalled was not asked for again. Now the same sweep over all 35 crash points with the key thrown away before it reaches the services:</p>
+<pre class="terminal" data-title="same sweep, keys discarded"><code>without keys: 6 of 35 crash points duplicate something
+  point 17  refund:after         refunds=2 emails=1
+  point 18  append:before        refunds=2 emails=1
+  point 19  append:torn          refunds=2 emails=1
+  point 27  send_email:after     refunds=1 emails=2
+  point 28  append:before        refunds=1 emails=2
+  point 29  append:torn          refunds=1 emails=2</code></pre>
+<p>Six of 35 crash points duplicate an action, and they are exactly the ones in the window: after an effect and before its result reached the journal (the effect itself, the start of the append, and a torn append). Everything else is already handled by the journal alone. That small, precisely located gap is what this lab is about.</p>
+
+<p>Five milestones, each adding a layer:</p>
+<ol class="steps">
+  <li><strong>The journal:</strong> durable one-line appends with <code>fsync</code>, repair of a torn last line, detection of real damage, and <code>rebuild</code>, which folds events back into the message list.</li>
+  <li><strong>What to do next:</strong> <code>next_step</code>, a pure function from the journal to the next move, and <code>idempotency_key</code>, the name of one attempt that every process computes identically.</li>
+  <li><strong>The durable loop:</strong> <code>run</code>, which resumes from the journal, never repeats a recorded result, and survives a kill at every one of 100 crash points.</li>
+  <li><strong>Approval gates:</strong> a refund above a limit waits for a human; the process exits while it waits and a later one resumes, with the decision bound to the exact arguments.</li>
+  <li><strong>Poison steps and a storm:</strong> an attempt counter that lives in the journal, a pause that does not count as a failure, and 40 random crash storms.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are in <code>agents/labs/code/lab05/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab05/starter.py"><code>starter.py</code></a></td><td>Your file. The exceptions, the <code>Step</code> record and the argument <code>digest</code> are given, and the event vocabulary is written out in the module docstring. Every function you write has a docstring with its contract and a <code>TODO</code>.</td></tr>
+    <tr><td><a href="code/lab05/check.py"><code>check.py</code></a></td><td>The self-check: hand-checked journals, seeded property tests, and the crash sweeps that kill your agent at every crash point.</td></tr>
+    <tr><td><a href="code/lab05/fixtures.py"><code>fixtures.py</code></a></td><td>The world: a bank and a mailer that honour idempotency keys, a poison tool, the stand-in model, the crash <code>Injector</code> and <code>drive</code>, a supervisor that restarts your agent after each crash. Read it; you can call <code>drive</code> yourself.</td></tr>
+    <tr><td><a href="code/lab05/demo.py"><code>demo.py</code></a></td><td>A short script that kills the agent at one chosen crash point and then sweeps all of them with the key thrown away. It needs Milestones 1 to 3 and produces the two transcripts below (<code>python3 demo.py solution</code> for the reference answer).</td></tr>
+    <tr><td><a href="code/lab05/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+    <tr><td><a href="code/lab05/llm.py"><code>llm.py</code></a></td><td>The shared stand-in model module. Do not edit it.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Everything is unimplemented, and it says so cleanly:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd agents/labs/code/lab05 &amp;&amp; python3 check.py</span>
+<span class="out">Lab 5 checks against starter.py
+
+  … Milestone 1: the journal, a torn tail and the message list: not implemented yet (TODO milestone 1: load)
+  … Milestone 2: what to do next, and the name of an attempt: not implemented yet (TODO milestone 2: idempotency_key)
+  … Milestone 3: the durable loop, killed at every crash point: not implemented yet (TODO milestone 3: run)
+  … Milestone 4: a human approval that survives a restart: not implemented yet (TODO milestone 4: gate)
+  … Milestone 5: poison steps and a crash storm: not implemented yet (TODO milestone 5: attempts_for)
+
+0/5 milestones passing  (0.0 s)</span></code></pre>
+<p>Each milestone reports its own first missing function. Work in order: later milestones use the earlier functions, and the loop of Milestone 3 needs all of Milestones 1 and 2.</p>
+
+<h2>Milestone 1: the journal</h2>
+
+<p>The journal is a file of events, one JSON object per line, only ever appended to. It is the agent's whole memory: after a restart, nothing else exists. The vocabulary is in the starter's docstring; for this milestone only two types matter. A <code>model</code> event holds the content blocks of a model reply exactly as received, and a <code>result</code> event holds what a tool returned, under the id of the <code>tool_use</code> block that asked for it:</p>
+<pre class="terminal" data-title="journal.jsonl (first three lines, shortened)"><code>{"type": "model", "content": [{"type": "tool_use", "id": "toolu_1e2061984c", "name": "lookup_order", "input": {"order": 42}}]}
+{"type": "result", "id": "toolu_1e2061984c", "output": "order 42: delivered, paid 30.00"}
+{"type": "model", "content": [{"type": "tool_use", "id": "toolu_058d8554ee", "name": "refund", "input": {"order": 42, "amount": 20.0}}]}</code></pre>
+<p>Two properties make this a good log. It is <strong>append-only</strong>, so a reader can never see a half-updated state, only a prefix of the truth. And it is <strong>one line per event</strong>, so the unit of damage is one event. Both depend on getting three details right.</p>
+<p><strong>Durability.</strong> When Python writes to a file, the bytes go to the operating system's buffers, not to the disk. If the machine loses power before the system flushes them, the write is gone, though your program believed it was done. <span class="term"><code>fsync</code></span> asks the operating system to push a file's bytes to the device before returning (<a href="../../systems/chapters/08-files.html">files and file descriptors</a> explains the layers). The rule for a journal is that an event counts only once it is durable, so <code>append</code> flushes Python's buffer and then calls <code>os.fsync</code> on every event. The checker replaces <code>os.fsync</code> with a counting wrapper to make sure you did.</p>
+<p><strong>The torn write.</strong> A crash can strike while a line is being written, leaving the file ending in half a JSON object with no newline. This is a <span class="term">torn write</span>. Two rules deal with it. <code>load</code> treats a last line with no newline as never written (it did not complete, so it is not an event). And <code>append</code> must remove that stump before writing, because otherwise the new event is glued onto the wreckage and both lines are lost. The same call also has to distinguish this normal case from real damage: an unparseable line <em>before</em> the last is not a crash artefact, it is corruption, and skipping it silently would hide lost events. That raises <code>CorruptJournal</code>.</p>
+<p><strong>Folding.</strong> <code>rebuild(task, log)</code> turns the journal into the message list the model sees. The task is the first user message; each <code>model</code> event is an assistant message; the <code>result</code> events that follow it are gathered into <em>one</em> user message of <code>tool_result</code> blocks, in order. Everything else in the journal (approvals, attempts) is bookkeeping that is not part of the conversation. Notice what this gives you: the messages are never stored, only derived, so there is no second copy that could disagree with the journal. This is the first design rule of <a href="../chapters/15-durable-execution.html">chapter 15</a>: log the non-deterministic facts (the model's reply is one), recompute everything derived from them.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>append(path, event)</code>, <code>load(path)</code> and <code>rebuild(task, log)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks that three appends give three newline-terminated lines (even when a string contains a newline) with at least three <code>fsync</code> calls, that appending never changes earlier bytes, that a torn last line is ignored by <code>load</code> and cut off by the next <code>append</code> (leaving a file in which every line parses), that a bad line in the middle raises <code>CorruptJournal</code>, and that <code>rebuild</code> gives the exact messages for a journal containing text, two tool calls, an approval event in the middle and an error result without modifying the events it was given. Then 25 random conversations must rebuild into alternating roles with every result in the right message, in order.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>json.dumps</code> escapes a newline inside a string as <code>\n</code>, so one event is always one line. Write <code>json.dumps(event) + "\n"</code>.</li>
+      <li>To find a torn tail, open the file in binary mode (<code>"rb+"</code>), read it, and check <code>data.endswith(b"\n")</code>. If not, <code>f.truncate(data.rfind(b"\n") + 1)</code> cuts back to the end of the last complete line (and to 0 when there is none).</li>
+      <li>In <code>load</code>, <code>text.split("\n")</code> on a well-formed file leaves an empty string last; on a torn file it leaves the stump last. Either way, drop the last element, then parse the rest.</li>
+      <li>In <code>rebuild</code>, a result belongs in a <em>new</em> user message when the previous message is the assistant's, and in the existing user message otherwise. <code>llm.tool_result(id, output, is_error)</code> builds the block.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> append(path: str, event: Dict[str, Any]) -&gt; <span class="kw">None</span>:
+    <span class="str">"""Add one event to the end of the journal file, durably.
+
+    One line per event: json.dumps(event) + "\\n". The line must be on disk (flush, then os.fsync)
+    before append returns: an event counts only once it is durable. If the file's last line is torn
+    (a crash left half a line with no newline), cut it off before writing, so the new event does
+    not glue itself onto the wreckage. Never rewrite earlier events.
+    """</span>
+    <span class="kw">if</span> os.path.exists(path):
+        <span class="kw">with</span> open(path, <span class="str">"rb+"</span>) <span class="kw">as</span> f:                      <span class="cmt"># cut off a torn last line, if there is one</span>
+            data = f.read()
+            <span class="kw">if</span> data <span class="kw">and</span> <span class="kw">not</span> data.endswith(<span class="str">b"\n"</span>):
+                f.truncate(data.rfind(<span class="str">b"\n"</span>) + <span class="num">1</span>)
+    <span class="kw">with</span> open(path, <span class="str">"a"</span>, encoding=<span class="str">"utf-8"</span>) <span class="kw">as</span> f:
+        f.write(json.dumps(event) + <span class="str">"\n"</span>)                <span class="cmt"># json.dumps escapes newlines inside strings</span>
+        f.flush()
+        os.fsync(f.fileno())                              <span class="cmt"># on disk before we go on</span>
+
+<span class="kw">def</span> load(path: str) -&gt; List[Dict[str, Any]]:
+    <span class="str">"""All events in the journal, in order. A missing file is an empty journal.
+
+    A last line with no newline is a torn write: it does not count, so leave it out. A line before
+    the last that is not valid JSON means the journal is damaged: raise CorruptJournal.
+    """</span>
+    <span class="kw">if</span> <span class="kw">not</span> os.path.exists(path):
+        <span class="kw">return</span> []
+    <span class="kw">with</span> open(path, encoding=<span class="str">"utf-8"</span>) <span class="kw">as</span> f:
+        lines = f.read().split(<span class="str">"\n"</span>)
+    lines.pop()                                           <span class="cmt"># "" after the final newline, or a torn last line</span>
+    events = []
+    <span class="kw">for</span> number, line <span class="kw">in</span> enumerate(lines, <span class="num">1</span>):
+        <span class="kw">try</span>:
+            events.append(json.loads(line))
+        <span class="kw">except</span> json.JSONDecodeError:
+            <span class="kw">raise</span> CorruptJournal(<span class="str">f"line {number} of {path} is not valid JSON"</span>) <span class="kw">from</span> <span class="kw">None</span>
+    <span class="kw">return</span> events
+
+<span class="kw">def</span> rebuild(task: str, log: List[Dict[str, Any]]) -&gt; List[Dict[str, Any]]:
+    <span class="str">"""Fold the journal into the message list the model sees.
+
+    [{"role": "user", "content": task}], then each "model" event as an assistant message with that
+    content, and the "result" events that follow it gathered into ONE user message of tool_result
+    blocks (use llm.tool_result(id, output, is_error)), in order. Other event types are not part of
+    the conversation. Do not modify the events in `log`.
+    """</span>
+    messages: List[Dict[str, Any]] = [{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: task}]
+    <span class="kw">for</span> ev <span class="kw">in</span> log:
+        <span class="kw">if</span> ev[<span class="str">"type"</span>] == <span class="str">"model"</span>:
+            messages.append({<span class="str">"role"</span>: <span class="str">"assistant"</span>, <span class="str">"content"</span>: ev[<span class="str">"content"</span>]})
+        <span class="kw">elif</span> ev[<span class="str">"type"</span>] == <span class="str">"result"</span>:
+            <span class="kw">if</span> messages[-<span class="num">1</span>][<span class="str">"role"</span>] == <span class="str">"assistant"</span>:       <span class="cmt"># the first result after a reply opens a new user message</span>
+                messages.append({<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: []})
+            messages[-<span class="num">1</span>][<span class="str">"content"</span>].append(tool_result(ev[<span class="str">"id"</span>], ev[<span class="str">"output"</span>], ev.get(<span class="str">"is_error"</span>, <span class="kw">False</span>)))
+    <span class="kw">return</span> messages</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: what to do next</h2>
+
+<p>A restarted process has nothing but the journal, so the first thing it must do is read it and decide what the agent was in the middle of. That decision should be a <strong>pure function</strong>, one that depends on nothing but the list of events, because pure functions are easy to test exhaustively and impossible to get wrong by forgetting some variable across a restart. <code>next_step(log)</code> returns one of three moves:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>The journal ends with…</th><th>Next move</th><th>Why</th></tr></thead>
+  <tbody>
+<tr><td>nothing</td><td><code>ask_model</code></td><td>no reply yet</td></tr>
+<tr><td>a model reply with tool calls, no results yet</td><td><code>run_tools</code> (all of them)</td><td>the model decided; the world has not been told</td></tr>
+<tr><td>a model reply with two calls and one result</td><td><code>run_tools</code> (the other one)</td><td>the process died between two tool calls of one reply</td></tr>
+<tr><td>a model reply with tool calls, all with results</td><td><code>ask_model</code></td><td>the model must see the results</td></tr>
+<tr><td>a model reply with no tool calls</td><td><code>finish</code></td><td>the model has answered</td></tr>
+  </tbody>
+</table></div>
+<p>The third row is easy to forget: a model may ask for several tools in one reply (<a href="../chapters/06-function-calling.html">parallel calls</a>), and the process can die after the first.</p>
+<p>There is a trap in the word "has a result". The stand-in model, like a real one, can make the <em>identical</em> call in two different turns: two refunds of 10.00 for order 7, for two damaged items. The two <code>tool_use</code> blocks have the same name, the same input and, in <code>llm.py</code>, the same id (the id is a hash of both). If you decide "this call is done" by looking for its id anywhere in the journal, the second refund looks complete as soon as the first one is, and the agent silently skips a refund it was asked to make. The rule: a call is done only if its result appears <em>after the model reply that asked for it</em>, so only the results after the last model event count.</p>
+<p>The second function is the name of one attempt, the <span class="term">idempotency key</span>: a string the caller attaches to a request so that a service which sees it again can return the first outcome instead of acting twice (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a> explains why a retry after a lost reply makes this necessary, and <a href="../../distributed/chapters/17-logs-exactly-once.html">distributed chapter 17</a> what "exactly once" can honestly mean). The question for an agent is where the key comes from, and the constraint is hard: it must be the same string in every attempt, in every process, with no shared memory. So it can only be computed from the journal. The recipe from the chapter is <code>run_id:seq:tool_use_id</code>:</p>
+<ul>
+  <li><code>run_id</code> keeps two runs apart (a key store is shared by every run that uses the service).</li>
+  <li><code>seq</code>, the 1-based number of the model reply that asked, keeps the two identical refunds apart, since they came from different replies.</li>
+  <li><code>tool_use_id</code> keeps the calls of one reply apart.</li>
+</ul>
+<p>A random key, a timestamp or a counter in memory all fail the same way: the restarted process computes a different one, and the bank sees a new request.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>next_step(log)</code>, returning a <code>Step</code>, and <code>idempotency_key(run_id, seq, tool_use_id)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. The key for <code>("run1", 2, "toolu_abc")</code> must be <code>run1:2:toolu_abc</code> and must differ between turns and between runs. Twelve hand-made journals must give the exact move, including approval events scattered through them (ignored), text and a tool call in one reply, the same call in a later turn (not done), and an old result for an id the last reply did not ask for (ignored). Then every prefix of 30 random journals, with a pool of only three distinct calls so that ids repeat across turns, must get the move an independent oracle expects.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Find the index of the last <code>model</code> event, then look only at <code>log[last + 1:]</code> for <code>result</code> events.</li>
+      <li><code>seq</code> is the number of <code>model</code> events in the whole log, which for a pending call is the index (1-based) of the reply that asked.</li>
+      <li>For <code>finish</code>, <code>llm.text_of({"content": blocks})</code> joins the text blocks.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> next_step(log: List[Dict[str, Any]]) -&gt; Step:
+    <span class="str">"""Decide the next move from the journal alone. Only "model" and "result" events matter here.
+
+    - no model event yet: ask the model.
+    - the last model reply has tool_use blocks: those whose id has no "result" event AFTER that model
+      event are pending. Any pending: run_tools (seq = number of model events so far, calls in the
+      order of the blocks). None pending: ask the model.
+    - the last model reply has no tool_use block: finish, with the text blocks joined (llm.text_of).
+
+    Careful: a model may legitimately make the identical call (same id) in two different turns. A
+    result from an earlier turn must not make the later call look done.
+    """</span>
+    last = max((i <span class="kw">for</span> i, e <span class="kw">in</span> enumerate(log) <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"model"</span>), default=<span class="kw">None</span>)
+    <span class="kw">if</span> last <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> Step(<span class="str">"ask_model"</span>)
+    seq = sum(<span class="num">1</span> <span class="kw">for</span> e <span class="kw">in</span> log <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"model"</span>)
+    uses = [b <span class="kw">for</span> b <span class="kw">in</span> log[last][<span class="str">"content"</span>] <span class="kw">if</span> b.get(<span class="str">"type"</span>) == <span class="str">"tool_use"</span>]
+    <span class="kw">if</span> <span class="kw">not</span> uses:
+        <span class="kw">return</span> Step(<span class="str">"finish"</span>, text=text_of({<span class="str">"content"</span>: log[last][<span class="str">"content"</span>]}))
+    done = {e[<span class="str">"id"</span>] <span class="kw">for</span> e <span class="kw">in</span> log[last + <span class="num">1</span>:] <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"result"</span>}   <span class="cmt"># only results AFTER the last reply</span>
+    pending = [u <span class="kw">for</span> u <span class="kw">in</span> uses <span class="kw">if</span> u[<span class="str">"id"</span>] <span class="kw">not</span> <span class="kw">in</span> done]
+    <span class="kw">return</span> Step(<span class="str">"run_tools"</span>, seq=seq, calls=pending) <span class="kw">if</span> pending <span class="kw">else</span> Step(<span class="str">"ask_model"</span>)
+
+<span class="kw">def</span> idempotency_key(run_id: str, seq: int, tool_use_id: str) -&gt; str:
+    <span class="str">"""The key sent with every attempt at one tool call: "run1:2:toolu_ab12cd34ef".
+
+    It must be computable from things already in the journal, so that every attempt, in every
+    process, derives the same string; and it must differ between two identical-looking calls made in
+    different turns.
+    """</span>
+    <span class="kw">return</span> <span class="str">f"{run_id}:{seq}:{tool_use_id}"</span></code></pre>
+  </details>
+</div>
+
+<h2>Milestone 3: the durable loop</h2>
+
+<p>Now the loop itself. It has the shape of the loop in <a href="../chapters/02-tool-loop.html">chapter 2</a> with one structural difference: <strong>it keeps no state between iterations.</strong> Each pass loads the journal, asks <code>next_step</code>, does one kind of work and appends what happened. If you find yourself storing the messages, a counter or "the last result" in a variable, the restarted process will not have it. The only variable that survives is the file.</p>
+<ul>
+  <li><strong>finish</strong>: return the text.</li>
+  <li><strong>run_tools</strong>: for each pending call, compute its key, call <code>tools[name](input, key)</code>, and <em>then</em> append the result. A tool that raises <code>ToolError</code> (a business refusal, such as "order is locked") or a name that does not exist becomes an error result the model can read. Any other exception, including a <code>Crash</code>, must propagate: swallowing it would turn a dead process into a live one that carries on in a state it cannot trust.</li>
+  <li><strong>ask_model</strong>: if the journal already holds <code>max_calls</code> model replies, raise <code>BudgetExceeded</code>. Otherwise call the model with <code>rebuild(task, log)</code> and append the reply.</li>
+</ul>
+<p>The budget check deserves a second look. A counter in a local variable resets to zero when the process dies, so an agent that crashes on its fortieth step restarts with forty fresh steps, and a step that triggers a crash by design gets an unlimited budget. Counting <code>model</code> events in the journal makes the limit survive restarts. (The checker runs a model that never stops asking for tools and expects <code>BudgetExceeded</code> after exactly the allowed number of replies, then again from a fresh process with no model call at all.)</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Once <code>run</code> works, run <code>python3 demo.py</code> against your own file. Then break the design on purpose and predict the effect before you look. In <code>idempotency_key</code>, return <code>f"{run_id}:{tool_use_id}"</code> (no <code>seq</code>) and run <code>python3 check.py 3</code>: which task fails first, and why? Put <code>time.time()</code> in the key instead: which crash points now fail, and what do they have in common? Finally comment out the <code>os.fsync</code> call and rerun Milestone 1. The sweeps still pass, because a simulated crash never loses data the operating system already holds. What does that tell you about what this check can and cannot show about durability?</p>
+</div>
+
+<h3>Every moment a process can die</h3>
+<p>The injector places crash points where a real process can die. Each row is a point; the last column is what the journal-plus-keys design does about it.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Crash point</th><th>Meaning</th><th>State on restart</th><th>Outcome</th></tr></thead>
+  <tbody>
+<tr><td><code>model:before</code></td><td>dies before the model is called</td><td>last event is older</td><td>model is asked: nothing was paid</td></tr>
+<tr><td><code>model:after</code></td><td>reply received, process dies</td><td>reply not journalled</td><td>model is asked again: one repeated call</td></tr>
+<tr><td><code>append:before</code></td><td>dies before writing an event</td><td>event missing</td><td>same as the step above it</td></tr>
+<tr><td><code>append:torn</code></td><td>dies halfway through a line</td><td>stump at the end</td><td><code>load</code> ignores it, <code>append</code> cuts it off</td></tr>
+<tr><td><code>append:after</code></td><td>event is on disk, process dies</td><td>event present</td><td>restart continues after it</td></tr>
+<tr><td><code>refund:before</code></td><td>dies before the bank acts</td><td>no result</td><td>the call is made: first and only time</td></tr>
+<tr><td><code>refund:after</code></td><td>the bank acted, the reply is lost</td><td>no result</td><td>the call is made again with the same key: the bank replays</td></tr>
+  </tbody>
+</table></div>
+<p>Every row except the second to last is a plain restart. Only the last is the window, and it is closed entirely by the key, which is why the key must be computed before the call from journal contents alone. The same points occur around <code>lookup_order</code> and <code>send_email</code>, and the tool-call, append and model points repeat for every step, so the plain task has 35 crash points and the checker makes 35 runs of it, each killed once.</p>
+<p>What does "survives" mean precisely? For each crash point the checker asserts five things after the restart: the run finishes after exactly one restart; the world holds exactly the expected number of refunds and emails; the journal is <em>identical</em> to the journal of an uninterrupted run (a stronger statement than the right outcome, since it proves the resumed run took the same decisions); the model was asked at most once more than the journal has replies; and no tool whose result was already in the journal at the moment of the crash was executed again. That last check is "completed tool results are replayed from the log, not re-executed", and it uses keys it derives itself, not yours.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>run(task, path, model, tools, run_id="run1", max_calls=8, max_attempts=None, tool_defs=None)</code>. Leave <code>max_attempts</code> for Milestone 5: while it is <code>None</code>, no attempt events may be written.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. An uninterrupted run of the plain task must leave exactly these seven events in the journal and call the model four times, passing each tool its key. Running a task whose journal is complete calls neither the model nor a tool. Resuming from a journal that already holds the lookup runs only the refund and the email. The identical refund asked for in two turns makes two refunds with two keys; two calls in one reply run in order. Errors become <code>is_error</code> results and a <code>Crash</code> propagates. The call budget holds across restarts. Then the 100 runs, one per crash point of the <code>plain</code>, <code>batch</code> and <code>twice</code> tasks.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Start with the straight-through version: <code>while True</code>, <code>load</code>, <code>next_step</code>, three branches. Get the uninterrupted test passing before thinking about crashes.</li>
+      <li>Build the result event as a dict and fill in <code>output</code> from the tool; add <code>"is_error": True</code> only for errors, so the journal of a good run stays minimal.</li>
+      <li>Raise <code>ToolError</code> yourself for an unknown tool name and catch it in the same <code>except</code> as a tool's own: one code path, two sources.</li>
+      <li>If a crash sweep fails, the message names the crash point, for example <code>(refund:after)</code>. Ask what the journal looks like at that moment and what your loop does next.</li>
+      <li>If the check hangs and then reports no answer after 25 seconds, a loop is not making progress: usually a pending call whose result is never appended, or no budget check.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> run(task: str, path: str, model, tools: Dict[str, Callable], run_id: str = <span class="str">"run1"</span>,
+        max_calls: int = <span class="num">8</span>, max_attempts: Optional[int] = <span class="kw">None</span>, tool_defs: Optional[list] = <span class="kw">None</span>) -&gt; str:
+    <span class="str">"""... (docstring as in the starter) ..."""</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        log = load(path)                                       <span class="cmt"># everything comes from the journal</span>
+        step = next_step(log)
+        <span class="kw">if</span> step.kind == <span class="str">"finish"</span>:
+            <span class="kw">return</span> step.text
+        <span class="kw">if</span> step.kind == <span class="str">"run_tools"</span>:
+            <span class="kw">for</span> call <span class="kw">in</span> step.calls:
+                key = idempotency_key(run_id, step.seq, call[<span class="str">"id"</span>])
+                event = {<span class="str">"type"</span>: <span class="str">"result"</span>, <span class="str">"id"</span>: call[<span class="str">"id"</span>]}
+                tool = tools.get(call[<span class="str">"name"</span>])
+                <span class="kw">try</span>:
+                    <span class="kw">if</span> tool <span class="kw">is</span> <span class="kw">None</span>:
+                        <span class="kw">raise</span> ToolError(<span class="str">f"unknown tool {call['name']!r}"</span>)
+                    event[<span class="str">"output"</span>] = tool(call[<span class="str">"input"</span>], key)    <span class="cmt"># the side effect happens here</span>
+                <span class="kw">except</span> ToolError <span class="kw">as</span> e:
+                    event[<span class="str">"output"</span>], event[<span class="str">"is_error"</span>] = <span class="str">f"error: {e}"</span>, <span class="kw">True</span>
+                append(path, event)                               <span class="cmt"># ...and only now does the journal know</span>
+        <span class="kw">else</span>:
+            <span class="kw">if</span> sum(<span class="num">1</span> <span class="kw">for</span> e <span class="kw">in</span> log <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"model"</span>) &gt;= max_calls:
+                <span class="kw">raise</span> BudgetExceeded(<span class="str">f"{max_calls} model replies are already in the journal"</span>)
+            resp = model.complete(rebuild(task, log), tools=tool_defs <span class="kw">or</span> [])
+            append(path, {<span class="str">"type"</span>: <span class="str">"model"</span>, <span class="str">"content"</span>: resp.content})</code></pre>
+  <p>This is the version without attempt counting. Milestone 5 adds the attempt bookkeeping around the tool call.</p>
+  </details>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"If I save the conversation after every step, the agent is safe to restart." Saving messages records what the model has seen, not what the world has done. In this lab the sweep without keys is exactly that design, and it duplicates an action at six crash points. The journal is what makes the agent <em>resumable</em>; the key is what makes the resumption <em>safe</em>. Neither does the other's job.</p>
+</div>
+
+<h2>Milestone 4: a human approval that survives a restart</h2>
+
+<p>Some actions should not happen without a person: a large refund, a deletion, an email to a customer (<a href="../chapters/19-agent-security.html">chapter 19</a> gives the security case, and <a href="../cases/case-06-replit-database.html">case 6</a> shows what happens without one). The durability question is narrower: what is the agent <em>doing</em> while it waits? If it holds a process open it holds memory, a connection and a model session for as long as a manager takes to read an email, and it cannot outlive a deploy. With a journal there is a better answer: write the proposal to the journal, <strong>exit</strong>, and cost nothing. The decision is another event. Whatever process next picks the run up folds the journal and goes on.</p>
+<p>An <span class="term">approval gate</span> is a wrapper around a tool. For refunds up to the limit it does nothing. Above it, it looks for a decision on <em>this call</em>, identified by the call's idempotency key:</p>
+<ol class="steps">
+  <li><strong>No decision yet:</strong> record an <code>approval_request</code> (key, exact arguments and their digest) unless one already exists, then raise <code>Paused</code>. The run stops; nothing was spent.</li>
+  <li><strong>The reviewer decides</strong> by calling <code>review</code>, which appends an <code>approval</code> event naming the key, the decision and the digest of what they were shown.</li>
+  <li><strong>The next process</strong> runs the same tool again. Now it finds the decision. If the digest differs from the arguments in hand, it refuses. If the decision is a denial, it returns the refusal as the tool's <em>result</em>, so the model can explain it or choose another route. If it is an approval, it makes the call (with the key, so a crash here is safe too).</li>
+</ol>
+<p>Three design points are worth stating because each prevents a real failure. <strong>The approval is bound to the arguments.</strong> <code>digest(args)</code> is eight hex characters of a SHA-256 over the arguments serialised with sorted keys; the reviewer's decision carries the digest they were shown. Without that, an injected instruction could change an amount after it was approved, or a reviewer could approve "a refund" without a particular amount in mind. Approve the action, not the intent. <strong>The approval is bound to the call.</strong> Two identical large refunds in one run have different keys, so approving the first does not approve the second (the checker tries exactly this). <strong>Asking again does not file again.</strong> A process that restarts while the reviewer is still thinking will reach the same gate, and must not add a second request.</p>
+<p>The checker also reads the digest of your request against <code>fixtures</code>' own: for the arguments <code>{"order": 44, "amount": 80.0}</code> the digest is <code>c0c7d986</code>, and for <code>{"order": 42, "amount": 30.0}</code> it is the <code>c59f39f3</code> that chapter 15 printed.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>gate(fn, path, limit)</code> and <code>review(path, decision, reason="", shown=None)</code>. Your <code>run</code> from Milestone 3 must already let <code>Paused</code> propagate.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. Unit level: 25.00 passes straight through and writes nothing, 25.01 raises <code>Paused</code> carrying the key. Then the whole story with real processes: process 1 leaves exactly <code>model, result, model, approval_request</code> in the journal and no refund, after two model calls; process 2, with no decision, pauses again with zero model calls and no duplicate request; after <code>review</code> approves, process 3 finishes in two model calls with one refund of 80.00 and one email, leaving nine events. A denial ends in <code>Stopped: refused by reviewer: needs a receipt</code> with no effects; a decision recorded against the digest <code>deadbeef</code> ends in the "different arguments" error. Two identical large refunds need two decisions. <code>review</code> with nothing waiting raises <code>LookupError</code>, and an unknown decision <code>ValueError</code>. Finally the crash sweep again, this time over all 38 crash points of the approval task with a reviewer who answers whenever asked.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>The wrapper takes <code>(args, key)</code> like every tool and returns a string. Only the pause is an exception.</li>
+      <li>Read the journal with <code>load(path)</code> each time the gate is called; do not remember anything in the closure.</li>
+      <li>In <code>review</code>, the requests that are still waiting are those whose key has no <code>approval</code> event; take the oldest. <code>shown or request["hash"]</code> gives the default.</li>
+      <li>Use the module-level <code>append</code> in both functions so that the checker's crashes also strike the approval writes.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> gate(fn: Callable, path: str, limit: float) -&gt; Callable:
+    <span class="str">"""Wrap a tool so that amounts above `limit` wait for a human.
+
+    wrapped(args, key):
+      amount = args["amount"]; if amount &lt;= limit, just return fn(args, key).
+      Otherwise look in the journal for an "approval" event with this key.
+        none yet -&gt; unless an "approval_request" with this key already exists, append one
+                    {"type": "approval_request", "key": key, "args": args, "hash": digest(args)};
+                    then raise Paused(key).
+        found, but its hash differs from digest(args) -&gt; return "error: approval was granted for different arguments".
+        found, decision is not "approve" -&gt; return "refused by reviewer: " + its reason.
+        found and approved -&gt; return fn(args, key).
+    """</span>
+    <span class="kw">def</span> wrapped(args, key):
+        <span class="kw">if</span> args[<span class="str">"amount"</span>] &lt;= limit:
+            <span class="kw">return</span> fn(args, key)
+        events = load(path)
+        verdict = next((e <span class="kw">for</span> e <span class="kw">in</span> events <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"approval"</span> <span class="kw">and</span> e[<span class="str">"key"</span>] == key), <span class="kw">None</span>)
+        <span class="kw">if</span> verdict <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">if</span> <span class="kw">not</span> any(e[<span class="str">"type"</span>] == <span class="str">"approval_request"</span> <span class="kw">and</span> e[<span class="str">"key"</span>] == key <span class="kw">for</span> e <span class="kw">in</span> events):
+                append(path, {<span class="str">"type"</span>: <span class="str">"approval_request"</span>, <span class="str">"key"</span>: key, <span class="str">"args"</span>: args, <span class="str">"hash"</span>: digest(args)})
+            <span class="kw">raise</span> Paused(key)                                     <span class="cmt"># the process may now exit</span>
+        <span class="kw">if</span> verdict[<span class="str">"hash"</span>] != digest(args):
+            <span class="kw">return</span> <span class="str">"error: approval was granted for different arguments"</span>
+        <span class="kw">if</span> verdict[<span class="str">"decision"</span>] != <span class="str">"approve"</span>:
+            <span class="kw">return</span> <span class="str">"refused by reviewer: "</span> + verdict[<span class="str">"reason"</span>]
+        <span class="kw">return</span> fn(args, key)
+    <span class="kw">return</span> wrapped
+
+<span class="kw">def</span> review(path: str, decision: str, reason: str = <span class="str">""</span>, shown: Optional[str] = <span class="kw">None</span>) -&gt; Dict[str, Any]:
+    <span class="str">"""The reviewer's side: answer the oldest approval_request that has no approval yet.
+
+    decision must be "approve" or "deny" (ValueError otherwise). Append and return
+    {"type": "approval", "key": &lt;the request's key&gt;, "decision", "reason", "hash": shown or &lt;the request's hash&gt;}.
+    `shown` is the hash of what the reviewer was actually shown; leave it out to approve exactly what was
+    requested. Raise LookupError when nothing is waiting.
+    """</span>
+    <span class="kw">if</span> decision <span class="kw">not</span> <span class="kw">in</span> (<span class="str">"approve"</span>, <span class="str">"deny"</span>):
+        <span class="kw">raise</span> ValueError(<span class="str">f"decision must be 'approve' or 'deny', not {decision!r}"</span>)
+    events = load(path)
+    answered = {e[<span class="str">"key"</span>] <span class="kw">for</span> e <span class="kw">in</span> events <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"approval"</span>}
+    waiting = [e <span class="kw">for</span> e <span class="kw">in</span> events <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"approval_request"</span> <span class="kw">and</span> e[<span class="str">"key"</span>] <span class="kw">not</span> <span class="kw">in</span> answered]
+    <span class="kw">if</span> <span class="kw">not</span> waiting:
+        <span class="kw">raise</span> LookupError(<span class="str">"no approval request is waiting"</span>)
+    req = waiting[<span class="num">0</span>]
+    event = {<span class="str">"type"</span>: <span class="str">"approval"</span>, <span class="str">"key"</span>: req[<span class="str">"key"</span>], <span class="str">"decision"</span>: decision, <span class="str">"reason"</span>: reason, <span class="str">"hash"</span>: shown <span class="kw">or</span> req[<span class="str">"hash"</span>]}
+    append(path, event)
+    <span class="kw">return</span> event</code></pre>
+  </details>
+</div>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the ship's logbook</p>
+  <p>A new watch officer takes over by reading the logbook, not by asking the last officer. If the first officer collapses mid-watch, the second still knows the course, and a standing order such as "no change of course without the captain's signature" waits in the book until the captain signs. The signature names the course it covers, so it cannot be reused for another.</p>
+  <p><em>Where it breaks down:</em> a logbook records what was ordered and what was done, but cannot tell you whether the last order was carried out before the officer collapsed. That is the window of this lab, and a ship has no key to turn: the rudder does not remember the order it already obeyed.</p>
+</div>
+
+<h2>Milestone 5: poison steps and a crash storm</h2>
+
+<p>A durable agent has one new failure that a forgetful one does not. Suppose a particular step kills the process every time: a tool result that exhausts memory, a parser bug triggered by one attachment. A forgetful agent restarts from the beginning, hits it, dies, and an operator notices. A durable agent dutifully resumes at the step that killed it, dies, resumes, and dies again, indefinitely, billing you for each attempt. This is a <span class="term">poison step</span>, and the defence is an attempt counter kept, like the budget, in the journal.</p>
+<p>Before running a pending call, the loop records <code>{"type": "attempt", "seq": …, "id": …, "n": k}</code>. If the process dies, the next one finds the attempt and counts it. When the count reaches <code>max_attempts</code> the loop appends a <code>failed</code> event and raises <code>RunFailed</code>: the run goes to a human queue (a <span class="term">dead-letter queue</span> in messaging terms) and no process touches the poison step again, because a journal that holds a <code>failed</code> event refuses to run.</p>
+<p>The subtle part is the interaction with Milestone 4. A run that pauses for approval exits with <code>Paused</code>; the next process starts a new attempt at the same call, and so on until the reviewer decides, perhaps days later. If those pauses counted as failed attempts, a patient reviewer would fail the run. So when a tool raises <code>Paused</code>, the loop appends an <code>attempt_end</code> event before re-raising, and <code>attempts_for</code> counts attempts <em>minus</em> clean ends. <strong>A step that is waiting is not a step that is failing</strong>, and the counter has to be able to tell them apart.</p>
+<p>The last test is the storm. Forty seeded runs, each choosing one of five tasks (including the two that need approvals) and a crash probability of 4 to 10 per cent <em>per crash point</em>, so a typical run is killed several times and some are killed in the middle of recovering from the previous kill. Each must finish with exactly the expected refunds and emails, distinct keys on distinct refunds, a model-call count of at most one more per crash than the journal has replies, and a journal identical to the uninterrupted run's.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>attempts_for(log, seq, tool_use_id)</code> and extend <code>run</code> to honour <code>max_attempts</code> as its docstring describes.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. <code>attempts_for</code> is checked on a hand-made log (attempts minus ends, per call, per turn). A poison task with <code>max_attempts=3</code> must end as failed after exactly three executions of the poison tool and three restarts, with attempt events numbered 1, 2, 3 and one <code>failed</code> event last; a further restart must not touch the tool or the model. With <code>max_attempts=None</code> no attempt events appear at all. A paused run restarted five times stays paused and still completes after the approval, with <code>max_attempts=2</code>. Then the 40 storms.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>The count is a sum over the log: +1 for each <code>attempt</code> and -1 for each <code>attempt_end</code> with the same <code>seq</code> and <code>id</code>.</li>
+      <li>Check the failed marker at the top of every loop pass, before <code>next_step</code>, so that a failed run never does anything.</li>
+      <li>Append the attempt event <em>before</em> executing the tool: that is what makes a crash during the tool count.</li>
+      <li>A storm failure prints the seed and the task. Replay it with <code>python3 check.py solution 5 &lt;seed&gt;</code> (or <code>check.py 5 &lt;seed&gt;</code> for your file). If a duplicate refund appears only in a storm, look for a place where two crash points can fall between an effect and its record.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> attempts_for(log: List[Dict[str, Any]], seq: int, tool_use_id: str) -&gt; int:
+    <span class="str">"""How many attempts at this call (seq, id) started and did not end cleanly.
+
+    The number of "attempt" events for the call, minus the number of "attempt_end" events for it.
+    """</span>
+    mine = [e <span class="kw">for</span> e <span class="kw">in</span> log <span class="kw">if</span> e[<span class="str">"type"</span>] <span class="kw">in</span> (<span class="str">"attempt"</span>, <span class="str">"attempt_end"</span>) <span class="kw">and</span> e[<span class="str">"seq"</span>] == seq <span class="kw">and</span> e[<span class="str">"id"</span>] == tool_use_id]
+    <span class="kw">return</span> sum(<span class="num">1</span> <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"attempt"</span> <span class="kw">else</span> -<span class="num">1</span> <span class="kw">for</span> e <span class="kw">in</span> mine)</code></pre>
+<p>In <code>run</code>, the attempt bookkeeping sits around the tool call. The complete loop, with Milestone 5 included, is:</p>
+<pre><code><span class="kw">def</span> run(task: str, path: str, model, tools: Dict[str, Callable], run_id: str = <span class="str">"run1"</span>,
+        max_calls: int = <span class="num">8</span>, max_attempts: Optional[int] = <span class="kw">None</span>, tool_defs: Optional[list] = <span class="kw">None</span>) -&gt; str:
+    <span class="str">"""Run the task to the end, resuming from the journal at `path`. Returns the final answer.
+
+    Repeat: load the journal, ask next_step, and
+      finish     -&gt; return the text.
+      run_tools  -&gt; for each pending call, in order: compute its key, call tools[name](input, key),
+                    and append a "result" event (output; plus "is_error": True for errors).
+                    An unknown tool name or a ToolError becomes an error result ("error: unknown tool
+                    'x'" / "error: &lt;message&gt;") that the model sees, not an exception. Any other
+                    exception (a Crash, say) must NOT be caught.
+      ask_model  -&gt; if the journal already holds max_calls model events, raise BudgetExceeded without
+                    calling the model. Otherwise model.complete(rebuild(task, log), tools=tool_defs or [])
+                    and append the reply as a "model" event with resp.content.
+
+    Write events only through `append(path, event)` and read only through `load(path)` (the module-level
+    names), because check.py swaps in versions that crash on purpose. Keep NO state in variables across
+    loop iterations: everything comes from the journal. Do not catch Paused.
+
+    Milestone 5 adds max_attempts (None = off, and then no attempt events are written at all):
+      before running a pending call, n = attempts_for(log, seq, id). If n &gt;= max_attempts append
+      {"type": "failed", "seq", "id", "reason"} and raise RunFailed. Otherwise append
+      {"type": "attempt", "seq", "id", "n": n + 1} and then run the tool. If the tool raises Paused,
+      append {"type": "attempt_end", "seq", "id"} and re-raise (a pause is not a failure).
+      A journal that already contains a "failed" event raises RunFailed at once.
+    """</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        log = load(path)
+        <span class="kw">if</span> any(e[<span class="str">"type"</span>] == <span class="str">"failed"</span> <span class="kw">for</span> e <span class="kw">in</span> log):
+            <span class="kw">raise</span> RunFailed(<span class="str">"this run was given up on earlier"</span>)
+        step = next_step(log)
+        <span class="kw">if</span> step.kind == <span class="str">"finish"</span>:
+            <span class="kw">return</span> step.text
+        <span class="kw">if</span> step.kind == <span class="str">"run_tools"</span>:
+            <span class="kw">for</span> call <span class="kw">in</span> step.calls:
+                key = idempotency_key(run_id, step.seq, call[<span class="str">"id"</span>])
+                <span class="kw">if</span> max_attempts <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+                    n = attempts_for(log, step.seq, call[<span class="str">"id"</span>])
+                    <span class="kw">if</span> n &gt;= max_attempts:
+                        append(path, {<span class="str">"type"</span>: <span class="str">"failed"</span>, <span class="str">"seq"</span>: step.seq, <span class="str">"id"</span>: call[<span class="str">"id"</span>],
+                                      <span class="str">"reason"</span>: <span class="str">f"{call['name']} did not finish in {n} attempts"</span>})
+                        <span class="kw">raise</span> RunFailed(<span class="str">f"{call['name']} did not finish in {n} attempts"</span>)
+                    append(path, {<span class="str">"type"</span>: <span class="str">"attempt"</span>, <span class="str">"seq"</span>: step.seq, <span class="str">"id"</span>: call[<span class="str">"id"</span>], <span class="str">"n"</span>: n + <span class="num">1</span>})
+                event = {<span class="str">"type"</span>: <span class="str">"result"</span>, <span class="str">"id"</span>: call[<span class="str">"id"</span>]}
+                tool = tools.get(call[<span class="str">"name"</span>])
+                <span class="kw">try</span>:
+                    <span class="kw">if</span> tool <span class="kw">is</span> <span class="kw">None</span>:
+                        <span class="kw">raise</span> ToolError(<span class="str">f"unknown tool {call['name']!r}"</span>)
+                    event[<span class="str">"output"</span>] = tool(call[<span class="str">"input"</span>], key)    <span class="cmt"># the side effect happens here</span>
+                <span class="kw">except</span> ToolError <span class="kw">as</span> e:
+                    event[<span class="str">"output"</span>], event[<span class="str">"is_error"</span>] = <span class="str">f"error: {e}"</span>, <span class="kw">True</span>
+                <span class="kw">except</span> Paused:
+                    <span class="kw">if</span> max_attempts <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+                        append(path, {<span class="str">"type"</span>: <span class="str">"attempt_end"</span>, <span class="str">"seq"</span>: step.seq, <span class="str">"id"</span>: call[<span class="str">"id"</span>]})
+                    <span class="kw">raise</span>
+                append(path, event)                               <span class="cmt"># ...and only now does the journal know</span>
+        <span class="kw">else</span>:
+            <span class="kw">if</span> sum(<span class="num">1</span> <span class="kw">for</span> e <span class="kw">in</span> log <span class="kw">if</span> e[<span class="str">"type"</span>] == <span class="str">"model"</span>) &gt;= max_calls:
+                <span class="kw">raise</span> BudgetExceeded(<span class="str">f"{max_calls} model replies are already in the journal"</span>)
+            resp = model.complete(rebuild(task, log), tools=tool_defs <span class="kw">or</span> [])
+            append(path, {<span class="str">"type"</span>: <span class="str">"model"</span>, <span class="str">"content"</span>: resp.content})</code></pre>
+  </details>
+</div>
+
+<h2>Run it all</h2>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution</span>
+<span class="out">Lab 5 checks against solution.py
+
+  ✔ Milestone 1: the journal, a torn tail and the message list
+      durable one-line appends, torn-tail repair, damage detection, and rebuild (25 random conversations)
+  ✔ Milestone 2: what to do next, and the name of an attempt
+      twelve hand-made journals, and every prefix of 30 random journals with repeated calls
+  ✔ Milestone 3: the durable loop, killed at every crash point
+      100 runs, one per crash point, each killed once and restarted:
+      plain: 35 crash points; batch: 30 crash points; twice: 35 crash points
+      every refund and email exactly once, journals identical to the uninterrupted run
+  ✔ Milestone 4: a human approval that survives a restart
+      pause, duplicate-free resume, deny, hash mismatch, per-call approvals, and 38 crash points of the whole approval flow
+  ✔ Milestone 5: poison steps and a crash storm
+      40 random crash storms: 177 crashes survived (at most 11 restarts in one run), no duplicate refund or email, journals identical to the uninterrupted runs
+
+5/5 milestones passing  (0.2 s)</span></code></pre>
+<p>Now see what the checker does when something is subtly wrong. This is a real run of <code>python3 check.py solution 2</code> against a copy of the solution whose <code>next_step</code> decides that a call is done if its id appears <em>anywhere</em> earlier in the journal. Everything works on every test that makes each call once, so a quick manual test would pass; the checker finds the case in which the model makes the same refund twice:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution 2   # with next_step deciding "done" from the whole journal</span>
+<span class="out">Lab 5 checks against solution.py
+
+  ✘ Milestone 2: what to do next, and the name of an attempt: the SAME call in a later turn is not already done: expected kind 'run_tools' text ''; got kind 'ask_model' text ''
+
+0/1 milestones passing  (0.0 s)</span></code></pre>
+<p>Every failure message says what was expected, what was received and which rule applies. For the crash sweeps it also names the task and the crash point; for the random cases it prints the seed.</p>
+
+<h2>Run it against a real model</h2>
+<p>The checker never calls a real model, but the loop you wrote runs unchanged against one. Set <code>LAB_MODEL</code> as described at the top of <code>llm.py</code> (for example <code>LAB_MODEL=ollama:&lt;model&gt;</code> for a local server), build the model with <code>llm.get_model()</code>, and pass the real tool schemas as <code>tool_defs</code>, because a real model needs to be told what the tools are:</p>
+<pre class="terminal" data-title="real_run.py (not run here)"><code>import os, tempfile
+from llm import get_model
+from fixtures import World
+
+world = World()
+defs = [{"name": "lookup_order", "description": "Look up an order by number.", "input_schema": {"type": "object", "properties": {"order": {"type": "integer"}}, "required": ["order"]}},
+        {"name": "refund", "description": "Refund an order.", "input_schema": {"type": "object", "properties": {"order": {"type": "integer"}, "amount": {"type": "number"}}, "required": ["order", "amount"]}},
+        {"name": "send_email", "description": "Email the customer.", "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}}, "required": ["to", "subject"]}}]
+path = "real-run.jsonl"
+print(run("Refund order 42 (20.00) and email the customer.", path, get_model(), world.tools(), tool_defs=defs))</code></pre>
+<p>I did not run this against a provider here. What to look for: start it, press Ctrl-C while the model is thinking, and run it again with the same journal path. The second run should continue from the last journalled event without repeating a model call that is already recorded; compare <code>real-run.jsonl</code> before and after. Notice also what a real model changes. Its replies differ from run to run, so the <em>journalled</em> reply is the only reason the resumed run follows the same path as the interrupted one; ask it again and it may choose a different tool. That is the reason a model's reply is logged rather than recomputed.</p>
+
+<h2>Going further</h2>
+<ul>
+  <li><strong>Expiry.</strong> An approval request that nobody decides in ten days should lapse into "escalate or cancel", not wait for ever. Add a timestamp to the request (through an injected clock, so the check stays deterministic) and have the gate return a refusal after a deadline. Where does the clock come from after a restart?</li>
+  <li><strong>Snapshots.</strong> Reading the whole journal on every pass is quadratic over a long run. Add a <code>snapshot</code> event holding the folded state and the position it covers, and have <code>load</code> start from the latest. Then record a model-generated <em>summary</em> as an event too, as chapter 15 explains: a summary is not reproducible, so it must be journalled, not recomputed.</li>
+  <li><strong>An unkeyed tool.</strong> Real email providers sometimes have no idempotency key. Give the mailer a searchable marker (the key in a header) and teach the tool "look before you leap": before sending, search for the marker. What is the new window, and how small can you make it?</li>
+  <li><strong>Two processes at once.</strong> A supervisor that mistakenly starts a second process while the first is slow produces two writers on one journal. Add a lease (a lock file with an owner and an expiry) and a fencing token, and read <a href="../../distributed/chapters/17-logs-exactly-once.html">distributed chapter 17</a> on why a lock alone is not enough.</li>
+  <li><strong>Versioning.</strong> Write a <code>start</code> event holding a hash of the prompt and the tool schemas, and refuse to resume a run whose hash no longer matches, or replay it with the old parsers. What do you do with runs in flight during a deploy?</li>
+  <li><strong>Swap the file for SQLite.</strong> Put the journal in a table with an auto-incrementing sequence and make "append the result and mark the attempt finished" one transaction. Which crash points disappear? Which cannot, and why (see <a href="../../data/chapters/13-crash-recovery.html">crash recovery</a>)?</li>
+  <li><strong>Compensation.</strong> If the email fails permanently after the refund succeeded, what should a saga do? Add a <code>compensate</code> step, journal it, and run the crash sweep over the failure path (<a href="../../architecture/chapters/15-sagas.html">sagas</a>).</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Every moving part here is older than agents. The journal is a <a href="../../data/chapters/13-crash-recovery.html">write-ahead log</a>, and <code>fsync</code> is the call that makes it a promise. The torn write is why databases checksum their log records. The window between an effect and its record is the Two Generals problem of <a href="../../networking/chapters/16-failure.html">networking chapter 16</a>: you cannot tell a request that failed from a reply that was lost, so the only safe request is one that can be repeated. The key that closes it is the same device Stripe's API uses for payments (see the <a href="../../design/cases/case-06-stripe-idempotency.html">idempotency case study</a>). The exhaustive crash sweep is a small deterministic simulation in the style of <a href="../../distributed/chapters/19-testing.html">distributed chapter 19</a>, and the dead-letter queue and attempt counter are standard messaging practice. What is new is only that one of the steps is a language model whose output cannot be recomputed, which is why its replies, and not the messages derived from them, are the journal's central entries.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>A journal is an append-only file of events, durable only if each append is flushed and <code>fsync</code>ed. A torn last line is a normal crash artefact (ignore it, then cut it off before appending); a bad line in the middle is damage and must be loud.</li>
+    <li>The next move is a pure function of the journal. A call is done only if its result follows the reply that asked for it, because a model can make the identical call twice.</li>
+    <li>The window between an effect and its record cannot be closed by ordering. It is closed by an idempotency key computed from journal contents (<code>run_id:seq:tool_use_id</code>), so every attempt, in every process, sends the same one.</li>
+    <li>The loop keeps no state between iterations; budgets and attempt counts are counted from the journal so a crash cannot reset them.</li>
+    <li>An approval gate is a pair of events bound to the call's key and the digest of its exact arguments. The agent exits while waiting and costs nothing, and a denial or mismatch returns to the model as a result.</li>
+    <li>A step that is waiting is not a step that is failing. Poison steps need an attempt counter in the journal and a dead-letter exit; clean pauses must not count against it.</li>
+    <li>Test recovery by enumerating crash points, not by sampling convenient ones: the six that mattered here were invisible to any hand-picked crash.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">In the sweep without idempotency keys, which crash point lets the bank refund twice?</p>
+    <ol class="q-options">
+      <li><code>refund:before</code>: the process dies before the bank is called</li>
+      <li><code>refund:after</code>: the bank acted but the process died before the result was journalled</li>
+      <li><code>append:after</code> of the result event: the event is on disk and the process dies</li>
+      <li><code>model:before</code> of the next turn</li>
+    </ol>
+    <div class="q-explain">After the bank acts and before the result is durable, the journal says the refund is still pending, so the restarted process makes the call again, and with no key the bank cannot tell. Before the call nothing has happened yet. After the result is on disk the journal already says it is done, and a crash before the next model call resumes there.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text"><code>next_step</code> decides a call is done if its <code>tool_use</code> id appears in any earlier <code>result</code> event. The model asks for the identical refund in two consecutive turns. What goes wrong?</p>
+    <ol class="q-options">
+      <li>Nothing: the id is unique to the call</li>
+      <li>The second refund is attempted twice</li>
+      <li>The agent never executes the second refund, because the first one's result makes it look finished</li>
+      <li>The journal becomes corrupt</li>
+    </ol>
+    <div class="q-explain">The id is a hash of the tool name and input, so identical calls share it. Looking anywhere in the journal makes the second call appear done as soon as the first completes, and the customer is refunded once instead of twice. Only results after the reply that asked count. It also explains why the key includes <code>seq</code>.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">After a crash, <code>load</code> finds a last line that is half a JSON object, with no newline. What should the journal layer do?</p>
+    <ol class="q-options">
+      <li>Raise <code>CorruptJournal</code> so a human looks at it</li>
+      <li>Ignore the line in <code>load</code>, and cut it off in the next <code>append</code></li>
+      <li>Parse as much of it as possible and keep that event</li>
+      <li>Delete the whole journal and start again</li>
+    </ol>
+    <div class="q-explain">A last line without a newline is a write that never completed, so it is not an event. Dropping it recovers the state as of the last complete event, and truncating it before the next append stops the new event being glued onto it. Raising would turn an ordinary crash into an outage; partial parsing invents events. Damage in the <em>middle</em> of the file is different and does raise.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A run pauses for approval, and the reviewer takes four days. The run is restarted by a supervisor every hour meanwhile, with <code>max_attempts=3</code>. Why does it not fail?</p>
+    <ol class="q-options">
+      <li>Each pause appends an <code>attempt_end</code> event, so <code>attempts_for</code> returns to zero</li>
+      <li>The attempt counter is held in memory and resets on restart</li>
+      <li>Approvals are exempt from attempt counting because they are tools of type <code>refund</code></li>
+      <li>The gate records approvals as results, so the attempt is complete</li>
+    </ol>
+    <div class="q-explain">The loop records an attempt before every call, and when the tool raises <code>Paused</code> it records the end of that attempt before exiting. The count is attempts minus clean ends, so waiting never accumulates. A counter in memory would reset on restart, which is the bug the journal exists to prevent, and nothing in the design exempts any tool.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A reviewer approves a refund of 30.00 shown in the console. Before the approval is processed an injected instruction changes the model's next attempt to 3000.00. What stops the larger refund?</p>
+    <ol class="q-options">
+      <li>The reviewer's login</li>
+      <li>The bank's idempotency store</li>
+      <li>The model's system prompt</li>
+      <li>The approval carries the digest of the arguments it covered, and the gate refuses when the digest of the arguments in hand differs</li>
+    </ol>
+    <div class="q-explain">Approval is bound to the exact arguments by hash, so approving one amount cannot release another. The login proves who approved, not what; the bank's store matches keys, not intent; prompts are exactly what an injection overrides.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In a crash sweep the journal of the resumed run must equal the journal of an uninterrupted run, not merely produce one refund. Why is that the stronger check?</p>
+    <ol class="q-options">
+      <li>Because it is faster to compare journals than bank balances</li>
+      <li>Because uninterrupted runs never contain approval events</li>
+      <li>It shows the resumed run took the same decisions in the same order, so nothing was lost, repeated or reordered even where the world's state would hide it</li>
+      <li>Because the bank stores the journal</li>
+    </ol>
+    <div class="q-explain">Two runs can end with one refund in the bank while one of them asked the model an extra question, journalled an event twice or skipped a step. Comparing journals catches all of these. Speed is not the reason, approval events appear in both journals, and the bank has its own store of keys, not the journal.</div>
+  </div>
+</section>
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

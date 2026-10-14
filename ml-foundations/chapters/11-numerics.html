@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Floating Point &amp; Numerical Stability · Math &amp; Code for Machine Learning</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="mlf" data-chapter="11">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Floating Point &amp; Numerical Stability</h1>
+  <p class="lede">Computers do not store real numbers; they store a finite set of them, packed densely near zero and sparsely far away. This chapter explains how a float is laid out, where rounding, overflow and underflow come from, why a softmax of large logits returns <code>nan</code> unless you subtract the maximum, and why modern training moves between float32, bfloat16, float16 and fp8 with care.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapters 8 to 10 treated numbers as exact. On a machine they are not, and the gap shows up as the classic failures of machine-learning code: a loss that turns <code>nan</code> at step 40,000, a model that trains in float32 but not in float16, a gradient that silently becomes zero, a probability that rounds to exactly 1. After this chapter you will be able to read a float's bits, predict when an expression overflows or loses precision, write the stable forms of softmax and cross-entropy, and explain mixed-precision training. It prepares the ground for mixed-precision training and loss spikes (<a href="../../deep-learning/chapters/17-training-stability.html">A2, chapter 17</a>), quantisation (<a href="../../llm-training/chapters/19-quantisation.html">A3, chapter 19</a>), and the memory arithmetic of <a href="../../llm-training/chapters/02-gpu-memory.html">A3, chapter 2</a>. Two cases follow these ideas in real systems: <a href="../cases/case-02-patriot-missile.html">the Patriot missile clock</a> and <a href="../cases/case-04-mixed-precision.html">mixed-precision training</a>, and <a href="../labs/lab-04-likelihood.html">Lab 4</a> asks you to write a stable log-softmax.</p>
+</div>
+
+<h2>How a float is stored</h2>
+
+<p>You met the idea in <a href="01-python-numerics.html">chapter 1</a>: Python's <code>float</code> is a 64-bit IEEE 754 number with about 16 significant digits. Here is the layout. A <span class="term">floating-point number</span> is scientific notation in base 2: a sign, a power of two, and a fraction. For a normal number, the value is</p>
+
+<p style="text-align:center">(&minus;1)<sup>sign</sup> &times; 1.<em>mantissa</em> &times; 2<sup>(exponent &minus; bias)</sup></p>
+
+<p>The bits are split into three fields. The <span class="term">sign</span> is one bit. The <span class="term">exponent</span> field says which power of two. The <span class="term">mantissa</span> (also called the significand or fraction) holds the digits after the binary point; the leading 1 is implied and not stored (the <span class="term">hidden bit</span>), which buys one free bit of precision. The exponent is stored with a <span class="term">bias</span> (127 for float32) so that it can be an unsigned integer. Float32 has 1 + 8 + 23 bits. The script reads the fields of a few numbers and rebuilds the value from them using the formula:</p>
+
+<pre class="terminal" data-title="fields.py"><code>import struct
+
+def fields32(x):
+    bits = struct.unpack("&gt;I", struct.pack("&gt;f", x))[0]
+    return bits &gt;&gt; 31, (bits &gt;&gt; 23) &amp; 0xFF, bits &amp; 0x7FFFFF
+
+def rebuild32(s, e, m):
+    if e == 0:
+        return (-1) ** s * (m / 2 ** 23) * 2.0 ** -126            # subnormal: no hidden 1
+    return (-1) ** s * (1 + m / 2 ** 23) * 2.0 ** (e - 127)
+
+print(f"{'x':&gt;12} {'sign':&gt;4} {'exp':&gt;4} {'(unbiased)':&gt;12}  {'mantissa bits':23}  rebuilt")
+for x in (1.0, -2.5, 0.1, 1 / 3, 1e-40):
+    s, e, m = fields32(x)
+    print(f"{x:12.6g} {s:4d} {e:4d} {(str(e - 127) if e else '-126, subnormal'):&gt;12}  {m:023b}  {rebuild32(s, e, m):.9g}")
+print("\nfloat32 of 0.1 is really", f"{rebuild32(*fields32(0.1)):.20f}")</code></pre>
+<pre class="terminal" data-title="output"><code>           x sign  exp   (unbiased)  mantissa bits            rebuilt
+           1    0  127            0  00000000000000000000000  1
+        -2.5    1  128            1  01000000000000000000000  -2.5
+         0.1    0  123           -4  10011001100110011001101  0.100000001
+    0.333333    0  125           -2  01010101010101010101011  0.333333343
+       1e-40    0    0 -126, subnormal  00000010001011011000010  9.9999461e-41
+
+float32 of 0.1 is really 0.10000000149011611938</code></pre>
+
+<p>Read the 0.1 row. The exponent field is 123, so the power is 2<sup>123&minus;127</sup> = 2<sup>&minus;4</sup>, and the mantissa 1001 1001 1001&hellip; is the repeating pattern of one-tenth in binary. Ten ends up as a repeating fraction in base 2, just as 1/3 does in base 10, so it must be cut off and rounded: the float32 closest to 0.1 is 0.100000001490116&hellip;, not 0.1. That is the origin of <code>0.1 + 0.2 != 0.3</code>. The last row shows a <span class="term">subnormal</span> number: when the exponent field is 0 the hidden bit is dropped and the value is mantissa &times; 2<sup>&minus;149</sup>, a graceful slide towards zero with shrinking precision rather than a cliff.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 262" role="img" aria-label="Bit layouts of five floating-point formats, each drawn as a sign bit, exponent bits and mantissa bits. float32 has 1, 8 and 23. float16 has 1, 5 and 10. bfloat16 has 1, 8 and 7. fp8 E5M2 has 1, 5 and 2. fp8 E4M3 has 1, 4 and 3.">
+<text x="20" y="22" class="t-xs t-muted">format</text><text x="120" y="22" class="t-xs t-muted">sign | exponent | mantissa (each square is one bit)</text><text x="650" y="22" class="t-xs t-muted">largest value</text><text x="20" y="55" class="t-sm t-bold">float32</text><rect x="120" y="36" width="16" height="28" class="fs-yellow s-yellow" style="stroke-width:1.5"/><text x="128.0" y="54" text-anchor="middle" class="t-xs t-bold">S</text><rect x="136" y="36" width="128" height="28" class="fs-orange s-orange" style="stroke-width:1.5"/><text x="200.0" y="54" text-anchor="middle" class="t-xs t-bold">exp 8</text><rect x="264" y="36" width="368" height="28" class="fs-blue s-blue" style="stroke-width:1.5"/><text x="448.0" y="54" text-anchor="middle" class="t-xs t-bold">mantissa 23</text><text x="650" y="55" class="t-sm mono">3.4e38</text><text x="20" y="99" class="t-sm t-bold">float16</text><rect x="120" y="80" width="16" height="28" class="fs-yellow s-yellow" style="stroke-width:1.5"/><text x="128.0" y="98" text-anchor="middle" class="t-xs t-bold">S</text><rect x="136" y="80" width="80" height="28" class="fs-orange s-orange" style="stroke-width:1.5"/><text x="176.0" y="98" text-anchor="middle" class="t-xs t-bold">exp 5</text><rect x="216" y="80" width="160" height="28" class="fs-blue s-blue" style="stroke-width:1.5"/><text x="296.0" y="98" text-anchor="middle" class="t-xs t-bold">mantissa 10</text><text x="650" y="99" class="t-sm mono">65,504</text><text x="20" y="143" class="t-sm t-bold">bfloat16</text><rect x="120" y="124" width="16" height="28" class="fs-yellow s-yellow" style="stroke-width:1.5"/><text x="128.0" y="142" text-anchor="middle" class="t-xs t-bold">S</text><rect x="136" y="124" width="128" height="28" class="fs-orange s-orange" style="stroke-width:1.5"/><text x="200.0" y="142" text-anchor="middle" class="t-xs t-bold">exp 8</text><rect x="264" y="124" width="112" height="28" class="fs-blue s-blue" style="stroke-width:1.5"/><text x="320.0" y="142" text-anchor="middle" class="t-xs t-bold">mantissa 7</text><text x="650" y="143" class="t-sm mono">3.4e38</text><text x="20" y="187" class="t-sm t-bold">fp8 E5M2</text><rect x="120" y="168" width="16" height="28" class="fs-yellow s-yellow" style="stroke-width:1.5"/><text x="128.0" y="186" text-anchor="middle" class="t-xs t-bold">S</text><rect x="136" y="168" width="80" height="28" class="fs-orange s-orange" style="stroke-width:1.5"/><text x="176.0" y="186" text-anchor="middle" class="t-xs t-bold">exp 5</text><rect x="216" y="168" width="32" height="28" class="fs-blue s-blue" style="stroke-width:1.5"/><text x="232.0" y="186" text-anchor="middle" class="t-xs t-bold">2</text><text x="650" y="187" class="t-sm mono">57,344</text><text x="20" y="231" class="t-sm t-bold">fp8 E4M3</text><rect x="120" y="212" width="16" height="28" class="fs-yellow s-yellow" style="stroke-width:1.5"/><text x="128.0" y="230" text-anchor="middle" class="t-xs t-bold">S</text><rect x="136" y="212" width="64" height="28" class="fs-orange s-orange" style="stroke-width:1.5"/><text x="168.0" y="230" text-anchor="middle" class="t-xs t-bold">exp 4</text><rect x="200" y="212" width="48" height="28" class="fs-blue s-blue" style="stroke-width:1.5"/><text x="224.0" y="230" text-anchor="middle" class="t-xs t-bold">mantissa 3</text><text x="650" y="231" class="t-sm mono">448</text>
+</svg>
+<figcaption><strong>The same three fields at different sizes.</strong> The exponent bits set the range; the mantissa bits set the precision. bfloat16 keeps float32's 8 exponent bits (same range) and spends only 7 on the mantissa; float16 trades range for precision with 5 and 10. The two fp8 formats make the same trade at 8 bits.</figcaption>
+</figure>
+
+<p>The designer of a format chooses how to split a bit budget. More exponent bits give more range; more mantissa bits give more precision. The formats used in machine learning are all points on that trade-off, drawn above and tabulated below.</p>
+
+<h2>Rounding and spacing</h2>
+
+<p>Between any two powers of two there are the same number of floats (2<sup>23</sup> for float32), so the gaps double each time you pass a power of two. The toy format in the figure has only 2 mantissa bits, so the effect is easy to see; the real formats work the same way with finer ticks.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 216" role="img" aria-label="A number line from 0 to 8 with tick marks showing the representable values of a toy floating-point format with two mantissa bits. Between 1 and 2 the gap is 0.25, between 2 and 4 it is 0.5, between 4 and 8 it is 1. The ticks get sparser as numbers grow.">
+<line x1="50" y1="80" x2="720.0" y2="80" class="line-thin"/><line x1="70.6" y1="64" x2="70.6" y2="96" class="s-blue sw-2"/><line x1="75.8" y1="64" x2="75.8" y2="96" class="s-blue sw-2"/><line x1="80.9" y1="64" x2="80.9" y2="96" class="s-blue sw-2"/><line x1="86.1" y1="64" x2="86.1" y2="96" class="s-blue sw-2"/><line x1="91.2" y1="64" x2="91.2" y2="96" class="s-cyan sw-2"/><line x1="101.6" y1="64" x2="101.6" y2="96" class="s-cyan sw-2"/><line x1="111.9" y1="64" x2="111.9" y2="96" class="s-cyan sw-2"/><line x1="122.2" y1="64" x2="122.2" y2="96" class="s-cyan sw-2"/><line x1="132.5" y1="64" x2="132.5" y2="96" class="s-blue sw-2"/><line x1="153.1" y1="64" x2="153.1" y2="96" class="s-blue sw-2"/><line x1="173.8" y1="64" x2="173.8" y2="96" class="s-blue sw-2"/><line x1="194.4" y1="64" x2="194.4" y2="96" class="s-blue sw-2"/><line x1="215.0" y1="64" x2="215.0" y2="96" class="s-cyan sw-2"/><line x1="256.2" y1="64" x2="256.2" y2="96" class="s-cyan sw-2"/><line x1="297.5" y1="64" x2="297.5" y2="96" class="s-cyan sw-2"/><line x1="338.8" y1="64" x2="338.8" y2="96" class="s-cyan sw-2"/><line x1="380.0" y1="64" x2="380.0" y2="96" class="s-blue sw-2"/><line x1="462.5" y1="64" x2="462.5" y2="96" class="s-blue sw-2"/><line x1="545.0" y1="64" x2="545.0" y2="96" class="s-blue sw-2"/><line x1="627.5" y1="64" x2="627.5" y2="96" class="s-blue sw-2"/><line x1="710.0" y1="64" x2="710.0" y2="96" class="s-cyan sw-2"/><text x="50.0" y="114" text-anchor="middle" class="t-xs t-muted">0</text><text x="132.5" y="114" text-anchor="middle" class="t-xs t-muted">1</text><text x="215.0" y="114" text-anchor="middle" class="t-xs t-muted">2</text><text x="380.0" y="114" text-anchor="middle" class="t-xs t-muted">4</text><text x="710.0" y="114" text-anchor="middle" class="t-xs t-muted">8</text><line x1="135.5" y1="130" x2="212.0" y2="130" class="line"/><text x="173.8" y="150" text-anchor="middle" class="t-xs">[1, 2): gap 0.25</text><line x1="218.0" y1="130" x2="377.0" y2="130" class="line"/><text x="297.5" y="150" text-anchor="middle" class="t-xs">[2, 4): gap 0.5</text><line x1="383.0" y1="130" x2="707.0" y2="130" class="line"/><text x="545.0" y="150" text-anchor="middle" class="t-xs">[4, 8): gap 1</text><text x="50" y="30" class="t-sm t-bold">A toy float with 2 mantissa bits: four values per power of two</text><text x="50" y="50" class="t-xs t-muted">Ticks are the numbers it can represent (the ticks below 1 are crowded: 0.25 to 1 has gaps 0.0625 to 0.125).</text><text x="50" y="180" class="t-xs">Every number is rounded to the nearest tick. The relative error stays about the same;</text><text x="50" y="196" class="t-xs">the absolute error doubles with each power of two.</text>
+</svg>
+<figcaption><strong>Floats are dense near zero and sparse far away.</strong> Real formats have more ticks per power of two (float32 has 8,388,608) but the same doubling pattern, which is why adding 1 to 16,777,216 in float32 changes nothing.</figcaption>
+</figure>
+
+<p>The <span class="term">relative</span> gap between neighbours is roughly constant, about 2<sup>&minus;23</sup> &asymp; 1.2 &times; 10<sup>&minus;7</sup> for float32, a number called <span class="term">machine epsilon</span> (the gap from 1.0 to the next float above it). That means a float32 is good to about 7 significant decimal digits at any scale, and a float64 to about 16. The absolute gap, though, grows with the number, as the script shows:</p>
+
+<pre class="terminal" data-title="spacing.py"><code>import numpy as np
+
+print("Gap between neighbouring floats (np.spacing):")
+for v in (1.0, 1000.0, 30000.0, 1e9):
+    g16 = f"{np.spacing(np.float16(v)):.2e}" if v &lt; 65504 else "overflow"
+    print(f"  near {v:&gt;11.0f}: float64 gap {np.spacing(np.float64(v)):.2e}   float32 gap {np.spacing(np.float32(v)):.2e}   float16 gap {g16}")
+
+print("\nAbsorption: adding a small number to a big one")
+print("  float32: 2**24 + 1 =", np.float32(2 ** 24) + np.float32(1), "(expected 16777217)")
+print("  float64: 0.1 + 0.2 == 0.3 ?", 0.1 + 0.2 == 0.3, " difference", 0.1 + 0.2 - 0.3)
+
+print("\nCancellation: the variance of three numbers near 1e4 (true value 2/3)")
+x32 = np.array([10000.0, 10001.0, 10002.0], dtype=np.float32)
+naive = (x32 ** 2).mean() - x32.mean() ** 2                 # E[x^2] - E[x]^2
+two_pass = ((x32 - x32.mean()) ** 2).mean()
+print(f"  naive E[x^2]-E[x]^2 in float32: {naive}")
+print(f"  two-pass in float32           : {two_pass:.6f}")</code></pre>
+<pre class="terminal" data-title="output"><code>Gap between neighbouring floats (np.spacing):
+  near           1: float64 gap 2.22e-16   float32 gap 1.19e-07   float16 gap 9.77e-04
+  near        1000: float64 gap 1.14e-13   float32 gap 6.10e-05   float16 gap 5.00e-01
+  near       30000: float64 gap 3.64e-12   float32 gap 1.95e-03   float16 gap 1.60e+01
+  near  1000000000: float64 gap 1.19e-07   float32 gap 6.40e+01   float16 gap overflow
+
+Absorption: adding a small number to a big one
+  float32: 2**24 + 1 = 1.6777216e+07 (expected 16777217)
+  float64: 0.1 + 0.2 == 0.3 ? False  difference 5.551115123125783e-17
+
+Cancellation: the variance of three numbers near 1e4 (true value 2/3)
+  naive E[x^2]-E[x]^2 in float32: 0.0
+  two-pass in float32           : 0.666667</code></pre>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a ruler whose marks spread out</p>
+  <p>Imagine a measuring tape engraved with ticks, but the ticks double their spacing every time the length doubles. Near the start you can read to a hair; at a hundred metres you can only read to the nearest metre. Every measurement is rounded to the closest tick. A float is that tape: precision is always about the same <em>fraction</em> of the number, which is wonderful for a huge range of magnitudes and harmful when you add numbers of very different size.</p>
+  <p><em>Where it breaks down:</em> a tape is read once, but a computation reads and rounds again at every operation, so errors compound. Hardware also rounds correctly (to the nearest tick), which makes single operations accurate to half a gap, but a chain of them can drift much further.</p>
+</div>
+
+<p>Three consequences recur in machine learning code.</p>
+
+<ul>
+  <li><strong>Absorption.</strong> Adding a number smaller than half the gap to a big number does nothing: in float32, 2<sup>24</sup> + 1 = 2<sup>24</sup>, as the output shows. A small update to a large weight, or one more term in a long running sum, can vanish.</li>
+  <li><strong>Cancellation.</strong> Subtracting two nearly equal numbers cancels the leading digits and leaves mostly rounding noise. The output computes the variance of 10000, 10001, 10002 (true value 2/3) as E[x&sup2;] &minus; E[x]&sup2; in float32 and gets exactly 0.0: the two terms are about 10<sup>8</sup>, each rounded to a gap of 8, and their difference is lost. The two-pass formula, subtract the mean first, then square, gives 0.666667. Same data, same precision, and the algebraically equivalent formula is wrong by 100%.</li>
+  <li><strong>Non-associativity.</strong> (a + b) + c can differ from a + (b + c). Sums of many numbers depend on order, which is why GPU reductions can give slightly different totals from run to run (chapter 4, reproducibility) and why accumulating in a higher precision than the inputs is standard practice.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Floating-point error is tiny, so it only matters for scientific computing." Each rounding is small, but the failures are not. A naive variance returned 0 instead of 0.67, a softmax returns <code>nan</code> for logits of 1000 (below), and the rounding error in converting 0.1 s clock ticks, accumulated to about 0.34 s over 100 hours of uptime, helped cause a missed missile interception (<a href="../cases/case-02-patriot-missile.html">Case 2</a>). Treat float arithmetic as an engineering material with known failure modes, and learn the stable form of each formula you use.</p>
+</div>
+
+<h2>Range: overflow, underflow and NaN</h2>
+
+<p>The exponent field limits how large and how small a number can be. The numbers in the table are computed from the layouts in the figure, with float16 and float32 cross-checked against NumPy:</p>
+
+<pre class="terminal" data-title="formats.py"><code>import numpy as np
+
+def describe(name, ebits, mbits, ieee=True, max_override=None):
+    bias = 2 ** (ebits - 1) - 1
+    emax = (2 ** ebits - 2 if ieee else 2 ** ebits - 1) - bias
+    top = (2 - 2.0 ** -mbits) if ieee else (2 - 2.0 ** (1 - mbits))      # E4M3 loses its top mantissa code to NaN
+    vmax = max_override or top * 2.0 ** emax
+    min_norm = 2.0 ** (1 - bias)
+    min_sub = 2.0 ** (1 - bias - mbits)
+    return name, 1 + ebits + mbits, ebits, mbits, vmax, min_norm, min_sub, 2.0 ** -mbits
+
+rows = [describe("float32", 8, 23), describe("float16", 5, 10), describe("bfloat16", 8, 7),
+        describe("fp8 E5M2", 5, 2), describe("fp8 E4M3", 4, 3, ieee=False)]
+print(f"{'format':9} {'bits':&gt;4} {'exp':&gt;3} {'man':&gt;3} {'max':&gt;10} {'min normal':&gt;11} {'min subnormal':&gt;14} {'rel. step':&gt;9}")
+for n, b, e, m, vmax, mn, ms, eps in rows:
+    print(f"{n:9} {b:4d} {e:3d} {m:3d} {vmax:10.4g} {mn:11.3g} {ms:14.3g} {eps:9.2e}")
+
+f16, f32 = np.finfo(np.float16), np.finfo(np.float32)
+print("\ncross-check against numpy:")
+print("  float16 max", f16.max, " min normal", f16.tiny, " eps", f16.eps)
+print("  float32 max", f32.max, " min normal", f32.tiny, " eps", f32.eps)</code></pre>
+<pre class="terminal" data-title="output"><code>format    bits exp man        max  min normal  min subnormal rel. step
+float32     32   8  23  3.403e+38    1.18e-38        1.4e-45  1.19e-07
+float16     16   5  10   6.55e+04     6.1e-05       5.96e-08  9.77e-04
+bfloat16    16   8   7   3.39e+38    1.18e-38       9.18e-41  7.81e-03
+fp8 E5M2     8   5   2  5.734e+04     6.1e-05       1.53e-05  2.50e-01
+fp8 E4M3     8   4   3        448      0.0156        0.00195  1.25e-01
+
+cross-check against numpy:
+  float16 max 6.55e+04  min normal 6.104e-05  eps 0.000977
+  float32 max 3.4028235e+38  min normal 1.1754944e-38  eps 1.1920929e-07</code></pre>
+
+<p>The columns tell you what each format is for. <span class="term">Overflow</span> happens when a result exceeds the maximum: IEEE formats produce <code>inf</code> (the fp8 E4M3 format has no infinity and produces NaN instead). In float16, e<sup>12</sup> = 162,755 already overflows, since the maximum is 65,504. <span class="term">Underflow</span> is the opposite: results below the smallest subnormal become 0, and results between the smallest normal and the smallest subnormal lose precision gradually. A float16 gradient of 10<sup>&minus;8</sup> becomes exactly 0; in bfloat16 it is fine.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 310" role="img" aria-label="Horizontal bars on a logarithmic axis from 1e-46 to 1e40 showing the range of each format. float32 and bfloat16 span nearly 1e-45 to 3e38. float16 spans 6e-8 to 65504. fp8 E5M2 spans 1.5e-5 to 57344. fp8 E4M3 spans 0.002 to 448. A dashed line at 1e-8 marks a small gradient, which falls below the float16 range.">
+<line x1="144.7" y1="44" x2="144.7" y2="248" class="line-thin"/><text x="144.7" y="266" text-anchor="middle" class="t-xs t-muted">1e-40</text><line x1="293.5" y1="44" x2="293.5" y2="248" class="line-thin"/><text x="293.5" y="266" text-anchor="middle" class="t-xs t-muted">1e-20</text><line x1="442.3" y1="44" x2="442.3" y2="248" class="line-thin"/><text x="442.3" y="266" text-anchor="middle" class="t-xs t-muted">1e0</text><line x1="591.2" y1="44" x2="591.2" y2="248" class="line-thin"/><text x="591.2" y="266" text-anchor="middle" class="t-xs t-muted">1e20</text><line x1="740.0" y1="44" x2="740.0" y2="248" class="line-thin"/><text x="740.0" y="266" text-anchor="middle" class="t-xs t-muted">1e40</text><text x="20" y="68" class="t-sm t-bold">float32</text><rect x="108.5" y="52" width="51.5" height="22" class="f-orange" style="opacity:0.8"/><rect x="160.1" y="52" width="569.0" height="22" class="f-blue" style="opacity:0.8"/><text x="20" y="108" class="t-sm t-bold">bfloat16</text><rect x="144.4" y="92" width="15.7" height="22" class="f-orange" style="opacity:0.8"/><rect x="160.1" y="92" width="569.0" height="22" class="f-blue" style="opacity:0.8"/><text x="20" y="148" class="t-sm t-bold">float16</text><rect x="388.6" y="132" width="22.4" height="22" class="f-orange" style="opacity:0.8"/><rect x="411.0" y="132" width="67.2" height="22" class="f-blue" style="opacity:0.8"/><text x="20" y="188" class="t-sm t-bold">fp8 E5M2</text><rect x="406.5" y="172" width="4.5" height="22" class="f-orange" style="opacity:0.8"/><rect x="411.0" y="172" width="66.8" height="22" class="f-blue" style="opacity:0.8"/><text x="20" y="228" class="t-sm t-bold">fp8 E4M3</text><rect x="422.2" y="212" width="6.7" height="22" class="f-orange" style="opacity:0.8"/><rect x="428.9" y="212" width="33.2" height="22" class="f-blue" style="opacity:0.8"/><line x1="382.8" y1="34" x2="382.8" y2="248" class="line-dash s-red"/><text x="387.8" y="30" class="t-xs tc-red">a gradient of 1e-8</text><text x="100" y="288" class="t-xs">blue: normal numbers (full precision). orange: subnormals (gradual underflow).</text>
+</svg>
+<figcaption><strong>Range, drawn on a log scale.</strong> bfloat16 covers essentially the same range as float32; float16 spans about 12 orders of magnitude against 83 for float32, and misses a gradient of 1e-8 entirely; the fp8 formats are narrower still, which is why they need per-tensor scale factors.</figcaption>
+</figure>
+
+<p>The special values obey rules that are useful to know. <code>inf</code> arises from overflow or division by zero; <code>inf &minus; inf</code>, <code>0 &times; inf</code>, <code>0/0</code> and <code>inf/inf</code> give <span class="term">NaN</span> ("not a number"). NaN is contagious: any arithmetic with a NaN gives NaN, so a single bad value early in a network infects the loss, the gradients and every weight within one step. NaN even compares unequal to itself (<code>nan != nan</code> is true), which is the standard test for it. This is why a training run goes from perfectly healthy to all-<code>nan</code> in a single step.</p>
+
+<h2>Writing stable code</h2>
+
+<h3>Softmax and the log-sum-exp trick</h3>
+
+<p>The softmax turns scores z<sub>1</sub>, &hellip;, z<sub>K</sub> into probabilities: p<sub>i</sub> = e<sup>z<sub>i</sub></sup> / &sum;<sub>j</sub> e<sup>z<sub>j</sub></sup>. Transcribed literally it breaks on large scores, since exp overflows: e<sup>89</sup> is already past the float32 maximum, and logits in the hundreds are normal in practice (attention scores before scaling, large-vocabulary language models, a confident classifier). The repair follows from an identity. For any constant c,</p>
+
+<p style="text-align:center">e<sup>z<sub>i</sub>&minus;c</sup> / &sum;<sub>j</sub> e<sup>z<sub>j</sub>&minus;c</sup> = (e<sup>&minus;c</sup> e<sup>z<sub>i</sub></sup>) / (e<sup>&minus;c</sup> &sum;<sub>j</sub> e<sup>z<sub>j</sub></sup>) = p<sub>i</sub>,</p>
+
+<p>because e<sup>&minus;c</sup> cancels. Softmax is unchanged by shifting every score by the same amount, so choose c = max<sub>j</sub> z<sub>j</sub>. Now the largest exponent is e<sup>0</sup> = 1, so no overflow is possible, and at least one term of the sum is 1, so the sum cannot underflow to zero either. Terms that underflow to 0 were negligible anyway.</p>
+
+<p>The same shift gives the stable <span class="term">log-sum-exp</span>, logsumexp(z) = ln &sum;<sub>j</sub> e<sup>z<sub>j</sub></sup> = c + ln &sum;<sub>j</sub> e<sup>z<sub>j</sub>&minus;c</sup>, and hence the stable <strong>log-softmax</strong>: ln p<sub>i</sub> = z<sub>i</sub> &minus; logsumexp(z). Working in log space avoids a second hazard. A probability like e<sup>&minus;200</sup> is 1.4 &times; 10<sup>&minus;87</sup>, below float32's smallest number, so it becomes 0, and then ln 0 = &minus;inf. Cross-entropy needs &minus;ln p of the true class, so the right approach never forms p at all. The script runs both routes:</p>
+
+<pre class="terminal" data-title="softmax.py"><code>import numpy as np
+
+np.seterr(all="ignore")   # hide overflow warnings so the output is readable; in real code, keep them on
+
+def softmax_naive(z):
+    e = np.exp(z)
+    return e / e.sum()
+
+def softmax_stable(z):
+    e = np.exp(z - z.max())            # shift so the largest logit is 0: exp never exceeds 1
+    return e / e.sum()
+
+def log_softmax(z):
+    m = z.max()
+    return z - (m + np.log(np.exp(z - m).sum()))     # z - logsumexp(z)
+
+z = np.array([1000.0, 1001.0, 1002.0], dtype=np.float32)
+print("logits", z)
+print("naive :", softmax_naive(z), "   (exp(1000) overflows float32: inf/inf = nan)")
+print("stable:", softmax_stable(z))
+
+z16 = np.array([12.0, 11.0, 10.0], dtype=np.float16)
+print("\nfloat16, logits", z16, " exp(12) =", np.exp(z16)[0], "(the float16 maximum is 65504)")
+print("naive :", softmax_naive(z16))
+print("stable:", softmax_stable(z16))
+
+z = np.array([0.0, -200.0], dtype=np.float32)
+p = softmax_stable(z)
+print("\nlogits", z, " probabilities", p)
+print("log(softmax(z)) via probabilities :", np.log(p), " &lt;- log(0) = -inf")
+print("log_softmax(z), done in log space :", log_softmax(z), " &lt;- exact")
+
+# Cross-entropy for the true class 1, from logits
+print("cross-entropy, naive route :", -np.log(p[1]))
+print("cross-entropy, log-softmax :", -log_softmax(z)[1])</code></pre>
+<pre class="terminal" data-title="output"><code>logits [1000. 1001. 1002.]
+naive : [nan nan nan]    (exp(1000) overflows float32: inf/inf = nan)
+stable: [0.09003057 0.24472848 0.66524094]
+
+float16, logits [12. 11. 10.]  exp(12) = inf (the float16 maximum is 65504)
+naive : [nan  0.  0.]
+stable: [0.6655 0.2448 0.0901]
+
+logits [   0. -200.]  probabilities [1. 0.]
+log(softmax(z)) via probabilities : [  0. -inf]  &lt;- log(0) = -inf
+log_softmax(z), done in log space : [   0. -200.]  &lt;- exact
+cross-entropy, naive route : inf
+cross-entropy, log-softmax : 200.0</code></pre>
+
+<p>In float32 the naive softmax of [1000, 1001, 1002] is all NaN (inf divided by inf), while the shifted version returns the right answer, [0.090, 0.245, 0.665]. In float16, where exp(12) already overflows, the naive version loses even a modest logit set. And for logits [0, &minus;200], the naive cross-entropy of the second class is <code>inf</code> where the log-space version returns the exact 200. This is why frameworks provide fused functions (<code>log_softmax</code>, <code>cross_entropy</code> taking logits, <code>binary_cross_entropy_with_logits</code>): they apply these identities for you. Passing probabilities to a loss that expected logits, or applying <code>softmax</code> and then <code>log</code> yourself, throws the protection away.</p>
+
+<h3>A short list of stable idioms</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Unstable form</th><th>Problem</th><th>Stable form</th></tr></thead>
+<tbody>
+<tr><td>exp(z) / sum(exp(z))</td><td>overflow for z &gt; 88 (float32), 11 (float16)</td><td>subtract max(z) first; use <code>log_softmax</code></td></tr>
+<tr><td>log(softmax(z))</td><td>log of an underflowed 0 gives &minus;inf</td><td>z &minus; logsumexp(z)</td></tr>
+<tr><td>log(1 + x) for small x</td><td>1 + x rounds away x</td><td><code>log1p(x)</code></td></tr>
+<tr><td>exp(x) &minus; 1 for small x</td><td>cancellation</td><td><code>expm1(x)</code></td></tr>
+<tr><td>1 / (1 + exp(&minus;z)) for very negative z</td><td>exp(&minus;z) overflows</td><td>branch on the sign of z, or use <code>sigmoid</code> from the library</td></tr>
+<tr><td>E[x&sup2;] &minus; E[x]&sup2;</td><td>cancellation (as above)</td><td>subtract the mean first, or use Welford's algorithm</td></tr>
+<tr><td>sqrt(x&sup2; + y&sup2;)</td><td>x&sup2; can overflow or underflow</td><td><code>hypot(x, y)</code></td></tr>
+<tr><td>x / (sqrt(v))</td><td>division by 0 when v = 0</td><td>add a small &epsilon; (as in Adam and layer norm), in a precision that can hold it</td></tr>
+</tbody></table></div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <ol class="steps">
+    <li>Run <code>softmax.py</code> with <code>np.seterr(all="ignore")</code> removed so you see the warnings NumPy raises. Which line produces each warning?</li>
+    <li>Write <code>sigmoid(z)</code> two ways, the textbook <code>1/(1+exp(-z))</code> and a branch that uses <code>exp(z)/(1+exp(z))</code> for negative z. Evaluate both at z = &minus;800 and z = 800 in float64, and explain the warnings.</li>
+    <li>Use <code>np.float32</code> to compute <code>np.log(1 + 1e-10)</code> and <code>np.log1p(1e-10)</code>. The true value is 10<sup>&minus;10</sup>.</li>
+    <li>Compute the variance of <code>1e8 + np.arange(100)</code> in float64 with the naive formula, the two-pass formula and <code>np.var</code>. At what offset (1e8, 1e9, 1e10&hellip;) does the naive formula first fail?</li>
+  </ol>
+</div>
+
+<h2>Mixed precision: using fewer bits on purpose</h2>
+
+<p>Lower precision is attractive because bits are cost. Half the bits means half the memory for weights and activations and roughly twice the arithmetic throughput on hardware with 16-bit units, and for memory-bound work, such as decoding one token at a time, the bytes moved set the speed (<a href="../../systems/chapters/21-parallelism-gpus.html">Systems, chapter 21</a>; <a href="../../systems/chapters/02-memory-hierarchy.html">chapter 2</a>). But a 16-bit format has either less range (float16) or less precision (bfloat16). <span class="term">Mixed-precision</span> training (Micikevicius et al., 2017) keeps each quantity in the format that can hold it:</p>
+
+<ul>
+  <li><strong>Master weights in float32.</strong> The weights are stored in float32 and rounded to 16 bits for the forward and backward pass. The update is applied to the float32 copy. Why this matters is the next demonstration.</li>
+  <li><strong>Loss scaling (float16 only).</strong> Multiply the loss by a constant (say 1024) before the backward pass so that small gradients move into float16's range, then divide the gradients by the same constant in float32 before the optimiser step. Adaptive loss scaling, which raises and lowers the factor when overflows occur, is standard.</li>
+  <li><strong>Sensitive operations in float32.</strong> Reductions (sums, softmax denominators, normalisation statistics) and the loss itself are computed or accumulated in float32, even when their inputs are 16-bit.</li>
+</ul>
+
+<p>Each rule answers an observed failure. This script reproduces three of them, with float16 from NumPy and bfloat16 emulated by rounding a float32 to its top 16 bits:</p>
+
+<pre class="terminal" data-title="lowprec.py"><code>import numpy as np
+
+def to_bf16(x):
+    """Round float32 to bfloat16: keep the top 16 bits of the float32, rounding to nearest even."""
+    b = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    b = (b + 0x7FFF + ((b &gt;&gt; 16) &amp; 1)) &amp; 0xFFFF0000
+    return b.astype(np.uint32).view(np.float32)
+
+# 1. A tiny gradient: representable in float32 and bfloat16, but not in float16.
+g = np.float32(1e-8)
+print(f"gradient 1e-8 -&gt; float16: {np.float16(g)}   bfloat16: {to_bf16(g):.3e}   float32: {g:.1e}")
+scale = np.float32(1024)
+scaled = np.float16(g * scale)
+print(f"scaled by 1024 first: float16 holds {scaled}; unscale in float32: {np.float32(scaled) / scale:.3e}")
+
+# 2. Lost updates: add 1e-4 to a weight of 1.0, ten thousand times.
+w16, wbf, w32 = np.float16(1.0), to_bf16(1.0), np.float32(1.0)
+for _ in range(10000):
+    w16 = np.float16(w16 + np.float16(1e-4))
+    wbf = to_bf16(np.float32(wbf) + np.float32(1e-4))
+    w32 = w32 + np.float32(1e-4)
+print(f"\n10,000 updates of +1e-4 to a weight of 1.0 (exact answer 2.0):")
+print(f"  float16 weight  : {float(w16):.4f}")
+print(f"  bfloat16 weight : {float(wbf):.4f}")
+print(f"  float32 weight  : {float(w32):.4f}")
+
+# 3. Accumulating a long sum: a dot product of 4096 ones-ish terms
+rng = np.random.default_rng(0)
+x = rng.uniform(0.5, 1.5, 100000).astype(np.float16)
+acc16 = np.float16(0)
+for v in x:
+    acc16 = np.float16(acc16 + v)
+print(f"\nsum of 100,000 values: float16 accumulator {float(acc16):.0f}, float32 accumulator {x.astype(np.float32).sum():.0f}")</code></pre>
+<pre class="terminal" data-title="output"><code>gradient 1e-8 -&gt; float16: 0.0   bfloat16: 1.001e-08   float32: 1.0e-08
+scaled by 1024 first: float16 holds 1.0251998901367188e-05; unscale in float32: 1.001e-08
+
+10,000 updates of +1e-4 to a weight of 1.0 (exact answer 2.0):
+  float16 weight  : 1.0000
+  bfloat16 weight : 1.0000
+  float32 weight  : 2.0002
+
+sum of 100,000 values: float16 accumulator 4096, float32 accumulator 99958</code></pre>
+
+<p><strong>Underflow of gradients.</strong> A gradient of 10<sup>&minus;8</sup> is 0 in float16 but survives in bfloat16 (same range as float32). Scaling by 1024 first brings it into float16's range (1.0252 &times; 10<sup>&minus;5</sup> is a subnormal there, coarsely rounded, but non-zero), and dividing afterwards in float32 gives back 1.001 &times; 10<sup>&minus;8</sup>, which is within 0.1% of the original. <strong>Lost updates.</strong> Adding 10<sup>&minus;4</sup> to a weight of 1.0 ten thousand times should give 2.0. In float16 the gap near 1.0 is about 10<sup>&minus;3</sup>, so each +10<sup>&minus;4</sup> rounds back to 1.0 and the weight never moves; in bfloat16 the gap is 0.0078, so the same. Only the float32 weight learns (it reaches 2.0002, not exactly 2: even float32 shows rounding drift, here a 0.01% error, which is the Patriot effect in miniature). This is exactly why master weights exist. <strong>Stuck accumulators.</strong> Summing 100,000 numbers around 1 in a float16 accumulator stops at 4,096: from there the gap is 4, and adding a number below 2 changes nothing. The true sum is about 100,000. Always accumulate in higher precision, as GPU matrix units do internally.</p>
+
+<p>Why have two 16-bit formats? <strong>Float16</strong> has the finer precision (10 mantissa bits) but a narrow range, so it needs loss scaling and care about overflow. <strong>bfloat16</strong> (introduced by Google for its TPUs, hence "brain float") copies float32's 8 exponent bits, so it has float32's range and normally needs no loss scaling, at the price of only 7 mantissa bits, about 2 to 3 significant decimal digits. For training, whose gradients span many orders of magnitude, range tends to matter more than precision, so bfloat16 became the common default on recent hardware, with float32 for the sensitive parts. The training-stability chapter (A2, chapter 17) shows what happens when the lost precision bites.</p>
+
+<h2>Going lower: fp8</h2>
+
+<p>Eight-bit floats halve the cost again. Micikevicius et al. (2022, <em>FP8 Formats for Deep Learning</em>) proposed two encodings, <strong>E4M3</strong> (4 exponent bits, 3 mantissa bits; maximum 448, no infinities) and <strong>E5M2</strong> (5 and 2; IEEE-style, maximum 57,344). The typical split is E4M3 for the forward pass (weights and activations, which need precision) and E5M2 for gradients (which need range). With only 4 or 5 exponent bits, the representable range is narrow (see the figure), so a tensor's values must be <em>scaled</em> into it. The standard device is a <span class="term">scale factor</span> per tensor (or per block of values): divide by a number chosen so that the tensor's largest absolute value (its <em>amax</em>) maps to the format's maximum, quantise, and remember the scale to undo it. The script has a small quantiser, checked against NumPy's float16, and applies it to data with a standard deviation of 0.002:</p>
+
+<pre class="terminal" data-title="fp8.py"><code>import numpy as np
+
+def quantise(x, ebits, mbits, vmax, ieee=True):
+    """Round x to the nearest value of a small float format (round half to even, saturate at vmax)."""
+    bias = 2 ** (ebits - 1) - 1
+    emin = 1 - bias                                    # exponent of the smallest normal number
+    x = np.asarray(x, dtype=np.float64)
+    e = np.floor(np.log2(np.maximum(np.abs(x), 1e-300)))
+    e = np.maximum(e, emin)                            # below emin the step stays fixed: subnormals
+    step = 2.0 ** (e - mbits)
+    q = np.round(x / step) * step                      # np.round rounds half to even
+    return np.clip(q, -vmax, vmax)
+
+# Sanity check of the quantiser against numpy's own float16
+rng = np.random.default_rng(0)
+x = rng.standard_normal(10000) * 10
+print("matches np.float16 on 10,000 values:", np.array_equal(quantise(x, 5, 10, 65504.0), x.astype(np.float16).astype(np.float64)))
+
+E4M3, E5M2 = (4, 3, 448.0), (5, 2, 57344.0)
+data = rng.standard_normal(100000) * 2e-3            # activations/gradients with a small typical size
+print(f"\ndata: standard deviation {data.std():.1e}, largest value {np.abs(data).max():.1e}")
+print(f"{'format':9} {'scaling':&gt;16} {'zeroed':&gt;8} {'mean rel. error':&gt;16}")
+for name, (eb, mb, vmax) in (("E4M3", E4M3), ("E5M2", E5M2)):
+    for label, s in (("none", 1.0), ("amax -&gt; max", vmax / np.abs(data).max())):
+        q = quantise(data * s, eb, mb, vmax) / s            # scale up, round, scale back
+        nz = data != 0
+        zeroed = np.mean(q[nz] == 0)
+        rel = np.mean(np.abs(q[nz] - data[nz]) / np.abs(data[nz]))
+        print(f"{name:9} {label:&gt;16} {zeroed:8.1%} {rel:16.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>matches np.float16 on 10,000 values: True
+
+data: standard deviation 2.0e-03, largest value 9.5e-03
+format             scaling   zeroed  mean rel. error
+E4M3                  none    37.4%            0.550
+E4M3           amax -&gt; max     0.0%            0.022
+E5M2                  none     0.3%            0.050
+E5M2           amax -&gt; max     0.0%            0.045</code></pre>
+
+<p>Without scaling, 37% of the values are rounded to exactly zero in E4M3 (the smallest subnormal is 0.00195), and those that survive are 55% off on average. Scaling by amax brings the error down to 2%, and no value is lost. E5M2 has a wider range so it tolerates the unscaled data better (5% error) but is coarser once scaled (4.5%). Mean relative error of 2% to 5% is the price of 8 bits, and is tolerable in matrix multiplications because errors are random and average out over thousands of terms, with accumulation kept in higher precision.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Hardware support decides what is practical, and it changes with each accelerator generation. Fp8 matrix units arrived with Nvidia's Hopper generation and are well supported in training libraries. Beyond fp8, block-scaled formats store a small group of values (often 16 or 32) with a shared scale factor: the Open Compute Project's "microscaling" (MX) specification v1.0, ratified in 2023, defines MXFP8 and a 4-bit MXFP4 with 32-element blocks, and Nvidia's NVFP4 is a related 4-bit format with 16-element blocks and a finer-grained scale. I confirmed these descriptions only in secondary sources (papers and documentation excerpts), not in the specifications themselves. How much accuracy 4-bit training costs, and which recipe is best, is an active research area. Use the principle (range via exponent bits, precision via mantissa bits, scaling to fit) and check your hardware and library documentation for what is actually supported.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Numeric formats are a storage decision as well as an arithmetic one. A weight stored in 2 bytes instead of 4 halves the memory bandwidth needed to read it, and for token-by-token decoding, which is bound by memory bandwidth rather than arithmetic, that translates almost directly into speed (<a href="../../systems/chapters/22-performance-engineering.html">Systems, chapter 22</a>, on finding the real bottleneck). Storage matters for training too, but less than one might hope: the 16 bytes per parameter of Adam state in chapter 10 includes float32 master weights and two float32 moments, so moving weights and gradients to 16 bits trimmed the total rather than halving it.</p>
+</div>
+
+<h2>Finding the source of a NaN</h2>
+
+<p>When a run produces <code>nan</code> or <code>inf</code> the first priority is to catch it where it starts, not where it is noticed (usually the loss, several operations downstream). A workable procedure:</p>
+
+<ol class="steps">
+  <li><strong>Reproduce on a small scale.</strong> Fix the random seed (chapter 4), find the step number where the first NaN appears, and restart from the last good checkpoint with that batch.</li>
+  <li><strong>Find the first non-finite value.</strong> Check intermediate tensors with <code>isfinite</code> after each layer or turn on the framework's anomaly detection (for example PyTorch's <code>torch.autograd.set_detect_anomaly(True)</code>, slow but effective), which raises on the operation that produced the first NaN in the backward pass.</li>
+  <li><strong>Classify it.</strong> <em>Overflow</em> (a huge activation or logit: unscaled attention, an exploding layer, loss scale too high), <em>invalid operation</em> (log of 0 or a negative number, sqrt of a negative, 0/0, a division by a variance of exactly 0), or <em>bad data</em> (a NaN or inf in an input row; a missing value that was not handled).</li>
+  <li><strong>Apply the matching fix.</strong> Overflow: stable softmax, lower precision-sensitive scale, normalisation, clipping, bfloat16 instead of float16. Invalid operation: epsilon, clamp inputs, <code>log1p</code>, fused loss. Data: validate and filter inputs.</li>
+  <li><strong>Check &epsilon; against the format.</strong> Adam's default &epsilon; = 10<sup>&minus;8</sup> is below float16's smallest subnormal (6 &times; 10<sup>&minus;8</sup>) and underflows to 0 there, which silently removes the safeguard against dividing by zero. Optimiser state should be kept in float32 for this reason.</li>
+</ol>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A float is sign &times; 1.mantissa &times; 2<sup>exponent</sup>. Exponent bits set the range; mantissa bits set the relative precision. Neighbouring floats are about 2<sup>&minus;m</sup> apart in relative terms (1.2 &times; 10<sup>&minus;7</sup> for float32), so the absolute gap grows with the number.</li>
+    <li>Decimal fractions such as 0.1 are not exactly representable; single operations are correctly rounded, but absorption, cancellation and order-dependence make long computations drift or fail.</li>
+    <li>Overflow gives <code>inf</code>, underflow gives 0, invalid operations give <code>nan</code>, which spreads through every later calculation.</li>
+    <li>Subtract the maximum before exponentiating. Use log-softmax and fused cross-entropy on logits, <code>log1p</code>, <code>expm1</code>, <code>hypot</code>, and two-pass or Welford variance.</li>
+    <li>Float16 has precision but little range (needs loss scaling); bfloat16 has float32's range but about 2 to 3 digits (needs float32 master weights and accumulation); fp8 formats need per-tensor or per-block scale factors.</li>
+    <li>Mixed precision works by assigning each quantity the cheapest format that can hold it, and accumulating in float32.</li>
+    <li>To debug a NaN, find the first non-finite value, classify it as overflow, invalid operation or bad data, then apply the matching stable form.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html" target="_blank" rel="noopener">David Goldberg, "What Every Computer Scientist Should Know About Floating-Point Arithmetic" (1991)</a>. The classic, thorough reference on rounding, cancellation and the IEEE 754 standard.</li>
+  <li><a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Micikevicius et al., "Mixed Precision Training" (2017; ICLR 2018)</a>. Master weights and loss scaling for float16 training.</li>
+  <li><a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">Micikevicius et al., "FP8 Formats for Deep Learning" (2022)</a>. The E4M3 and E5M2 encodings and the evidence that fp8 training matches 16-bit quality.</li>
+  <li><a href="https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus" target="_blank" rel="noopener">Google Cloud, "BFloat16: the secret to high performance on Cloud TPUs"</a>. The motivation for keeping float32's exponent range at 16 bits.</li>
+  <li><a href="https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/" target="_blank" rel="noopener">Gregory Gundersen, "The Log-Sum-Exp Trick" (2020)</a>. A short, clear derivation of the stable softmax and log-sum-exp.</li>
+  <li><a href="https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf" target="_blank" rel="noopener">Open Compute Project, "OCP Microscaling Formats (MX) Specification v1.0" (2023)</a>. The primary specification for block-scaled low-precision formats (not fetched for this chapter).</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">A float32 softmax is applied to logits [900, 905, 910]. What happens, and what is the minimal fix?</p>
+    <ol class="q-options">
+      <li>It works, because the three values are close together</li>
+      <li>It returns zeros because the probabilities underflow; switch to float64</li>
+      <li>exp overflows to inf and the division gives nan; subtract the largest logit before exponentiating</li>
+      <li>It returns the right answer but slowly; use log-softmax for speed</li>
+    </ol>
+    <div class="q-explain">e<sup>900</sup> is far beyond float32's maximum (about e<sup>88.7</sup>), so exp returns inf, and inf/inf is nan. The closeness of the values does not help the overflow. Float64 would only postpone it (its limit is about e<sup>709</sup>); the shift z &minus; max(z) fixes the problem at any magnitude because softmax is shift-invariant.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">In float16 you add an update of 10<sup>&minus;4</sup> to a weight equal to 1.0, many times. What happens, and why?</p>
+    <ol class="q-options">
+      <li>The weight never changes, because the gap between floats near 1.0 is about 10<sup>&minus;3</sup> and each update rounds back to 1.0</li>
+      <li>The weight grows normally, because 10<sup>&minus;4</sup> is above float16's smallest subnormal</li>
+      <li>The weight becomes nan after a few updates</li>
+      <li>The weight changes by 10<sup>&minus;3</sup> each time, rounding the update up</li>
+    </ol>
+    <div class="q-explain">Representability of the update (it is above 6&times;10<sup>&minus;8</sup>) is not the issue: the sum 1.0001 must be rounded to a float16 near 1, and the nearest is 1.0. This is why master weights are kept in float32. Rounding to nearest never rounds an update up by a factor of ten, and nothing here overflows.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">Why can bfloat16 usually train without the loss scaling that float16 needs?</p>
+    <ol class="q-options">
+      <li>It has more mantissa bits, so gradients are represented more precisely</li>
+      <li>It stores gradients in float32 internally</li>
+      <li>It rounds more cleverly than float16</li>
+      <li>It has the same 8 exponent bits as float32, so tiny gradients such as 10<sup>&minus;8</sup> are in its range instead of underflowing</li>
+    </ol>
+    <div class="q-explain">The difference is the exponent: bfloat16 has 8 bits, like float32, so its range is the same (to about 10<sup>&minus;38</sup> for normal numbers), while float16 has 5 and underflows below about 6&times;10<sup>&minus;8</sup>. bfloat16 actually has <em>fewer</em> mantissa bits than float16 (7 versus 10), so option 0 is backwards.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A classifier's cross-entropy loss is computed as <code>-log(softmax(z)[target])</code>, and for some examples the loss is inf even though the logits are finite and moderate (the target logit is 200 below the maximum). The best fix is:</p>
+    <ol class="q-options">
+      <li>Add a small constant to the loss</li>
+      <li>Compute the loss from logits with a fused log-softmax (z<sub>t</sub> &minus; logsumexp(z)), never forming the probability</li>
+      <li>Clip the probabilities to the interval [0, 1]</li>
+      <li>Convert the logits to float16</li>
+    </ol>
+    <div class="q-explain">The probability e<sup>&minus;200</sup> is about 10<sup>&minus;87</sup>, below float32's range, so it underflows to 0 and log(0) = &minus;inf. The log-space formula gives exactly 200 without ever creating the tiny number. Clipping to [0, 1] does nothing for a value that is already 0, and float16 has an even smaller range.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">You quantise a tensor of values with typical size 0.002 to fp8 E4M3 (smallest subnormal about 0.002, maximum 448) with no scaling, and many entries become 0. What is the standard remedy?</p>
+    <ol class="q-options">
+      <li>Switch to float64 for that tensor</li>
+      <li>Add noise to the tensor before quantising</li>
+      <li>Multiply by a per-tensor (or per-block) scale factor chosen so that the largest magnitude maps near 448, then divide it out afterwards</li>
+      <li>Round the values up instead of to nearest</li>
+    </ol>
+    <div class="q-explain">The problem is that the values sit near the bottom of E4M3's range. Scaling shifts them upward into the range where the format has resolution, and the scale is kept to undo it. In the chapter's experiment this cut the zeroed fraction from 37% to 0 and the error from 55% to 2%. Float64 defeats the purpose of fp8, and rounding up or adding noise does not change the range.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">You compute the variance of values near 10<sup>4</sup> in float32 as E[x&sup2;] &minus; E[x]&sup2; and get exactly 0.0, though the data clearly vary. What explains it?</p>
+    <ol class="q-options">
+      <li>Catastrophic cancellation: both terms are about 10<sup>8</sup> with a rounding gap of several units, so their small difference is swallowed</li>
+      <li>Float32 cannot store numbers as large as 10<sup>8</sup></li>
+      <li>The data contain a NaN</li>
+      <li>NumPy's <code>mean</code> is inaccurate for small arrays</li>
+    </ol>
+    <div class="q-explain">Float32 holds 10<sup>8</sup> easily (its limit is 3.4&times;10<sup>38</sup>), but near 10<sup>8</sup> adjacent floats are 8 apart, so a true difference of 0.67 vanishes. Subtracting the mean first (two-pass) keeps the numbers small and the answer exact. No NaN is involved; a NaN would make the result NaN, not 0.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

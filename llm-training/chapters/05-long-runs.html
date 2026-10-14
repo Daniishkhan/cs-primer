@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkpoints, Failures &amp; Long Runs · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="05">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Checkpoints, Failures &amp; Long Runs</h1>
+  <p class="lede">A pretraining run is a single job that lasts weeks on thousands of machines that break. This chapter explains how often they break, what a checkpoint must contain for a restart to be exact, how often to take one, and which numbers to watch so that you notice trouble before the loss curve does.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The earlier chapters of this part made one step of training fit in memory and spread it over many GPUs. A real run repeats that step over a million times. At that length failure stops being an exception and becomes a scheduled event, and the difference between a team that finishes in 54 days and one that finishes in 80 is mostly this chapter: restarts that are fast, checkpoints that are correct, and monitoring that is boring. After reading you will be able to estimate a cluster's failure interval from first principles, size a checkpoint, choose a checkpoint interval with a formula you can defend, and list what must be saved for a resume to be bit-exact.</p>
+</div>
+
+<h2>Why a large run is always failing</h2>
+
+<p>Start with arithmetic. Suppose each GPU, with its host, network card and share of a switch, goes wrong on average once every <var>m</var> days, independently of the others. A cluster of <var>N</var> of them sees its first failure after about <var>m</var>/<var>N</var> days. The failure rate of a system that needs every part is the sum of its parts' rates, so <strong>doubling the machines halves the time between failures</strong>. This is the same series-reliability argument as in <a href="../../reliability/chapters/01-availability-math.html">What Reliability Means</a>, with a harsher input: a training job is a chain of 16,000 links, not a bundle of independent replicas.</p>
+
+<p>Real numbers make this concrete. Llama 3 405B was pretrained on up to 16,384 H100 GPUs. In a 54-day snapshot of that run the team recorded 466 job interruptions: 47 planned (firmware upgrades, configuration and dataset changes) and 419 unexpected (Dubey et al., 2024, "The Llama 3 Herd of Models", section 3.3.4). Dividing, 54 days is 1,296 hours, so an unexpected interruption arrived on average every 1,296 / 419 = 3.1 hours, around the clock for nearly two months. Working backwards to a per-GPU figure (a derived number, not the paper's): 54 &times; 16,384 / 419 is about 2,100 GPU-days per interruption, or roughly 5.8 years per GPU, counting every cause. Each GPU is individually reliable. The cluster is not.</p>
+
+<p>The reason one fault is so expensive is <span class="term">synchronous training</span>. In data-parallel and tensor-parallel training (<a href="03-parallelism.html">chapter 03</a>) every rank must finish each step's collective communication before any rank continues. The paper puts it directly: the synchronous nature of training makes it less fault-tolerant, and a single GPU failure may require a restart of the entire job. Compare this with the web services in <a href="../../networking/chapters/16-failure.html">Failure, Timeouts &amp; Retries</a>, where a dead replica costs a retry. Here a dead rank halts all 16,384.</p>
+
+<h2>What actually breaks</h2>
+
+<p>The Llama 3 paper classifies the 419 unexpected interruptions by root cause. The largest categories were faulty GPUs (148), GPU HBM3 memory (72), software bugs in dependencies (54), network switches and cables (35) and unplanned host maintenance (32). About 78 percent of unexpected interruptions were attributed to confirmed or suspected hardware, and GPU issues alone were 58.7 percent. Only three needed significant manual intervention; automation handled the rest.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Horizontal bar chart of unexpected interruptions during a 54-day Llama 3 405B run: faulty GPU 148, GPU HBM3 memory 72, software bug 54, network switch or cable 35, unplanned host maintenance 32, GPU SRAM 19, GPU system processor 17, and 42 across eleven smaller categories, out of 419.">
+    <text x="20" y="22" class="t-xs t-faint">UNEXPECTED INTERRUPTIONS IN A 54-DAY SNAPSHOT (TOTAL 419; BARS TO SCALE, 148 = 400 PX)</text>
+    <text x="190" y="58" text-anchor="end" class="t-sm">Faulty GPU</text><rect x="200" y="42" width="400" height="22" rx="4" class="f-red"/><text x="608" y="58" class="t-sm t-bold">148</text>
+    <text x="190" y="92" text-anchor="end" class="t-sm">GPU HBM3 memory</text><rect x="200" y="76" width="195" height="22" rx="4" class="f-red"/><text x="403" y="92" class="t-sm t-bold">72</text>
+    <text x="190" y="126" text-anchor="end" class="t-sm">Software bug</text><rect x="200" y="110" width="146" height="22" rx="4" class="f-orange"/><text x="354" y="126" class="t-sm t-bold">54</text>
+    <text x="190" y="160" text-anchor="end" class="t-sm">Network switch or cable</text><rect x="200" y="144" width="95" height="22" rx="4" class="f-cyan"/><text x="303" y="160" class="t-sm t-bold">35</text>
+    <text x="190" y="194" text-anchor="end" class="t-sm">Unplanned host maintenance</text><rect x="200" y="178" width="86" height="22" rx="4" class="f-yellow"/><text x="294" y="194" class="t-sm t-bold">32</text>
+    <text x="190" y="228" text-anchor="end" class="t-sm">GPU SRAM memory</text><rect x="200" y="212" width="51" height="22" rx="4" class="f-red"/><text x="259" y="228" class="t-sm t-bold">19</text>
+    <text x="190" y="262" text-anchor="end" class="t-sm">GPU system processor</text><rect x="200" y="246" width="46" height="22" rx="4" class="f-red"/><text x="254" y="262" class="t-sm t-bold">17</text>
+    <text x="190" y="296" text-anchor="end" class="t-sm">11 other categories</text><rect x="200" y="280" width="113" height="22" rx="4" class="f-purple"/><text x="321" y="296" class="t-sm t-bold">42</text>
+  </svg>
+  <figcaption><strong>Most failures are hardware, and most hardware failures are GPUs.</strong> Red bars are GPU-related. The other categories include NIC, SSD, power supply, silent data corruption (6 events) and NCCL watchdog timeouts (7). Counts are from Table 5 of the Llama 3 paper; the paper's printed percentages do not all match its counts, so only counts are shown here.</figcaption>
+</figure>
+
+<p>Older public evidence tells the same story at smaller scale. Meta's OPT-175B run (Zhang et al., 2022) used 992 80 GB A100 GPUs, and the authors report that hardware failures caused at least 35 manual restarts and the cycling of over 100 hosts across about two months, with an estimated 70 or more further automatic restarts. The public logbook for that run is the subject of a case study in <a href="../../deep-learning/cases/case-07-opt-logbook.html">A2</a>, and the Llama 3 reliability work is the subject of <a href="../cases/case-03-llama3-training.html">case study 3</a> of this course.</p>
+
+<p>Four kinds of trouble deserve names, because each needs a different response.</p>
+
+<ul>
+  <li><strong>Hard failure.</strong> A GPU, host or link stops working and the job crashes or hangs. Detection is easy if the framework has timeouts; recovery is a restart.</li>
+  <li><strong>Hang.</strong> Nothing crashes but no progress is made, usually because one rank is waiting for a collective that another rank will never join. Without a watchdog timeout a hang can burn thousands of GPU-hours before a person notices.</li>
+  <li><strong>Straggler.</strong> A part that still works but slowly: a throttled GPU, a flaky link. Because training is synchronous, one slow rank sets the pace for everyone. The Llama 3 team notes that even a single straggler can slow thousands of other GPUs.</li>
+  <li><strong>Silent data corruption.</strong> A computation returns a wrong number without any error. Nothing crashes. The damage appears as odd loss behaviour much later, which makes it the hardest class to diagnose; the Llama 3 table counts 6 such events.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The 54-day snapshot above is a 2024 measurement on H100 hardware. Failure rates per GPU depend on generation, cooling, power and software, and public data is thin: the Llama 3 paper and the OPT logbook remain the most detailed open accounts of a frontier-scale run. Treat the shape (a failure every few hours at about 16,000 GPUs, hardware dominant) as the durable lesson and recompute the numbers for the cluster you are given.</p>
+</div>
+
+<h2>What a checkpoint contains</h2>
+
+<p>A <span class="term">checkpoint</span> is a snapshot of everything needed to continue training as if nothing had happened. After a crash, the job restarts, reads the latest checkpoint and carries on from that step. Everything done since the checkpoint is lost and repeated.</p>
+
+<p>The weights alone are not enough. With the mixed-precision AdamW recipe from <a href="02-gpu-memory.html">chapter 02</a>, training state per parameter is a bf16 working copy of the weight (2 bytes), a float32 master copy (4 bytes) and Adam's two float32 moment estimates (4 bytes each). Gradients are recomputed on the next step, so they are not saved. That is 14 bytes per parameter on disk, versus 2 bytes if you saved only the model for inference.</p>
+
+<pre class="terminal" data-title="ckpt_size.py"><code>P = 405e9                       # parameters (Llama 3 405B)
+GPUS = 16384
+parts = {"bf16 weights": 2, "fp32 master weights": 4, "Adam m (fp32)": 4, "Adam v (fp32)": 4}
+total = sum(parts.values())     # bytes per parameter saved; gradients are recomputed, not saved
+print(f"bytes per parameter in a training checkpoint: {total}")
+size = P * total
+print(f"full checkpoint: {size/1e12:.2f} TB, per GPU: {size/GPUS/1e6:.0f} MB (if sharded evenly over {GPUS:,} GPUs)")
+for name, bw in [("one 2 GB/s writer", 2e9), ("100 GB/s", 100e9), ("2 TB/s (sustained fabric rate in the Llama 3 paper)", 2e12)]:
+    print(f"  write at {name:&lt;52} {size/bw:&gt;9.1f} s")
+print(f"\n{1000} checkpoints kept would need {1000*size/1e15:.1f} PB; keeping the last 3 needs {3*size/1e12:.1f} TB")
+</code></pre>
+<pre class="terminal" data-title="output"><code>bytes per parameter in a training checkpoint: 14
+full checkpoint: 5.67 TB, per GPU: 346 MB (if sharded evenly over 16,384 GPUs)
+  write at one 2 GB/s writer                                       2835.0 s
+  write at 100 GB/s                                                  56.7 s
+  write at 2 TB/s (sustained fabric rate in the Llama 3 paper)        2.8 s
+
+1000 checkpoints kept would need 5.7 PB; keeping the last 3 needs 17.0 TB
+</code></pre>
+
+<p>A single checkpoint of a 405-billion-parameter model is therefore about 5.7 TB. Sharded evenly over 16,384 GPUs that is 346 MB each, which sits inside the 1 MB to 4 GB per GPU range the Llama 3 paper reports for its checkpoints (our figure is an even split; real shards differ with the parallelism layout). The write-time lines show why storage design matters: one writer at 2 GB/s needs 47 minutes; a fabric sustaining 2 TB/s (the sustained figure the paper gives for its Tectonic storage cluster) needs under three seconds in the ideal case. The paper describes the real difficulty as bursty writes that saturate the storage fabric for short periods.</p>
+
+<p>Other state also belongs in the checkpoint, and forgetting it is the classic restart bug.</p>
+
+<ul>
+  <li><strong>Optimiser state</strong>, already counted above. Without Adam's moments the first steps after resume behave like the first steps of a new run.</li>
+  <li><strong>Step counter and learning-rate schedule position.</strong> Warmup and cosine decay are functions of the step; resuming at step 0 of the schedule sends the learning rate back to warmup.</li>
+  <li><strong>Data loader position.</strong> Which documents were consumed, in which order. This is the same idea as a consumer offset in a log (<a href="../../distributed/chapters/17-logs-exactly-once.html">Logs, Streams and Exactly-Once</a>): without it you re-read some data and skip other data.</li>
+  <li><strong>Random number generator states</strong> for dropout, data shuffling and any sampling, per rank.</li>
+  <li><strong>Loss-scaling state</strong> if you use fp16, and any running statistics.</li>
+</ul>
+
+<p>The script below shows why. It trains a small linear model with momentum SGD for 1,000 steps, "crashes" at step 400, and resumes four ways. Only the resume with the complete state reproduces the uninterrupted run to the last bit.</p>
+
+<pre class="terminal" data-title="resume.py"><code>import json, numpy as np
+
+D = 8
+w_true = np.arange(1, D + 1, dtype=np.float64) / 4
+data_rng = np.random.default_rng(7)
+X = data_rng.standard_normal((4096, D)); y = X @ w_true + 0.1 * data_rng.standard_normal(4096)
+
+def train(steps, state=None, stop_at=None, restore=("params", "opt", "cursor", "rng")):
+    """Minibatch SGD with momentum. State = everything needed to continue exactly."""
+    if state is None:
+        state = {"w": np.zeros(D), "v": np.zeros(D), "step": 0, "perm_seed": 1,
+                 "cursor": 0, "rng": np.random.default_rng(123).bit_generator.state}
+    w, v = state["w"].copy(), state["v"].copy()
+    rng = np.random.default_rng(); rng.bit_generator.state = state["rng"]
+    perm = np.random.default_rng(state["perm_seed"]).permutation(len(X))
+    cursor, step = state["cursor"], state["step"]
+    while step &lt; steps:
+        idx = perm[cursor:cursor + 32]; cursor = (cursor + 32) % len(X)
+        noise = 0.01 * rng.standard_normal(D)                    # stands in for dropout-style randomness
+        g = 2 * X[idx].T @ (X[idx] @ w - y[idx]) / len(idx) + noise
+        v = 0.9 * v + g; w = w - 0.01 * v; step += 1
+        if stop_at == step:
+            return {"w": w, "v": v, "step": step, "perm_seed": 1, "cursor": cursor, "rng": rng.bit_generator.state}
+    return {"w": w, "v": v, "step": step}
+
+def loss(s): return float(np.mean((X @ s["w"] - y) ** 2))
+
+ref = train(1000)
+ck = train(1000, stop_at=400)                                    # "crash" after step 400, checkpoint saved
+good = train(1000, state=ck)                                     # resume with everything
+nov = dict(ck, v=np.zeros(D))                                    # forgot optimiser momentum
+no_cursor = dict(ck, cursor=0)                                   # forgot data position
+no_rng = dict(ck, rng=np.random.default_rng(123).bit_generator.state)   # forgot RNG state
+print(f"uninterrupted run, final loss          {loss(ref):.12f}")
+for name, st in [("resume, full state", good), ("resume, momentum lost", train(1000, state=nov)),
+                 ("resume, data cursor lost", train(1000, state=no_cursor)), ("resume, RNG state lost", train(1000, state=no_rng))]:
+    same = np.array_equal(st["w"], ref["w"])
+    print(f"{name:&lt;38} {loss(st):.12f}  bit-identical: {same}")
+</code></pre>
+<pre class="terminal" data-title="output"><code>uninterrupted run, final loss          0.010041271243
+resume, full state                     0.010041271243  bit-identical: True
+resume, momentum lost                  0.010041271243  bit-identical: False
+resume, data cursor lost               0.009918593096  bit-identical: False
+resume, RNG state lost                 0.010082667095  bit-identical: False
+</code></pre>
+
+<p>Look at the losses as well as the flags. Lost momentum gives the same loss to twelve digits, because this toy problem is easy and convex: the run recovers. The data cursor and RNG variants end at slightly different losses. None of the broken resumes looks wrong on a loss curve, which is what makes the bug dangerous: the run continues, the numbers are plausible, and the difference only shows up as irreproducibility or as a subtle shift in what the model saw. On a real run the data cursor matters more, because losing it can silently repeat a stretch of the corpus.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A checkpoint is the model weights." The weights are what you ship, and about one seventh of what you need to resume (2 of 14 bytes per parameter). A weights-only file lets you fine-tune or evaluate but not continue the pretraining run faithfully. Keep the two ideas apart: the <em>resume checkpoint</em> for the run, and the <em>exported model</em> for everything downstream.</p>
+</div>
+
+<h3>Making checkpoints fast and safe</h3>
+
+<p>Three engineering ideas keep checkpointing from eating the run.</p>
+
+<ol class="steps">
+  <li><strong>Shard the write.</strong> Each rank writes only the parameters and optimiser state it owns, in parallel, instead of gathering 5.7 TB onto one machine. PyTorch's distributed checkpoint library (<code>torch.distributed.checkpoint</code>) does this and can reload onto a different number of GPUs, which matters when the cluster you restart on is not the one you saved from.</li>
+  <li><strong>Save asynchronously.</strong> Copy the state to host memory quickly (the GPUs pause only for this), then let background threads write to storage while training continues. PyTorch documents <code>async_save</code> for this since version 2.4. The costs are extra host memory, roughly a checkpoint's worth, and the rule that only one save should be in flight.</li>
+  <li><strong>Write atomically and verify.</strong> Write to a temporary name, check sizes or checksums, then rename to the final name, so a crash in mid-write never leaves a file that looks complete. Keep several recent checkpoints, not one: if the newest is corrupt (and a crash during a save is exactly when that happens) you fall back to the previous.</li>
+</ol>
+
+<p>The same discipline applies to backups generally: a checkpoint you have never restored is a hope, not a recovery plan (<a href="../../reliability/chapters/18-disaster-recovery.html">Backups &amp; Disaster Recovery</a>). Teams routinely test a resume on a small run, including onto a different GPU count, long before the big run needs it.</p>
+
+<h2>How often to checkpoint</h2>
+
+<p>Checkpointing has a price: <var>C</var> seconds of paused GPUs each time (less with asynchronous saves). Not checkpointing also has a price: after a failure you redo everything since the last checkpoint. Too often wastes time saving; too rarely wastes time redoing. The balance has a classical answer.</p>
+
+<p>Let <var>T</var> be the training time between checkpoints and <var>M</var> the mean time between failures. Per interval, you pay <var>C</var> to save. A failure arrives on average once per <var>M</var>, at a random point in an interval, so it destroys <var>T</var>/2 of work on average, plus the restart time <var>R</var>. Per second of useful training, the overhead is approximately</p>
+
+<p style="text-align:center">waste(<var>T</var>) &asymp; <var>C</var>/<var>T</var> + (<var>T</var>/2 + <var>R</var>)/<var>M</var></p>
+
+<p>The first term falls as <var>T</var> grows; the second rises. Setting the derivative with respect to <var>T</var> to zero, <em>&minus;C/T<sup>2</sup> + 1/(2M) = 0</em>, gives</p>
+
+<p style="text-align:center"><var>T</var><sub>opt</sub> &asymp; &radic;(2 <var>C</var> <var>M</var>)</p>
+
+<p>This is Young's first-order result (Young, 1974, "A first order approximation to the optimum checkpoint interval"), refined by Daly (2006, "A higher order estimate of the optimum checkpoint interval for restart dumps"). Note that <var>R</var> drops out of the optimum: restart time adds a fixed cost per failure but does not change where the best interval sits. The formula assumes failures arrive at random with a constant rate and that the interval is much shorter than <var>M</var>. It is a guide, not a law.</p>
+
+<p>To test it, the script below simulates a 30-day run in which failures arrive at random with the mean interval from the Llama 3 data (3.09 hours). Two scenarios share that failure rate. In the first, a blocking save pauses the GPUs for 120 s and a restart takes 15 minutes. In the second, an asynchronous save pauses for 10 s and a restart takes 5 minutes. The pause and restart values are illustrative assumptions of this chapter, not measurements from any run.</p>
+
+<pre class="terminal" data-title="interval.py"><code>import math, random
+
+DAYS_OBSERVED, UNEXPECTED = 54, 419            # Llama 3 405B snapshot (Dubey et al., 2024)
+M = DAYS_OBSERVED * 24 * 3600 / UNEXPECTED     # mean seconds between unexpected interruptions
+C = 120.0                                      # assumption: seconds GPUs are paused per checkpoint
+R = 900.0                                      # assumption: seconds to restart, reload and warm up
+WORK = 30 * 24 * 3600.0                        # useful training seconds we need to complete
+
+def run(T, seed):
+    """Simulate one run: checkpoint every T seconds of progress; failures arrive as a Poisson process."""
+    rng = random.Random(seed)
+    done = 0.0                                 # useful seconds banked in the last checkpoint
+    clock = 0.0
+    next_fail = rng.expovariate(1 / M)
+    while done &lt; WORK:
+        seg = min(T, WORK - done)
+        need = seg + C                         # train for seg, then pay the checkpoint pause
+        if clock + need &lt;= next_fail:
+            clock += need; done += seg
+        else:                                  # failure mid-segment: lose the segment, pay restart
+            clock = next_fail + R
+            next_fail = clock + rng.expovariate(1 / M)
+    return WORK / clock                        # goodput: useful time over elapsed time
+
+def report(label, c, r, minutes_list):
+    global C, R
+    C, R = c, r
+    print(f"{label}: checkpoint pause C = {C:.0f} s, restart R = {R:.0f} s, Young optimum = {math.sqrt(2*C*M)/60:.1f} min")
+    print("  interval   model waste   simulated waste")
+    for minutes in minutes_list:
+        T = minutes * 60
+        extra = C / T + (T / 2 + R) / M        # first-order overhead per useful second
+        model = extra / (1 + extra)            # as a share of elapsed time
+        g = sum(run(T, s) for s in range(20)) / 20
+        print(f"  {minutes:&gt;5} min   {100*model:&gt;9.1f}%   {100*(1-g):&gt;13.1f}%")
+    print()
+
+print(f"MTBF M = {M/3600:.2f} h ({M:.0f} s) from 419 unexpected interruptions in 54 days\n")
+report("blocking save to slow storage", 120.0, 900.0, (5, 10, 20, 27, 45, 90, 180))
+report("fast async save, quick restart", 10.0, 300.0, (2, 4, 8, 16, 45, 180))
+</code></pre>
+<pre class="terminal" data-title="output"><code>MTBF M = 3.09 h (11135 s) from 419 unexpected interruptions in 54 days
+
+blocking save to slow storage: checkpoint pause C = 120 s, restart R = 900 s, Young optimum = 27.2 min
+  interval   model waste   simulated waste
+      5 min        33.1%            35.1%
+     10 min        23.5%            25.3%
+     20 min        19.0%            20.7%
+     27 min        18.5%            20.3%
+     45 min        19.8%            21.9%
+     90 min        25.7%            29.3%
+    180 min        36.6%            45.3%
+
+fast async save, quick restart: checkpoint pause C = 10 s, restart R = 300 s, Young optimum = 7.9 min
+  interval   model waste   simulated waste
+      2 min        10.4%            10.6%
+      4 min         7.4%             7.5%
+      8 min         6.5%             6.7%
+     16 min         7.4%             7.6%
+     45 min        13.2%            14.1%
+    180 min        33.9%            41.7%
+
+</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Line chart of simulated wasted time against checkpoint interval on a logarithmic axis from 2 to 200 minutes. The slow-save curve starts near 35 percent at 5 minutes, reaches a minimum near 20 percent around 27 minutes and climbs to 45 percent at 180 minutes. The fast-save curve starts near 10.6 percent at 2 minutes, bottoms near 6.7 percent at 8 minutes and climbs to 42 percent at 180 minutes.">
+    <line x1="80" y1="250" x2="700" y2="250" class="line"/>
+    <line x1="80" y1="50" x2="80" y2="250" class="line"/>
+    <text x="74" y="254" text-anchor="end" class="t-xs t-muted">0%</text>
+    <text x="74" y="214" text-anchor="end" class="t-xs t-muted">10%</text>
+    <text x="74" y="174" text-anchor="end" class="t-xs t-muted">20%</text>
+    <text x="74" y="134" text-anchor="end" class="t-xs t-muted">30%</text>
+    <text x="74" y="94" text-anchor="end" class="t-xs t-muted">40%</text>
+    <line x1="80" y1="210" x2="700" y2="210" class="line-thin"/><line x1="80" y1="170" x2="700" y2="170" class="line-thin"/><line x1="80" y1="130" x2="700" y2="130" class="line-thin"/><line x1="80" y1="90" x2="700" y2="90" class="line-thin"/>
+    <text x="80" y="268" text-anchor="middle" class="t-xs t-muted">2</text>
+    <text x="199.4" y="268" text-anchor="middle" class="t-xs t-muted">5</text>
+    <text x="289.7" y="268" text-anchor="middle" class="t-xs t-muted">10</text>
+    <text x="380" y="268" text-anchor="middle" class="t-xs t-muted">20</text>
+    <text x="499.4" y="268" text-anchor="middle" class="t-xs t-muted">50</text>
+    <text x="589.7" y="268" text-anchor="middle" class="t-xs t-muted">100</text>
+    <text x="680" y="268" text-anchor="middle" class="t-xs t-muted">200</text>
+    <text x="390" y="294" text-anchor="middle" class="t-sm">Checkpoint interval T (minutes of training, log scale)</text>
+    <text x="16" y="150" class="t-xs t-muted" transform="rotate(-90 16 150)" text-anchor="middle">Share of elapsed time wasted</text>
+    <polyline points="199.4,109.6 289.7,148.8 380.0,167.2 419.1,168.8 485.7,162.4 576.0,132.8 666.3,68.8" fill="none" class="s-blue sw-2"/>
+    <polyline points="80.0,207.6 170.3,220.0 260.6,223.2 350.9,219.6 485.7,193.6 666.3,83.2" fill="none" class="s-orange sw-2"/>
+    <circle cx="419.1" cy="168.8" r="5" class="f-blue"/><circle cx="260.6" cy="223.2" r="5" class="f-orange"/>
+    <text x="440" y="190" class="t-xs tc-blue">slow save (C = 120 s): best near 27 min</text>
+    <text x="270" y="244" class="t-xs tc-orange">fast async save (C = 10 s): best near 8 min</text>
+  </svg>
+  <figcaption><strong>A shallow valley, not a cliff.</strong> Simulated waste (checkpoint pauses, lost work and restarts) against checkpoint interval, from the table above. The minimum sits where Young's formula puts it, 27.2 and 7.9 minutes, and the curve is flat near the bottom: being off by a factor of 1.5 in either direction costs a point or two. Being off by a factor of 5 does not.</figcaption>
+</figure>
+
+<p>Two lessons follow. First, <strong>the best lever is making <var>C</var> small</strong>: cutting the pause from 120 s to 10 s moved the optimum from 27 to 8 minutes and cut waste from about 20 percent to under 7, which puts goodput near 93 percent, in line with the more-than-90-percent effective training time Llama 3 reported. Second, checkpointing more often is cheap once saves are asynchronous, so the real limit on frequency becomes storage capacity and bandwidth (14 bytes per parameter per copy) rather than GPU time.</p>
+
+<h2>The anatomy of one failure</h2>
+
+<p>Follow a single failure through time.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 820 240" role="img" aria-label="Timeline of a training run. Blue training segments alternate with small purple checkpoint pauses. A red failure marker interrupts the third segment. The work since the last checkpoint is marked as lost, an orange block covers detection, restart and reload, and training then resumes from the second checkpoint and repeats the lost work.">
+    <defs><marker id="ahLT05a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="80" width="170" height="40" rx="4" class="f-blue"/><text x="105" y="105" text-anchor="middle" class="t-sm t-dark">train</text>
+    <rect x="190" y="80" width="14" height="40" class="f-purple"/>
+    <rect x="204" y="80" width="170" height="40" class="f-blue"/><text x="289" y="105" text-anchor="middle" class="t-sm t-dark">train</text>
+    <rect x="374" y="80" width="14" height="40" class="f-purple"/>
+    <rect x="388" y="80" width="130" height="40" class="fs-red s-red sw-2"/><text x="453" y="105" text-anchor="middle" class="t-sm">work later lost</text>
+    <line x1="518" y1="60" x2="518" y2="140" class="line s-red sw-2"/>
+    <text x="518" y="52" text-anchor="middle" class="t-sm t-bold tc-red">failure</text>
+    <rect x="518" y="80" width="110" height="40" class="f-orange"/><text x="573" y="105" text-anchor="middle" class="t-sm t-dark">restart, reload</text>
+    <rect x="628" y="80" width="130" height="40" class="fs-yellow s-yellow sw-2"/><text x="693" y="105" text-anchor="middle" class="t-sm">same work again</text>
+    <text x="197" y="150" text-anchor="middle" class="t-xs t-muted">checkpoint 1</text>
+    <text x="381" y="150" text-anchor="middle" class="t-xs t-muted">checkpoint 2</text>
+    <line x1="381" y1="158" x2="381" y2="170" class="line-thin"/>
+    <line x1="388" y1="178" x2="518" y2="178" class="line s-red" marker-end="url(#ahLT05a)"/>
+    <text x="453" y="196" text-anchor="middle" class="t-xs">lost: on average T/2</text>
+    <line x1="518" y1="214" x2="628" y2="214" class="line s-orange" marker-end="url(#ahLT05a)"/>
+    <text x="573" y="232" text-anchor="middle" class="t-xs">R: detect, replace, reload</text>
+    <text x="20" y="40" class="t-xs t-faint">TIME, LEFT TO RIGHT. THE RUN RESUMES FROM CHECKPOINT 2.</text>
+  </svg>
+  <figcaption><strong>Three costs per failure.</strong> Work since the last checkpoint is lost (T/2 on average), the job is down while the fault is detected, a bad node replaced and state reloaded (R), and the lost work is done again. Small purple blocks are checkpoint pauses, a cost paid every interval whether or not anything fails.</figcaption>
+</figure>
+
+<p>The restart time <var>R</var> is itself a chain of steps, and automation shortens each one.</p>
+
+<ol class="steps">
+  <li><strong>Detect.</strong> A rank crashes, or a watchdog notices that a collective has not completed within a timeout. Meta's team describes a PyTorch "flight recorder" that keeps a ring buffer of recent communication events and stack traces per rank and dumps it when the watchdog fires, so a hang can be traced to the rank that never arrived.</li>
+  <li><strong>Localise.</strong> Decide which machine is at fault. This is often the slowest step, because a hung NVLink transfer shows up as a stalled kernel with no error code.</li>
+  <li><strong>Replace.</strong> Remove the bad node from the pool and bring in a spare. Clusters keep spare machines for this, which is a reliability design choice: spare capacity bought so that recovery does not wait for a repair (the same trade as N+1 redundancy in <a href="../../reliability/chapters/15-blast-radius.html">blast-radius design</a>).</li>
+  <li><strong>Reload.</strong> Start processes, initialise communication, read the checkpoint, and warm up kernels. Reading 5.7 TB across thousands of ranks at once is itself a load-spike on storage.</li>
+  <li><strong>Resume</strong> and verify the loss is where it was.</li>
+</ol>
+
+<p>Llama 3's team reports that it reduced job startup and checkpointing time, built diagnosis tools, and handled all but three of its interruptions without manual intervention. That automation is why more than 90 percent of the elapsed time was effective training despite a failure every three hours.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: autosave in a long game</p>
+  <p>A game that autosaves every few minutes is a checkpoint policy. Save too rarely and a crash costs you an hour of play; save too often and the screen freezes constantly. The best interval depends on how long a save takes and how often the game crashes, exactly as in the formula above.</p>
+  <p><em>Where it breaks down:</em> a game has one player and one state. A training run has thousands of ranks whose saved shards must all describe the same step, so a save is only good if every rank finished it, and a crash in the middle of a save must not corrupt the previous one.</p>
+</div>
+
+<h2>Watching a run</h2>
+
+<p>You cannot babysit a run by reading the loss. A good monitoring setup has two jobs: catch problems the run does not announce, and tell a software issue from a hardware one. Metrics to log every step, per the practices in <a href="../../deep-learning/chapters/17-training-stability.html">A2's stability chapter</a> and the telemetry ideas in <a href="../../reliability/chapters/04-metrics.html">Metrics, Percentiles &amp; Histograms</a>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Signal</th><th>What a bad value looks like</th><th>Likely meaning</th></tr></thead>
+  <tbody>
+    <tr><td>Training loss</td><td>NaN or inf, or a sudden jump</td><td>Divergence or a bad batch; roll back</td></tr>
+    <tr><td>Gradient norm</td><td>Burst before a loss spike</td><td>Instability; often the earliest warning</td></tr>
+    <tr><td>Step time</td><td>A sustained rise of 10 to 25 percent</td><td>A straggler, network congestion or throttling</td></tr>
+    <tr><td>Throughput, MFU</td><td>Drifts down over hours</td><td>Thermal throttling, data loader starvation</td></tr>
+    <tr><td>Data loader wait</td><td>Non-zero</td><td>Storage or preprocessing cannot keep up</td></tr>
+    <tr><td>GPU health</td><td>ECC errors, temperature, clock drops</td><td>A failing device before it fails</td></tr>
+    <tr><td>Time since checkpoint, last save duration</td><td>Save time growing</td><td>Storage degraded; your safety net is slipping</td></tr>
+  </tbody>
+</table></div>
+
+<p>Two lessons from the Llama 3 report show how physical this gets. Throughput varied by 1 to 2 percent with the time of day, because higher mid-day temperatures affected GPU voltage and frequency scaling. And when tens of thousands of GPUs start or stop together (all waiting on a checkpoint, say), power consumption can swing across the data centre on the order of tens of megawatts. Neither shows up in a loss curve.</p>
+
+<p>The script below is a minimal watchdog over a synthetic log with three injected problems: a loss spike with a gradient-norm burst at step 150, a 25-step straggler window from step 200, and a NaN at step 280. It compares each step with a rolling median, which is robust because a few outliers cannot drag the median the way they drag a mean, and it prints an alert only when one starts and when it clears.</p>
+
+<pre class="terminal" data-title="watchdog.py"><code>import math, random, statistics as st
+
+random.seed(5)
+log = []                                         # (step, loss, grad_norm, step_seconds)
+for step in range(1, 301):
+    loss = 3.0 * math.exp(-step / 120) + 2.0 + random.gauss(0, 0.01)
+    gn, t = 0.4 + random.gauss(0, 0.03), 4.0 + random.gauss(0, 0.05)
+    if step == 150: loss += 1.5; gn *= 9         # a loss spike with a gradient-norm burst
+    if 200 &lt;= step &lt; 230: t += 1.2               # a straggler: one slow GPU drags every step
+    if step == 280: loss = float("nan")          # divergence
+    log.append((step, loss, gn, t))
+
+def check(history, window=50):
+    """Return alerts for the latest record, comparing with a rolling median (robust to spikes)."""
+    step, loss, gn, t = history[-1]
+    past = history[-window - 1:-1]
+    alerts = []
+    if not math.isfinite(loss): return [f"step {step}: loss is {loss}: stop and roll back"]
+    med = lambda i: st.median(r[i] for r in past if math.isfinite(r[i]))
+    if len(past) &gt;= 20:
+        if loss &gt; med(1) + 0.5: alerts.append(f"step {step}: loss spike {loss:.2f} vs median {med(1):.2f}")
+        if gn &gt; 3 * med(2):     alerts.append(f"step {step}: grad norm {gn:.2f} is {gn/med(2):.1f}x the median")
+        if t &gt; 1.15 * med(3):   alerts.append(f"step {step}: step time {t:.2f}s vs median {med(3):.2f}s (straggler?)")
+    return alerts
+
+active = {}                                      # alert kind -&gt; first step of the current run of alerts
+for i in range(len(log)):
+    kinds = {a.split(": ")[1].split()[0]: a for a in check(log[:i + 1])}
+    for kind, a in kinds.items():
+        if kind not in active:                   # print only when an alert starts
+            active[kind] = log[i][0]; print(a)
+    for kind in list(active):
+        if kind not in kinds:                    # alert ended: say how long it lasted
+            print(f"step {log[i][0]}: {kind}-alert cleared after {log[i][0] - active.pop(kind)} steps")
+</code></pre>
+<pre class="terminal" data-title="output"><code>step 150: loss spike 4.35 vs median 3.06
+step 150: grad norm 3.48 is 8.9x the median
+step 151: loss-alert cleared after 1 steps
+step 151: grad-alert cleared after 1 steps
+step 200: step time 5.22s vs median 4.01s (straggler?)
+step 225: step-alert cleared after 25 steps
+step 280: loss is nan: stop and roll back
+step 281: loss-alert cleared after 1 steps
+</code></pre>
+
+<p>Collapsing repeated alerts matters in practice: the straggler produced 25 consecutive breaches, and paging someone 25 times is how alert fatigue starts (see <a href="../../reliability/chapters/07-alerting-oncall.html">Alerting &amp; On-Call</a>). Real systems also alert on time since the last step, because a hang produces no log lines to compare.</p>
+
+<h3>Loss spikes: the failure that is not hardware</h3>
+
+<p>Some interruptions are not machine faults at all. The loss suddenly jumps, perhaps recovers, perhaps does not. Causes and defences (learning-rate warmup, gradient clipping, careful initialisation, bf16 rather than fp16) are the subject of <a href="../../deep-learning/chapters/17-training-stability.html">A2 chapter 17</a>; what matters here is the operational response. PaLM's authors (Chowdhery et al., 2022) saw around twenty spikes during the 540-billion-parameter run despite gradient clipping. Their mitigation was operational: restart from a checkpoint about 100 steps before the spike and skip a few hundred data batches around it. When they replayed the same batches from an earlier checkpoint without the spike, they concluded that spikes arise from the combination of particular batches and a particular parameter state. The Llama 3 team, by contrast, reports few loss spikes and no interventions for divergence, helped by a lower batch size early in training.</p>
+
+<p>This is why you keep several checkpoints and why the data loader position must be in the checkpoint: rolling back and skipping data only works if you can control exactly which data comes next.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Everything here maps onto ideas from the first path. Synchronous training behaves like a chain of series components (<a href="../../reliability/chapters/01-availability-math.html">availability maths</a>), a straggler is a tail-latency problem in which the slowest of N participants sets the pace (<a href="../../reliability/chapters/09-tail-latency.html">Tail Latency at Scale</a>), a checkpoint plus data-loader offset is a snapshot plus log position, and the recovery runbook is incident response with the on-call replaced by automation (<a href="../../reliability/chapters/16-incident-response.html">Incident Response</a>).</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In <code>interval.py</code>, change <code>M</code> to the failure interval of a cluster one tenth the size (ten times longer) and predict the new optimal interval from the formula before running it. Then set the checkpoint pause <var>C</var> to 600 s (a very slow save) and find where simulated waste is lowest. In <code>resume.py</code>, add a fifth variant that restores everything but resets the step counter to zero, and say what the learning rate schedule would do if there were one.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 interval.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 resume.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 -c "import math; print(math.sqrt(2*120*11135)/60)"</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Failure rate scales with machine count. At 16,384 H100 GPUs, Llama 3 saw an unexpected interruption about every three hours; about 78 percent traced to hardware.</li>
+    <li>Synchronous training turns one fault into a full stop, so recovery speed matters more than prevention.</li>
+    <li>A resume checkpoint holds weights, master copies, optimiser moments, step, schedule position, data cursor and RNG states: about 14 bytes per parameter, not 2.</li>
+    <li>Checkpoint intervals follow T = &radic;(2CM). Reduce C with sharded, asynchronous, atomic saves and the optimal interval and the waste both shrink.</li>
+    <li>Monitor step time and gradient norm as well as loss; alert on sustained breaches, and treat hangs, stragglers, silent corruption and loss spikes as different problems.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Dubey et al., "The Llama 3 Herd of Models" (2024)</a>. Section 3.3.4 has the interruption counts, root causes and operational lessons used throughout.</li>
+  <li><a href="https://arxiv.org/abs/2205.01068" target="_blank" rel="noopener">Zhang et al., "OPT: Open Pre-trained Transformer Language Models" (2022)</a>. Reports the restarts and host cycling on a 992-GPU run.</li>
+  <li><a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">Chowdhery et al., "PaLM: Scaling Language Modeling with Pathways" (2022)</a>. Section 5.1 describes loss spikes and the rollback-and-skip response.</li>
+  <li><a href="https://doi.org/10.1145/361147.361115" target="_blank" rel="noopener">Young, "A first order approximation to the optimum checkpoint interval", Communications of the ACM (1974)</a>. The origin of the square-root rule.</li>
+  <li><a href="https://doi.org/10.1016/j.future.2004.11.016" target="_blank" rel="noopener">Daly, "A higher order estimate of the optimum checkpoint interval for restart dumps", Future Generation Computer Systems (2006)</a>. Extends Young's result to include restart time and higher-order terms.</li>
+  <li><a href="https://pytorch.org/tutorials/recipes/distributed_async_checkpoint_recipe.html" target="_blank" rel="noopener">PyTorch tutorial, "Asynchronous Saving with Distributed Checkpoint (DCP)"</a>. How sharded asynchronous saves work in practice, and their memory cost.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Suppose each GPU and its share of host and network fails independently about once every 5 years. Roughly how often would a 16,384-GPU synchronous job see a failure?</p>
+    <ol class="q-options"><li>About every 3 minutes</li><li>About every 2.7 hours</li><li>About every 5 days</li><li>About every 1.5 years</li></ol>
+    <div class="q-explain">Failure rates add: 5 years is about 1,826 days, and 1,826 / 16,384 is about 0.11 days, or 2.7 hours. Hours is also what Llama 3 observed (about 3.1 hours). Days or years would be right only for a few machines, and minutes would imply per-GPU lifetimes of weeks.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A blocking checkpoint pauses training for 60 seconds, and the cluster's mean time between failures is 8 hours. Using Young's formula, which interval is closest to optimal?</p>
+    <ol class="q-options"><li>About 5 minutes</li><li>About 8 hours</li><li>About 31 minutes</li><li>About 3 hours</li></ol>
+    <div class="q-explain">T = &radic;(2 &times; 60 &times; 28,800) = &radic;3,456,000, about 1,860 s or 31 minutes. Five minutes would spend too much time saving; 3 hours and 8 hours would throw away large amounts of work at each failure.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A resume restores weights, optimiser state and step but forgets the data loader position, so it restarts at the beginning of the shuffled order. The loss curve looks normal. What is the most important consequence?</p>
+    <ol class="q-options"><li>The run will crash within a few steps</li><li>The learning rate returns to warmup</li><li>The model's weights are corrupted</li><li>Part of the corpus is seen twice and other parts may never be seen, and the run is no longer reproducible</li></ol>
+    <div class="q-explain">Nothing crashes and the weights are fine, which is why the bug hides. The learning-rate problem belongs to a forgotten step counter, not the data cursor. The harm is silent: a duplicated stretch of data, a skipped stretch, and a run that cannot be replayed.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">What does an asynchronous checkpoint trade for its shorter GPU pause?</p>
+    <ol class="q-options"><li>It uses extra host memory for the staged copy, and a crash before the background write finishes loses that checkpoint, so the previous one must be kept</li><li>It saves less state, so the resume is no longer exact</li><li>It requires every rank to write the full model, which multiplies storage by the rank count</li><li>It removes the need to checkpoint optimiser state</li></ol>
+    <div class="q-explain">Async saves copy state to host memory (roughly a checkpoint's worth) and write in the background, so an in-flight save can be lost. The state saved is the same, sharding still applies, and the optimiser state is still required.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Step time has risen by 25 percent for the last 40 steps. Loss and gradient norm are normal and no rank has crashed. What is the most sensible first action?</p>
+    <ol class="q-options"><li>Roll back to the previous checkpoint and skip the next batches</li><li>Look for a straggler: compare per-rank timings and communication traces to find the slow GPU, host or link, and replace it</li><li>Lower the learning rate</li><li>Increase the checkpoint interval to save time</li></ol>
+    <div class="q-explain">Normal loss and gradients mean the maths is fine; the symptom is speed, which in synchronous training points to one slow participant. Rolling back and skipping data is the response to loss spikes. Changing the learning rate or checkpoint interval does not address a slow device.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">PaLM's authors replayed the batches around a loss spike from an earlier checkpoint and the spike did not recur. What did they conclude, and what did they do?</p>
+    <ol class="q-options"><li>The hardware was faulty; they replaced the machines</li><li>The data was corrupt; they deleted it from the corpus permanently</li><li>Spikes came from a combination of specific batches and a particular parameter state; they restarted from a checkpoint about 100 steps earlier and skipped a few hundred batches</li><li>The learning rate was too low; they increased it</li></ol>
+    <div class="q-explain">Because the same batches did not spike from an earlier parameter state, neither the data alone nor the hardware was the cause. The workaround was to roll back and skip, not to remove data permanently or retune the learning rate.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

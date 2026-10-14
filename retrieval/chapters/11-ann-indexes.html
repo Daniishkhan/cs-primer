@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approximate Nearest-Neighbour Search · Retrieval, Search &amp; Document AI</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/ret11-ann.css">
+</head>
+<body data-root="../.." data-course="ret" data-chapter="11">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Approximate Nearest-Neighbour Search</h1>
+  <p class="lede">Dense retrieval needs the closest vectors to a query among millions or billions. Checking all of them is exact and too slow; the indexes in this chapter check a small fraction and accept a little loss. We build the idea of IVF, product quantisation and HNSW from the arithmetic up, measure each on the same data, and learn to read the three-way trade between recall, latency and memory.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The vector index is the part of a retrieval system that decides what you can afford: how many vectors fit in memory, how many queries a second a node serves, and how quickly new documents become searchable. Its settings (<code>nprobe</code>, <code>efSearch</code>, <code>M</code>, the number of PQ bytes) silently cap your recall before any reranker or language model sees a result. After this chapter you can size an index with arithmetic, choose between IVF, PQ and HNSW for a given constraint, set their parameters from a measured recall curve instead of a guess, and explain why filters and updates make approximate search harder. It continues <a href="07-dense-retrieval.html">chapter 7</a>'s embeddings and prepares <a href="12-filters-permissions.html">chapter 12</a>.</p>
+</div>
+
+<h2>Why exact search stops working</h2>
+
+<p>A dense retriever turns a query into a vector and returns the stored vectors with the highest similarity. Done exactly, that is a scan: one similarity per stored vector, each costing <em>d</em> multiply-adds for <em>d</em> dimensions. With unit-length vectors, ranking by cosine, inner product or (inverted) Euclidean distance gives the same order, so the arithmetic is one dot product per vector. The first listing generates a small clustered stand-in for embeddings (10,000 unit vectors, 64 dimensions, 200 queries; synthetic data, not real text embeddings) and prices brute force.</p>
+
+<pre class="terminal" data-title="data.py"><code>&quot;&quot;&quot;Synthetic &#x27;embeddings&#x27; for chapter 11: clustered unit vectors, a stand-in for real text embeddings.&quot;&quot;&quot;
+import numpy as np
+
+def make(n=10_000, d=64, n_clusters=100, n_queries=200, seed=7):
+    rng = np.random.default_rng(seed)
+    centres = rng.normal(size=(n_clusters, d))
+    def sample(m):
+        c = rng.integers(0, n_clusters, size=m)
+        x = centres[c] + 1.8 * rng.normal(size=(m, d))
+        return (x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float32)
+    return sample(n), sample(n_queries)
+
+def exact_topk(X, Q, k=10):
+    sims = Q @ X.T                                  # cosine, because every vector has length 1
+    idx = np.argpartition(-sims, k, axis=1)[:, :k]
+    order = np.take_along_axis(sims, idx, 1).argsort(axis=1)[:, ::-1]
+    return np.take_along_axis(idx, order, 1)
+
+def recall_at_k(found, truth):
+    return float(np.mean([len(set(f) &amp; set(t)) / len(t) for f, t in zip(found, truth)]))</code></pre>
+<pre class="terminal" data-title="exact.py"><code>import time
+import numpy as np
+from data import make, exact_topk
+
+X, Q = make()
+n, d = X.shape
+t0 = time.perf_counter()
+truth = exact_topk(X, Q, 10)
+dt = time.perf_counter() - t0
+print(f&quot;{n:,} vectors x {d} dims, {len(Q)} queries, float32&quot;)
+print(f&quot;memory for vectors : {X.nbytes / 1e6:.1f} MB  ({X.nbytes // n} bytes per vector)&quot;)
+print(f&quot;multiply-adds/query: {n * d:,}   ({n} distances x {d} dims)&quot;)
+print(f&quot;brute force, batched: {dt * 1000:.0f} ms for {len(Q)} queries = {dt / len(Q) * 1000:.2f} ms per query on this machine&quot;)
+print(f&quot;same arithmetic at 100M vectors x 768 dims: {100_000_000 * 768:,} multiply-adds and {100_000_000 * 768 * 4 / 1e9:.0f} GB read per query&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>10,000 vectors x 64 dims, 200 queries, float32
+memory for vectors : 2.6 MB  (256 bytes per vector)
+multiply-adds/query: 640,000   (10000 distances x 64 dims)
+brute force, batched: 19 ms for 200 queries = 0.10 ms per query on this machine
+same arithmetic at 100M vectors x 768 dims: 76,800,000,000 multiply-adds and 307 GB read per query</code></pre>
+
+<p>At 10,000 vectors, brute force takes a fraction of a millisecond per query, because it is one matrix multiplication that the hardware does very well (the timing is for this machine; yours will differ). The last line is the problem. At 100 million vectors of 768 dimensions the same scan is 76.8 billion multiply-adds and 307 GB of memory traffic per query, and a server does not do that in the tens of milliseconds a search request allows. So the question becomes: can we avoid looking at most vectors?</p>
+
+<h3>The structures that work for 3 dimensions do not work for 768</h3>
+
+<p>For low-dimensional data there are exact answers: a k-d tree splits space along one coordinate at a time and discards whole regions. In high dimensions, two things break it. First, a tree over 100 million points has about 27 levels, so it can split on at most 27 of 768 coordinates; the region that "might contain a closer point" still touches most of the tree. Second, distances concentrate: in high dimensions the nearest and the farthest point are nearly the same distance away, so there is little to prune. The next listing measures that on random data.</p>
+
+<pre class="terminal" data-title="concentration.py"><code>import numpy as np
+rng = np.random.default_rng(0)
+print(&quot;   dims   nearest/farthest distance   (10,000 random points, one random query)&quot;)
+for d in (2, 10, 100, 1000):
+    X, q = rng.normal(size=(10_000, d)), rng.normal(size=d)
+    dist = np.linalg.norm(X - q, axis=1)
+    print(f&quot;{d:&gt;7}   {dist.min() / dist.max():&gt;10.2f}&quot;)
+levels = np.log2(100_000_000)
+print(f&quot;\nA kd-tree over 100 million points has about {levels:.0f} levels, so at most {levels:.0f} of 768 coordinates are ever split on.&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>   dims   nearest/farthest distance   (10,000 random points, one random query)
+      2         0.00
+     10         0.19
+    100         0.61
+   1000         0.85
+
+A kd-tree over 100 million points has about 27 levels, so at most 27 of 768 coordinates are ever split on.</code></pre>
+
+<p>In two dimensions the nearest point is vastly closer than the farthest (a ratio of 0.00 after rounding). By 1,000 dimensions the nearest point is 85% as far as the farthest. Real embeddings are not random, because their effective dimensionality is lower and they cluster, which is what the approximate indexes below exploit, but the effect explains why exact tree indexes are not the answer.</p>
+
+<p>So we accept <span class="term">approximate nearest-neighbour</span> (ANN) search: return neighbours that are <em>probably</em> the true nearest, and measure how often that is wrong. The metric is <span class="term">ANN recall@k</span>: the fraction of the exact top-<em>k</em> that the index returns. Do not confuse it with the relevance recall of <a href="04-relevance-metrics.html">chapter 4</a>. ANN recall compares the index with exact search over <em>the same embeddings</em>; relevance recall compares the results with human judgements. An ANN recall of 0.95 says the index agrees with brute force on 95% of the top-<em>k</em>. It says nothing about whether those neighbours were the right documents.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p><strong>"Recall of 0.95 means 5% of my answers are wrong."</strong> It means that 5% of the exact top-10 neighbours are missing from the index's top 10. If the document that answers the query was the exact top-1 and the index finds it, nothing was lost; the missing neighbours may be ranks 8 to 10, which rarely matter after reranking. Conversely, a perfect ANN recall of 1.0 does not help if the embedding model ranks the answer 40th. Measure the two separately: ANN recall against exact search to tune the index, and end-to-end relevance metrics (chapters 4 and 5) to decide whether the loss matters.</p>
+</div>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: finding a street in an unfamiliar country</p>
+  <p>To find the nearest bakery to a given address, you would not drive down every street. You would use a hierarchy: motorway to the right region, main road to the right town, local streets to the address, looking around only when you arrive. A graph index is such a road network. Another approach is a regional guidebook: look up the town first (IVF), then search only that town. Product quantisation is like describing every address as "town 37, district 201" rather than by full coordinates: smaller to store, slightly less precise.</p>
+  <p><em>Where it breaks down:</em> roads live in two dimensions, so "nearby" is easy to define and a motorway really does get you near. In 768 dimensions, neighbours are not arranged along lines, a greedy move toward the target can end in a pocket from which every neighbour is farther, and the best graph (the next sections) must be built from the data itself.</p>
+</div>
+
+<h2>Inverted file index (IVF): search the right neighbourhood</h2>
+
+<p>The inverted file index borrows the name and shape of chapter 2's inverted index. Run <span class="term">k-means</span> on the vectors to find <em>nlist</em> centroids, and assign every vector to its nearest centroid, building <em>nlist</em> lists (the "cells" of a partition of space). At query time, compare the query to the centroids only, choose the <em>nprobe</em> closest cells, and scan the vectors in those cells exactly. If the query's true neighbours lie in the probed cells, you find them while touching about <em>nprobe</em>/<em>nlist</em> of the data.</p>
+
+<pre class="terminal" data-title="kmeans.py"><code>import numpy as np
+
+def kmeans(X, k, iters=12, seed=0):
+    &quot;&quot;&quot;Lloyd&#x27;s algorithm. Returns centroids (k x d) and the cluster id of every row.&quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    C = X[rng.choice(len(X), k, replace=False)].copy()
+    for _ in range(iters):
+        # squared distance up to a constant: |c|^2 - 2 x.c
+        assign = np.argmin((C * C).sum(1)[None, :] - 2 * X @ C.T, axis=1)
+        for j in range(k):
+            members = X[assign == j]
+            if len(members):
+                C[j] = members.mean(0)
+    assign = np.argmin((C * C).sum(1)[None, :] - 2 * X @ C.T, axis=1)
+    return C, assign</code></pre>
+<pre class="terminal" data-title="ivf.py"><code>import numpy as np
+from data import make, exact_topk, recall_at_k
+from kmeans import kmeans
+
+X, Q = make()
+truth = exact_topk(X, Q, 10)
+nlist = 100
+C, assign = kmeans(X, nlist)
+lists = [np.where(assign == j)[0] for j in range(nlist)]          # the inverted lists
+print(f&quot;{nlist} cells; list sizes: min {min(map(len, lists))}, mean {len(X) // nlist}, max {max(map(len, lists))}\n&quot;)
+
+def search(q, nprobe, k=10):
+    cells = np.argsort(-(C @ q))[:nprobe]                        # closest centroids by cosine-like score
+    cand = np.concatenate([lists[j] for j in cells])
+    top = cand[np.argsort(-(X[cand] @ q))[:k]]
+    return top, nlist + len(cand)                                 # distances: to centroids + to candidates
+
+print(&quot;nprobe  recall@10  distances/query  vs brute force&quot;)
+for nprobe in (1, 2, 4, 8, 16, 32):
+    found, cost = [], []
+    for q in Q:
+        top, c = search(q, nprobe)
+        found.append(top); cost.append(c)
+    print(f&quot;{nprobe:&gt;6}  {recall_at_k(found, truth):&gt;9.3f}  {np.mean(cost):&gt;15,.0f}  {len(X) / np.mean(cost):&gt;9.1f}x fewer&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>100 cells; list sizes: min 36, mean 100, max 164
+
+nprobe  recall@10  distances/query  vs brute force
+     1      0.548              203       49.1x fewer
+     2      0.631              300       33.3x fewer
+     4      0.715              500       20.0x fewer
+     8      0.795              902       11.1x fewer
+    16      0.876            1,700        5.9x fewer
+    32      0.954            3,298        3.0x fewer</code></pre>
+
+<p>With <em>nprobe</em> = 1 we compute 203 distances per query (100 for centroids, about 100 for the cell) instead of 10,000, a 49 times saving, and find 55% of the true top-10. Probing more cells climbs the curve: 87.6% at 16 probes with 1,700 distances, 95.4% at 32 with 3,298. The cost grows almost linearly with <em>nprobe</em>, recall grows more slowly: the usual diminishing return.</p>
+
+<p>Why not 100% at <em>nprobe</em> = 1? Because a query near a cell boundary has neighbours on both sides, and only one side is searched. That is the central failure mode of any partition-based index, and the reason the knob exists. Practical notes:</p>
+<ul>
+  <li><strong>Choosing nlist.</strong> The FAISS guidelines suggest <em>nlist</em> between 4&radic;N and 16&radic;N, and between 30 and 256 training vectors per cell. For our 10,000 vectors that rule would give 400 or more cells and require 12,000 or more training vectors, so I used 100 cells to keep the example valid. Too few cells make each scan long; too many make the centroid comparison costly and the boundary problem worse.</li>
+  <li><strong>Training data.</strong> The centroids describe the data they were trained on. If your corpus drifts (a new product line, a new language), cells become unbalanced and recall falls; plan to retrain.</li>
+  <li><strong>Unbalanced cells.</strong> Our cells held between 36 and 164 vectors. A cell ten times larger than average costs ten times as much to scan each time it is probed, and is probed more often, so it dominates tail latency.</li>
+</ul>
+
+<h2>Product quantisation: store a code, not a vector</h2>
+
+<p>IVF reduces how many vectors we compare, not how much memory they use. At 3,072 bytes per 768-dimensional float32 vector, 100 million vectors need 307 GB. <span class="term">Product quantisation</span> (PQ; Jégou, Douze and Schmid, "Product Quantization for Nearest Neighbor Search", 2011) compresses each vector to a few bytes.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Product quantisation in three rows. Top row: a vector is cut into eight sub-vectors x1 to x8 of 8 numbers each. Middle row: each sub-vector is replaced by the id of the nearest of 256 centroids in its own codebook. Bottom row: the stored code is eight bytes, for example 37, 201, 5, 148, 92, 250, 13, 76. A note says the 64-number vector of 256 bytes became 8 bytes, 32 times smaller, and that at query time distances are summed from lookup tables.">
+    <defs><marker id="ahRET11b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="22" class="t-xs t-faint t-bold">1. CUT: a 64-number vector (256 bytes as float32) into 8 pieces</text>
+    <rect x="20" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="61" y="55" text-anchor="middle" class="t-xs t-bold">x1</text><text x="61" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="61" y1="74" x2="61" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="20" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="61" y="128" text-anchor="middle" class="t-xs t-bold">codebook 1</text><text x="61" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="61" y1="158" x2="61" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="20" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="61" y="209" text-anchor="middle" class="t-sm mono t-bold">37</text>
+    <rect x="110" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="151" y="55" text-anchor="middle" class="t-xs t-bold">x2</text><text x="151" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="151" y1="74" x2="151" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="110" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="151" y="128" text-anchor="middle" class="t-xs t-bold">codebook 2</text><text x="151" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="151" y1="158" x2="151" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="110" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="151" y="209" text-anchor="middle" class="t-sm mono t-bold">201</text>
+    <rect x="200" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="241" y="55" text-anchor="middle" class="t-xs t-bold">x3</text><text x="241" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="241" y1="74" x2="241" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="200" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="241" y="128" text-anchor="middle" class="t-xs t-bold">codebook 3</text><text x="241" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="241" y1="158" x2="241" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="200" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="241" y="209" text-anchor="middle" class="t-sm mono t-bold">5</text>
+    <rect x="290" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="331" y="55" text-anchor="middle" class="t-xs t-bold">x4</text><text x="331" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="331" y1="74" x2="331" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="290" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="331" y="128" text-anchor="middle" class="t-xs t-bold">codebook 4</text><text x="331" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="331" y1="158" x2="331" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="290" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="331" y="209" text-anchor="middle" class="t-sm mono t-bold">148</text>
+    <rect x="380" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="421" y="55" text-anchor="middle" class="t-xs t-bold">x5</text><text x="421" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="421" y1="74" x2="421" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="380" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="421" y="128" text-anchor="middle" class="t-xs t-bold">codebook 5</text><text x="421" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="421" y1="158" x2="421" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="380" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="421" y="209" text-anchor="middle" class="t-sm mono t-bold">92</text>
+    <rect x="470" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="511" y="55" text-anchor="middle" class="t-xs t-bold">x6</text><text x="511" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="511" y1="74" x2="511" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="470" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="511" y="128" text-anchor="middle" class="t-xs t-bold">codebook 6</text><text x="511" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="511" y1="158" x2="511" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="470" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="511" y="209" text-anchor="middle" class="t-sm mono t-bold">250</text>
+    <rect x="560" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="601" y="55" text-anchor="middle" class="t-xs t-bold">x7</text><text x="601" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="601" y1="74" x2="601" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="560" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="601" y="128" text-anchor="middle" class="t-xs t-bold">codebook 7</text><text x="601" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="601" y1="158" x2="601" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="560" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="601" y="209" text-anchor="middle" class="t-sm mono t-bold">13</text>
+    <rect x="650" y="40" width="82" height="34" rx="6" class="fs-green s-green sw-2"/><text x="691" y="55" text-anchor="middle" class="t-xs t-bold">x8</text><text x="691" y="68" text-anchor="middle" class="t-xs t-muted">8 numbers</text>
+    <line x1="691" y1="74" x2="691" y2="106" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="650" y="108" width="82" height="50" rx="6" class="fs-purple s-purple sw-2"/><text x="691" y="128" text-anchor="middle" class="t-xs t-bold">codebook 8</text><text x="691" y="146" text-anchor="middle" class="t-xs">256 centroids</text>
+    <line x1="691" y1="158" x2="691" y2="186" class="line" marker-end="url(#ahRET11b)"/>
+    <rect x="650" y="188" width="82" height="32" rx="6" class="fs-orange s-orange sw-2"/><text x="691" y="209" text-anchor="middle" class="t-sm mono t-bold">76</text>
+    <text x="20" y="244" class="t-xs t-faint t-bold">2. REPLACE each piece by the id of its nearest centroid in that piece's own codebook (purple).</text>
+    <text x="20" y="262" class="t-xs t-faint t-bold">3. STORE the ids (orange): 8 bytes instead of 256, 32 times smaller. Example ids are illustrative.</text>
+    <text x="20" y="284" class="t-xs t-muted">Query time: 8 tables of 256 values; a stored vector's score is the sum of 8 lookups.</text>
+  </svg>
+  <figcaption><strong>Compress by parts.</strong> Each piece has only 256 possible values, so one byte names it; the whole vector has 256<sup>8</sup> possible codes, far more than a single codebook of 256 could offer, because the pieces combine.</figcaption>
+</figure>
+
+<p>The scheme has three steps. <em>Train</em>: cut every vector into <em>m</em> sub-vectors and run k-means with 256 centroids separately in each sub-space, producing <em>m</em> codebooks. <em>Encode</em>: replace each sub-vector by the one-byte id of its nearest centroid, so a vector becomes <em>m</em> bytes. <em>Search</em> uses <span class="term">asymmetric distance computation</span>: the query stays uncompressed; for each of its <em>m</em> sub-vectors you compute the inner product with the 256 centroids of the matching codebook once, producing <em>m</em> small tables. A stored vector's approximate score is then the sum of <em>m</em> table lookups. The per-vector cost is <em>m</em> lookups and adds instead of <em>d</em> multiply-adds.</p>
+
+<pre class="terminal" data-title="pq.py"><code>import numpy as np
+from data import make, exact_topk, recall_at_k
+from kmeans import kmeans
+
+X, Q = make()
+truth = exact_topk(X, Q, 10)
+n, d = X.shape
+
+def train_pq(X, m, ks=256):
+    &quot;&quot;&quot;Split every vector into m sub-vectors; learn ks centroids per sub-space.&quot;&quot;&quot;
+    ds = X.shape[1] // m
+    return [kmeans(X[:, i * ds:(i + 1) * ds], ks, iters=10, seed=i)[0] for i in range(m)]
+
+def encode(X, books):
+    ds = X.shape[1] // len(books)
+    codes = np.empty((len(X), len(books)), dtype=np.uint8)
+    for i, B in enumerate(books):
+        sub = X[:, i * ds:(i + 1) * ds]
+        codes[:, i] = np.argmin((B * B).sum(1)[None, :] - 2 * sub @ B.T, axis=1)
+    return codes
+
+def adc_scores(q, codes, books):
+    &quot;&quot;&quot;Asymmetric distance: exact query against compressed database vectors, via m lookup tables.&quot;&quot;&quot;
+    ds = len(q) // len(books)
+    tables = np.stack([books[i] @ q[i * ds:(i + 1) * ds] for i in range(len(books))])   # m x 256 inner products
+    return tables[np.arange(len(books)), codes].sum(axis=1)                              # n scores, m adds each
+
+print(f&quot;{&#x27;m&#x27;:&gt;3} {&#x27;bytes/vec&#x27;:&gt;9} {&#x27;compression&#x27;:&gt;11} {&#x27;recall@10&#x27;:&gt;10} {&#x27;+ rerank 100&#x27;:&gt;13}&quot;)
+for m in (4, 8, 16, 32):
+    books = train_pq(X, m)
+    codes = encode(X, books)
+    found, found_rr = [], []
+    for q in Q:
+        s = adc_scores(q, codes, books)
+        top = np.argsort(-s)[:10]
+        short = np.argsort(-s)[:100]                         # shortlist, then rescore with the full vectors
+        rr = short[np.argsort(-(X[short] @ q))[:10]]
+        found.append(top); found_rr.append(rr)
+    print(f&quot;{m:&gt;3} {codes.shape[1]:&gt;9} {X.itemsize * d / codes.shape[1]:&gt;10.0f}x {recall_at_k(found, truth):&gt;10.3f} {recall_at_k(found_rr, truth):&gt;13.3f}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>  m bytes/vec compression  recall@10  + rerank 100
+  4         4         64x      0.201         0.603
+  8         8         32x      0.366         0.869
+ 16        16         16x      0.618         0.998
+ 32        32          8x      0.864         1.000</code></pre>
+
+<p>Read the table as a memory-quality dial. With 8 bytes per vector (32 times smaller), PQ alone finds 37% of the true top-10: the quantisation error is large relative to the gaps between neighbours. With 16 bytes it finds 62%, with 32 bytes 86%. The right-hand column shows the standard remedy: take the 100 best by PQ score as a shortlist, then rescore those 100 with the full-precision vectors (kept on disk or in a slower tier). That lifts 8 bytes to 87% and 16 bytes to 99.8%, for the cost of reading 100 full vectors per query. PQ is a <em>filter</em> that is good at not discarding the truth, not a final ranker.</p>
+
+<p>Other quantisers occupy the same design space. <em>Scalar quantisation</em> stores each number in 8 bits (4 times smaller than float32) or fewer. <em>Binary quantisation</em> keeps one bit per dimension (32 times smaller) and uses the Hamming distance, usually with a reranking step. <em>Optimised PQ</em> rotates the vectors first so the pieces carry equal information. Lowering the number of dimensions (for embedding models trained for it, as in Matryoshka representation learning, Kusupati et al., 2022) shrinks vectors before any quantiser. All trade accuracy for memory; none is free.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Compression changes which part of the memory hierarchy an index lives in. 10 GB of PQ codes fit in RAM on one machine and are scanned at memory speed; 307 GB of float32 vectors need sharding or an SSD, where random reads cost microseconds rather than nanoseconds. This is the same reasoning as in <a href="../../systems/chapters/22-performance-engineering.html">performance engineering</a>: count bytes moved, not only operations. The index is also a specialised store with its own durability and update story, covered more generally in <a href="../../data/chapters/17-specialised-stores.html">specialised stores</a>.</p>
+</div>
+
+<h2>HNSW: a graph you can navigate</h2>
+
+<p>The Hierarchical Navigable Small World graph (HNSW; Malkov and Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs", first posted 2016) is the most widely used ANN index for in-memory vector search. It starts from a simple observation: if every vector is linked to a few of its near neighbours, you can walk from any vector toward a query by repeatedly stepping to whichever linked vector is closer to the query, and stop when no neighbour improves. That is a greedy search on a <span class="term">proximity graph</span>.</p>
+
+<p>On its own, this walk can take many steps (it crawls) and can get stuck in a local minimum. HNSW fixes the first problem with layers, the idea of a skip list. Each vector is assigned a random top layer with exponentially decreasing probability, so layer 0 holds every vector, layer 1 about 1/<em>M</em> of them, layer 2 about 1/<em>M</em><sup>2</sup>, and so on. Each layer has its own graph over the vectors it holds. Search starts at a fixed entry point on the top layer, where long hops cover large distances, descends one layer when it can no longer improve, and does the careful search on layer 0.</p>
+
+<div class="widget stepper" data-autoplay-ms="4500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One HNSW query, layer by layer</h4></div>
+  <svg viewBox="0 0 760 340" role="img" aria-label="An HNSW graph drawn as three layers of nodes along a line. Layer 0 has 16 nodes numbered 0 to 15, layer 1 has nodes 1, 4, 8, 11 and 14, layer 2 has nodes 4 and 11. A query sits between nodes 9 and 10. The search starts at node 4 on layer 2, hops to node 11, drops to layer 1 and stays at 11, drops to layer 0, hops to node 10, checks neighbours 9 and 11, and returns 10 first.">
+    <defs><marker id="ahRET11a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-yellow"/></marker></defs>
+    <text x="14" y="46" class="t-xs t-faint t-bold">LAYER 2: 2 nodes</text>
+    <text x="14" y="136" class="t-xs t-faint t-bold">LAYER 1: 5 nodes</text>
+    <text x="14" y="284" class="t-xs t-faint t-bold">LAYER 0: all vectors</text>
+    <line x1="216" y1="70" x2="524" y2="70" class="line-thin"/>
+    <line x1="84" y1="160" x2="216" y2="160" class="line-thin"/>
+    <line x1="216" y1="160" x2="392" y2="160" class="line-thin"/>
+    <line x1="392" y1="160" x2="524" y2="160" class="line-thin"/>
+    <line x1="524" y1="160" x2="656" y2="160" class="line-thin"/>
+    <line x1="40" y1="250" x2="84" y2="250" class="line-thin"/>
+    <line x1="84" y1="250" x2="128" y2="250" class="line-thin"/>
+    <line x1="128" y1="250" x2="172" y2="250" class="line-thin"/>
+    <line x1="172" y1="250" x2="216" y2="250" class="line-thin"/>
+    <line x1="216" y1="250" x2="260" y2="250" class="line-thin"/>
+    <line x1="260" y1="250" x2="304" y2="250" class="line-thin"/>
+    <line x1="304" y1="250" x2="348" y2="250" class="line-thin"/>
+    <line x1="348" y1="250" x2="392" y2="250" class="line-thin"/>
+    <line x1="392" y1="250" x2="436" y2="250" class="line-thin"/>
+    <line x1="436" y1="250" x2="480" y2="250" class="line-thin"/>
+    <line x1="480" y1="250" x2="524" y2="250" class="line-thin"/>
+    <line x1="524" y1="250" x2="568" y2="250" class="line-thin"/>
+    <line x1="568" y1="250" x2="612" y2="250" class="line-thin"/>
+    <line x1="612" y1="250" x2="656" y2="250" class="line-thin"/>
+    <line x1="656" y1="250" x2="700" y2="250" class="line-thin"/>
+    <line x1="84" y1="170" x2="84" y2="240" class="line-dash" stroke-opacity="0.5"/>
+    <line x1="216" y1="170" x2="216" y2="240" class="line-dash" stroke-opacity="0.5"/>
+    <line x1="392" y1="170" x2="392" y2="240" class="line-dash" stroke-opacity="0.5"/>
+    <line x1="524" y1="170" x2="524" y2="240" class="line-dash" stroke-opacity="0.5"/>
+    <line x1="656" y1="170" x2="656" y2="240" class="line-dash" stroke-opacity="0.5"/>
+    <line x1="216" y1="80" x2="216" y2="150" class="line-dash" stroke-opacity="0.5"/>
+    <line x1="524" y1="80" x2="524" y2="150" class="line-dash" stroke-opacity="0.5"/>
+    <circle cx="216" cy="70" r="10" class="fs-purple s-purple sw-2"/><text x="216" y="74" text-anchor="middle" class="t-xs mono">4</text>
+    <circle cx="524" cy="70" r="10" class="fs-purple s-purple sw-2"/><text x="524" y="74" text-anchor="middle" class="t-xs mono">11</text>
+    <circle cx="84" cy="160" r="10" class="fs-purple s-purple sw-2"/><text x="84" y="164" text-anchor="middle" class="t-xs mono">1</text>
+    <circle cx="216" cy="160" r="10" class="fs-purple s-purple sw-2"/><text x="216" y="164" text-anchor="middle" class="t-xs mono">4</text>
+    <circle cx="392" cy="160" r="10" class="fs-purple s-purple sw-2"/><text x="392" y="164" text-anchor="middle" class="t-xs mono">8</text>
+    <circle cx="524" cy="160" r="10" class="fs-purple s-purple sw-2"/><text x="524" y="164" text-anchor="middle" class="t-xs mono">11</text>
+    <circle cx="656" cy="160" r="10" class="fs-purple s-purple sw-2"/><text x="656" y="164" text-anchor="middle" class="t-xs mono">14</text>
+    <circle cx="40" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="40" y="254" text-anchor="middle" class="t-xs mono">0</text>
+    <circle cx="84" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="84" y="254" text-anchor="middle" class="t-xs mono">1</text>
+    <circle cx="128" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="128" y="254" text-anchor="middle" class="t-xs mono">2</text>
+    <circle cx="172" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="172" y="254" text-anchor="middle" class="t-xs mono">3</text>
+    <circle cx="216" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="216" y="254" text-anchor="middle" class="t-xs mono">4</text>
+    <circle cx="260" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="260" y="254" text-anchor="middle" class="t-xs mono">5</text>
+    <circle cx="304" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="304" y="254" text-anchor="middle" class="t-xs mono">6</text>
+    <circle cx="348" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="348" y="254" text-anchor="middle" class="t-xs mono">7</text>
+    <circle cx="392" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="392" y="254" text-anchor="middle" class="t-xs mono">8</text>
+    <circle cx="436" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="436" y="254" text-anchor="middle" class="t-xs mono">9</text>
+    <circle cx="480" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="480" y="254" text-anchor="middle" class="t-xs mono">10</text>
+    <circle cx="524" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="524" y="254" text-anchor="middle" class="t-xs mono">11</text>
+    <circle cx="568" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="568" y="254" text-anchor="middle" class="t-xs mono">12</text>
+    <circle cx="612" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="612" y="254" text-anchor="middle" class="t-xs mono">13</text>
+    <circle cx="656" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="656" y="254" text-anchor="middle" class="t-xs mono">14</text>
+    <circle cx="700" cy="250" r="10" class="fs-purple s-purple sw-2"/><text x="700" y="254" text-anchor="middle" class="t-xs mono">15</text>
+    <line x1="470" y1="56" x2="470" y2="286" class="line-dash s-yellow"/><path d="M461,294 L470,285 L479,294 L470,303 z" class="f-yellow"/><text x="470" y="320" text-anchor="middle" class="t-xs tc-yellow t-bold">query</text>
+    <g data-steps="2-" data-active="2"><circle cx="216" cy="70" r="15" fill="none" class="s-yellow sw-3"/><text x="216" y="50" text-anchor="middle" class="t-xs t-bold">entry point</text></g>
+    <g data-steps="3-" data-active="3"><line x1="228" y1="70" x2="510" y2="70" class="line s-yellow sw-3" marker-end="url(#ahRET11a)"/><circle cx="524" cy="70" r="15" fill="none" class="s-yellow sw-3"/></g>
+    <g data-steps="4-" data-active="4"><line x1="524" y1="84" x2="524" y2="146" class="line s-yellow sw-3" marker-end="url(#ahRET11a)"/><circle cx="524" cy="160" r="15" fill="none" class="s-yellow sw-3"/></g>
+    <g data-steps="5-" data-active="5"><line x1="524" y1="174" x2="524" y2="236" class="line s-yellow sw-3" marker-end="url(#ahRET11a)"/><line x1="512" y1="250" x2="494" y2="250" class="line s-yellow sw-3" marker-end="url(#ahRET11a)"/><circle cx="480" cy="250" r="15" fill="none" class="s-yellow sw-3"/></g>
+    <g data-steps="6-" data-active="6"><circle cx="436" cy="250" r="15" fill="none" class="s-orange sw-2"/><circle cx="524" cy="250" r="15" fill="none" class="s-orange sw-2"/><text x="560" y="286" class="t-xs tc-orange t-bold">orange: beam also checks 9 and 11</text></g>
+    <g data-steps="7" data-active="7"><circle cx="480" cy="250" r="15" fill="none" class="s-green sw-3"/><text x="560" y="304" class="t-xs tc-green t-bold">green: result 10, then 9 and 11</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>The structure.</strong> Layer 0 contains every vector, linked to its near neighbours. Layers above hold random subsets, so they are sparse and their links span long distances. Dashed lines show that a node on an upper layer is the same vector as on layer 0.</li>
+    <li><strong>Enter at the top.</strong> The search always starts at the entry point of the highest layer (node 4 here). The query is the yellow diamond.</li>
+    <li><strong>Greedy hop on layer 2.</strong> Node 4's only neighbour on this layer is node 11, which is closer to the query, so we move there. No neighbour of 11 is closer, so we stop on this layer.</li>
+    <li><strong>Drop to layer 1.</strong> The result so far becomes the entry point for the next layer down. On layer 1, node 11's neighbours (8 and 14) are both farther from the query, so we stay.</li>
+    <li><strong>Layer 0, greedy.</strong> On the dense bottom layer, node 11's neighbour 10 is closer to the query, so we move to 10.</li>
+    <li><strong>Layer 0, beam.</strong> The bottom-layer search keeps a candidate list of size <em>ef</em> and expands the most promising candidate until nothing in the list can be improved. Here that means checking 9 and 11, neighbours of 10.</li>
+    <li><strong>Return.</strong> The best <em>k</em> found are returned, nearest first: node 10, then 9 and 11. Only a few of the 16 nodes were ever compared with the query.</li>
+  </ol>
+</div>
+
+<h3>The three parameters</h3>
+<dl class="terms">
+  <dt><em>M</em></dt><dd>The number of links each node keeps (layer 0 allows 2<em>M</em>). More links mean a better-connected graph and higher achievable recall, but more memory and slower build. FAISS's guidelines give the memory cost as <em>d</em> &times; 4 + <em>M</em> &times; 2 &times; 4 bytes per vector.</dd>
+  <dt><em>efConstruction</em></dt><dd>How wide the candidate list is while inserting. Higher builds a better graph, slower. It is fixed at build time: changing it means rebuilding.</dd>
+  <dt><em>efSearch</em></dt><dd>How wide the candidate list is at query time. This is the knob you turn at runtime: it trades latency for recall, like <em>nprobe</em> for IVF.</dd>
+</dl>
+
+<p>Inserting a vector uses the same search: find its nearest neighbours in each layer from its top layer down, connect to them, and prune over-full neighbour lists. The pruning rule matters. A plain "keep the <em>M</em> closest" tends to link a node only to others in the same tight cluster, leaving clusters disconnected. The paper's heuristic keeps a candidate only if it is closer to the new node than to any neighbour already chosen, which spreads links in different directions. The listing implements all of it in about 90 lines (open it below), counts distance computations as its cost measure, and builds an index over the same 10,000 vectors.</p>
+
+<pre class="terminal" data-title="hnsw.py (excerpt: the search on one layer)"><code>    def _search_layer(self, q, eps, ef, layer):
+        """Best-first search; returns the ef best (similarity, id) pairs, best first."""
+        visited = set(eps)
+        s0 = self._sims(q, list(eps))
+        cand = [(-s, e) for s, e in zip(s0, eps)]; heapq.heapify(cand)      # max-heap by similarity
+        best = [(s, e) for s, e in zip(s0, eps)]; heapq.heapify(best)         # min-heap of the ef best
+        while cand:
+            ns, e = heapq.heappop(cand)
+            if -ns &lt; best[0][0] and len(best) &gt;= ef:
+                break                                                         # nothing left can improve the result
+            new = [n for n in self.links[layer][e] if n not in visited]
+            if not new:
+                continue
+            visited.update(new)
+            for s, n in zip(self._sims(q, new), new):
+                if len(best) &lt; ef or s &gt; best[0][0]:
+                    heapq.heappush(cand, (-s, n)); heapq.heappush(best, (s, n))
+                    if len(best) &gt; ef:
+                        heapq.heappop(best)
+        return sorted(best, reverse=True)</code></pre>
+
+<details class="deeper">
+  <summary>The full HNSW class <span class="hint">about 90 lines, runnable</span></summary>
+  <pre class="terminal" data-title="hnsw.py"><code>import heapq, math, time
+import numpy as np
+from data import make, exact_topk, recall_at_k
+
+class HNSW:
+    def __init__(self, X, M=12, ef_construction=64, seed=1):
+        self.X, self.M, self.efc = X, M, ef_construction
+        self.mL = 1 / math.log(M)
+        self.rng = np.random.default_rng(seed)
+        self.links = []                  # links[layer][node] -&gt; list of neighbour ids
+        self.level = []                  # top layer of each node
+        self.entry = None
+        self.dist_calls = 0
+        for i in range(len(X)):
+            self._insert(i)
+
+    def _sims(self, q, ids):
+        self.dist_calls += len(ids)
+        return self.X[ids] @ q
+
+    def _search_layer(self, q, eps, ef, layer):
+        &quot;&quot;&quot;Best-first search; returns the ef best (similarity, id) pairs, best first.&quot;&quot;&quot;
+        visited = set(eps)
+        s0 = self._sims(q, list(eps))
+        cand = [(-s, e) for s, e in zip(s0, eps)]; heapq.heapify(cand)      # max-heap by similarity
+        best = [(s, e) for s, e in zip(s0, eps)]; heapq.heapify(best)         # min-heap of the ef best
+        while cand:
+            ns, e = heapq.heappop(cand)
+            if -ns &lt; best[0][0] and len(best) &gt;= ef:
+                break                                                         # nothing left can improve the result
+            new = [n for n in self.links[layer][e] if n not in visited]
+            if not new:
+                continue
+            visited.update(new)
+            for s, n in zip(self._sims(q, new), new):
+                if len(best) &lt; ef or s &gt; best[0][0]:
+                    heapq.heappush(cand, (-s, n)); heapq.heappush(best, (s, n))
+                    if len(best) &gt; ef:
+                        heapq.heappop(best)
+        return sorted(best, reverse=True)
+
+    def _select(self, cands, m):
+        &quot;&quot;&quot;Neighbour heuristic: keep a candidate only if it is closer to the query than to every kept one.&quot;&quot;&quot;
+        kept = []
+        for s, c in cands:                                                    # cands sorted best first
+            if all(s &gt; float(self.X[c] @ self.X[r]) for _, r in kept):
+                kept.append((s, c))
+            if len(kept) == m:
+                break
+        return kept
+
+    def _insert(self, i):
+        L = int(-math.log(1.0 - self.rng.random()) * self.mL)
+        self.level.append(L)
+        while len(self.links) &lt;= L:
+            self.links.append([[] for _ in range(i)])           # a new top layer: no links yet
+        for layer in range(len(self.links)):
+            self.links[layer].append([])
+        if self.entry is None:
+            self.entry = i
+            return
+        q, ep = self.X[i], [self.entry]
+        for layer in range(self.level[self.entry], L, -1):                    # greedy descent above the new node&#x27;s top layer
+            ep = [self._search_layer(q, ep, 1, layer)[0][1]]
+        for layer in range(min(L, self.level[self.entry]), -1, -1):
+            W = self._search_layer(q, ep, self.efc, layer)
+            chosen = self._select(W, self.M)
+            self.links[layer][i] = [c for _, c in chosen]
+            cap = 2 * self.M if layer == 0 else self.M
+            for _, c in chosen:
+                self.links[layer][c].append(i)
+                if len(self.links[layer][c]) &gt; cap:                           # shrink an over-full neighbour list
+                    ids = self.links[layer][c]
+                    sc = sorted(zip(self.X[ids] @ self.X[c], ids), reverse=True)
+                    self.links[layer][c] = [n for _, n in self._select(sc, cap)]
+            ep = [n for _, n in W]
+        if L &gt; self.level[self.entry]:
+            self.entry = i
+
+    def search(self, q, k=10, ef=50):
+        ep = [self.entry]
+        for layer in range(self.level[self.entry], 0, -1):
+            ep = [self._search_layer(q, ep, 1, layer)[0][1]]
+        return [n for _, n in self._search_layer(q, ep, max(ef, k), 0)[:k]]
+
+if __name__ == &quot;__main__&quot;:
+    X, Q = make()
+    truth = exact_topk(X, Q, 10)
+    t0 = time.perf_counter()
+    g = HNSW(X, M=12, ef_construction=64)
+    print(f&quot;built {len(X):,} nodes in {time.perf_counter() - t0:.1f} s; layers: {len(g.links)}; &quot;
+          f&quot;nodes per layer: {[sum(1 for l in g.level if l &gt;= k) for k in range(len(g.links))]}&quot;)
+    print(f&quot;distance computations while building: {g.dist_calls / len(X):,.0f} per inserted vector\n&quot;)
+    print(&quot;   ef  recall@10  distances/query&quot;)
+    for ef in (10, 20, 40, 80, 160, 320):
+        found, cost = [], []
+        for q in Q:
+            before = g.dist_calls
+            found.append(g.search(q, 10, ef)); cost.append(g.dist_calls - before)
+        print(f&quot;{ef:&gt;5}  {recall_at_k(found, truth):&gt;9.3f}  {np.mean(cost):&gt;14,.0f}&quot;)</code></pre>
+</details>
+<pre class="terminal" data-title="output"><code>built 10,000 nodes in 7.7 s; layers: 4; nodes per layer: [10000, 870, 67, 4]
+distance computations while building: 897 per inserted vector
+
+   ef  recall@10  distances/query
+   10      0.600             284
+   20      0.726             422
+   40      0.830             683
+   80      0.921           1,187
+  160      0.976           2,102
+  320      0.996           3,567</code></pre>
+
+<p>The build took under ten seconds in plain Python for 10,000 vectors and produced four layers holding 10,000, 870, 67 and 4 nodes, close to the geometric 1/<em>M</em> shrinkage. Each insertion cost about 900 distance computations, so the build is far more expensive than the encode step of PQ. At query time <em>ef</em> = 80 gave 92.1% recall for 1,187 distances; <em>ef</em> = 320 gave 99.6% for 3,567. Compare that with IVF: 1,700 distances for 87.6%. The plot overlays the two curves.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Recall at 10 against distance computations per query on a logarithmic axis from 100 to 10,000, for two indexes over the same 10,000 vectors. The orange IVF curve rises from 0.55 at about 200 distances to 0.88 at about 1,700, 0.95 at about 3,300 and 0.995 at about 6,500. The blue HNSW curve rises from 0.60 at about 280 to 0.92 at about 1,200, 0.98 at about 2,100, 0.997 at about 3,600 and 1.0 at about 5,600. A dashed green line at 10,000 distances marks brute force with recall 1.0.">
+    <line x1="80" y1="200" x2="690" y2="200" class="line-thin"/><line x1="80" y1="30" x2="80" y2="200" class="line-thin"/>
+    <line x1="76" y1="200.0" x2="690" y2="200.0" class="line-thin" stroke-opacity="0.25"/>
+    <text x="72" y="204.0" text-anchor="end" class="t-xs t-faint">0.5</text>
+    <line x1="76" y1="166.0" x2="690" y2="166.0" class="line-thin" stroke-opacity="0.25"/>
+    <text x="72" y="170.0" text-anchor="end" class="t-xs t-faint">0.6</text>
+    <line x1="76" y1="132.0" x2="690" y2="132.0" class="line-thin" stroke-opacity="0.25"/>
+    <text x="72" y="136.0" text-anchor="end" class="t-xs t-faint">0.7</text>
+    <line x1="76" y1="98.0" x2="690" y2="98.0" class="line-thin" stroke-opacity="0.25"/>
+    <text x="72" y="102.0" text-anchor="end" class="t-xs t-faint">0.8</text>
+    <line x1="76" y1="64.0" x2="690" y2="64.0" class="line-thin" stroke-opacity="0.25"/>
+    <text x="72" y="68.0" text-anchor="end" class="t-xs t-faint">0.9</text>
+    <line x1="76" y1="30.0" x2="690" y2="30.0" class="line-thin" stroke-opacity="0.25"/>
+    <text x="72" y="34.0" text-anchor="end" class="t-xs t-faint">1.0</text>
+    <line x1="80.0" y1="200" x2="80.0" y2="204" class="line-thin"/><text x="80.0" y="218" text-anchor="middle" class="t-xs t-faint">100</text>
+    <line x1="225.5" y1="200" x2="225.5" y2="204" class="line-thin"/><text x="225.5" y="218" text-anchor="middle" class="t-xs t-faint">300</text>
+    <line x1="385.0" y1="200" x2="385.0" y2="204" class="line-thin"/><text x="385.0" y="218" text-anchor="middle" class="t-xs t-faint">1,000</text>
+    <line x1="530.5" y1="200" x2="530.5" y2="204" class="line-thin"/><text x="530.5" y="218" text-anchor="middle" class="t-xs t-faint">3,000</text>
+    <line x1="690.0" y1="200" x2="690.0" y2="204" class="line-thin"/><text x="690.0" y="218" text-anchor="middle" class="t-xs t-faint">10,000</text>
+    <text x="385.0" y="238" text-anchor="middle" class="t-xs t-muted">distance computations per query (log scale)</text>
+    <text x="26" y="115.0" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 26 115.0)">recall@10</text>
+    <line x1="690.0" y1="30" x2="690.0" y2="200" class="line-dash s-green"/>
+    <text x="684.0" y="192" text-anchor="end" class="t-xs tc-green t-bold">brute force: recall 1.0</text>
+    <path d="M174.1,183.5 L225.6,155.3 L293.2,127.1 L371.4,99.7 L455.3,72.2 L543.1,45.8 L632.8,31.5" class="line s-orange sw-2" fill="none"/>
+    <circle cx="174.1" cy="183.5" r="3.5" class="f-orange"/>
+    <circle cx="225.6" cy="155.3" r="3.5" class="f-orange"/>
+    <circle cx="293.2" cy="127.1" r="3.5" class="f-orange"/>
+    <circle cx="371.4" cy="99.7" r="3.5" class="f-orange"/>
+    <circle cx="455.3" cy="72.2" r="3.5" class="f-orange"/>
+    <circle cx="543.1" cy="45.8" r="3.5" class="f-orange"/>
+    <circle cx="632.8" cy="31.5" r="3.5" class="f-orange"/>
+    <path d="M218.5,166.2 L270.6,123.2 L334.5,88.0 L407.7,56.9 L483.4,38.3 L553.5,31.2 L612.6,30.0" class="line s-blue sw-2" fill="none"/>
+    <circle cx="218.5" cy="166.2" r="3.5" class="f-blue"/>
+    <circle cx="270.6" cy="123.2" r="3.5" class="f-blue"/>
+    <circle cx="334.5" cy="88.0" r="3.5" class="f-blue"/>
+    <circle cx="407.7" cy="56.9" r="3.5" class="f-blue"/>
+    <circle cx="483.4" cy="38.3" r="3.5" class="f-blue"/>
+    <circle cx="553.5" cy="31.2" r="3.5" class="f-blue"/>
+    <circle cx="612.6" cy="30.0" r="3.5" class="f-blue"/>
+    <text x="170.1" y="199.5" class="t-xs tc-orange t-bold">1</text>
+    <text x="377.4" y="115.7" class="t-xs tc-orange t-bold">8</text>
+    <text x="551.1" y="61.8" class="t-xs tc-orange t-bold">32</text>
+    <text x="200.5" y="158.2" class="t-xs tc-blue t-bold">10</text>
+    <text x="385.7" y="50.9" class="t-xs tc-blue t-bold">80</text>
+    <text x="457.4" y="32.3" class="t-xs tc-blue t-bold">160</text>
+    <text x="88" y="40" class="t-xs tc-orange t-bold">orange: IVF, 100 cells</text>
+    <text x="88" y="56" class="t-xs tc-blue t-bold">blue: HNSW, M = 12</text>
+  </svg>
+  <figcaption><strong>Pay more, find more.</strong> Both curves climb steeply at first and flatten near 1.0. On this synthetic data HNSW reaches a given recall with about 40 to 55 percent fewer distance computations than IVF; the gap and even the ordering vary with the data, so measure on yours. The numbers come from <code>curves.py</code>, which reruns the two listings above for more settings.</figcaption>
+</figure>
+
+<h3>What the benchmark curve hides</h3>
+<ul>
+  <li><strong>Memory.</strong> HNSW keeps full vectors <em>and</em> the links, so its memory is at least that of a flat index plus the graph (next section). The recall per distance is good; the footprint is not small.</li>
+  <li><strong>Random access.</strong> Each hop jumps to an unrelated address. In RAM that is fine; on an SSD, where each hop is a separate read, an unmodified HNSW is slow. Disk-oriented graph indexes such as DiskANN (Subramanya et al., 2019) lay out the graph and compressed vectors to reduce reads per query.</li>
+  <li><strong>Updates and deletes.</strong> Inserting works in the same way as build. Deleting a node leaves holes in other nodes' neighbour lists; most implementations mark the node as deleted and filter it out, so the graph degrades until it is rebuilt or repaired. A corpus with heavy churn needs a rebuild schedule.</li>
+  <li><strong>Filters.</strong> If you ask for the nearest vectors <em>that also satisfy a metadata filter</em>, a graph walk that must skip non-matching nodes can wander or dead-end, and post-filtering the top-<em>k</em> can return too few results. That is the subject of <a href="12-filters-permissions.html">chapter 12</a> and is a major reason systems with permissions need care.</li>
+</ul>
+
+<h2>The recall, latency and memory triangle</h2>
+
+<p>Every ANN index is a position in the space of three things you want and cannot have at once: high recall, low latency and small memory. Settings move you along one trade; the choice of index moves you to a different region.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="A triangle with corners labelled high recall at the top, low latency at the bottom left, and low memory at the bottom right. Flat exact search sits near the high recall corner. HNSW sits on the left edge between high recall and low latency. IVF with full vectors sits in the middle. IVF with product quantisation sits on the bottom edge between low latency and low memory. The placement is qualitative.">
+    <path d="M200,36 L50,226 L350,226 Z" fill="none" class="line s-purple sw-2"/>
+    <text x="200" y="24" text-anchor="middle" class="t-sm t-bold">High recall</text>
+    <text x="50" y="248" text-anchor="middle" class="t-sm t-bold">Low latency</text>
+    <text x="350" y="248" text-anchor="middle" class="t-sm t-bold">Low memory</text>
+    <circle cx="200" cy="98" r="7" class="f-green"/><text x="212" y="102" class="t-xs t-bold">Flat</text>
+    <circle cx="124" cy="146" r="7" class="f-blue"/><text x="136" y="150" class="t-xs t-bold">HNSW</text>
+    <circle cx="196" cy="176" r="7" class="f-orange"/><text x="208" y="180" class="t-xs t-bold">IVF</text>
+    <circle cx="256" cy="212" r="7" class="f-yellow"/><text x="268" y="204" class="t-xs t-bold">IVF-PQ</text>
+
+    <circle cx="430" cy="64" r="7" class="f-green"/>
+    <text x="446" y="62" class="t-sm t-bold">Flat (exact)</text>
+    <text x="446" y="80" class="t-xs t-muted">recall 1.0, scans everything, full memory</text>
+    <circle cx="430" cy="118" r="7" class="f-blue"/>
+    <text x="446" y="116" class="t-sm t-bold">HNSW</text>
+    <text x="446" y="134" class="t-xs t-muted">fast and accurate, memory above flat</text>
+    <circle cx="430" cy="172" r="7" class="f-orange"/>
+    <text x="446" y="170" class="t-sm t-bold">IVF with full vectors</text>
+    <text x="446" y="188" class="t-xs t-muted">tune nprobe; memory as flat</text>
+    <circle cx="430" cy="226" r="7" class="f-yellow"/>
+    <text x="446" y="224" class="t-sm t-bold">IVF-PQ</text>
+    <text x="446" y="242" class="t-xs t-muted">tiny and quick, lossy, needs a rerank</text>
+    <text x="380" y="282" text-anchor="middle" class="t-xs t-muted">Qualitative placement from this chapter's measurements and arithmetic, not a measured chart.</text>
+  </svg>
+  <figcaption><strong>No corner is free.</strong> Combinations exist (IVF cells with PQ codes, HNSW over compressed vectors with a rerank from disk) and large systems usually combine two ideas, such as FAISS's own index families that pair an IVF coarse step with a PQ code or an HNSW router over the cells.</figcaption>
+</figure>
+
+<p>The memory side is arithmetic, so do it before you choose. The listing prices 100 million 768-dimensional embeddings.</p>
+
+<pre class="terminal" data-title="memory.py"><code># What 100 million 768-dimensional embeddings cost to hold, by index design. A = assumption.
+N, D = 100_000_000, 768
+M = 16                 # A: HNSW links per node (layer 0 keeps up to 2*M)
+PQ_M = 96              # A: PQ sub-vectors (8 dimensions each), 1 byte per code
+ID = 8                 # bytes per stored vector id (int64)
+GB = 1e9
+
+rows = [
+ (&quot;flat, float32&quot;,                    N * D * 4),
+ (&quot;flat, float16&quot;,                    N * D * 2),
+ (&quot;flat, int8 (scalar quantised)&quot;,    N * D * 1),
+ (&quot;flat, 1 bit per dimension&quot;,        N * D // 8),
+ (&quot;HNSW over float32 vectors&quot;,        N * D * 4 + N * (2 * M * 4 + 4)),   # vectors + layer-0 links (2M x 4 B) + upper layers (~4 B)
+ (&quot;IVF-PQ, 96 bytes/code + id&quot;,       N * (PQ_M + ID)),
+ (&quot;IVF-PQ, 48 bytes/code + id&quot;,       N * (PQ_M // 2 + ID)),
+]
+print(f&quot;{&#x27;index design&#x27;:&lt;34}{&#x27;bytes/vector&#x27;:&gt;13}{&#x27;RAM (GB)&#x27;:&gt;10}&quot;)
+for name, total in rows:
+    print(f&quot;{name:&lt;34}{total / N:&gt;13,.0f}{total / GB:&gt;10,.1f}&quot;)
+print(&quot;\nIVF-PQ keeps full vectors elsewhere (disk) if you want to re-rank a shortlist with exact distances.&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>index design                       bytes/vector  RAM (GB)
+flat, float32                             3,072     307.2
+flat, float16                             1,536     153.6
+flat, int8 (scalar quantised)               768      76.8
+flat, 1 bit per dimension                    96       9.6
+HNSW over float32 vectors                 3,204     320.4
+IVF-PQ, 96 bytes/code + id                  104      10.4
+IVF-PQ, 48 bytes/code + id                   56       5.6
+
+IVF-PQ keeps full vectors elsewhere (disk) if you want to re-rank a shortlist with exact distances.</code></pre>
+
+<p>The span is 30 times: from 320 GB for HNSW over float32 (the vectors plus 132 bytes of links each) to 10.4 GB for PQ codes. That is the difference between a cluster and a single machine. It is also why practical systems store compressed vectors for the first pass and rescore a small shortlist with better ones, and why embeddings with fewer dimensions or lower precision are attractive when they lose little quality on your queries.</p>
+
+<h2>Try the idea in two dimensions</h2>
+
+<p>The widget places 260 points in 2D clusters. In <strong>IVF</strong> mode, points are coloured by cell; yellow rings mark the probed cells. In <strong>Graph</strong> mode, each point links to its four nearest neighbours (plus a few extra links so the graph is connected); the beam search starts from a fixed point (purple square), or from the best node of a sparse upper layer if you tick the box, which is the HNSW idea. Green rings are the five results, the red dashed ring is the true nearest neighbour, and the line at the bottom counts distance computations. Click the plot to move the query.</p>
+
+<div class="widget" id="ret11-ann">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">ANN explorer</h4></div>
+  <p class="widget-help">Move the query near a cluster boundary and use few probes: IVF misses neighbours across the boundary. In graph mode try ef = 1, then 6, then 30, with and without the upper layer.</p>
+  <div class="an-ctl">
+    <div><label for="an-mode">Index</label>
+      <select id="an-mode" data-act="mode"><option value="ivf" selected>IVF (12 cells)</option><option value="graph">Graph (HNSW-style)</option></select></div>
+    <div data-box="nprobe"><label for="an-nprobe">nprobe: <output data-act="nprobe-out">1</output></label><input id="an-nprobe" data-act="nprobe" type="range" min="1" max="12" step="1" value="1"></div>
+    <div data-box="ef" style="display:none"><label for="an-ef">ef: <output data-act="ef-out">6</output></label><input id="an-ef" data-act="ef" type="range" min="1" max="40" step="1" value="6"></div>
+    <div data-box="upper" style="display:none"><label><input type="checkbox" data-act="upper"> Start from the sparse upper layer</label></div>
+    <div><button class="btn small primary" type="button" data-act="random">Random query</button></div>
+  </div>
+  <svg class="an-plot" viewBox="0 0 400 300" role="img" aria-label="Scatter plot of 260 points in clusters with a query marker; the selected index scans some of the points, shown larger, and rings mark the results and the true nearest neighbour."></svg>
+  <div class="widget-out an-out" aria-live="polite"></div>
+  <p class="an-legend">Yellow cross: query. Red dashed ring: true nearest neighbour. Green rings: the 5 results returned. Orange (graph) or full-colour (IVF) points: compared with the query.</p>
+</div>
+
+<h2>Choosing and operating an index</h2>
+
+<ol class="steps">
+  <li><strong>Check whether you need one.</strong> FAISS's guidelines note that a flat index is the only one that guarantees exact results and is appropriate when you will do only a few thousand searches. At a few hundred thousand vectors, a brute-force scan on a modern CPU or GPU is often fast enough, simpler, and exact. Work out vectors &times; dimensions &times; bytes and compare with your latency target before adding an index.</li>
+  <li><strong>Get the memory budget first.</strong> Use the arithmetic above. If full vectors do not fit, you are choosing between PQ or other quantisation, a disk-based graph index, or sharding.</li>
+  <li><strong>Plot the recall curve on your data.</strong> Embed a sample of real queries, compute exact top-10 by brute force, then sweep <em>nprobe</em> or <em>efSearch</em> and record ANN recall@10 and p95 latency. Pick the cheapest point that meets your recall target (for example 0.95 to 0.99), with margin for growth.</li>
+  <li><strong>Check the end-to-end effect.</strong> Compare relevance metrics (chapters 4 and 5) at that setting against the exact search. If a reranker follows (<a href="08-rerankers.html">chapter 8</a>), deeper candidate lists compensate for some ANN loss.</li>
+  <li><strong>Plan for change.</strong> A new embedding model means a new index (vectors from different models are not comparable). Plan rebuilds for churn, drift and deletes, and keep the old index until the new one has been compared on your judged queries.</li>
+  <li><strong>Watch it in production.</strong> Sample queries against exact search periodically and alert when recall drifts; track latency percentiles, memory and build duration.</li>
+</ol>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Create a folder <code>ann/</code>, save the listings from this chapter into it (<code>data.py</code>, <code>kmeans.py</code>, <code>ivf.py</code>, <code>pq.py</code>, <code>hnsw.py</code>) and run them.</p>
+  <ul>
+    <li>In <code>data.py</code> change the noise factor 1.8 to 0.6 (clusters become well separated). What happens to IVF recall at <em>nprobe</em> = 1? What does that say about how much an index's recall depends on the data rather than the algorithm?</li>
+    <li>In <code>hnsw.py</code> build with <code>M=4</code> and with <code>M=24</code>. Plot recall at <em>ef</em> = 40 against distances for both. What does each cost you in build time and memory (use the FAISS formula)?</li>
+    <li>In <code>pq.py</code> keep <em>m</em> = 8 but rerank the top 20 instead of the top 100. How much recall do you lose, and how many full vectors per query do you save?</li>
+  </ul>
+  <pre class="terminal" data-title="terminal"><code><span class="prompt">$</span> <span class="cmd">python3 ivf.py &amp;&amp; python3 pq.py &amp;&amp; python3 hnsw.py</span></code></pre>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The pgvector extension for PostgreSQL offers both HNSW and IVFFlat indexes. Its README (read in October 2026) lists HNSW defaults of <code>m</code> = 16, <code>ef_construction</code> = 64 and <code>hnsw.ef_search</code> = 40; for IVFFlat it suggests <code>lists</code> of rows / 1000 up to a million rows and <code>probes</code> starting near the square root of <code>lists</code>, with a default of 1. It also documents half-precision, bit and sparse vector types and, since version 0.8.0, iterative index scans that keep searching until enough filtered results are found. FAISS's guidelines (also read this month) suggest an IVF cell count between 4&radic;N and 16&radic;N and name an IVF-with-HNSW-routing family for collections beyond a million vectors. Dedicated vector databases and search engines wrap the same families of index with their own defaults and names. Versions, limits and defaults change; read the documentation of the release you run, and rely on the recall curve you measure, not on a vendor's chart.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Exact search costs <em>N</em> &times; <em>d</em> operations and memory traffic per query. Tree indexes fail in high dimensions because distances concentrate and few coordinates can be split. ANN trades a little accuracy for a large saving.</li>
+    <li>ANN recall@k compares an index with exact search over the same embeddings. It is not relevance recall. Tune with the first, decide with the second.</li>
+    <li>IVF clusters vectors with k-means and scans only the <em>nprobe</em> nearest cells. Its failure mode is the cell boundary; <em>nprobe</em> buys recall at roughly linear cost.</li>
+    <li>Product quantisation stores one byte per sub-vector (for example 8 bytes for 256), scores with lookup tables, and needs a rerank from full vectors to reach high recall.</li>
+    <li>HNSW is a layered proximity graph: a greedy descent through sparse layers, then a beam search of width <em>efSearch</em> on layer 0. It gives high recall per distance computation, costs memory for the links, is expensive to build, and is awkward under deletes, disk and filters.</li>
+    <li>Do the memory arithmetic first (100 million 768-d vectors: 307 GB flat, 320 GB HNSW, about 10 GB PQ), then plot recall against cost on your own queries and data.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener">Malkov and Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs" (2016; TPAMI 2018)</a>. The HNSW paper: layers, search, insertion and the neighbour-selection heuristic.</li>
+  <li><a href="https://ieeexplore.ieee.org/document/5432202" target="_blank" rel="noopener">Jégou, Douze and Schmid, "Product Quantization for Nearest Neighbor Search" (TPAMI 2011)</a>. Product quantisation and asymmetric distance computation.</li>
+  <li><a href="https://arxiv.org/abs/1702.08734" target="_blank" rel="noopener">Johnson, Douze and Jégou, "Billion-scale similarity search with GPUs" (2017)</a>. The FAISS paper: brute-force, approximate and compressed-domain search on GPUs; see also <a href="../cases/case-05-faiss.html">case study 5</a>.</li>
+  <li><a href="https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index" target="_blank" rel="noopener">FAISS wiki, "Guidelines to choose an index"</a>. Practical rules for nlist, training size, flat versus HNSW versus PQ.</li>
+  <li><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener">pgvector README</a>. HNSW and IVFFlat in PostgreSQL, their parameters and filtered-search behaviour.</li>
+  <li><a href="https://papers.nips.cc/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html" target="_blank" rel="noopener">Subramanya et al., "DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node" (NeurIPS 2019)</a>. A graph index designed for SSDs and compressed vectors.</li>
+  <li><a href="https://arxiv.org/abs/2205.13147" target="_blank" rel="noopener">Kusupati et al., "Matryoshka Representation Learning" (NeurIPS 2022)</a>. Embeddings that stay useful when truncated to fewer dimensions.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Why do k-d trees, so effective in 2 or 3 dimensions, give little speed-up for 768-dimensional embeddings?</p>
+    <ol class="q-options"><li>They cannot store floating-point numbers</li><li>A tree splits on one coordinate per level, so it touches few of the 768 coordinates, and distances concentrate so there is little to prune</li><li>They require the data to be sorted by label</li><li>They only work for Euclidean distance on integers</li></ol>
+    <div class="q-explain">A tree with 27 levels over 100 million points splits on at most 27 coordinates, and the listing showed nearest/farthest distance ratios near 0.85 at 1,000 dimensions. Floating-point storage and metric choice are not the obstacle.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">An IVF index with nprobe = 1 misses neighbours for queries that sit close to the edge between two cells. What is the most direct fix?</p>
+    <ol class="q-options"><li>Retrain with fewer cells and a different random seed only</li><li>Switch to float64 vectors</li><li>Delete the centroids</li><li>Raise nprobe so that adjacent cells are scanned too, accepting more distance computations</li></ol>
+    <div class="q-explain">The neighbours are in a cell that was not probed. Probing more cells covers the boundary at roughly linear extra cost (the ivf.py output rose from 55% to 87.6% recall between nprobe 1 and 16). More precision in the numbers does not change which cell a vector belongs to.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">You store 768-dimensional float32 vectors as PQ codes with 96 sub-vectors of 1 byte. By what factor is each vector smaller, and what should you add to keep recall high?</p>
+    <ol class="q-options"><li>32 times smaller; rescore a shortlist with the full-precision vectors</li><li>8 times smaller; increase the vector dimension</li><li>96 times smaller; nothing, PQ is lossless</li><li>768 times smaller; retrain the embedding model</li></ol>
+    <div class="q-explain">768 &times; 4 = 3,072 bytes becomes 96 bytes: 32 times smaller. PQ is lossy (the pq.py table showed 37% recall at 8 bytes for 64 dimensions), and a rescoring step with full vectors recovers most of the loss.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">An HNSW index serves queries at 12 ms with recall@10 of 0.90. You need 0.97 and can afford more latency but no rebuild. Which parameter do you change?</p>
+    <ol class="q-options"><li>M, because it only affects query time</li><li>efConstruction, because it can be changed on a live index</li><li>efSearch, which widens the candidate list at query time and so trades latency for recall</li><li>The entry point of layer 0</li></ol>
+    <div class="q-explain">efSearch is a query-time setting (in hnsw.py, recall rose from 0.921 at ef 80 to 0.976 at ef 160 while distances rose from 1,187 to 2,102). M and efConstruction shape the graph and take effect only at build time.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A colleague says: "Our index has ANN recall@10 of 0.95, so 5% of user questions get a wrong answer." What is the right correction?</p>
+    <ol class="q-options"><li>They are right: the two numbers are the same thing</li><li>ANN recall measures agreement with exact search over the same embeddings; whether the missing 5% of neighbours matter depends on relevance, which you measure with judged queries and end-to-end metrics</li><li>ANN recall of 0.95 means 95% of answers are correct</li><li>Recall cannot be measured for an approximate index</li></ol>
+    <div class="q-explain">The missing neighbours may be lower-ranked and irrelevant, or a reranker may recover them; or the exact search may be wrong in the first place. Compute ANN recall against brute force to tune, and relevance metrics against judgements to decide.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Roughly how much memory does an HNSW index need for 50 million 1,024-dimensional float32 vectors with M = 16 (links stored as 4-byte ids, layer 0 holding up to 2M)?</p>
+    <ol class="q-options"><li>About 210 GB</li><li>About 50 GB</li><li>About 4 GB</li><li>About 2,000 GB</li></ol>
+    <div class="q-explain">Per vector: 1,024 &times; 4 = 4,096 bytes of data plus about 2 &times; 16 &times; 4 = 128 bytes of layer-0 links and a few bytes for upper layers, roughly 4,230 bytes. Times 50 million is about 211 GB. 50 GB would be a PQ-compressed size; the vectors alone are 205 GB.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/ret11-ann.js"></script>
+</body>
+</html>

@@ -1,0 +1,959 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Language-Modelling Objective · Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/dl14-surprise.css">
+</head>
+<body data-root="../.." data-course="dl" data-chapter="14">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>The Language-Modelling Objective</h1>
+  <p class="lede">Every large language model is trained on one number: the average surprise of the next token. This chapter derives that number from probability, shows why its gradient is so simple, translates it between nats, bits, perplexity and bits per byte, measures what a model has learned at each step up a ladder of simple baselines, and explains what a low loss does and does not tell you.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The loss is the one metric available at every step of every training run, it is the quantity scaling laws predict, and it is what you will watch when a run misbehaves. But it is easy to misread: perplexity numbers from different tokenisers cannot be compared, a masked loss is a different loss, and a loss that looks superb may come from a leak. After this chapter you can derive the cross-entropy objective and its gradient, convert any reported loss into bits per byte so that models with different tokenisers can be compared, explain what a given perplexity means, use n-gram baselines to judge whether a model has learned anything, and say what the objective teaches a model and what it leaves open. It builds on chapter 12's model and the information-theory background of A0 (the A0 chapters on maximum likelihood and on entropy and KL divergence), restated here so the chapter stands alone.</p>
+</div>
+
+<h2>Language as a chain of predictions</h2>
+
+<p>A <span class="term">language model</span> should say how probable any piece of text is. Write a text as tokens x<sub>1</sub>, x<sub>2</sub>, &hellip;, x<sub>N</sub>. The chain rule of probability, which is an identity and not a modelling assumption, says that the probability of the whole sequence is the product of each token's probability given everything before it:</p>
+<p style="text-align:center">p(x<sub>1</sub>, &hellip;, x<sub>N</sub>) = p(x<sub>1</sub>) &middot; p(x<sub>2</sub> | x<sub>1</sub>) &middot; p(x<sub>3</sub> | x<sub>1</sub>, x<sub>2</sub>) &middot; &hellip; &middot; p(x<sub>N</sub> | x<sub>1</sub>, &hellip;, x<sub>N&minus;1</sub>) = &prod;<sub>t</sub> p(x<sub>t</sub> | x<sub>&lt;t</sub>).</p>
+<p>So a model that can predict the next token from the previous ones, which is all a GPT does, defines a probability for every possible text, with no approximation. That is the justification for <span class="term">next-token prediction</span> as an objective: it is a complete description of a distribution over sequences, split into steps the network can learn one at a time. The other factorisations exist (predict a masked word from both sides, as BERT does; predict a sequence from another sequence, as translation models do), but the left-to-right one is the one that also lets you <em>sample</em> text, by drawing one token, appending it and repeating (chapter 15).</p>
+
+<p>The trained chapter-12 model can score a string with this product. The script below sums the log-probabilities of every character of a line given the characters before it, and does the same for two scrambled versions of the line: one with the words shuffled and one with the characters shuffled. Using logarithms turns the product into a sum and avoids numbers too small to store.</p>
+
+<pre class="terminal" data-title="seqprob.py"><code>import math, numpy as np
+from gpt_model import CFG, forward
+p = dict(np.load("gpt.npz"))
+text = open("input.txt", encoding="utf-8").read()
+chars = sorted(set(text)); stoi = {c: i for i, c in enumerate(chars)}
+val = text[int(0.9 * len(text)):]
+
+def log_prob(s):                                           # ln p(s) by the chain rule, from one forward pass
+    ids = np.array([[stoi[c] for c in s]])
+    lg = forward(p, ids[:, :-1], CFG)[0].astype(np.float64)
+    z = lg - lg.max(-1, keepdims=True); lp = z - np.log(np.exp(z).sum(-1, keepdims=True))
+    return float(lp[np.arange(len(s) - 1), ids[0, 1:]].sum())          # the first character is given, not predicted
+
+line = "Yet read the gamut of Hortensio.\n"
+rng = np.random.default_rng(0)
+words = line.split(" ")
+variants = {
+    "the real line": line,
+    "words shuffled": " ".join(rng.permutation(words)),
+    "characters shuffled": "".join(rng.permutation(list(line))),
+}
+for name, s in variants.items():
+    lp = log_prob(s)
+    print(f"{name:20s} {s!r:40s} ln p = {lp:7.1f}   per character {-lp / (len(s) - 1):.2f} nats")</code></pre>
+<pre class="terminal" data-title="output"><code>the real line        'Yet read the gamut of Hortensio.\n'     ln p =   -72.4   per character 2.26 nats
+words shuffled       'gamut the Hortensio.\n of Yet read'     ln p =   -84.4   per character 2.64 nats
+characters shuffled  'rif t mre.eYHo h\ntaeoo un sgdetta'     ln p =  -168.0   per character 5.25 nats</code></pre>
+
+<p>The real line costs 72.4 nats in total, 2.26 per character. Shuffling the <em>words</em> keeps the spelling but breaks the grammar, and the cost rises to 84.4: the model has learned something about word order, even at this tiny scale. Shuffling the <em>characters</em> keeps only the letter frequencies, and the cost jumps to 168 nats, 5.25 per character, which is <em>worse than guessing uniformly</em> (ln 65 = 4.17). The model is confident about structure that is not there, and confident predictions that turn out wrong are punished hard, as the next section shows.</p>
+
+<h2>Cross-entropy: the loss</h2>
+
+<p>We want the model's probabilities to be high for the text that actually occurs. The standard criterion is <span class="term">maximum likelihood</span>: choose the weights &theta; that maximise the probability the model assigns to the training text. Maximising a product is the same as maximising its logarithm, and it is conventional to <em>minimise</em> rather than maximise, so we minimise the negative log-likelihood, averaged over the N predictions so that its size does not depend on how much text we use:</p>
+<p style="text-align:center">L(&theta;) = &minus; (1/N) &sum;<sub>t</sub> ln p<sub>&theta;</sub>(x<sub>t</sub> | x<sub>&lt;t</sub>).</p>
+<p>This is the <span class="term">cross-entropy loss</span>. For each position the network outputs <span class="term">logits</span> z (one real number per vocabulary entry); the model's distribution is the <span class="term">softmax</span> p<sub>j</sub> = e<sup>z<sub>j</sub></sup> / &sum;<sub>k</sub> e<sup>z<sub>k</sub></sup>; and the loss at that position is &minus;ln p<sub>y</sub> where y is the true next token. A probability of 1 costs nothing, 0.5 costs 0.69, 0.1 costs 2.3, and the cost grows without bound as the probability approaches zero. Step through one position with five candidate words.</p>
+
+<div class="widget stepper" data-autoplay-ms="4000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One prediction: from logits to loss to gradient</h4></div>
+  <svg viewBox="0 0 760 310" role="img" aria-label="Five candidate words, mat, hat, cat, dog and the, in columns. Rows show the logits 2.0, 0.5, 1.0, minus 1.0 and 0.0; their exponentials 7.389, 1.649, 2.718, 0.368 and 1.0; the probabilities 0.563, 0.126, 0.207, 0.028 and 0.076; the loss minus the log of 0.563 which is 0.5744; and the gradient minus 0.437, plus 0.126, plus 0.207, plus 0.028 and plus 0.076.">
+<text x="190" y="28" text-anchor="middle" class="mono t-sm t-bold">mat</text>
+<text x="302" y="28" text-anchor="middle" class="mono t-sm t-bold">hat</text>
+<text x="414" y="28" text-anchor="middle" class="mono t-sm t-bold">cat</text>
+<text x="526" y="28" text-anchor="middle" class="mono t-sm t-bold">dog</text>
+<text x="638" y="28" text-anchor="middle" class="mono t-sm t-bold">the</text>
+<g data-steps="1-" data-active="1">
+<text x="10" y="66" class="t-sm t-bold">logits z</text>
+<rect x="146" y="44" width="88" height="32" rx="6" class="fs-blue s-blue sw-1"/><text x="190" y="65" text-anchor="middle" class="mono t-sm">+2.0</text>
+<rect x="258" y="44" width="88" height="32" rx="6" class="fs-blue s-blue sw-1"/><text x="302" y="65" text-anchor="middle" class="mono t-sm">+0.5</text>
+<rect x="370" y="44" width="88" height="32" rx="6" class="fs-blue s-blue sw-1"/><text x="414" y="65" text-anchor="middle" class="mono t-sm">+1.0</text>
+<rect x="482" y="44" width="88" height="32" rx="6" class="fs-blue s-blue sw-1"/><text x="526" y="65" text-anchor="middle" class="mono t-sm">-1.0</text>
+<rect x="594" y="44" width="88" height="32" rx="6" class="fs-blue s-blue sw-1"/><text x="638" y="65" text-anchor="middle" class="mono t-sm">+0.0</text>
+</g>
+<g data-steps="2-" data-active="2">
+<text x="10" y="112" class="t-sm t-bold">e^z</text>
+<rect x="146" y="90" width="88" height="32" rx="6" class="fs-teal s-teal sw-1"/><text x="190" y="111" text-anchor="middle" class="mono t-sm">7.389</text>
+<rect x="258" y="90" width="88" height="32" rx="6" class="fs-teal s-teal sw-1"/><text x="302" y="111" text-anchor="middle" class="mono t-sm">1.649</text>
+<rect x="370" y="90" width="88" height="32" rx="6" class="fs-teal s-teal sw-1"/><text x="414" y="111" text-anchor="middle" class="mono t-sm">2.718</text>
+<rect x="482" y="90" width="88" height="32" rx="6" class="fs-teal s-teal sw-1"/><text x="526" y="111" text-anchor="middle" class="mono t-sm">0.368</text>
+<rect x="594" y="90" width="88" height="32" rx="6" class="fs-teal s-teal sw-1"/><text x="638" y="111" text-anchor="middle" class="mono t-sm">1.000</text>
+</g>
+<g data-steps="3-" data-active="3">
+<text x="10" y="158" class="t-sm t-bold">p = e^z / sum</text>
+<rect x="146" y="136" width="88" height="32" rx="6" class="fs-purple s-purple sw-1"/><text x="190" y="157" text-anchor="middle" class="mono t-sm">0.563</text>
+<rect x="258" y="136" width="88" height="32" rx="6" class="fs-purple s-purple sw-1"/><text x="302" y="157" text-anchor="middle" class="mono t-sm">0.126</text>
+<rect x="370" y="136" width="88" height="32" rx="6" class="fs-purple s-purple sw-1"/><text x="414" y="157" text-anchor="middle" class="mono t-sm">0.207</text>
+<rect x="482" y="136" width="88" height="32" rx="6" class="fs-purple s-purple sw-1"/><text x="526" y="157" text-anchor="middle" class="mono t-sm">0.028</text>
+<rect x="594" y="136" width="88" height="32" rx="6" class="fs-purple s-purple sw-1"/><text x="638" y="157" text-anchor="middle" class="mono t-sm">0.076</text>
+</g>
+<g data-steps="2-"><text x="710" y="111" class="t-xs t-muted">sum = 13.124</text></g>
+<g data-steps="4-" data-active="4"><rect x="138" y="38" width="104" height="146" rx="8" fill="none" class="s-yellow sw-3"/><text x="190" y="204" text-anchor="middle" class="t-xs tc-yellow t-bold">the true next word</text></g>
+<g data-steps="5-" data-active="5"><text x="10" y="236" class="t-sm t-bold">loss</text><rect x="146" y="214" width="190" height="32" rx="6" class="fs-yellow s-yellow sw-2"/><text x="241" y="235" text-anchor="middle" class="mono t-sm">-ln 0.563 = 0.5744</text></g>
+<g data-steps="6" data-active="6"><text x="10" y="278" class="t-sm t-bold">gradient</text><text x="10" y="294" class="t-xs t-muted">p minus one-hot</text>
+<rect x="146" y="262" width="88" height="32" rx="6" class="fs-red s-red sw-1"/><text x="190" y="283" text-anchor="middle" class="mono t-sm">-0.437</text>
+<rect x="258" y="262" width="88" height="32" rx="6" class="fs-red s-red sw-1"/><text x="302" y="283" text-anchor="middle" class="mono t-sm">+0.126</text>
+<rect x="370" y="262" width="88" height="32" rx="6" class="fs-red s-red sw-1"/><text x="414" y="283" text-anchor="middle" class="mono t-sm">+0.207</text>
+<rect x="482" y="262" width="88" height="32" rx="6" class="fs-red s-red sw-1"/><text x="526" y="283" text-anchor="middle" class="mono t-sm">+0.028</text>
+<rect x="594" y="262" width="88" height="32" rx="6" class="fs-red s-red sw-1"/><text x="638" y="283" text-anchor="middle" class="mono t-sm">+0.076</text>
+</g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>The network's scores.</strong> After "the cat sat on the" the network gives each candidate a logit: a raw score, positive or negative, with no meaning until normalised.</li>
+    <li><strong>Exponentiate.</strong> e<sup>z</sup> makes every score positive and magnifies differences: a gap of 1 in the logits becomes a factor of 2.7. The five values add up to 13.124.</li>
+    <li><strong>Normalise: the softmax.</strong> Dividing by the sum gives probabilities that add to 1: "mat" 0.563, "cat" 0.207, and so on. This is the model's belief about the next word.</li>
+    <li><strong>Look up the truth.</strong> The text actually continued with "mat". Only this one probability enters the loss; the model gets no direct credit for how it spread the rest.</li>
+    <li><strong>Take &minus;ln.</strong> The loss is &minus;ln 0.563 = 0.574 nats (0.83 bits). Had the model given "mat" probability 0.99 the loss would be 0.01; at 0.01 it would be 4.6.</li>
+    <li><strong>The gradient.</strong> The derivative of this loss with respect to each logit is simply p minus the one-hot target: &minus;0.437 for "mat" (raise its logit) and +p for every other word (lower them, in proportion to how much probability they hold). The gradients add up to zero.</li>
+  </ol>
+</div>
+
+<p>Here is the same example in code, with the checks that matter: the gradient against finite differences, the numerical trap in softmax, and the relation between per-token loss, sequence probability and perplexity.</p>
+
+<pre class="terminal" data-title="ce_demo.py"><code>import math
+import numpy as np
+
+# Context: "the cat sat on the ___"; the true next word is "mat".
+words = ["mat", "hat", "cat", "dog", "the"]
+logits = np.array([2.0, 0.5, 1.0, -1.0, 0.0])
+target = 0
+
+z = logits - logits.max()                      # subtracting the max changes nothing and prevents overflow
+probs = np.exp(z) / np.exp(z).sum()
+loss = -math.log(probs[target])
+grad = probs.copy(); grad[target] -= 1         # d loss / d logits = p - onehot
+show = lambda a, f=".3f": "  ".join(f"{w} {x:{f}}" for w, x in zip(words, a))
+print("probs   ", show(probs))
+print(f"loss = -ln p(mat) = {loss:.4f} nats = {loss / math.log(2):.4f} bits;  perplexity of this one prediction = {math.exp(loss):.3f}")
+print("gradient", show(grad, "+.3f"), "  (sums to %.1f)" % grad.sum())
+
+# numerical check of that gradient
+eps, num = 1e-6, []
+for i in range(len(logits)):
+    lp, lm = logits.copy(), logits.copy(); lp[i] += eps; lm[i] -= eps
+    f = lambda l: -(l[target] - np.log(np.exp(l).sum()))
+    num.append((f(lp) - f(lm)) / (2 * eps))
+print("numerical", show(num, "+.3f"))
+
+# Why the loss is computed from logits, not from probabilities
+big = np.array([1000.0, 999.0, 0.0])
+with np.errstate(all="ignore"):
+    naive = np.exp(big) / np.exp(big).sum()
+    print("\nnaive softmax of [1000, 999, 0]:", naive, "-&gt; log:", np.log(naive))
+zb = big - big.max()
+print("log-sum-exp form             :", np.round(zb - np.log(np.exp(zb).sum()), 4).tolist())
+
+# A whole sequence: the loss is the mean of per-token losses, the sequence probability is their product
+p_correct = np.array([0.30, 0.55, 0.10, 0.80, 0.25])        # the model's probability for each true next token
+nll = -np.log(p_correct)
+print("\nper-token losses:", nll.round(3), " mean:", round(float(nll.mean()), 4))
+print("probability of the whole sequence:", round(float(p_correct.prod()), 5), " = exp(-sum) =", round(float(np.exp(-nll.sum())), 5))
+print("perplexity exp(mean loss):", round(float(np.exp(nll.mean())), 3), " = 1 / geometric mean of the probabilities:", round(float(1 / p_correct.prod() ** (1 / 5)), 3))
+
+# Loss masking: score only the positions that matter (here the last three), ignore the rest
+mask = np.array([0, 0, 1, 1, 1], bool)
+print("masked mean over the 3 answer positions:", round(float(nll[mask].mean()), 4), " (all five:", round(float(nll.mean()), 4), ")")</code></pre>
+<pre class="terminal" data-title="output"><code>probs    mat 0.563  hat 0.126  cat 0.207  dog 0.028  the 0.076
+loss = -ln p(mat) = 0.5744 nats = 0.8287 bits;  perplexity of this one prediction = 1.776
+gradient mat -0.437  hat +0.126  cat +0.207  dog +0.028  the +0.076   (sums to 0.0)
+numerical mat -0.437  hat +0.126  cat +0.207  dog +0.028  the +0.076
+
+naive softmax of [1000, 999, 0]: [nan nan  0.] -&gt; log: [ nan  nan -inf]
+log-sum-exp form             : [-0.3133, -1.3133, -1000.3133]
+
+per-token losses: [1.204 0.598 2.303 0.223 1.386]  mean: 1.1428
+probability of the whole sequence: 0.0033  = exp(-sum) = 0.0033
+perplexity exp(mean loss): 3.135  = 1 / geometric mean of the probabilities: 3.135
+masked mean over the 3 answer positions: 1.304  (all five: 1.1428 )</code></pre>
+
+<p>Three observations. The numerical gradient matches p &minus; one-hot to three decimals, which is the gradient chapter 12 used at the start of its backward pass. The naive softmax of logits [1000, 999, 0] returns NaN (exp(1000) overflows), while the log-sum-exp form, which subtracts the maximum first, is exact; this is why every framework offers a fused <code>cross_entropy(logits, targets)</code> and why you should never apply <code>log(softmax(x))</code> by hand (A0 chapter 11 covers the numerics). And for a sequence, the mean per-token loss is 1.1428, whose exponential is the perplexity 3.135.</p>
+
+<details class="deeper"><summary>Go deeper: why the gradient is p &minus; y, and what the loss really measures <span class="hint">optional derivations</span></summary>
+<p><b>The gradient.</b> With one-hot target y the loss is L = &minus;z<sub>y</sub> + ln &sum;<sub>k</sub> e<sup>z<sub>k</sub></sup>. The derivative with respect to z<sub>j</sub> has two terms. The first is &minus;1 if j = y and 0 otherwise. The second is e<sup>z<sub>j</sub></sup> / &sum;<sub>k</sub> e<sup>z<sub>k</sub></sup> = p<sub>j</sub>. So &part;L/&part;z<sub>j</sub> = p<sub>j</sub> &minus; 1[j = y]. Averaging over N positions divides by N. This is a general fact for softmax outputs trained with cross-entropy: the error signal is the predicted distribution minus the target distribution.</p>
+<p><b>Entropy and KL divergence.</b> Let the true next-token distribution at some context be p and the model's be q. The expected loss is the cross-entropy H(p, q) = &minus;&sum; p<sub>j</sub> ln q<sub>j</sub>. It splits exactly as H(p, q) = H(p) + KL(p &#x2016; q), where H(p) = &minus;&sum; p<sub>j</sub> ln p<sub>j</sub> is the entropy of the real distribution and KL(p &#x2016; q) = &sum; p<sub>j</sub> ln(p<sub>j</sub>/q<sub>j</sub>) &ge; 0 is the extra cost of using q instead of p. Two consequences. The loss can never go below the <em>entropy of the data</em>: some text is genuinely unpredictable (what name comes next in a list of strangers?) and no model can remove that part. And minimising the loss is the same as minimising the KL divergence from the true distribution to the model's, which is why the KL divergence reappears in every post-training method (A3 chapters 08 and 12), where it keeps a fine-tuned model close to the original.</p>
+<p><b>Why not accuracy?</b> Accuracy, the fraction of positions where the top prediction is right, is not differentiable and ignores confidence: a model that gives the right answer 0.51 and one that gives it 0.99 have the same accuracy. The log-loss rewards calibrated probabilities, is smooth, and is a <em>proper scoring rule</em>: its expected value is minimised exactly when the model's probabilities equal the true ones.</p>
+</details>
+
+<p>The sliders below make the shape of the loss tangible. They set the probability the model gave to the correct token at each of six positions of "the cat sat on the mat". Watch how a single very low probability, which is a confident mistake, dominates the average, and how perplexity relates to it.</p>
+
+<div class="widget" id="dl14-surprise">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Surprise, loss and perplexity</h4></div>
+  <p class="widget-help">Each slider is the probability the model assigned to the <em>true</em> next token (logarithmic scale, 0.001 to 1). The bars show &minus;ln p for each position; the yellow mark is the mean, the training loss. The right-hand column is the gradient of the loss on that token's own logit: close to zero when the model is right, close to &minus;1 when it is badly wrong. Try the presets, then drag one slider to 0.001.</p>
+  <div class="widget-row">
+    <button class="btn" type="button" data-preset="mixed">Mixed</button>
+    <button class="btn" type="button" data-preset="uniform">Uniform over 50 words</button>
+    <button class="btn" type="button" data-preset="sure">Confident and right</button>
+    <button class="btn" type="button" data-preset="oops">One confident mistake</button>
+  </div>
+  <div class="dl14-sliders"></div>
+  <svg class="dl14-chart" viewBox="0 0 720 250" role="img" aria-label="Bars showing the loss at each of six positions, the mean loss, and the gradient on each correct token's logit."></svg>
+  <p class="dl14-summary widget-out"></p>
+</div>
+
+<h2>Units: nats, bits, perplexity and bits per byte</h2>
+
+<p>The same quantity is quoted in several units, and confusing them is a common source of bad comparisons.</p>
+<ul>
+  <li><b>Nats per token.</b> The natural logarithm, what frameworks compute. The loss of a model that guesses uniformly over V tokens is ln V.</li>
+  <li><b>Bits per token.</b> The same loss divided by ln 2 = 0.693. The loss is the average number of bits an ideal compressor using the model's probabilities would need per token (arithmetic coding makes this literal), which is why information theory describes it.</li>
+  <li><span class="term">Perplexity</span>, exp(L). It is the inverse geometric mean of the probabilities given to the true tokens, and has a readable meaning: <b>the model is as uncertain as if it were picking uniformly among exp(L) equally likely options at each step.</b> A perplexity of 65 over a 65-character vocabulary means the model knows nothing; 5.3 means it narrows each prediction down to about five characters. The example in <code>ce_demo.py</code> has perplexity 3.1.</li>
+  <li><span class="term">Bits per byte</span> (bpb) or bits per character: the total bits needed, divided by the number of bytes or characters of the original text, not the number of tokens.</li>
+</ul>
+
+<p>The last unit exists because <b>perplexity per token depends on the tokeniser</b>. A model that predicts bigger chunks (longer tokens) has fewer, harder predictions and a higher per-token perplexity, even if it is no worse at predicting the text. To compare models with different tokenisers you convert to a per-byte figure: bits per byte = (loss in nats per token &times; tokens) / (bytes &times; ln 2). The next script trains simple count-based models at two granularities on Shakespeare and compares them in both ways. The model family is the same (an interpolated n-gram model, defined in the next section) at the character level and at the level of the 768-token BPE vocabulary of chapter 13.</p>
+
+<pre class="terminal" data-title="lm_bpb.py"><code>import math
+from collections import defaultdict, Counter
+import numpy as np
+from bpe import train_bpe, encode
+
+text = open("input.txt", encoding="utf-8").read()
+cut = int(0.9 * len(text)); train_t, val_t = text[:cut], text[cut:]
+
+def wb_loss(train, val, V, hist_len):
+    """Mean negative log-likelihood (nats per symbol) of an interpolated (Witten-Bell) model."""
+    ctx = [defaultdict(Counter) for _ in range(hist_len + 1)]
+    for i in range(len(train)):
+        for k in range(min(hist_len, i) + 1):
+            ctx[k][tuple(train[i - k:i])][train[i]] += 1
+    tot = [{h: sum(c.values()) for h, c in d.items()} for d in ctx]
+    nll = 0.0
+    for i in range(len(val)):
+        p = 1.0 / V
+        for k in range(min(hist_len, i) + 1):
+            h = tuple(val[i - k:i]); cnt = ctx[k].get(h)
+            if cnt is None: break
+            p = (cnt[val[i]] + len(cnt) * p) / (tot[k][h] + len(cnt))
+        nll -= math.log(p)
+    return nll / len(val)
+
+merges = train_bpe(train_t, 512)
+rows = []
+chars_tr = [ord(c) for c in train_t]; chars_va = [ord(c) for c in val_t]
+tok_tr, tok_va = encode(train_t, merges), encode(val_t, merges)
+nbytes = len(val_t.encode())
+print(f"validation text: {nbytes:,} bytes; as characters {len(chars_va):,} symbols; as BPE tokens (V=768) {len(tok_va):,} symbols")
+print(f"{'model':26s} {'loss/symbol':&gt;11s} {'perplexity':&gt;11s} {'bits per byte':&gt;14s}")
+for name, tr, va, V, hl in [("characters, bigram", chars_tr, chars_va, 65, 1), ("characters, 5-gram", chars_tr, chars_va, 65, 4),
+                            ("BPE tokens, unigram", tok_tr, tok_va, 768, 0), ("BPE tokens, bigram", tok_tr, tok_va, 768, 1)]:
+    l = wb_loss(tr, va, V, hl)
+    print(f"{name:26s} {l:11.3f} {math.exp(l):11.1f} {l * len(va) / nbytes / math.log(2):14.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>validation text: 111,540 bytes; as characters 111,540 symbols; as BPE tokens (V=768) 53,009 symbols
+model                      loss/symbol  perplexity  bits per byte
+characters, bigram               2.486        12.0          3.586
+characters, 5-gram               1.669         5.3          2.408
+BPE tokens, unigram              5.507       246.5          3.776
+BPE tokens, bigram               3.871        48.0          2.654</code></pre>
+
+<p>The character 5-gram has perplexity 5.3 per character, the BPE-token bigram 48.0 per token. Judged by perplexity the second is nine times worse, which is nonsense: its tokens are about twice as long. In bits per byte the two are 2.41 and 2.65, a fair comparison that says the character model with four characters of context is a little better than a token model with one token (about 2 bytes) of context. This is why the Pile benchmark (Gao et al., 2020) reports bits per byte for its evaluation sets, and why a published perplexity is meaningful only next to its tokeniser and test set.</p>
+
+<h2>What the model learns from predicting the next token</h2>
+
+<p>An informal way to measure what a model has learned is to compare it with simple models that use less context. Count-based <span class="term">n-gram models</span> predict the next character from the previous n&minus;1 characters by counting how often each followed that history in the training text. The script computes them with interpolated (Witten-Bell) smoothing, which mixes each order with the order below it so that unseen contexts do not get probability zero, and scores them on the same held-out text as the trained chapter-12 GPT, in three ways.</p>
+
+<pre class="terminal" data-title="lm_ladder.py"><code>import math
+from collections import defaultdict, Counter
+import numpy as np
+from gpt_model import CFG, forward, cross_entropy
+
+text = open("input.txt", encoding="utf-8").read()
+chars = sorted(set(text)); V = len(chars)
+n = int(0.9 * len(text)); train, val = text[:n], text[n:]
+
+# ---- count-based models: interpolated n-grams (Witten-Bell smoothing) ----
+N = 6
+ctx = [defaultdict(Counter) for _ in range(N)]            # ctx[k][history of k characters][next char] = count
+for i in range(len(train)):
+    for k in range(min(N, i + 1)):
+        ctx[k][train[i - k:i]][train[i]] += 1
+tot = [{h: sum(c.values()) for h, c in d.items()} for d in ctx]
+
+def prob(c, hist, order):                                  # order = number of history characters used
+    p = 1.0 / V
+    for k in range(order + 1):
+        h = hist[len(hist) - k:] if k else ""
+        cnt = ctx[k].get(h)
+        if cnt is None: break
+        types = len(cnt)
+        p = (cnt[c] + types * p) / (tot[k][h] + types)
+    return p
+
+print("model                       val loss (nats/char)   bits/char   perplexity")
+print(f"{'uniform over 65 characters':27s} {math.log(V):10.3f} {math.log(V)/math.log(2):15.2f} {V:12.1f}")
+for order in range(0, N):
+    loss = -np.mean([math.log(prob(val[i], val[max(0, i - order):i], order)) for i in range(len(val))])
+    name = {0: "unigram", 1: "bigram (1 char of context)"}.get(order, f"{order + 1}-gram ({order} chars of context)")
+    print(f"{name:27s} {loss:10.3f} {loss/math.log(2):15.2f} {math.exp(loss):12.1f}")
+
+# ---- the trained Transformer on the same val text, scored in three ways ----
+p = {k: v.astype(np.float64) for k, v in np.load("gpt.npz").items()}
+stoi = {c: i for i, c in enumerate(chars)}
+v = np.array([stoi[c] for c in val]); T = CFG["T"]
+
+def losses_for(starts, T=T):
+    x = np.stack([v[s:s + T] for s in starts]); y = np.stack([v[s + 1:s + T + 1] for s in starts])
+    out = []
+    for i in range(0, len(starts), 64):
+        lg = forward(p, x[i:i + 64], CFG); z = lg - lg.max(-1, keepdims=True)
+        lp = z - np.log(np.exp(z).sum(-1, keepdims=True))
+        out.append(-np.take_along_axis(lp, y[i:i + 64, :, None], -1)[..., 0])
+    return np.concatenate(out)                             # (windows, T) per-character losses
+
+starts = list(range(0, len(v) - T - 1, T))
+L = losses_for(starts)
+print(f"\nGPT, non-overlapping windows of {T}: {L.mean():.3f} nats/char  ({len(starts)} windows)")
+print("loss by position in the window:", " ".join(f"{L[:, t].mean():.2f}" for t in (0, 1, 2, 3, 7, 15, 31, 47, 63)), "  (positions 0 1 2 3 7 15 31 47 63)")
+np.save("pos_loss.npy", L.mean(0))
+starts2 = list(range(0, len(v) - T - 1, 16))
+L2 = losses_for(starts2)
+print(f"GPT, stride 16, scoring only the last 16 positions of each window: {L2[:, -16:].mean():.3f} nats/char")</code></pre>
+<pre class="terminal" data-title="output"><code>model                       val loss (nats/char)   bits/char   perplexity
+uniform over 65 characters       4.174            6.02         65.0
+unigram                          3.347            4.83         28.4
+bigram (1 char of context)       2.486            3.59         12.0
+3-gram (2 chars of context)      2.049            2.96          7.8
+4-gram (3 chars of context)      1.774            2.56          5.9
+5-gram (4 chars of context)      1.669            2.41          5.3
+6-gram (5 chars of context)      1.698            2.45          5.5
+
+GPT, non-overlapping windows of 64: 1.738 nats/char  (1742 windows)
+loss by position in the window: 2.51 2.11 1.91 1.84 1.72 1.75 1.74 1.70 1.79   (positions 0 1 2 3 7 15 31 47 63)
+GPT, stride 16, scoring only the last 16 positions of each window: 1.712 nats/char</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 296" role="img" aria-label="Horizontal bars of validation loss in nats per character: uniform 4.174, unigram 3.347, bigram 2.486, 3-gram 2.049, 4-gram 1.774, 5-gram 1.669, 6-gram 1.698 and the tiny GPT 1.730, with bits per character at the right.">
+<text x="10.0" y="16.0" class="t-xs t-muted">model</text>
+<text x="662.0" y="16.0" class="t-xs t-muted">bits/char</text>
+<text x="200.0" y="42.0" text-anchor="end" class="t-sm">uniform over 65</text>
+<rect x="210.0" y="29.0" width="417.4" height="20.0" rx="3" class="box s-blue sw-1"/>
+<text x="635.4" y="44.0" class="mono t-sm">4.174</text>
+<text x="662.0" y="44.0" class="mono t-xs t-muted">6.02</text>
+<text x="200.0" y="72.0" text-anchor="end" class="t-sm">unigram</text>
+<rect x="210.0" y="59.0" width="334.7" height="20.0" rx="3" class="f-orange"/>
+<text x="552.7" y="74.0" class="mono t-sm">3.347</text>
+<text x="662.0" y="74.0" class="mono t-xs t-muted">4.83</text>
+<text x="200.0" y="102.0" text-anchor="end" class="t-sm">bigram (1 char of context)</text>
+<rect x="210.0" y="89.0" width="248.6" height="20.0" rx="3" class="f-yellow"/>
+<text x="466.6" y="104.0" class="mono t-sm">2.486</text>
+<text x="662.0" y="104.0" class="mono t-xs t-muted">3.59</text>
+<text x="200.0" y="132.0" text-anchor="end" class="t-sm">3-gram</text>
+<rect x="210.0" y="119.0" width="204.9" height="20.0" rx="3" class="f-yellow"/>
+<text x="422.9" y="134.0" class="mono t-sm">2.049</text>
+<text x="662.0" y="134.0" class="mono t-xs t-muted">2.96</text>
+<text x="200.0" y="162.0" text-anchor="end" class="t-sm">4-gram</text>
+<rect x="210.0" y="149.0" width="177.4" height="20.0" rx="3" class="f-yellow"/>
+<text x="395.4" y="164.0" class="mono t-sm">1.774</text>
+<text x="662.0" y="164.0" class="mono t-xs t-muted">2.56</text>
+<text x="200.0" y="192.0" text-anchor="end" class="t-sm">5-gram</text>
+<rect x="210.0" y="179.0" width="166.9" height="20.0" rx="3" class="f-yellow"/>
+<text x="384.9" y="194.0" class="mono t-sm">1.669</text>
+<text x="662.0" y="194.0" class="mono t-xs t-muted">2.41</text>
+<text x="200.0" y="222.0" text-anchor="end" class="t-sm">6-gram</text>
+<rect x="210.0" y="209.0" width="169.8" height="20.0" rx="3" class="f-yellow"/>
+<text x="387.8" y="224.0" class="mono t-sm">1.698</text>
+<text x="662.0" y="224.0" class="mono t-xs t-muted">2.45</text>
+<text x="200.0" y="252.0" text-anchor="end" class="t-sm t-bold">tiny GPT (108,352 weights)</text>
+<rect x="210.0" y="239.0" width="173.0" height="20.0" rx="3" class="f-blue"/>
+<text x="391.0" y="254.0" class="mono t-sm">1.730</text>
+<text x="662.0" y="254.0" class="mono t-xs t-muted">2.50</text>
+<line x1="210.0" y1="22.0" x2="210.0" y2="266.0" class="line-thin"/>
+<text x="430.0" y="280.0" text-anchor="middle" class="t-xs t-muted">validation loss, nats per character (lower is better)</text>
+  </svg>
+  <figcaption><strong>The ladder.</strong> Each step of context removes uncertainty. Counting gets down to 1.67 nats (2.41 bits) per character with four characters of context; a 6-gram does slightly worse because most of its contexts have been seen too few times. The tiny GPT sits at 1.73.</figcaption>
+</figure>
+
+<p>The ladder shows the general pattern of what next-token prediction teaches. With no context the best strategy is the letter frequencies (4.17 to 3.35). One character of context captures spelling's local constraints, such as "q" being followed by "u" and "th" being followed by a vowel (3.35 to 2.49). Two and three characters capture syllables and short words (2.05, 1.77). By five characters or so, a table of counts runs out of data: the 6-gram, with 65<sup>5</sup> possible contexts, is worse than the 5-gram. A neural model does not keep a table, so it can share statistical strength between similar contexts, which is its advantage as the context and the data grow. Beyond spelling, a larger model trained on more text must predict words, sentences and arguments, and each of these costs a little of the remaining loss: grammar, facts, style, arithmetic, how a character in a story would react. This is the claim of the whole field: <b>a good enough predictor of text has to model much of what the text is about</b>. The claim is empirical and gets stronger with scale; at 108,352 weights the model has only learned spelling and layout.</p>
+
+<p>Two of the three numbers at the bottom of the output deserve a comment. The 1.738 is the loss on non-overlapping windows of 64 characters, which is how <code>estimate</code> evaluates. In such a scheme the early characters of each window have little context. Scoring only the <em>last</em> 16 positions of windows slid forward 16 characters at a time (every scored character has at least 48 characters of context) gives 1.712, a more honest figure for what the model can do. This sliding-window evaluation is standard practice for perplexity with a fixed context length (the Hugging Face documentation on "perplexity of fixed-length models" explains it); using non-overlapping windows overstates the loss. And the row of numbers for positions shows the effect directly.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 286" role="img" aria-label="Validation loss of the tiny GPT by position in a 64-character window. It starts at 2.51 at position 0, 2.11 at position 1 and 1.91 at position 2, reaches about 1.72 by position 8 and stays between 1.70 and 1.79 to position 63.">
+<rect x="70.0" y="20.0" width="650.0" height="212.0" rx="4" class="box" opacity="0.35"/>
+<line x1="70.0" y1="214.3" x2="720.0" y2="214.3" class="line-thin"/>
+<text x="62.0" y="218.3" text-anchor="end" class="t-xs t-muted">1.6</text>
+<line x1="70.0" y1="179.0" x2="720.0" y2="179.0" class="line-thin"/>
+<text x="62.0" y="183.0" text-anchor="end" class="t-xs t-muted">1.8</text>
+<line x1="70.0" y1="143.7" x2="720.0" y2="143.7" class="line-thin"/>
+<text x="62.0" y="147.7" text-anchor="end" class="t-xs t-muted">2.0</text>
+<line x1="70.0" y1="108.3" x2="720.0" y2="108.3" class="line-thin"/>
+<text x="62.0" y="112.3" text-anchor="end" class="t-xs t-muted">2.2</text>
+<line x1="70.0" y1="73.0" x2="720.0" y2="73.0" class="line-thin"/>
+<text x="62.0" y="77.0" text-anchor="end" class="t-xs t-muted">2.4</text>
+<line x1="70.0" y1="37.7" x2="720.0" y2="37.7" class="line-thin"/>
+<text x="62.0" y="41.7" text-anchor="end" class="t-xs t-muted">2.6</text>
+<line x1="70.0" y1="232.0" x2="70.0" y2="237.0" class="line-thin"/>
+<text x="70.0" y="251.0" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="152.5" y1="232.0" x2="152.5" y2="237.0" class="line-thin"/>
+<text x="152.5" y="251.0" text-anchor="middle" class="t-xs t-muted">8</text>
+<line x1="235.1" y1="232.0" x2="235.1" y2="237.0" class="line-thin"/>
+<text x="235.1" y="251.0" text-anchor="middle" class="t-xs t-muted">16</text>
+<line x1="317.6" y1="232.0" x2="317.6" y2="237.0" class="line-thin"/>
+<text x="317.6" y="251.0" text-anchor="middle" class="t-xs t-muted">24</text>
+<line x1="400.2" y1="232.0" x2="400.2" y2="237.0" class="line-thin"/>
+<text x="400.2" y="251.0" text-anchor="middle" class="t-xs t-muted">32</text>
+<line x1="482.7" y1="232.0" x2="482.7" y2="237.0" class="line-thin"/>
+<text x="482.7" y="251.0" text-anchor="middle" class="t-xs t-muted">40</text>
+<line x1="565.2" y1="232.0" x2="565.2" y2="237.0" class="line-thin"/>
+<text x="565.2" y="251.0" text-anchor="middle" class="t-xs t-muted">48</text>
+<line x1="647.8" y1="232.0" x2="647.8" y2="237.0" class="line-thin"/>
+<text x="647.8" y="251.0" text-anchor="middle" class="t-xs t-muted">56</text>
+<line x1="720.0" y1="232.0" x2="720.0" y2="237.0" class="line-thin"/>
+<text x="720.0" y="251.0" text-anchor="middle" class="t-xs t-muted">63</text>
+<line x1="70" y1="190.0" x2="720" y2="190.0" class="line-dash s-green sw-1"/>
+<text x="716.0" y="184.0" text-anchor="end" class="t-xs t-muted">mean over the window 1.74</text>
+<path d="M70.0,53.0 L80.3,124.8 L90.6,160.3 L101.0,171.8 L111.3,176.0 L121.6,189.3 L131.9,185.7 L142.2,193.1 L152.5,193.3 L162.9,201.8 L173.2,191.2 L183.5,198.4 L193.8,189.8 L204.1,180.5 L214.4,184.5 L224.8,187.9 L235.1,202.0 L245.4,196.9 L255.7,203.3 L266.0,199.3 L276.3,202.2 L286.7,188.9 L297.0,193.4 L307.3,187.9 L317.6,183.1 L327.9,197.7 L338.3,201.9 L348.6,195.0 L358.9,188.2 L369.2,204.9 L379.5,205.2 L389.8,190.3 L400.2,194.0 L410.5,197.1 L420.8,200.2 L431.1,193.1 L441.4,194.6 L451.7,187.8 L462.1,205.4 L472.4,190.7 L482.7,191.0 L493.0,184.5 L503.3,185.4 L513.7,190.4 L524.0,192.5 L534.3,193.6 L544.6,189.2 L554.9,196.0 L565.2,197.9 L575.6,187.9 L585.9,195.5 L596.2,194.9 L606.5,202.7 L616.8,198.0 L627.1,204.4 L637.5,206.5 L647.8,198.9 L658.1,192.0 L668.4,204.9 L678.7,187.3 L689.0,208.1 L699.4,203.4 L709.7,188.5 L720.0,181.4" fill="none" class="line s-blue sw-2"/>
+<text x="80.0" y="57.0" class="t-xs">position 0: 2.51</text>
+<text x="152.5" y="169.3" text-anchor="middle" class="t-xs">position 8: 1.72</text>
+<text x="395.0" y="270.0" text-anchor="middle" class="t-xs t-muted">position in the 64-character window (0 = first character, which has only itself as context)</text>
+<text transform="translate(16,126) rotate(-90)" text-anchor="middle" class="t-xs t-muted">loss, nats</text>
+  </svg>
+  <figcaption><strong>Context helps, up to a point.</strong> Loss by position in the window, averaged over 1,742 held-out windows. The first characters, with almost no context, are the hardest; after about eight characters the curve is flat. This model barely uses context beyond eight characters, in agreement with the local attention heads of chapter 12.</figcaption>
+</figure>
+
+<p>For a model that is large enough to use its context, the curve keeps falling for hundreds or thousands of positions, which is how Kaplan et al. (2020) describe larger Transformers. That decline is exactly what a longer context window buys, and what measures whether a long-context model really uses its context.</p>
+
+<h3>Where the surprise is</h3>
+
+<p>The average hides the structure. The script below computes the surprisal (&minus;log<sub>2</sub> p, in bits) of every character in 120 held-out characters, giving each character up to 64 characters of context, and the figure shows it as a bar under each character.</p>
+
+<pre class="terminal" data-title="surprisal.py"><code>import math, numpy as np
+from gpt_model import CFG, forward
+p = dict(np.load("gpt.npz"))
+text = open("input.txt", encoding="utf-8").read()
+chars = sorted(set(text)); stoi = {c: i for i, c in enumerate(chars)}
+val = text[int(0.9 * len(text)):]
+T = CFG["T"]
+
+start = val.index("\n\n", 20000) + 2                       # a stretch of held-out text
+snippet = val[start:start + 120]
+ids = np.array([stoi[c] for c in val[start - T:start + 120]])
+bits = []
+for j in range(T, len(ids)):                               # score each character given up to T before it
+    lg = forward(p, ids[None, max(0, j - T):j], CFG)[0, -1].astype(np.float64)
+    z = lg - lg.max(); logp = z - np.log(np.exp(z).sum())
+    bits.append(-logp[ids[j]] / math.log(2))               # surprisal of the true character, in bits
+bits = np.array(bits)
+
+print(f"{len(snippet)} held-out characters, mean surprisal {bits.mean():.2f} bits "
+      f"(median {np.median(bits):.2f}, maximum {bits.max():.1f})")
+print("cheapest:", ", ".join(f"{snippet[i]!r} {bits[i]:.1f}" for i in np.argsort(bits)[:4]), "bits")
+print("dearest :", ", ".join(f"{snippet[i]!r} {bits[i]:.1f}" for i in np.argsort(-bits)[:4]), "bits")
+start_bits = [b for i, b in enumerate(bits) if i == 0 or snippet[i - 1] in " \n"]
+other_bits = [b for i, b in enumerate(bits) if not (i == 0 or snippet[i - 1] in " \n")]
+print(f"first letter of a word or line: {np.mean(start_bits):.2f} bits;  all other characters: {np.mean(other_bits):.2f} bits")
+np.save("snip_bits.npy", bits); open("snip.txt", "w").write(snippet)</code></pre>
+<pre class="terminal" data-title="output"><code>120 held-out characters, mean surprisal 2.60 bits (median 2.39, maximum 7.7)
+cheapest: '\n' 0.0, '\n' 0.0, '\n' 0.0, ' ' 0.0 bits
+dearest : '.' 7.7, 'u' 7.5, 'u' 7.4, 'H' 7.4 bits
+first letter of a word or line: 4.28 bits;  all other characters: 2.20 bits</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 246" role="img" aria-label="Three lines of a Shakespeare excerpt, each character with a bar under it whose height is the model's surprisal in bits. Speaker names such as BIANCA and word-initial letters have tall bars, while the newline after a speaker's colon, spaces and the ends of words have almost none.">
+<rect x="14.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="14.0" y="52.9" width="15.5" height="23.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="21.8" y="28.0" text-anchor="middle" class="mono t-sm">B</text>
+<rect x="31.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="31.5" y="46.1" width="15.5" height="29.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="39.2" y="28.0" text-anchor="middle" class="mono t-sm">I</text>
+<rect x="49.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="49.0" y="56.8" width="15.5" height="19.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="56.8" y="28.0" text-anchor="middle" class="mono t-sm">A</text>
+<rect x="66.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="66.5" y="69.3" width="15.5" height="6.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="74.2" y="28.0" text-anchor="middle" class="mono t-sm">N</text>
+<rect x="84.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="84.0" y="53.6" width="15.5" height="22.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="91.8" y="28.0" text-anchor="middle" class="mono t-sm">C</text>
+<rect x="101.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="101.5" y="71.7" width="15.5" height="4.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="109.2" y="28.0" text-anchor="middle" class="mono t-sm">A</text>
+<rect x="119.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="119.0" y="73.8" width="15.5" height="2.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="126.8" y="28.0" text-anchor="middle" class="mono t-sm">:</text>
+<rect x="136.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="136.5" y="75.9" width="15.5" height="0.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="144.2" y="28.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="154.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="154.0" y="60.3" width="15.5" height="15.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="161.8" y="28.0" text-anchor="middle" class="mono t-sm">W</text>
+<rect x="171.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="171.5" y="72.8" width="15.5" height="3.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="179.2" y="28.0" text-anchor="middle" class="mono t-sm">h</text>
+<rect x="189.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="189.0" y="62.8" width="15.5" height="13.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="196.8" y="28.0" text-anchor="middle" class="mono t-sm">y</text>
+<rect x="206.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="206.5" y="71.9" width="15.5" height="4.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="214.2" y="28.0" text-anchor="middle" class="mono t-sm">,</text>
+<rect x="224.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="224.0" y="75.9" width="15.5" height="0.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="231.8" y="28.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="241.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="241.5" y="54.2" width="15.5" height="21.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="249.2" y="28.0" text-anchor="middle" class="mono t-sm">I</text>
+<rect x="259.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="259.0" y="74.3" width="15.5" height="1.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="266.8" y="28.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="276.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="276.5" y="59.3" width="15.5" height="16.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="284.2" y="28.0" text-anchor="middle" class="mono t-sm">a</text>
+<rect x="294.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="294.0" y="75.1" width="15.5" height="0.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="301.8" y="28.0" text-anchor="middle" class="mono t-sm">m</text>
+<rect x="311.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="311.5" y="75.6" width="15.5" height="0.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="319.2" y="28.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="329.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="329.0" y="51.3" width="15.5" height="24.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="336.8" y="28.0" text-anchor="middle" class="mono t-sm">p</text>
+<rect x="346.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="346.5" y="64.5" width="15.5" height="11.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="354.2" y="28.0" text-anchor="middle" class="mono t-sm">a</text>
+<rect x="364.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="364.0" y="64.8" width="15.5" height="11.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="371.8" y="28.0" text-anchor="middle" class="mono t-sm">s</text>
+<rect x="381.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="381.5" y="69.8" width="15.5" height="6.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="389.2" y="28.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="399.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="399.0" y="66.1" width="15.5" height="9.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="406.8" y="28.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="416.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="416.5" y="58.8" width="15.5" height="17.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="424.2" y="28.0" text-anchor="middle" class="mono t-sm">m</text>
+<rect x="434.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="434.0" y="68.1" width="15.5" height="7.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="441.8" y="28.0" text-anchor="middle" class="mono t-sm">y</text>
+<rect x="451.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="451.5" y="75.0" width="15.5" height="1.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="459.2" y="28.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="469.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="469.0" y="56.2" width="15.5" height="19.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="476.8" y="28.0" text-anchor="middle" class="mono t-sm">g</text>
+<rect x="486.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="486.5" y="60.0" width="15.5" height="16.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="494.2" y="28.0" text-anchor="middle" class="mono t-sm">a</text>
+<rect x="504.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="504.0" y="48.9" width="15.5" height="27.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="511.8" y="28.0" text-anchor="middle" class="mono t-sm">m</text>
+<rect x="521.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="521.5" y="40.7" width="15.5" height="35.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="529.2" y="28.0" text-anchor="middle" class="mono t-sm">u</text>
+<rect x="539.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="539.0" y="62.1" width="15.5" height="13.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="546.8" y="28.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="556.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="556.5" y="49.7" width="15.5" height="26.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="564.2" y="28.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="574.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="574.0" y="49.7" width="15.5" height="26.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="581.8" y="28.0" text-anchor="middle" class="mono t-sm">l</text>
+<rect x="591.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="591.5" y="69.5" width="15.5" height="6.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="599.2" y="28.0" text-anchor="middle" class="mono t-sm">o</text>
+<rect x="609.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="609.0" y="57.2" width="15.5" height="18.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="616.8" y="28.0" text-anchor="middle" class="mono t-sm">n</text>
+<rect x="626.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="626.5" y="74.8" width="15.5" height="1.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="634.2" y="28.0" text-anchor="middle" class="mono t-sm">g</text>
+<rect x="644.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="644.0" y="63.5" width="15.5" height="12.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="651.8" y="28.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="661.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="661.5" y="59.1" width="15.5" height="16.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="669.2" y="28.0" text-anchor="middle" class="mono t-sm">a</text>
+<rect x="679.0" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="679.0" y="55.7" width="15.5" height="20.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="686.8" y="28.0" text-anchor="middle" class="mono t-sm">g</text>
+<rect x="696.5" y="38.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="696.5" y="55.6" width="15.5" height="20.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="704.2" y="28.0" text-anchor="middle" class="mono t-sm">o</text>
+<rect x="14.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="14.0" y="125.6" width="15.5" height="24.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="21.8" y="102.0" text-anchor="middle" class="mono t-sm">.</text>
+<rect x="31.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="31.5" y="149.1" width="15.5" height="0.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="39.2" y="102.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="49.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="49.0" y="148.5" width="15.5" height="1.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="56.8" y="102.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="66.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="66.5" y="130.3" width="15.5" height="19.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="74.2" y="102.0" text-anchor="middle" class="mono t-sm">H</text>
+<rect x="84.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="84.0" y="136.1" width="15.5" height="13.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="91.8" y="102.0" text-anchor="middle" class="mono t-sm">O</text>
+<rect x="101.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="101.5" y="147.1" width="15.5" height="2.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="109.2" y="102.0" text-anchor="middle" class="mono t-sm">R</text>
+<rect x="119.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="119.0" y="149.5" width="15.5" height="0.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="126.8" y="102.0" text-anchor="middle" class="mono t-sm">T</text>
+<rect x="136.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="136.5" y="149.4" width="15.5" height="0.6" rx="2" class="f-orange" opacity="0.9"/>
+<text x="144.2" y="102.0" text-anchor="middle" class="mono t-sm">E</text>
+<rect x="154.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="154.0" y="149.6" width="15.5" height="0.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="161.8" y="102.0" text-anchor="middle" class="mono t-sm">N</text>
+<rect x="171.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="171.5" y="149.4" width="15.5" height="0.6" rx="2" class="f-orange" opacity="0.9"/>
+<text x="179.2" y="102.0" text-anchor="middle" class="mono t-sm">S</text>
+<rect x="189.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="189.0" y="142.8" width="15.5" height="7.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="196.8" y="102.0" text-anchor="middle" class="mono t-sm">I</text>
+<rect x="206.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="206.5" y="149.2" width="15.5" height="0.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="214.2" y="102.0" text-anchor="middle" class="mono t-sm">O</text>
+<rect x="224.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="224.0" y="149.7" width="15.5" height="0.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="231.8" y="102.0" text-anchor="middle" class="mono t-sm">:</text>
+<rect x="241.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="241.5" y="150.0" width="15.5" height="0.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="249.2" y="102.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="259.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="259.0" y="126.2" width="15.5" height="23.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="266.8" y="102.0" text-anchor="middle" class="mono t-sm">Y</text>
+<rect x="276.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="276.5" y="136.6" width="15.5" height="13.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="284.2" y="102.0" text-anchor="middle" class="mono t-sm">e</text>
+<rect x="294.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="294.0" y="146.2" width="15.5" height="3.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="301.8" y="102.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="311.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="311.5" y="147.5" width="15.5" height="2.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="319.2" y="102.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="329.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="329.0" y="116.8" width="15.5" height="33.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="336.8" y="102.0" text-anchor="middle" class="mono t-sm">r</text>
+<rect x="346.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="346.5" y="144.5" width="15.5" height="5.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="354.2" y="102.0" text-anchor="middle" class="mono t-sm">e</text>
+<rect x="364.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="364.0" y="140.3" width="15.5" height="9.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="371.8" y="102.0" text-anchor="middle" class="mono t-sm">a</text>
+<rect x="381.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="381.5" y="139.6" width="15.5" height="10.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="389.2" y="102.0" text-anchor="middle" class="mono t-sm">d</text>
+<rect x="399.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="399.0" y="144.8" width="15.5" height="5.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="406.8" y="102.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="416.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="416.5" y="136.5" width="15.5" height="13.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="424.2" y="102.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="434.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="434.0" y="146.3" width="15.5" height="3.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="441.8" y="102.0" text-anchor="middle" class="mono t-sm">h</text>
+<rect x="451.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="451.5" y="145.7" width="15.5" height="4.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="459.2" y="102.0" text-anchor="middle" class="mono t-sm">e</text>
+<rect x="469.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="469.0" y="145.6" width="15.5" height="4.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="476.8" y="102.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="486.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="486.5" y="130.0" width="15.5" height="20.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="494.2" y="102.0" text-anchor="middle" class="mono t-sm">g</text>
+<rect x="504.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="504.0" y="136.1" width="15.5" height="13.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="511.8" y="102.0" text-anchor="middle" class="mono t-sm">a</text>
+<rect x="521.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="521.5" y="120.0" width="15.5" height="30.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="529.2" y="102.0" text-anchor="middle" class="mono t-sm">m</text>
+<rect x="539.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="539.0" y="114.5" width="15.5" height="35.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="546.8" y="102.0" text-anchor="middle" class="mono t-sm">u</text>
+<rect x="556.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="556.5" y="137.6" width="15.5" height="12.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="564.2" y="102.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="574.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="574.0" y="126.5" width="15.5" height="23.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="581.8" y="102.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="591.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="591.5" y="132.6" width="15.5" height="17.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="599.2" y="102.0" text-anchor="middle" class="mono t-sm">o</text>
+<rect x="609.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="609.0" y="147.3" width="15.5" height="2.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="616.8" y="102.0" text-anchor="middle" class="mono t-sm">f</text>
+<rect x="626.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="626.5" y="148.7" width="15.5" height="1.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="634.2" y="102.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="644.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="644.0" y="115.1" width="15.5" height="34.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="651.8" y="102.0" text-anchor="middle" class="mono t-sm">H</text>
+<rect x="661.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="661.5" y="130.5" width="15.5" height="19.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="669.2" y="102.0" text-anchor="middle" class="mono t-sm">o</text>
+<rect x="679.0" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="679.0" y="135.1" width="15.5" height="14.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="686.8" y="102.0" text-anchor="middle" class="mono t-sm">r</text>
+<rect x="696.5" y="112.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="696.5" y="140.6" width="15.5" height="9.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="704.2" y="102.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="14.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="14.0" y="215.0" width="15.5" height="9.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="21.8" y="176.0" text-anchor="middle" class="mono t-sm">e</text>
+<rect x="31.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="31.5" y="208.3" width="15.5" height="15.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="39.2" y="176.0" text-anchor="middle" class="mono t-sm">n</text>
+<rect x="49.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="49.0" y="201.3" width="15.5" height="22.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="56.8" y="176.0" text-anchor="middle" class="mono t-sm">s</text>
+<rect x="66.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="66.5" y="199.9" width="15.5" height="24.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="74.2" y="176.0" text-anchor="middle" class="mono t-sm">i</text>
+<rect x="84.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="84.0" y="213.6" width="15.5" height="10.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="91.8" y="176.0" text-anchor="middle" class="mono t-sm">o</text>
+<rect x="101.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="101.5" y="187.5" width="15.5" height="36.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="109.2" y="176.0" text-anchor="middle" class="mono t-sm">.</text>
+<rect x="119.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="119.0" y="223.0" width="15.5" height="1.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="126.8" y="176.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="136.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="136.5" y="222.7" width="15.5" height="1.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="144.2" y="176.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="154.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="154.0" y="201.0" width="15.5" height="23.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="161.8" y="176.0" text-anchor="middle" class="mono t-sm">B</text>
+<rect x="171.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="171.5" y="200.4" width="15.5" height="23.6" rx="2" class="f-orange" opacity="0.9"/>
+<text x="179.2" y="176.0" text-anchor="middle" class="mono t-sm">I</text>
+<rect x="189.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="189.0" y="198.9" width="15.5" height="25.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="196.8" y="176.0" text-anchor="middle" class="mono t-sm">A</text>
+<rect x="206.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="206.5" y="209.5" width="15.5" height="14.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="214.2" y="176.0" text-anchor="middle" class="mono t-sm">N</text>
+<rect x="224.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="224.0" y="204.0" width="15.5" height="20.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="231.8" y="176.0" text-anchor="middle" class="mono t-sm">C</text>
+<rect x="241.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="241.5" y="218.5" width="15.5" height="5.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="249.2" y="176.0" text-anchor="middle" class="mono t-sm">A</text>
+<rect x="259.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="259.0" y="222.7" width="15.5" height="1.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="266.8" y="176.0" text-anchor="middle" class="mono t-sm">:</text>
+<rect x="276.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="276.5" y="223.9" width="15.5" height="0.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="284.2" y="176.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="294.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="294.0" y="190.2" width="15.5" height="33.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="301.8" y="176.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="311.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="311.5" y="203.9" width="15.5" height="20.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="319.2" y="176.0" text-anchor="middle" class="mono t-sm">S</text>
+<rect x="329.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="329.0" y="213.6" width="15.5" height="10.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="336.8" y="176.0" text-anchor="middle" class="mono t-sm">e</text>
+<rect x="346.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="346.5" y="212.6" width="15.5" height="11.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="354.2" y="176.0" text-anchor="middle" class="mono t-sm">r</text>
+<rect x="364.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="364.0" y="223.0" width="15.5" height="1.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="371.8" y="176.0" text-anchor="middle" class="mono t-sm">v</text>
+<rect x="381.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="381.5" y="215.1" width="15.5" height="8.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="389.2" y="176.0" text-anchor="middle" class="mono t-sm">a</text>
+<rect x="399.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="399.0" y="219.4" width="15.5" height="4.6" rx="2" class="f-orange" opacity="0.9"/>
+<text x="406.8" y="176.0" text-anchor="middle" class="mono t-sm">n</text>
+<rect x="416.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="416.5" y="222.5" width="15.5" height="1.5" rx="2" class="f-orange" opacity="0.9"/>
+<text x="424.2" y="176.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="434.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="434.0" y="192.9" width="15.5" height="31.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="441.8" y="176.0" text-anchor="middle" class="mono t-sm">:</text>
+<rect x="451.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="451.5" y="222.3" width="15.5" height="1.7" rx="2" class="f-orange" opacity="0.9"/>
+<text x="459.2" y="176.0" text-anchor="middle" class="mono t-sm">↵</text>
+<rect x="469.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="469.0" y="202.8" width="15.5" height="21.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="476.8" y="176.0" text-anchor="middle" class="mono t-sm">M</text>
+<rect x="486.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="486.5" y="200.0" width="15.5" height="24.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="494.2" y="176.0" text-anchor="middle" class="mono t-sm">i</text>
+<rect x="504.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="504.0" y="220.0" width="15.5" height="4.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="511.8" y="176.0" text-anchor="middle" class="mono t-sm">s</text>
+<rect x="521.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="521.5" y="218.8" width="15.5" height="5.2" rx="2" class="f-orange" opacity="0.9"/>
+<text x="529.2" y="176.0" text-anchor="middle" class="mono t-sm">t</text>
+<rect x="539.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="539.0" y="212.1" width="15.5" height="11.9" rx="2" class="f-orange" opacity="0.9"/>
+<text x="546.8" y="176.0" text-anchor="middle" class="mono t-sm">r</text>
+<rect x="556.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="556.5" y="206.6" width="15.5" height="17.4" rx="2" class="f-orange" opacity="0.9"/>
+<text x="564.2" y="176.0" text-anchor="middle" class="mono t-sm">e</text>
+<rect x="574.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="574.0" y="211.2" width="15.5" height="12.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="581.8" y="176.0" text-anchor="middle" class="mono t-sm">s</text>
+<rect x="591.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="591.5" y="220.0" width="15.5" height="4.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="599.2" y="176.0" text-anchor="middle" class="mono t-sm">s</text>
+<rect x="609.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="609.0" y="210.2" width="15.5" height="13.8" rx="2" class="f-orange" opacity="0.9"/>
+<text x="616.8" y="176.0" text-anchor="middle" class="mono t-sm">,</text>
+<rect x="626.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="626.5" y="223.9" width="15.5" height="0.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="634.2" y="176.0" text-anchor="middle" class="mono t-sm"> </text>
+<rect x="644.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="644.0" y="201.4" width="15.5" height="22.6" rx="2" class="f-orange" opacity="0.9"/>
+<text x="651.8" y="176.0" text-anchor="middle" class="mono t-sm">y</text>
+<rect x="661.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="661.5" y="223.0" width="15.5" height="1.0" rx="2" class="f-orange" opacity="0.9"/>
+<text x="669.2" y="176.0" text-anchor="middle" class="mono t-sm">o</text>
+<rect x="679.0" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="679.0" y="223.9" width="15.5" height="0.1" rx="2" class="f-orange" opacity="0.9"/>
+<text x="686.8" y="176.0" text-anchor="middle" class="mono t-sm">u</text>
+<rect x="696.5" y="186.0" width="15.5" height="38.0" rx="2" class="box" opacity="0.35"/>
+<rect x="696.5" y="216.7" width="15.5" height="7.3" rx="2" class="f-orange" opacity="0.9"/>
+<text x="704.2" y="176.0" text-anchor="middle" class="mono t-sm">r</text>
+<text x="14.0" y="242.0" class="t-xs t-muted">bar height = surprisal of the true character, in bits (full height = 8 bits or more)</text>
+  </svg>
+  <figcaption><strong>Surprise lives at the starts of things.</strong> Held-out text, 120 characters, bar height proportional to bits of surprisal (capped at 8). Tall bars: the first letters of words and speaker names, and rare letters in "gamut". Almost no bar: the newline after a colon, spaces, and the rest of a word once it is under way.</figcaption>
+</figure>
+
+<p>The mean is 2.60 bits, but the median is 2.39 and the range runs from nearly 0 to 7.7. The first letter of a word or line averages 4.28 bits against 2.20 for all other characters: once a word has started, it mostly finishes itself. Notice "HORTENSIO" in the second speaker line: after "HORTE" the remaining letters cost 0.1 bits each, because that name occurs often in the training text and the model has memorised it. But "gamut" costs 7.4 bits at its "u" the first time and 7.5 bits the second time it appears a line later; a model of this size does not copy from its own context. Larger Transformers do (this is what induction heads implement), and the loss they achieve on repeated material drops accordingly.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the guessing game</p>
+  <p>Shannon (1951) estimated the information in English by asking people to guess the next letter of a text, one at a time: a good guess means little information, a wrong guess means a lot. Cross-entropy is this game with the model as the player and the logarithm as the score: you score high for being sure and right, and heavily negative for being sure and wrong. A player who spreads their guesses evenly scores badly, but never disastrously.</p>
+  <p><em>Where it breaks down:</em> a human gets to try letters until they find the right one, and the number of tries is the measurement. The model must put all its bets down at once, as probabilities, before the answer is revealed, and cannot take back an overconfident bet.</p>
+</div>
+
+<h2>Training details that change the loss</h2>
+
+<h3>Teacher forcing</h3>
+<p>In training, the model at position t is always given the <em>true</em> previous tokens, not its own earlier guesses. This is called <span class="term">teacher forcing</span>. It is what lets all positions be computed in parallel with a mask, and it gives each position a clean learning signal. The cost is a mismatch: at generation time the model feeds on its own outputs, which can contain errors it never saw in training, so errors can compound (the repetition loops of chapter 15 are one form of this).</p>
+
+<h3>Masking the loss</h3>
+<p>The loss need not include every position. In practice, positions are excluded by an <span class="term">ignore index</span> or a mask: padding (empty slots in a short sequence), the prompt in supervised fine-tuning (the model is trained to produce the answer but not to predict the question; A3 chapter 10), and in some pipelines the tokens of tool results. The last lines of <code>ce_demo.py</code> show the effect: averaging only over the last three of five positions gives 1.30 instead of 1.14. Two warnings follow. A masked loss is a different quantity, so compare losses only if their masks match. And the mean must be taken over the unmasked positions only, or a batch with more padding appears to have a smaller loss. Both are easy bugs.</p>
+
+<h3>Packing and boundaries</h3>
+<p>Pretraining text consists of documents of very different lengths. The usual practice is to concatenate them with a separator token (the end-of-text token of chapter 13) and cut windows from the stream. A window can then span two unrelated documents, and the model at the start of the second must predict from the first. Cheap implementations accept this; careful ones mask attention across document boundaries. Either way, the separator token must be present at boundaries in training data, or the model never learns what the end of a document looks like and cannot stop.</p>
+
+<h3>Evaluation protocol</h3>
+<p>A reported loss depends on the data and on the procedure: which held-out set; whether it was filtered for overlap with the training data; which tokeniser; the context length and whether windows overlap; whether the average is per token or per byte; and how many batches were averaged (a 20-batch estimate on a noisy stream is only good to a couple of hundredths of a nat). The chapter's <code>estimate</code> function reuses the same 20 batches each time, so that differences between lines of the log are due to the model rather than the sample. Test-set contamination can make a held-out loss artificially low (A6 chapter 07).</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A perplexity of 5 means the model gets the next token right one time in five", or "lower perplexity always means a better model." Perplexity 5 means the model is as unsure as a uniform choice among five options, on average, in a geometric-mean sense; it says nothing directly about how often its top guess is right (which can be much higher). And perplexity only ranks models fairly if they share the tokeniser and the test text. Compare bits per byte on the same held-out text, and be wary of any single number, however convenient.</p>
+</div>
+
+<h2>What the loss does not tell you</h2>
+
+<p>The loss is the right training objective and an incomplete evaluation. Three limits matter in practice.</p>
+<ul>
+  <li><b>All tokens count equally.</b> Predicting a space, a comma or "the" costs as much as predicting the answer to a question. A model can reduce its average loss a lot by getting better at common syntax while staying equally poor at the rare, hard tokens that carry the facts. Capabilities such as arithmetic, code or recall of facts may improve in steps that the average loss hides.</li>
+  <li><b>The loss measures the data, not the use.</b> It is the cost of predicting <em>web text</em>. A model that must follow instructions, refuse requests or reason over several steps is shaped by later stages (A3: fine-tuning on demonstrations and preferences), and benchmarks of those behaviours do not track the pre-training loss in a simple way. Within a family of models trained the same way, though, loss is smooth and predictable, and it falls as a power law of compute, parameters and data, which is the basis of scaling laws (chapter 18).</li>
+  <li><b>A lower loss can be a bug.</b> Chapter 12's masked-and-unmasked experiment gave 0.04 and 7.9 for the same weights. Always check a surprising improvement against a simple baseline from the ladder above.</li>
+</ul>
+
+<p>The practical conclusion: use the loss to monitor training and to compare runs that differ in size, data and hyperparameters; evaluate behaviour with task-level tests as well (A6); and be explicit about the dataset and tokeniser behind every loss figure you quote.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Shannon's guessing experiments (1951) bounded the entropy of printed English, using a 27-symbol alphabet of letters and space and up to 100 letters of context, between roughly 0.6 and 1.3 bits per letter (his Table of upper and lower bounds at N = 100: 1.3 and 0.6). Modern models are routinely quoted at around or below one bit per byte on large web corpora, but those figures depend on the corpus, the cleaning and the tokeniser, and I have not verified a specific current number against a primary source, so I give none. The Shakespeare figures in this chapter (2.4 to 2.5 bits per character) are for a 65-symbol alphabet with capitals and punctuation, a tiny model and a one-megabyte corpus: they should not be compared with Shannon's or with any web-scale figure. Pre-training loss is also no longer the only target: reasoning-oriented models are trained further with rewards on verifiable outcomes (A3 chapter 14), for which the next-token loss is only a starting point.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>1. In <code>ce_demo.py</code> change the logits so that the true word has the <em>lowest</em> score. What is the loss, and which gradient entry is largest? 2. Run <code>lm_ladder.py</code> and extend <code>N</code> to 8 orders. Where does the count model peak? Try replacing Witten-Bell by add-one smoothing and see how much worse high orders become. 3. Make a table of bits per byte, perplexity and loss for the BPE bigram at 512 and at 1,024 merges (edit <code>train_bpe(train_t, 512)</code>). Which numbers move together? 4. In <code>surprisal.py</code> pick a different stretch of the validation text (change <code>20000</code>) and find which characters cost the most. 5. Use the explorer to find the probability at which one position's loss equals the mean loss of the other five, set to 0.5 each.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 ce_demo.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 lm_ladder.py</span>   <span class="cmt"># needs gpt.npz from chapter 12's train.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 lm_bpb.py</span>     <span class="cmt"># needs bpe.py from chapter 13</span></code></pre>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Treat the loss as a production metric with the same hygiene as any other. Training runs should log loss at every step and on held-out slices (by language, by domain, by source), because an average can stay flat while one slice degrades; chapter 17 lists what to watch, and the practices of <a href="../../reliability/chapters/04-metrics.html">Reliability chapter 04</a> (what to count, at what granularity, and how to avoid averages that hide tails) apply directly. The held-out set is a versioned artefact: change it and every historical loss is incomparable, the way changing a dashboard's query breaks a trend line. Evaluation pipelines should report the tokeniser version and units alongside every number (<a href="../../evals/chapters/02-eval-harnesses.html">A6 chapter 02</a>). The per-token loss also gives you a cheap anomaly detector for data pipelines: a sudden rise in the loss of new training data against a model trained on the old data signals a change in format, language or quality upstream, long before a human reads the text.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>The chain rule makes next-token prediction a complete description of a distribution over text: p(x) = &prod; p(x<sub>t</sub> | x<sub>&lt;t</sub>). It also allows sampling.</li>
+    <li>The loss is the average negative log probability of the true next token (cross-entropy, maximum likelihood). Its gradient with respect to the logits is softmax minus one-hot, divided by N. Compute it from logits with the log-sum-exp form, never as log(softmax(x)).</li>
+    <li>Expected cross-entropy equals the data's entropy plus the KL divergence from truth to model, so there is a floor set by irreducible unpredictability, and the rest is model error.</li>
+    <li>Nats, bits, perplexity (exp of the loss) and bits per byte are the same quantity in different units. Perplexity per token depends on the tokeniser; compare bits per byte on the same text. Chapter 13's BPE bigram has a perplexity nine times the character 5-gram's yet is only 0.24 bits per byte worse.</li>
+    <li>Models learn the statistics of text in order of context length. The chapter's tiny GPT (1.73 nats) sits just above a 5-gram table (1.67) on held-out Shakespeare; surprise is concentrated at the starts of words and names.</li>
+    <li>Teacher forcing, masks, packing and the evaluation protocol all change what a loss number means. A masked loss is a different loss; sliding-window evaluation gives lower, fairer losses than non-overlapping windows (1.712 against 1.738 here).</li>
+    <li>The loss is a smooth, predictable training signal, not a complete measure of capability: all tokens count equally, and later stages and task benchmarks decide usefulness.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://www.princeton.edu/~wbialek/rome/refs/shannon_51.pdf" target="_blank" rel="noopener">Shannon, "Prediction and Entropy of Printed English" (1951)</a>. The guessing-game experiments and the 0.6 to 1.3 bits-per-letter bounds, in a readable paper.</li>
+  <li><a href="https://jmlr.org/papers/v3/bengio03a.html" target="_blank" rel="noopener">Bengio, Ducharme, Vincent and Jauvin, "A Neural Probabilistic Language Model" (2003)</a>. The first neural language model, motivated by the n-gram table problem seen in the ladder.</li>
+  <li><a href="https://arxiv.org/abs/2101.00027" target="_blank" rel="noopener">Gao et al., "The Pile: An 800GB Dataset of Diverse Text for Language Modeling" (2020)</a>. A corpus whose evaluation reports bits per byte to make tokenisers comparable.</li>
+  <li><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">Kaplan et al., "Scaling Laws for Neural Language Models" (2020)</a>. Test loss as a power law of parameters, data and compute; also loss as a function of position in the context.</li>
+  <li><a href="https://huggingface.co/docs/transformers/perplexity" target="_blank" rel="noopener">Hugging Face, "Perplexity of fixed-length models"</a>. The sliding-window evaluation, worked through with code.</li>
+  <li><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">Radford et al., "Language Models are Unsupervised Multitask Learners" (GPT-2, 2019)</a>. Reports language-modelling results in perplexity and bits per character and discusses the effect of tokenisation on them.</li>
+  <li><a href="https://www.deeplearningbook.org/contents/ml.html" target="_blank" rel="noopener">Goodfellow, Bengio and Courville, <em>Deep Learning</em> (2016), chapter 5, section 5.5</a>. Maximum likelihood estimation and why cross-entropy and KL divergence are the same objective.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A model gives the true next token probability 0.25 at every one of 1,000 positions. What are its loss in nats and its perplexity?</p>
+    <ol class="q-options"><li>0.25 and 4</li><li>1.39 and 0.25</li><li>1.39 and 4</li><li>0.25 and 1.39</li></ol>
+    <div class="q-explain">The loss is &minus;ln 0.25 = 1.386 at each position, and the perplexity is exp(1.386) = 4: as unsure as a uniform choice among four options. The first option mixes the probability with the loss; the other two swap the quantities.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">At one position the softmax gives the true token probability 0.02 while another token gets 0.9. Which statement about the gradient with respect to the logits is correct?</p>
+    <ol class="q-options"><li>The true token's logit gets gradient about &minus;0.98 (push it up strongly), and the 0.9 token's logit gets +0.9 (push it down)</li><li>Only the true token's logit receives a gradient</li><li>All logits get the same gradient</li><li>The true token's logit gets +0.02</li></ol>
+    <div class="q-explain">The gradient of the loss is p minus the one-hot target: 0.02 &minus; 1 = &minus;0.98 for the true token and +p for every other token. Gradient descent moves against the gradient, so the true logit rises and the overconfident wrong one falls. Every logit receives a gradient, in proportion to its probability.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Model A uses a 50,000-token vocabulary and reports perplexity 20 per token on a test set. Model B uses characters and reports perplexity 5 per character on the same set, which has 4.2 characters per A-token. Which comparison is valid?</p>
+    <ol class="q-options"><li>B is better, because 5 is less than 20</li><li>A is better, because its vocabulary is larger</li><li>They are equal, because both are perplexities</li><li>Convert both to bits per character: A has ln(20)/4.2/ln 2 = 1.03 bits per character, B has log2(5) = 2.32, so A is better</li></ol>
+    <div class="q-explain">Perplexities per token and per character are not comparable. Converting to a common unit, A's 20-perplexity per token spread over 4.2 characters is about 1.03 bits per character, against 2.32 for B, so A predicts the text better. Vocabulary size alone says nothing about quality.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">You fine-tune with the prompt tokens masked out of the loss and notice the reported loss is lower than for the same model without masking. Which explanation is most plausible?</p>
+    <ol class="q-options"><li>Masking removes gradient noise, so the model is better</li><li>The masked loss averages only over the answer positions, which are a different (here easier) set of predictions; the numbers are not comparable</li><li>The model has overfitted to the prompts</li><li>Masking changes the softmax</li></ol>
+    <div class="q-explain">A masked loss is a different quantity: it is the mean over a different set of positions. Prompts are often harder to predict than formulaic answers, or the reverse, so the two numbers say nothing about which model is better. Masking changes which positions count, not the softmax, and it says nothing about overfitting by itself.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">On held-out text, a 5-gram model reaches 1.67 nats per character and a 6-gram model reaches 1.70, although the 6-gram has strictly more context. What explains this?</p>
+    <ol class="q-options"><li>The 6-gram is implemented incorrectly</li><li>More context always hurts in language models</li><li>Most 5-character contexts have been seen too few times, so the counts are unreliable even with smoothing</li><li>The test set contains no 6-character words</li></ol>
+    <div class="q-explain">The number of possible contexts grows exponentially with their length, so counts become sparse and noisy: the model memorises training accidents. Smoothing softens this but cannot remove it. More context is useful in principle, and neural models can use it because they share parameters across contexts. Nothing in the setup suggests a bug.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You are told that a new model's validation loss is "much better" than the previous version's. Which check would you run first?</p>
+    <ol class="q-options"><li>Retrain with a larger learning rate</li><li>Switch the units to bits per byte</li><li>Compute perplexity instead of loss</li><li>Check that the validation text, tokeniser, masking and context handling are the same as before, and that the held-out text does not overlap with training data</li></ol>
+    <div class="q-explain">An apparent improvement is often a change in the measurement: a different tokeniser or test set, a changed mask, or contamination of the held-out data. Changing units or perplexity relabels the same number, and a larger learning rate tests nothing. Only after confirming that the comparison is like for like do the numbers mean anything.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/dl14-surprise.js"></script>
+</body>
+</html>

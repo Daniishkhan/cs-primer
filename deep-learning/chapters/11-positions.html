@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Positional Information · Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dl" data-chapter="11">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Positional Information</h1>
+  <p class="lede">Attention treats its input as an unordered set: shuffle the tokens and the outputs shuffle with them. Yet word order carries meaning. This chapter shows exactly why order is invisible to attention, then follows the four answers the field has given: learned position tables, sinusoids, relative biases, and rotary embeddings (RoPE), with code that proves the key property of each.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>"The dog bit the man" and "the man bit the dog" contain the same tokens. A model that cannot tell them apart cannot read. The way a model represents position also sets a hard-looking limit, the context length: a model with a table of 1,024 learned positions has nothing to say about position 1,025, and a model trained with rotary embeddings on 4,096 tokens may degrade quickly beyond them. Extending context windows, a major product feature, is largely an exercise in manipulating positional encodings, and a wrong convention in a position routine produces a model that loads and runs but quietly gets worse. After this chapter you can explain why attention needs positions, write sinusoidal and rotary encodings, prove that RoPE makes attention depend on relative distance, and read a model card line such as "RoPE base 500,000" or "YaRN-extended to 128k".</p>
+</div>
+
+<h2>Attention cannot see order</h2>
+
+<p>Look again at chapter 09's formula. The score between token i and token j is built from q<sub>i</sub> = x<sub>i</sub>W<sub>Q</sub> and k<sub>j</sub> = x<sub>j</sub>W<sub>K</sub>. Those depend on <em>which token</em> sits at i and j, never on the numbers i and j. The output for token i is a weighted sum over the set of value vectors; sums do not care about order. So if you permute the input tokens, each token still gets exactly the same output as before, just moved to its new row. This property is called <span class="term">permutation equivariance</span>. The script puts "dog bites man" and "man bites dog" through one unmasked attention layer and prints the output at the word "bites".</p>
+
+<pre class="terminal" data-title="perm.py"><code>import numpy as np
+np.set_printoptions(precision=3, suppress=True)
+rng = np.random.default_rng(0)
+C, vocab = 8, ["dog", "bites", "man"]
+emb = rng.normal(size=(3, C))                           # one embedding per word
+Wq, Wk, Wv = (rng.normal(size=(C, C)) / np.sqrt(C) for _ in range(3))
+
+def softmax(a):
+    e = np.exp(a - a.max(-1, keepdims=True)); return e / e.sum(-1, keepdims=True)
+
+def self_attention(x):                                  # x: (T, C), no mask
+    q, k, v = x @ Wq, x @ Wk, x @ Wv
+    return softmax(q @ k.T / np.sqrt(C)) @ v
+
+def sinusoid(T, d):
+    pos = np.arange(T)[:, None]
+    freq = 10000.0 ** (-np.arange(0, d, 2) / d)
+    pe = np.zeros((T, d)); pe[:, 0::2] = np.sin(pos * freq); pe[:, 1::2] = np.cos(pos * freq)
+    return pe
+
+a = emb[[0, 1, 2]]                                      # "dog bites man"
+b = emb[[2, 1, 0]]                                      # "man bites dog"
+print("without positions, output at 'bites':")
+print(" dog bites man:", self_attention(a)[1])
+print(" man bites dog:", self_attention(b)[1])
+pe = sinusoid(3, C)
+print("with sinusoidal positions added:")
+print(" dog bites man:", self_attention(a + pe)[1])
+print(" man bites dog:", self_attention(b + pe)[1])</code></pre>
+<pre class="terminal" data-title="output"><code>without positions, output at 'bites':
+ dog bites man: [ 0.262  0.165  0.28  -0.164 -0.961  0.089  0.971  1.528]
+ man bites dog: [ 0.262  0.165  0.28  -0.164 -0.961  0.089  0.971  1.528]
+with sinusoidal positions added:
+ dog bites man: [-0.101  1.029 -0.723  1.273 -1.237 -0.377  0.537  0.783]
+ man bites dog: [-0.02   1.106 -0.73   1.328 -1.314 -0.432  0.547  0.943]</code></pre>
+
+<p>Without positions, "bites" gets an identical output vector in both sentences, so no later layer could ever tell who bit whom. After adding a sinusoidal position code to each embedding (explained below) the two vectors differ. Chapter 10 found the same thing at block level: with no mask and no positions a block is permutation-equivariant.</p>
+
+<p>The causal mask of chapter 09 is one source of order, because token 0 can only see itself and token 7 can see eight tokens. Haviv et al. ("Transformer Language Models without Positional Encodings Still Learn Positional Information", 2022) found that causal language models trained with no positional encoding at all still reach respectable quality, and Kazemnejad et al. ("The Impact of Positional Encoding on Length Generalization in Transformers", 2023) found, in small-scale experiments, that such models can generalise to longer sequences than some explicit encodings. These results are interesting, but practical models still use explicit positions, because they help quality and give the designer control over how position is represented.</p>
+
+<h2>What a position code should do</h2>
+<p>A position encoding has to give the network enough information to distinguish "where", and the design questions are these:</p>
+<ol class="steps">
+  <li><b>Distinct.</b> Every position within the context length gets a different signal.</li>
+  <li><b>Usable by attention.</b> The model must be able to compute things like "the token two before me" or "the start of the document" from it with a few matrix products.</li>
+  <li><b>Relative.</b> Language is mostly about nearness. A rule such as "an adjective modifies the noun just after it" should work at position 7 and at position 7,000 alike.</li>
+  <li><b>Length-robust.</b> It should behave sensibly beyond the lengths seen in training, or at least be extensible cheaply.</li>
+  <li><b>Cheap.</b> Few parameters, little extra computation and no obstacle for fast kernels.</li>
+</ol>
+<p>No scheme gets all five perfectly. Each of the following trades some away.</p>
+
+<h2>Learned absolute embeddings</h2>
+<p>The simplest design is a table. Make a matrix of shape (T<sub>max</sub>, C), one learned row per position, and add row i to the token embedding at position i: x<sub>i</sub> = E[token<sub>i</sub>] + P[i]. The table is trained by gradient descent like any other weight. GPT-2 uses T<sub>max</sub> = 1,024 positions, BERT uses 512. In GPT-2 small the table has 1,024 &times; 768 = 786,432 parameters, about 0.6% of the model.</p>
+<p>It is easy and works well inside its range. Its limits follow directly: position 1,025 has no row at all, so the context length is fixed at training time; row 700 is learned separately from row 701, so nothing tells the model that they are neighbours except what training discovers (and rarely used late positions are trained less); and the encoding is purely absolute, so "two tokens back" has to be rediscovered at every position.</p>
+
+<h2>Sinusoidal encodings</h2>
+<p>Vaswani et al. (2017) used a fixed formula instead of a table. For position p and an even number of dimensions d, pair up the dimensions and give pair i its own frequency:</p>
+<p style="text-align:center">PE(p, 2i) = sin( p / 10000<sup>2i/d</sup> ), &nbsp;&nbsp; PE(p, 2i+1) = cos( p / 10000<sup>2i/d</sup> ).</p>
+<p>The first pair oscillates quickly (wavelength 2&pi; &asymp; 6.3 positions), the next more slowly, and the last very slowly (up to 10000 &middot; 2&pi; positions). Each position gets a vector of sines and cosines at many speeds. The figure draws four of the pairs.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 340" role="img" aria-label="Four sine waves over positions 0 to 63 for dimension pairs 0 to 3 of a sixteen-dimensional sinusoidal encoding. Pair 0 has period 6.3 and oscillates about ten times; pair 1 has period 19.9; pair 2 has period 62.8 and completes one cycle; pair 3 has period 198.7 and covers a fraction of a cycle.">
+<rect x="150" y="20.0" width="580" height="56" class="box" rx="4"/>
+<line x1="150" y1="48.0" x2="730" y2="48.0" class="line-thin"/>
+<path d="M150.0,48.0 L159.2,29.5 L168.4,28.0 L177.6,44.9 L186.8,64.6 L196.0,69.1 L205.2,54.1 L214.4,33.5 L223.7,26.2 L232.9,38.9 L242.1,60.0 L251.3,70.0 L260.5,59.8 L269.7,38.8 L278.9,26.2 L288.1,33.7 L297.3,54.3 L306.5,69.2 L315.7,64.5 L324.9,44.7 L334.1,27.9 L343.3,29.6 L352.5,48.2 L361.7,66.6 L371.0,67.9 L380.2,50.9 L389.4,31.2 L398.6,27.0 L407.8,42.0 L417.0,62.6 L426.2,69.7 L435.4,56.9 L444.6,35.9 L453.8,26.0 L463.0,36.4 L472.2,57.4 L481.4,69.8 L490.6,62.2 L499.8,41.5 L509.0,26.8 L518.3,31.6 L527.5,51.5 L536.7,68.2 L545.9,66.3 L555.1,47.6 L564.3,29.3 L573.5,28.2 L582.7,45.3 L591.9,64.9 L601.1,69.0 L610.3,53.8 L619.5,33.3 L628.7,26.3 L637.9,39.3 L647.1,60.3 L656.3,70.0 L665.6,59.5 L674.8,38.4 L684.0,26.2 L693.2,34.0 L702.4,54.7 L711.6,69.3 L720.8,64.3 L730.0,44.3" fill="none" class="s-blue sw-2"/>
+<text x="142" y="44.0" text-anchor="end" class="t-xs t-bold">pair 0</text>
+<text x="142" y="59.0" text-anchor="end" class="t-xs t-muted">period 6.3</text>
+<rect x="150" y="86.0" width="580" height="56" class="box" rx="4"/>
+<line x1="150" y1="114.0" x2="730" y2="114.0" class="line-thin"/>
+<path d="M150.0,114.0 L159.2,107.2 L168.4,101.0 L177.6,96.1 L186.8,93.0 L196.0,92.0 L205.2,93.2 L214.4,96.4 L223.7,101.4 L232.9,107.6 L242.1,114.5 L251.3,121.3 L260.5,127.4 L269.7,132.1 L278.9,135.1 L288.1,136.0 L297.3,134.7 L306.5,131.3 L315.7,126.3 L324.9,120.0 L334.1,113.1 L343.3,106.3 L352.5,100.3 L361.7,95.6 L371.0,92.8 L380.2,92.0 L389.4,93.5 L398.6,97.0 L407.8,102.1 L417.0,108.5 L426.2,115.4 L435.4,122.1 L444.6,128.1 L453.8,132.6 L463.0,135.3 L472.2,135.9 L481.4,134.4 L490.6,130.8 L499.8,125.5 L509.0,119.1 L518.3,112.2 L527.5,105.5 L536.7,99.6 L545.9,95.1 L555.1,92.5 L564.3,92.1 L573.5,93.8 L582.7,97.5 L591.9,102.9 L601.1,109.4 L610.3,116.3 L619.5,123.0 L628.7,128.8 L637.9,133.1 L647.1,135.6 L656.3,135.9 L665.6,134.0 L674.8,130.2 L684.0,124.7 L693.2,118.2 L702.4,111.3 L711.6,104.6 L720.8,98.9 L730.0,94.7" fill="none" class="s-green sw-2"/>
+<text x="142" y="110.0" text-anchor="end" class="t-xs t-bold">pair 1</text>
+<text x="142" y="125.0" text-anchor="end" class="t-xs t-muted">period 19.9</text>
+<rect x="150" y="152.0" width="580" height="56" class="box" rx="4"/>
+<line x1="150" y1="180.0" x2="730" y2="180.0" class="line-thin"/>
+<path d="M150.0,180.0 L159.2,177.8 L168.4,175.6 L177.6,173.5 L186.8,171.4 L196.0,169.5 L205.2,167.6 L214.4,165.8 L223.7,164.2 L232.9,162.8 L242.1,161.5 L251.3,160.4 L260.5,159.5 L269.7,158.8 L278.9,158.3 L288.1,158.1 L297.3,158.0 L306.5,158.2 L315.7,158.6 L324.9,159.2 L334.1,160.0 L343.3,161.0 L352.5,162.2 L361.7,163.6 L371.0,165.1 L380.2,166.8 L389.4,168.7 L398.6,170.6 L407.8,172.6 L417.0,174.7 L426.2,176.9 L435.4,179.1 L444.6,181.3 L453.8,183.5 L463.0,185.6 L472.2,187.7 L481.4,189.7 L490.6,191.7 L499.8,193.5 L509.0,195.1 L518.3,196.6 L527.5,198.0 L536.7,199.2 L545.9,200.2 L555.1,200.9 L564.3,201.5 L573.5,201.9 L582.7,202.0 L591.9,201.9 L601.1,201.6 L610.3,201.1 L619.5,200.4 L628.7,199.4 L637.9,198.3 L647.1,197.0 L656.3,195.5 L665.6,193.9 L674.8,192.1 L684.0,190.2 L693.2,188.2 L702.4,186.1 L711.6,184.0 L720.8,181.8 L730.0,179.6" fill="none" class="s-orange sw-2"/>
+<text x="142" y="176.0" text-anchor="end" class="t-xs t-bold">pair 2</text>
+<text x="142" y="191.0" text-anchor="end" class="t-xs t-muted">period 62.8</text>
+<rect x="150" y="218.0" width="580" height="56" class="box" rx="4"/>
+<line x1="150" y1="246.0" x2="730" y2="246.0" class="line-thin"/>
+<path d="M150.0,246.0 L159.2,245.3 L168.4,244.6 L177.6,243.9 L186.8,243.2 L196.0,242.5 L205.2,241.9 L214.4,241.2 L223.7,240.5 L232.9,239.8 L242.1,239.2 L251.3,238.5 L260.5,237.9 L269.7,237.2 L278.9,236.6 L288.1,236.0 L297.3,235.3 L306.5,234.7 L315.7,234.1 L324.9,233.6 L334.1,233.0 L343.3,232.4 L352.5,231.9 L361.7,231.4 L371.0,230.9 L380.2,230.4 L389.4,229.9 L398.6,229.4 L407.8,229.0 L417.0,228.5 L426.2,228.1 L435.4,227.7 L444.6,227.3 L453.8,227.0 L463.0,226.6 L472.2,226.3 L481.4,226.0 L490.6,225.7 L499.8,225.5 L509.0,225.2 L518.3,225.0 L527.5,224.8 L536.7,224.6 L545.9,224.5 L555.1,224.4 L564.3,224.2 L573.5,224.1 L582.7,224.1 L591.9,224.0 L601.1,224.0 L610.3,224.0 L619.5,224.0 L628.7,224.1 L637.9,224.1 L647.1,224.2 L656.3,224.3 L665.6,224.4 L674.8,224.6 L684.0,224.8 L693.2,225.0 L702.4,225.2 L711.6,225.4 L720.8,225.7 L730.0,225.9" fill="none" class="s-purple sw-2"/>
+<text x="142" y="242.0" text-anchor="end" class="t-xs t-bold">pair 3</text>
+<text x="142" y="257.0" text-anchor="end" class="t-xs t-muted">period 198.7</text>
+<text x="150.0" y="296" text-anchor="middle" class="t-xs t-faint">0</text>
+<text x="297.3" y="296" text-anchor="middle" class="t-xs t-faint">16</text>
+<text x="444.6" y="296" text-anchor="middle" class="t-xs t-faint">32</text>
+<text x="591.9" y="296" text-anchor="middle" class="t-xs t-faint">48</text>
+<text x="730.0" y="296" text-anchor="middle" class="t-xs t-faint">63</text>
+<text x="440.0" y="314" text-anchor="middle" class="t-xs t-muted">position in the sequence</text>
+  </svg>
+  <figcaption><strong>Sinusoids at many speeds.</strong> Each lane is the sine member of one dimension pair for a 16-dimensional code (the cosines are the same waves shifted a quarter turn). The fast lane tells nearby positions apart; the slow lane says roughly where in the sequence you are. The combination is unique, like the hands of a clock.</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: clock hands and an odometer</p>
+  <p>Telling the time needs several hands. The second hand moves fast and identifies the moment within a minute, the minute hand identifies the minute within the hour, and the hour hand the hour within the day. No single hand is unique over a day, but the three together are. The sinusoids are a clock with many hands running at geometrically spaced speeds: the fast ones separate neighbouring positions, the slow ones separate distant regions.</p>
+  <p><em>Where it breaks down:</em> a real clock repeats every twelve hours, whereas the slowest sinusoid has a wavelength of tens of thousands of positions, so the code is effectively unique for any practical length, and the model does not read the hands one by one: attention compares whole vectors with dot products.</p>
+</div>
+
+<p>Why sines and cosines in pairs? Because shifting a position is then a <em>rotation</em>. For one pair with frequency &omega;, the vector (sin(p&omega;), cos(p&omega;)) at position p+k equals the vector at p rotated by the angle k&omega;, and that rotation does not depend on p. So PE(p+k) is a fixed linear function of PE(p), for every p: the offset k is something a linear layer could, in principle, read off. The authors say this is the reason for the choice, and report that a learned table gave nearly identical results in their experiments. The script verifies both consequences numerically with d = 8.</p>
+
+<pre class="terminal" data-title="sinus.py"><code>import numpy as np
+np.set_printoptions(precision=3, suppress=True, linewidth=120)
+d, T = 8, 64
+pos = np.arange(T)[:, None]
+freq = 10000.0 ** (-np.arange(0, d, 2) / d)             # one frequency per sin/cos pair
+pe = np.zeros((T, d)); pe[:, 0::2] = np.sin(pos * freq); pe[:, 1::2] = np.cos(pos * freq)
+print("frequencies:", freq, " wavelengths:", 2 * np.pi / freq)
+print("PE for positions 0, 1, 2:\n", pe[:3])
+
+# property 1: PE(p + k) is a fixed rotation of PE(p), the same for every p
+k = 5
+def shift_matrix(k):                                    # block-diagonal rotation by k * freq
+    R = np.zeros((d, d))
+    for i, w in enumerate(freq):
+        c, s = np.cos(k * w), np.sin(k * w)
+        R[2*i:2*i+2, 2*i:2*i+2] = [[c, s], [-s, c]]
+    return R
+R = shift_matrix(k)
+err = max(np.abs(R @ pe[p] - pe[p + k]).max() for p in range(T - k))
+print(f"max |R(5) PE(p) - PE(p+5)| over all p: {err:.1e}")
+
+# property 2: the dot product of two codes depends only on how far apart they are
+dots = lambda p, q: pe[p] @ pe[q]
+print("PE(3).PE(8) =", round(dots(3, 8), 6), "  PE(40).PE(45) =", round(dots(40, 45), 6), "  (offset 5)")
+print("PE(3).PE(4) =", round(dots(3, 4), 6), "  PE(3).PE(30) =", round(dots(3, 30), 6), "  (offset 1 and 27)")</code></pre>
+<pre class="terminal" data-title="output"><code>frequencies: [1.    0.1   0.01  0.001]  wavelengths: [   6.283   62.832  628.319 6283.185]
+PE for positions 0, 1, 2:
+ [[ 0.     1.     0.     1.     0.     1.     0.     1.   ]
+ [ 0.841  0.54   0.1    0.995  0.01   1.     0.001  1.   ]
+ [ 0.909 -0.416  0.199  0.98   0.02   1.     0.002  1.   ]]
+max |R(5) PE(p) - PE(p+5)| over all p: 8.7e-16
+PE(3).PE(8) = 3.159983   PE(40).PE(45) = 3.159983   (offset 5)
+PE(3).PE(4) = 3.535256   PE(3).PE(30) = 0.767195   (offset 1 and 27)</code></pre>
+
+<p>The rotation matrix R(5) maps PE(p) to PE(p+5) for all p with an error of 10<sup>&minus;15</sup>, and the dot product between two codes (3.159983) is the same for the pairs (3, 8) and (40, 45) since both are 5 apart. The dot product also shrinks as the offset grows (3.54 at offset 1, 0.77 at offset 27), which is a pleasant built-in notion of "nearness". But notice what the model actually receives: the code is <em>added to the token embedding at the input</em>, once, before the first layer. Attention then has to disentangle word from position inside the mixed vector, through its learned projections. The relative structure exists in the code but is only indirectly visible in the scores, which is a motivation for the methods below.</p>
+
+<h2>Relative position</h2>
+<p>If what matters is the distance j &minus; i between two tokens, build that into the attention scores directly instead of the inputs. Shaw, Uszkoreit and Vaswani ("Self-Attention with Relative Position Representations", 2018) added a learned vector for each clipped distance to the keys (and values) inside the attention computation, and reported better translation quality than absolute encodings. Raffel et al. ("Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer", 2019) simplified this in T5, using one learned number per head per distance bucket, added to the score:</p>
+<p style="text-align:center">s<sub>ij</sub> = q<sub>i</sub>&middot;k<sub>j</sub> / &radic;d<sub>k</sub> + b<sub>h</sub>( i &minus; j ).</p>
+<p>Distances beyond the largest bucket share one bias, so the scheme tolerates unseen lengths. Press, Smith and Lewis ("Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation", ALiBi, 2021) went further and used no learned parameters and no input encoding at all: the score is penalised linearly with distance, s<sub>ij</sub> = q<sub>i</sub>&middot;k<sub>j</sub> / &radic;d<sub>k</sub> &minus; m<sub>h</sub>(i &minus; j), where each head h has a fixed slope m<sub>h</sub> (a geometric sequence such as 1/2, 1/4, &hellip;, 1/256 for eight heads). Close tokens are favoured; each head decays at its own rate. The authors report that models trained on short sequences keep working on longer ones. Both methods act on the scores and need an extra (T, T) matrix of biases, which complicates the fastest attention kernels slightly; today both are used less often than rotary embeddings.</p>
+
+<h2>Rotary position embeddings (RoPE)</h2>
+
+<p>Su et al. ("RoFormer: Enhanced Transformer with Rotary Position Embedding", 2021) asked for a cleaner property: find a position-dependent transformation f such that the attention score between a query at position m and a key at position n depends on the two vectors and only on the <em>difference</em> n &minus; m:</p>
+<p style="text-align:center">f( q, m ) &middot; f( k, n ) = g( q, k, n &minus; m ).</p>
+<p>In two dimensions the answer is a rotation. Rotate the query vector by an angle proportional to its position, m&theta;, and the key by n&theta;. A rotation preserves lengths and turns the angle between two vectors into (angle before) plus (n &minus; m)&theta;. The dot product of two vectors is their lengths times the cosine of the angle between them, so only the difference of rotations matters. The figure shows two cases that give the same score.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 305" role="img" aria-label="Two circles. Left: a query vector rotated to position 2 and a key vector rotated to position 5, with the angle between them marked alpha plus three theta. Right: the same two vectors moved forward by three positions to positions 5 and 8: both turn by the same amount and the angle between them is again alpha plus three theta.">
+<defs><marker id="ahDL11b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="200" y="22" text-anchor="middle" class="t-sm t-bold">query at position 2, key at position 5</text>
+<circle cx="200" cy="150" r="100" fill="none" class="line-thin"/>
+<line x1="92" y1="150" x2="308" y2="150" class="line-thin"/><line x1="200" y1="42" x2="200" y2="258" class="line-thin"/>
+<line x1="200" y1="150" x2="167.7" y2="55.4" class="s-orange sw-3" marker-end="url(#ahDL11b)"/>
+<text x="160.6" y="46.1" text-anchor="middle" class="t-xs t-bold">q (pos 2)</text>
+<line x1="200" y1="150" x2="109.6" y2="107.3" class="s-blue sw-3" marker-end="url(#ahDL11b)"/>
+<text x="89.7" y="105.3" text-anchor="middle" class="t-xs t-bold">k (pos 5)</text>
+<path d="M185.5,107.4 A45,45 0 0 0 159.3,130.8" fill="none" class="s-yellow sw-2"/>
+<text x="153.4" y="101.8" text-anchor="middle" class="t-xs tc-yellow t-bold">&alpha; + 3&theta;</text>
+<text x="560" y="22" text-anchor="middle" class="t-sm t-bold">both moved forward by 3 positions</text>
+<circle cx="560" cy="150" r="100" fill="none" class="line-thin"/>
+<line x1="452" y1="150" x2="668" y2="150" class="line-thin"/><line x1="560" y1="42" x2="560" y2="258" class="line-thin"/>
+<line x1="560" y1="150" x2="463.3" y2="175.6" class="s-orange sw-3" marker-end="url(#ahDL11b)"/>
+<text x="442.1" y="183.1" text-anchor="middle" class="t-xs t-bold">q (pos 5)</text>
+<line x1="560" y1="150" x2="511.0" y2="237.2" class="s-blue sw-3" marker-end="url(#ahDL11b)"/>
+<text x="500.2" y="253.4" text-anchor="middle" class="t-xs t-bold">k (pos 8)</text>
+<path d="M516.5,161.5 A45,45 0 0 0 537.9,189.2" fill="none" class="s-yellow sw-2"/>
+<text x="504.6" y="196.8" text-anchor="middle" class="t-xs tc-yellow t-bold">&alpha; + 3&theta;</text>
+<text x="380" y="285" text-anchor="middle" class="t-xs t-muted">Moving both by 3 positions rotates both by 3&theta;, so the angle between them (&alpha; + 3&theta;) is unchanged. Here &theta; = 0.5.</text>
+  </svg>
+  <figcaption><strong>Rotation encodes position, and the angle between q and k encodes the gap.</strong> Each vector turns by &theta; radians for every position. Shifting both by 3 positions turns both by 3&theta;, so the angle between them, and with it their dot product, does not change.</figcaption>
+</figure>
+
+<p>For a head of width d<sub>k</sub>, split the dimensions into d<sub>k</sub>/2 consecutive pairs and rotate pair i by the angle m&theta;<sub>i</sub>, with the same geometric spread of frequencies as the sinusoids:</p>
+<p style="text-align:center">&theta;<sub>i</sub> = base<sup>&minus;2i/d<sub>k</sub></sup>, &nbsp;&nbsp; base = 10000 in the paper, &nbsp;&nbsp; i = 0, &hellip;, d<sub>k</sub>/2 &minus; 1.</p>
+<p>Written out, a pair (x<sub>2i</sub>, x<sub>2i+1</sub>) at position m becomes (x<sub>2i</sub> cos m&theta;<sub>i</sub> &minus; x<sub>2i+1</sub> sin m&theta;<sub>i</sub>, &nbsp;x<sub>2i</sub> sin m&theta;<sub>i</sub> + x<sub>2i+1</sub> cos m&theta;<sub>i</sub>). Four properties set it apart from the encodings above:</p>
+<ul>
+  <li><b>It is applied to queries and keys only, inside every attention layer,</b> not added to the input once. Values are untouched, so what is read from a token does not depend on where it sits; only <em>how strongly it is attended to</em> does.</li>
+  <li><b>It has no parameters</b> and costs a few elementwise multiplications per head.</li>
+  <li><b>The score is relative by construction,</b> as the derivation below shows.</li>
+  <li><b>Different pairs see different scales.</b> Fast pairs (&theta; near 1) distinguish adjacent tokens; slow pairs turn so little over thousands of tokens that they carry coarse position.</li>
+</ul>
+
+<details class="deeper">
+  <summary>Go deeper <span class="hint">optional: the proof that the score depends on n &minus; m</span></summary>
+  <p>Write R(a) for the 2 &times; 2 rotation by angle a, so that R(a)<sup>T</sup> = R(&minus;a) and R(a)R(b) = R(a + b). For one pair, take the 2-vectors q and k, and rotate them to positions m and n: q' = R(m&theta;)q and k' = R(n&theta;)k. Then</p>
+  <p style="text-align:center">q'&middot;k' = q<sup>T</sup> R(m&theta;)<sup>T</sup> R(n&theta;) k = q<sup>T</sup> R(&minus;m&theta;) R(n&theta;) k = q<sup>T</sup> R((n &minus; m)&theta;) k.</p>
+  <p>The score of a whole head is the sum of this quantity over its d<sub>k</sub>/2 pairs, each with its own &theta;<sub>i</sub>, so it depends on m and n only through n &minus; m. The matrix R((n &minus; m)&theta;) lies between q and k, so the model learns, through W<sub>Q</sub> and W<sub>K</sub>, which relative distances each pair should attend to. Su et al. also argue that, with the frequencies above, the contribution of each pair decays as the distance grows. They state this as a property of their choice of &theta;<sub>i</sub>; do not assume that it makes far tokens unattendable, since the model can learn to counteract it.</p>
+  <p>A practical warning: libraries disagree on which dimensions form a pair. The paper pairs neighbours (2i, 2i+1), as in the code below; many implementations pair dimension i with dimension i + d<sub>k</sub>/2 (called "rotate half"). They are the same maths on permuted dimensions, but weights trained under one convention must be loaded under that same convention, which is why conversion scripts between libraries permute the query and key weights. Getting this wrong loads without errors and gives a model that is much worse.</p>
+</details>
+
+<p>The script implements RoPE for pairs of neighbouring dimensions on arrays of shape (..., T, d<sub>k</sub>), then tests the claim in three ways.</p>
+
+<pre class="terminal" data-title="rope.py"><code>import numpy as np
+rng = np.random.default_rng(0)
+d_k, base = 8, 10000.0
+theta = base ** (-np.arange(0, d_k, 2) / d_k)           # one angle per pair of dimensions, (d_k/2,)
+
+def rope(x, pos):
+    """Rotate each consecutive pair (x[2i], x[2i+1]) of x by pos * theta[i]. x: (..., T, d_k), pos: (T,)."""
+    ang = pos[:, None] * theta[None, :]                  # (T, d_k/2)
+    cos, sin = np.cos(ang), np.sin(ang)
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    out = np.empty_like(x)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out
+
+q = rng.normal(size=d_k); k = rng.normal(size=d_k)       # one query vector and one key vector
+score = lambda m, n: rope(q[None], np.array([m]))[0] @ rope(k[None], np.array([n]))[0]
+print("unrotated q.k          :", round(q @ k, 6))
+for m, n in ((5, 2), (105, 102), (1005, 1002), (7, 2), (7, 9)):
+    print(f"query at {m:&gt;4}, key at {n:&gt;4} (n-m = {n - m:&gt;2}): score = {score(m, n):.6f}")
+print("rotation keeps the norm :", np.allclose(np.linalg.norm(rope(q[None], np.array([37]))), np.linalg.norm(q)))
+
+# a whole attention layer: shifting every position by the same amount leaves the output unchanged
+T = 6
+Q, K, V = rng.normal(size=(T, d_k)), rng.normal(size=(T, d_k)), rng.normal(size=(T, d_k))
+def attn(Q, K, V, pos):
+    s = rope(Q, pos) @ rope(K, pos).T / np.sqrt(d_k)
+    s = np.where(np.triu(np.ones((T, T), bool), 1), -np.inf, s)
+    e = np.exp(s - s.max(-1, keepdims=True)); return (e / e.sum(-1, keepdims=True)) @ V
+o0 = attn(Q, K, V, np.arange(T))
+o1 = attn(Q, K, V, np.arange(T) + 1000)
+print("output unchanged when positions are shifted by 1000:", np.allclose(o0, o1))
+print("max difference:", f"{np.abs(o0 - o1).max():.1e}")</code></pre>
+<pre class="terminal" data-title="output"><code>unrotated q.k          : -1.467987
+query at    5, key at    2 (n-m = -3): score = -1.586475
+query at  105, key at  102 (n-m = -3): score = -1.586475
+query at 1005, key at 1002 (n-m = -3): score = -1.586475
+query at    7, key at    2 (n-m = -5): score = -1.142699
+query at    7, key at    9 (n-m =  2): score = -1.380428
+rotation keeps the norm : True
+output unchanged when positions are shifted by 1000: True
+max difference: 2.7e-15</code></pre>
+
+<p>Query at 5 with key at 2, query at 105 with key at 102, and query at 1005 with key at 1002 all give the score &minus;1.586475, to the six digits shown: only the gap of &minus;3 matters. Different gaps give different scores (&minus;1.14, &minus;1.38), the rotation preserves the vector's length, and an entire causal attention layer is unchanged to 10<sup>&minus;15</sup> when every position is shifted by 1,000. Positions matter, but only relative to one another: this is the property that made RoPE the default.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"RoPE is relative, so a model trained on 4,096 tokens works on 100,000." Relative does not mean length-independent. At training time the model only ever saw gaps up to 4,095, and for the slow dimension pairs the angles m&theta;<sub>i</sub> only reached small values. At longer range the slow pairs take angle values the attention heads never saw, and the scores they produce are out of distribution; quality typically collapses well before the nominal limit unless the model is extended or retrained. Also: a model that <em>accepts</em> long input does not necessarily <em>use</em> it well. Even models trained for long contexts can retrieve a fact from the middle of a long prompt less reliably than from the ends (Liu et al., "Lost in the Middle", 2023), so claims about context length should be tested on your task.</p>
+</div>
+
+<h2>Going past the trained length</h2>
+
+<p>Because context length is a product feature, extending it is a large topic. The cleanest way to see the problem is to ask how many positions each rotation pair needs to complete one full turn: its wavelength 2&pi; &middot; base<sup>2i/d<sub>k</sub></sup>. The chart plots it for a head width of 128.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Wavelength in tokens on a log scale against dimension pair index for d_k equal to 128. With base 10,000 the wavelength rises from 6.3 to about 54,000. With base 500,000 it rises from 6.3 to about 2.6 million. Dashed horizontal lines mark 2,048 and 131,072 tokens.">
+<rect x="80" y="20" width="480" height="210" class="box" rx="4"/>
+<line x1="80" y1="230.0" x2="560" y2="230.0" class="line-thin"/>
+<text x="74" y="234.0" text-anchor="end" class="t-xs t-faint">1</text>
+<line x1="80" y1="200.0" x2="560" y2="200.0" class="line-thin"/>
+<text x="74" y="204.0" text-anchor="end" class="t-xs t-faint">10</text>
+<line x1="80" y1="170.0" x2="560" y2="170.0" class="line-thin"/>
+<text x="74" y="174.0" text-anchor="end" class="t-xs t-faint">100</text>
+<line x1="80" y1="140.0" x2="560" y2="140.0" class="line-thin"/>
+<text x="74" y="144.0" text-anchor="end" class="t-xs t-faint">1e3</text>
+<line x1="80" y1="110.0" x2="560" y2="110.0" class="line-thin"/>
+<text x="74" y="114.0" text-anchor="end" class="t-xs t-faint">1e4</text>
+<line x1="80" y1="80.0" x2="560" y2="80.0" class="line-thin"/>
+<text x="74" y="84.0" text-anchor="end" class="t-xs t-faint">1e5</text>
+<line x1="80" y1="50.0" x2="560" y2="50.0" class="line-thin"/>
+<text x="74" y="54.0" text-anchor="end" class="t-xs t-faint">1e6</text>
+<line x1="80" y1="20.0" x2="560" y2="20.0" class="line-thin"/>
+<text x="74" y="24.0" text-anchor="end" class="t-xs t-faint">1e7</text>
+<text x="80.0" y="246" text-anchor="middle" class="t-xs t-faint">0</text>
+<text x="201.9" y="246" text-anchor="middle" class="t-xs t-faint">16</text>
+<text x="323.8" y="246" text-anchor="middle" class="t-xs t-faint">32</text>
+<text x="445.7" y="246" text-anchor="middle" class="t-xs t-faint">48</text>
+<text x="560.0" y="246" text-anchor="middle" class="t-xs t-faint">63</text>
+<line x1="80" y1="130.7" x2="560" y2="130.7" class="line-dash s-green"/>
+<text x="566" y="134.7" class="t-xs">2,048 tokens</text>
+<line x1="80" y1="76.5" x2="560" y2="76.5" class="line-dash s-red"/>
+<text x="566" y="80.5" class="t-xs">131,072 tokens</text>
+<path d="M80.0,206.1 L87.6,204.2 L95.2,202.3 L102.9,200.4 L110.5,198.6 L118.1,196.7 L125.7,194.8 L133.3,192.9 L141.0,191.1 L148.6,189.2 L156.2,187.3 L163.8,185.4 L171.4,183.6 L179.0,181.7 L186.7,179.8 L194.3,177.9 L201.9,176.1 L209.5,174.2 L217.1,172.3 L224.8,170.4 L232.4,168.6 L240.0,166.7 L247.6,164.8 L255.2,162.9 L262.9,161.1 L270.5,159.2 L278.1,157.3 L285.7,155.4 L293.3,153.6 L301.0,151.7 L308.6,149.8 L316.2,147.9 L323.8,146.1 L331.4,144.2 L339.0,142.3 L346.7,140.4 L354.3,138.6 L361.9,136.7 L369.5,134.8 L377.1,132.9 L384.8,131.1 L392.4,129.2 L400.0,127.3 L407.6,125.4 L415.2,123.6 L422.9,121.7 L430.5,119.8 L438.1,117.9 L445.7,116.1 L453.3,114.2 L461.0,112.3 L468.6,110.4 L476.2,108.6 L483.8,106.7 L491.4,104.8 L499.0,102.9 L506.7,101.1 L514.3,99.2 L521.9,97.3 L529.5,95.4 L537.1,93.6 L544.8,91.7 L552.4,89.8 L560.0,87.9" fill="none" class="s-blue sw-2"/>
+<line x1="94" y1="30" x2="120" y2="30" class="s-blue sw-2"/><text x="128" y="34" class="t-xs">base 10,000</text>
+<path d="M80.0,206.1 L87.6,203.4 L95.2,200.7 L102.9,198.0 L110.5,195.4 L118.1,192.7 L125.7,190.0 L133.3,187.4 L141.0,184.7 L148.6,182.0 L156.2,179.3 L163.8,176.7 L171.4,174.0 L179.0,171.3 L186.7,168.7 L194.3,166.0 L201.9,163.3 L209.5,160.6 L217.1,158.0 L224.8,155.3 L232.4,152.6 L240.0,150.0 L247.6,147.3 L255.2,144.6 L262.9,141.9 L270.5,139.3 L278.1,136.6 L285.7,133.9 L293.3,131.3 L301.0,128.6 L308.6,125.9 L316.2,123.2 L323.8,120.6 L331.4,117.9 L339.0,115.2 L346.7,112.6 L354.3,109.9 L361.9,107.2 L369.5,104.5 L377.1,101.9 L384.8,99.2 L392.4,96.5 L400.0,93.9 L407.6,91.2 L415.2,88.5 L422.9,85.8 L430.5,83.2 L438.1,80.5 L445.7,77.8 L453.3,75.2 L461.0,72.5 L468.6,69.8 L476.2,67.1 L483.8,64.5 L491.4,61.8 L499.0,59.1 L506.7,56.5 L514.3,53.8 L521.9,51.1 L529.5,48.4 L537.1,45.8 L544.8,43.1 L552.4,40.4 L560.0,37.8" fill="none" class="s-orange sw-2"/>
+<line x1="94" y1="54" x2="120" y2="54" class="s-orange sw-2"/><text x="128" y="58" class="t-xs">base 500,000</text>
+<text x="320.0" y="266" text-anchor="middle" class="t-xs t-muted">dimension pair i (d_k = 128)</text>
+<text x="18" y="125.0" transform="rotate(-90 18 125.0)" text-anchor="middle" class="t-xs t-muted">wavelength in tokens (log scale)</text>
+  </svg>
+  <figcaption><strong>Every pair has its own ruler.</strong> Pairs whose wavelength lies below the training length (green dashed line) have seen full turns many times. Pairs above it have only ever seen a part of a turn, so longer inputs give them angles outside anything seen in training. A larger base (orange) stretches the rulers so that more pairs act as slow, coarse clocks.</figcaption>
+</figure>
+
+<pre class="terminal" data-title="rope_ext.py"><code>import numpy as np
+d_k, trained, target = 128, 2048, 8192
+for base in (10_000, 500_000):
+    i = np.arange(d_k // 2)
+    wavelength = 2 * np.pi * base ** (2 * i / d_k)       # positions needed for one full turn of pair i
+    unseen = (wavelength &gt; trained).sum()
+    print(f"base {base:&gt;7,}: wavelengths from {wavelength[0]:.1f} to {wavelength[-1]:,.0f} positions; "
+          f"{unseen} of {d_k // 2} pairs never complete a turn within {trained:,} trained positions")
+
+# position interpolation: squeeze the new positions back into the trained range
+base = 10_000
+theta = base ** (-np.arange(0, d_k, 2) / d_k)
+lowest = theta[-1]
+print(f"\nslowest pair, angle at position {trained - 1:,}: {(trained - 1) * lowest:.3f} rad (largest seen in training)")
+print(f"slowest pair, angle at position {target - 1:,}: {(target - 1) * lowest:.3f} rad  &lt;- never seen if used directly")
+scale = trained / target
+print(f"with interpolation (positions x {scale}): {(target - 1) * scale * lowest:.3f} rad  &lt;- back inside the trained range")
+fastest = theta[0]
+print(f"fastest pair, adjacent tokens differ by {fastest:.2f} rad; after interpolation by {fastest * scale:.2f} rad (neighbours blur)")</code></pre>
+<pre class="terminal" data-title="output"><code>base  10,000: wavelengths from 6.3 to 54,410 positions; 23 of 64 pairs never complete a turn within 2,048 trained positions
+base 500,000: wavelengths from 6.3 to 2,559,196 positions; 35 of 64 pairs never complete a turn within 2,048 trained positions
+
+slowest pair, angle at position 2,047: 0.236 rad (largest seen in training)
+slowest pair, angle at position 8,191: 0.946 rad  &lt;- never seen if used directly
+with interpolation (positions x 0.25): 0.236 rad  &lt;- back inside the trained range
+fastest pair, adjacent tokens differ by 1.00 rad; after interpolation by 0.25 rad (neighbours blur)</code></pre>
+
+<p>With a base of 10,000, 23 of the 64 pairs never complete a turn inside a 2,048-token training window. Run at 8,192 tokens, the slowest pair reaches 0.946 radians, but training never took it above 0.236. Three families of fixes exist.</p>
+<ul>
+  <li><b>Position interpolation.</b> Chen et al. ("Extending Context Window of Large Language Models via Position Interpolation", 2023) rescale the positions, so that 8,192 new positions are squeezed into the trained range (multiply by 2,048/8,192), then fine-tune briefly. They extended LLaMA models to 32,768 positions with fine-tuning of about 1,000 steps. The cost is visible in the last lines of the output: neighbouring tokens now differ by 0.25 radians where they used to differ by 1.00 in the fastest pair, so fine local distinctions blur, which is why a little fine-tuning is needed.</li>
+  <li><b>Frequency-aware scaling.</b> Scale different pairs differently: keep the fast pairs (which have seen many turns and encode fine local order) and interpolate only the slow ones. Variants include "NTK-aware" scaling, which raises the base, and YaRN (Peng et al., 2023), which combines per-frequency interpolation with a temperature correction on the attention logits and fine-tuning.</li>
+  <li><b>A larger base from the start.</b> If the model will be trained for long contexts, enlarge the base so the slow pairs span the target length. The Llama 3 report says it increases the RoPE base frequency to 500,000 to support longer contexts, citing Xiong et al. (2023) as showing that this value works for lengths up to 32,768. The chart shows the effect: at base 500,000, 35 of 64 pairs have wavelengths longer than 2,048 tokens.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>As far as published reports show, rotary embeddings (with a large base, often combined with a staged training schedule in which the context grows and a frequency-aware extension method is applied at the end) are the most common positional scheme in open-weight language models. Meta's April 2025 Llama 4 announcement describes an "iRoPE" design in which most layers use rotary embeddings and some interleaved attention layers use no positional encoding at all, with a temperature adjustment to the attention at inference time; other labs have published similar mixtures. Claims of million-token contexts are best read together with the evaluation they were measured on. Specific bases, scalings and context lengths change with each release, so read a model's own configuration (<code>rope_theta</code> and any <code>rope_scaling</code> entry in many open model files) rather than rely on a number remembered from here.</p>
+</div>
+
+<h2>Comparing the schemes</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Scheme</th><th>Where applied</th><th>Parameters</th><th>Relative?</th><th>Beyond trained length</th><th>Examples</th></tr></thead>
+  <tbody>
+    <tr><td>Learned absolute</td><td>Added to input embeddings</td><td>T<sub>max</sub> &times; C</td><td>No</td><td>Not possible without new rows</td><td>GPT-2, BERT</td></tr>
+    <tr><td>Sinusoidal</td><td>Added to input embeddings</td><td>0</td><td>Structure present, used indirectly</td><td>Defined, but weak in practice</td><td>Original Transformer</td></tr>
+    <tr><td>Relative bias (T5)</td><td>Added to attention scores</td><td>A few per head</td><td>Yes (bucketed)</td><td>Far distances share a bucket</td><td>T5</td></tr>
+    <tr><td>ALiBi</td><td>Linear penalty on scores</td><td>0</td><td>Yes</td><td>Designed for it; authors report good extrapolation</td><td>BLOOM, MPT</td></tr>
+    <tr><td>RoPE</td><td>Rotates queries and keys in each layer</td><td>0</td><td>Yes, by construction</td><td>Needs interpolation or retraining</td><td>GPT-NeoX, LLaMA family and many others</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>1. In <code>perm.py</code> add a causal mask to <code>self_attention</code> and compare the "bites" output for the two sentences without positional codes: do they still match? (Do not expect the same answer as the unmasked case.) 2. In <code>sinus.py</code>, print <code>pe[p] @ pe[p + k]</code> for k from 0 to 60 and watch the similarity decay; change <code>d</code> to 64 and see how it changes. 3. In <code>rope.py</code>, apply <code>rope</code> to the <em>value</em> vectors too and re-run the shift test. Does attention remain relative? (Think about what the output now contains.) 4. Set <code>base</code> to 100 and then 1,000,000 in <code>rope_ext.py</code> and count how many pairs complete a turn inside 2,048 tokens. 5. In <code>rope.py</code> switch to the "rotate half" pairing (pair i with i + d<sub>k</sub>/2) and check that the shift test still passes but the numbers differ from the first version.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 rope.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 rope_ext.py</span></code></pre>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Position choices show up in serving. With RoPE, keys are rotated before they are stored in the KV cache (<a href="../../llm-training/chapters/18-kv-cache.html">A3 chapter 18</a>), so a cached key carries its absolute position in its angle. A cached prefix can be reused only if the tokens sit at the same positions as when it was computed, which is one reason prefix caching in serving engines is keyed on exact token prefixes (<a href="../../llm-training/chapters/20-serving-engines.html">A3 chapter 20</a>); shifting a cached block to a new position means re-rotating its keys. Context length also sets the memory bill: the cache grows linearly with it, and the attention work grows with its square (chapter 09), so lengthening the context window multiplies serving cost before it multiplies quality (<a href="../../systems/chapters/21-parallelism-gpus.html">Zero to Systems chapter 21</a> on memory bandwidth). Finally, positional bugs are silent. A test that feeds the same prompt at an offset, or a long input, and compares quality is the cheapest defence, in the spirit of the regression checks in <a href="../../llm-training/chapters/23-evaluating-models.html">A3 chapter 23</a>.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Self-attention is permutation-equivariant: without position information it cannot distinguish "dog bites man" from "man bites dog". The causal mask leaks only a weak, implicit notion of order.</li>
+    <li>Learned absolute tables are simple but cap the context length and are not relative. Sinusoids are parameter-free and have a rotation structure, but are added once at the input.</li>
+    <li>Relative methods put distance into the scores (T5 buckets, ALiBi's linear penalty).</li>
+    <li>RoPE rotates each pair of query and key dimensions by position times a pair-specific frequency, so the dot product depends only on the position difference: R(m&theta;)<sup>T</sup>R(n&theta;) = R((n &minus; m)&theta;). It has no parameters and is applied in every layer to q and k, not to v.</li>
+    <li>Relative is not length-free: slow pairs reach angles never seen in training at longer range. Position interpolation, frequency-aware scaling (YaRN) and a larger base extend the context, each with trade-offs.</li>
+    <li>With RoPE, cached keys carry their absolute positions, and the pairing convention of dimensions must match the weights.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Vaswani et al., "Attention Is All You Need" (2017)</a>. Section 3.5 defines the sinusoidal encoding and gives the reason for it.</li>
+  <li><a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding" (2021)</a>. The RoPE paper, with the derivation in two and then d dimensions.</li>
+  <li><a href="https://arxiv.org/abs/1803.02155" target="_blank" rel="noopener">Shaw, Uszkoreit and Vaswani, "Self-Attention with Relative Position Representations" (2018)</a>. Relative positions inside attention.</li>
+  <li><a href="https://arxiv.org/abs/2108.12409" target="_blank" rel="noopener">Press, Smith and Lewis, "Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation" (ALiBi, 2021)</a>. The linear-bias alternative.</li>
+  <li><a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener">Chen et al., "Extending Context Window of Large Language Models via Position Interpolation" (2023)</a>. Rescaling positions to extend a RoPE model.</li>
+  <li><a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">Peng et al., "YaRN: Efficient Context Window Extension of Large Language Models" (2023)</a>. Frequency-dependent scaling plus an attention temperature.</li>
+  <li><a href="https://arxiv.org/abs/2203.16634" target="_blank" rel="noopener">Haviv et al., "Transformer Language Models without Positional Encodings Still Learn Positional Information" (2022)</a>. Why causal models are not entirely blind to order.</li>
+  <li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">Liu et al., "Lost in the Middle: How Language Models Use Long Contexts" (2023)</a>. Accepting long input is not the same as using it.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">An unmasked self-attention layer receives the tokens of a sentence with no positional information, and then the same tokens in a different order. What does it output?</p>
+    <ol class="q-options"><li>The same matrix of outputs, in the same row order</li><li>The same output vectors, but with rows permuted in the same way as the input</li><li>Completely different vectors, because attention weights depend on position</li><li>An error, because the sequence is not ordered</li></ol>
+    <div class="q-explain">Each score depends on the two tokens' vectors, not on their indices, and the output for a token is a sum over all tokens, which is order-independent. So each token's output is unchanged and moves with its token. The first option would be true only if the layer ignored order and also did not move rows, which is not what permuting the input does.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A model has 1,024 learned absolute position embeddings. A user sends 1,500 tokens. What is the fundamental problem?</p>
+    <ol class="q-options"><li>The softmax overflows at that length</li><li>Attention cost is quadratic, so it is too slow to run</li><li>The model must be rerun with a larger vocabulary</li><li>There is no learned vector for positions 1,024 to 1,499, so the model cannot represent them at all</li></ol>
+    <div class="q-explain">The table has exactly 1,024 rows. Quadratic cost is a practical issue but would still allow the computation; the missing rows make it impossible without new parameters. Vocabulary size is unrelated to position.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">In RoPE, a query at position 40 and a key at position 37 produce a score s. Where must a key sit for a query at position 1,040 to produce the same score s for the same vectors?</p>
+    <ol class="q-options"><li>Position 1,037</li><li>Position 37</li><li>Position 1,043</li><li>Position 40</li></ol>
+    <div class="q-explain">The score depends only on n &minus; m, which is &minus;3 here, so for m = 1,040 the key must be at n = 1,037. Keeping the key at 37 changes the gap to &minus;1,003. Position 1,043 flips the sign of the gap (+3), which in general gives a different score.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why does RoPE apply the rotation to queries and keys but not to values?</p>
+    <ol class="q-options"><li>Values are too small to rotate</li><li>The values are rotated in the second layer instead</li><li>Position needs to influence only how strongly a token is attended to; the content that gets read should not depend on where it sits, and the relative-score identity concerns only the q&middot;k dot product</li><li>Rotating values would make the attention weights negative</li></ol>
+    <div class="q-explain">The relative-position identity is a statement about the dot product of a rotated q and a rotated k. Values are mixed after the softmax; rotating them would add absolute position into the output content (try it in the exercise). Attention weights come from a softmax, so they cannot become negative either way.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A RoPE model is trained at 2,048 tokens with base 10,000 and then run at 8,192 tokens with no changes. Which pairs of dimensions are most likely to produce out-of-distribution angles?</p>
+    <ol class="q-options"><li>The fastest pairs, since they rotate the most per token</li><li>The slowest pairs, whose wavelengths exceed the training length, so longer positions reach angles never seen in training</li><li>None: RoPE is relative, so length does not matter</li><li>All pairs equally, because the rotation is the same for every pair</li></ol>
+    <div class="q-explain">Fast pairs have completed many full turns during training, so any angle modulo 2&pi; is familiar. A slow pair with a wavelength of, say, 50,000 positions moves through only a fraction of a turn in 2,048 positions; at 8,192 it reaches angles it never produced. That is the problem that interpolation and frequency-aware scaling address. The pairs have different frequencies, so the last option is wrong.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">You convert a RoPE model checkpoint between two libraries. It loads without error, but outputs are much worse. Without changing any weights, what is the most likely cause?</p>
+    <ol class="q-options"><li>The softmax scale factor differs</li><li>The vocabulary file is missing</li><li>The two libraries pair dimensions differently for the rotation (neighbours versus first half and second half), so the queries and keys are being rotated in the wrong planes</li><li>RoPE has to be disabled for conversions</li></ol>
+    <div class="q-explain">Both conventions are valid, but a given set of weights was trained under one of them. Under the wrong pairing, each rotation mixes the wrong dimensions, so the scores change in a subtle way and the model degrades silently. A missing vocabulary file would fail loudly. The scale factor affects scores uniformly and would not be a library-dependent surprise.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

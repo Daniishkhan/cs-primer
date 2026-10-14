@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool Calling: The Agent Loop · Agents, Tools &amp; Protocols</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/agt02-budget.css">
+</head>
+<body data-root="../.." data-course="agt" data-chapter="02">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Tool Calling: The Agent Loop</h1>
+  <p class="lede">A model can only write text. Tool calling is the arrangement that turns written requests into real actions: you describe functions, the model asks for one, your program runs it and reports back, and a loop repeats until the job is done or a limit says stop. This chapter builds that loop completely, including the parts that keep it from running away.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Everything else in this course sits on top of this loop: tool design, MCP servers, memory, multi-agent teams, computer use and coding agents are all this loop with something added. Get its mechanics exactly right and the rest is variations. Get them subtly wrong, with a missing tool result, an unbounded cycle or a retried payment, and you meet failures that are expensive, confusing or unsafe. After this chapter you can write the loop from scratch, say precisely what travels in each turn, handle errors and parallel calls, and put hard limits around cost and time. <a href="../labs/lab-01-agent-loop.html">Lab 1</a> has you build it.</p>
+</div>
+
+<h2>What a tool is</h2>
+
+<p>A <span class="term">tool</span> is a function your program makes available to the model, described by three things: a <strong>name</strong>, a plain-language <strong>description</strong> of what it does and when to use it, and an <strong>input schema</strong> that says what arguments it takes. The schema is written in <span class="term">JSON Schema</span>, a standard vocabulary for describing the shape of a JSON document: which keys exist, their types, which are required. Here are two tools for an order-support agent:</p>
+
+<pre class="terminal" data-title="tools.py"><code>import json
+from llm import ScriptedModel, tool_use, text_of, tool_calls, tool_result
+
+ORDERS = {"A-1001": {"status": "shipped", "total_cents": 4250, "carrier": "UPS"},
+          "A-1002": {"status": "processing", "total_cents": 1999, "carrier": None}}
+TRACKING = {"UPS": "Out for delivery in Leeds"}
+
+def get_order(order_id):
+    return json.dumps(ORDERS[order_id])               # KeyError for unknown ids
+def track_shipment(carrier):
+    return TRACKING[carrier]
+
+REGISTRY = {
+    "get_order": (get_order, {"name": "get_order", "description": "Fetch one order by its id, e.g. A-1001.",
+        "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}),
+    "track_shipment": (track_shipment, {"name": "track_shipment", "description": "Latest tracking event for a carrier name.",
+        "input_schema": {"type": "object", "properties": {"carrier": {"type": "string"}}, "required": ["carrier"]}}),
+}
+TOOL_DEFS = [d for _, d in REGISTRY.values()]</code></pre>
+
+<p>Two lists matter. <code>REGISTRY</code> maps each name to the real Python function; it stays in your program. <code>TOOL_DEFS</code> is the part sent to the model with every request, in the <code>tools</code> field from <a href="01-model-apis.html">chapter 1</a>. The model sees only names, descriptions and schemas. It never sees your code and it cannot run anything. This is the point people most often get wrong.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"The model calls the function." It does not. The model writes a structured <em>request</em> naming a tool and its arguments; <strong>your program decides whether to run it</strong>, runs it, and reports what happened. That gap is the entire safety story of agents: allow-lists, argument validation, permissions, approvals and sandboxes all live in the code that stands between "the model asked" and "the function ran". Providers also offer a few <em>server-side</em> tools (web search, code execution) that the provider runs for you, but the mechanism you build here, client-side tools, is the general case.</p>
+</div>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the order slip and the kitchen</p>
+  <p>In a restaurant the diner does not cook. A waiter writes an order slip in a fixed format ("table 4, dish 12, no onions"), the kitchen reads it, makes the dish or sends the slip back saying "out of stock", and the answer returns to the table. The model writes the slips; your program is the kitchen; <code>tool_result</code> is the plate or the "out of stock" note.</p>
+  <p><em>Where it breaks down:</em> a kitchen can be certain a slip came from a real waiter. Your program cannot be certain a request is wise or even well-formed: the "waiter" may have been misled by text in a document it read, so the kitchen must check each slip instead of trusting it.</p>
+</div>
+
+<h2>The turn structure</h2>
+
+<p>When you send a request with <code>tools</code> and the model decides to use one, its reply has <code>stop_reason: "tool_use"</code> and contains one or more <code>tool_use</code> blocks. Each has a unique <code>id</code>, the tool <code>name</code> and an <code>input</code> object that should satisfy the schema. Your program then sends the next request with the history extended by two messages: the assistant message exactly as received, and a <code>user</code> message holding a <code>tool_result</code> block for each request, tied to it by <code>tool_use_id</code>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="An assistant message containing a text block and two tool_use blocks with ids ta and tb. Below it a user message containing two tool_result blocks with tool_use_id ta and tb. Lines pair each tool_use with its tool_result.">
+    <defs><marker id="ahAG02a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="10" y="10" width="740" height="100" rx="10" class="box"/>
+    <text x="24" y="32" class="t-sm t-bold">message 1: role = assistant   (stop_reason: tool_use)</text>
+    <rect x="30" y="46" width="200" height="50" rx="6" class="box"/>
+    <text x="130" y="66" text-anchor="middle" class="t-xs t-bold">text</text>
+    <text x="130" y="84" text-anchor="middle" class="t-xs mono">"I'll check both."</text>
+    <rect x="260" y="46" width="230" height="50" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="375" y="66" text-anchor="middle" class="t-xs t-bold">tool_use  id = ta</text>
+    <text x="375" y="84" text-anchor="middle" class="t-xs mono">get_order {order_id: A-1001}</text>
+    <rect x="510" y="46" width="230" height="50" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="625" y="66" text-anchor="middle" class="t-xs t-bold">tool_use  id = tb</text>
+    <text x="625" y="84" text-anchor="middle" class="t-xs mono">get_order {order_id: A-1002}</text>
+    <rect x="10" y="160" width="740" height="100" rx="10" class="box"/>
+    <text x="24" y="182" class="t-sm t-bold">message 2: role = user   (your program's answer)</text>
+    <rect x="260" y="196" width="230" height="50" rx="6" class="fs-green s-green sw-2"/>
+    <text x="375" y="216" text-anchor="middle" class="t-xs t-bold">tool_result  tool_use_id = ta</text>
+    <text x="375" y="234" text-anchor="middle" class="t-xs mono">{"status": "shipped", ...}</text>
+    <rect x="510" y="196" width="230" height="50" rx="6" class="fs-green s-green sw-2"/>
+    <text x="625" y="216" text-anchor="middle" class="t-xs t-bold">tool_result  tool_use_id = tb</text>
+    <text x="625" y="234" text-anchor="middle" class="t-xs mono">{"status": "processing", ...}</text>
+    <line x1="375" y1="98" x2="375" y2="194" class="line" marker-end="url(#ahAG02a)"/>
+    <line x1="625" y1="98" x2="625" y2="194" class="line" marker-end="url(#ahAG02a)"/>
+    <text x="130" y="226" text-anchor="middle" class="t-xs t-muted">one result per request,</text>
+    <text x="130" y="242" text-anchor="middle" class="t-xs t-muted">matched by id</text>
+  </svg>
+  <figcaption><strong>Ids are the contract.</strong> Every <code>tool_use</code> must be answered by a <code>tool_result</code> with the same id, in the very next user message. Results are matched by id, not by position.</figcaption>
+</figure>
+
+<p>A few rules follow, and providers enforce them with a 400 error if you break them. The tool results travel in a <code>user</code> message because, from the model's side, they are information arriving from outside. Every <code>tool_use</code> id needs exactly one <code>tool_result</code>; a missing one leaves the conversation in an invalid state. Anthropic's API also expects the <code>tool_result</code> blocks to come first in that user message, before any extra text. OpenAI's Chat Completions API expresses the same idea differently, with an <code>assistant</code> message carrying <code>tool_calls</code> and a separate <code>tool</code>-role message per result; <a href="06-function-calling.html">chapter 6</a> maps the two.</p>
+
+<h2>The loop</h2>
+
+<p>Put the pieces together and the loop is short. This version keeps the tool functions above, runs each requested tool, returns failures as data, and stops after <code>max_iterations</code> model calls no matter what.</p>
+
+<pre class="terminal" data-title="loop.py (the tools.py listing first, then this)"><code>def run_tool(call):
+    fn, _ = REGISTRY[call["name"]]
+    try:
+        return tool_result(call["id"], fn(**call["input"]))
+    except Exception as e:                          # the model sees failures as data
+        return tool_result(call["id"], f"{type(e).__name__}: {e}", is_error=True)
+
+def agent_loop(model, question, max_iterations=6):
+    messages = [{"role": "user", "content": question}]
+    for i in range(1, max_iterations + 1):
+        reply = model.complete(messages, system="You are a support agent.", tools=TOOL_DEFS)
+        messages.append(reply.as_message())
+        calls = tool_calls(reply)
+        print(f"[{i}] stop_reason={reply.stop_reason:&lt;8} text={text_of(reply)!r} calls={[c['name'] + json.dumps(c['input']) for c in calls]}")
+        if reply.stop_reason != "tool_use":
+            return messages, "done"
+        messages.append({"role": "user", "content": [run_tool(c) for c in calls]})
+    return messages, "iteration budget exhausted"
+
+if __name__ == "__main__":
+    model = ScriptedModel([
+        [tool_use("get_order", {"order_id": "A-1001"}, id="t1")],
+        [tool_use("track_shipment", {"carrier": "UPS"}, id="t2")],
+        "Order A-1001 shipped with UPS and is out for delivery in Leeds.",
+    ])
+    messages, status = agent_loop(model, "Where is order A-1001?")
+    print("status:", status, "| messages in history:", len(messages))
+    print(json.dumps(messages[2], indent=1))</code></pre>
+<pre class="terminal" data-title="output"><code>[1] stop_reason=tool_use text='' calls=['get_order{"order_id": "A-1001"}']
+[2] stop_reason=tool_use text='' calls=['track_shipment{"carrier": "UPS"}']
+[3] stop_reason=end_turn text='Order A-1001 shipped with UPS and is out for delivery in Leeds.' calls=[]
+status: done | messages in history: 6
+{
+ "role": "user",
+ "content": [
+  {
+   "type": "tool_result",
+   "tool_use_id": "t1",
+   "content": "{\"status\": \"shipped\", \"total_cents\": 4250, \"carrier\": \"UPS\"}",
+   "is_error": false
+  }
+ ]
+}
+</code></pre>
+
+<p>Read the output as the loop's heartbeat. Iteration 1 returned a tool request, so the loop ran the tool and went round again. Iteration 3 returned <code>end_turn</code> with no tool request, which is the normal exit. The history now holds six messages: the question, then two (assistant, user) pairs for the tool round trips, then the final answer. Step through it slowly:</p>
+
+<div class="widget stepper" data-autoplay-ms="4200">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">Three model calls, two tool runs, one answer</h4></div>
+  <svg viewBox="0 0 760 340" role="img" aria-label="The agent loop in eight steps. Three boxes: your program, the model, and the tools. Arrows show the history and tool definitions going to the model, tool_use requests coming back, tool calls and results between program and tools. A panel on the right lists the message history growing from one message to six.">
+    <defs><marker id="ahAG02b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="40" width="170" height="64" rx="8" class="fs-green s-green sw-2"/>
+    <text x="105" y="68" text-anchor="middle" class="t-sm t-bold">Your program</text>
+    <text x="105" y="88" text-anchor="middle" class="t-xs t-muted">holds the history</text>
+    <rect x="300" y="40" width="170" height="64" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="385" y="68" text-anchor="middle" class="t-sm t-bold">Model</text>
+    <text x="385" y="88" text-anchor="middle" class="t-xs t-muted">one stateless call</text>
+    <rect x="160" y="250" width="170" height="64" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="245" y="278" text-anchor="middle" class="t-sm t-bold">Tools</text>
+    <text x="245" y="298" text-anchor="middle" class="t-xs t-muted">get_order, track_shipment</text>
+
+    <g data-steps="2" data-active="2">
+      <line x1="192" y1="62" x2="298" y2="62" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="245" y="54" text-anchor="middle" class="t-xs">history + tools</text>
+    </g>
+    <g data-steps="6" data-active="6">
+      <line x1="192" y1="62" x2="298" y2="62" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="245" y="54" text-anchor="middle" class="t-xs">history + tools</text>
+      <line x1="298" y1="86" x2="192" y2="86" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="245" y="102" text-anchor="middle" class="t-xs">tool_use</text>
+      <text x="385" y="124" text-anchor="middle" class="t-xs tc-orange t-bold">stop_reason: tool_use</text>
+    </g>
+    <g data-steps="8" data-active="8">
+      <line x1="192" y1="62" x2="298" y2="62" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="245" y="54" text-anchor="middle" class="t-xs">history + tools</text>
+      <line x1="298" y1="86" x2="192" y2="86" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="245" y="102" text-anchor="middle" class="t-xs">text answer</text>
+      <text x="385" y="124" text-anchor="middle" class="t-xs tc-green t-bold">stop_reason: end_turn</text>
+    </g>
+    <g data-steps="3" data-active="3">
+      <line x1="298" y1="86" x2="192" y2="86" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="245" y="102" text-anchor="middle" class="t-xs">tool_use</text>
+      <text x="385" y="124" text-anchor="middle" class="t-xs tc-orange t-bold">stop_reason: tool_use</text>
+    </g>
+    <g data-steps="4" data-active="4">
+      <line x1="90" y1="106" x2="186" y2="248" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="10" y="176" class="t-xs mono">get_order(</text>
+      <text x="10" y="192" class="t-xs mono">"A-1001")</text>
+      <line x1="240" y1="248" x2="150" y2="108" class="line-dash" marker-end="url(#ahAG02b)"/>
+      <text x="214" y="176" class="t-xs">result JSON</text>
+    </g>
+    <g data-steps="7" data-active="7">
+      <line x1="90" y1="106" x2="186" y2="248" class="line" marker-end="url(#ahAG02b)"/>
+      <text x="10" y="176" class="t-xs mono">track_shipment(</text>
+      <text x="10" y="192" class="t-xs mono">"UPS")</text>
+      <line x1="240" y1="248" x2="150" y2="108" class="line-dash" marker-end="url(#ahAG02b)"/>
+      <text x="214" y="176" class="t-xs">tracking text</text>
+    </g>
+    <g data-steps="8">
+      <rect x="360" y="236" width="140" height="82" rx="8" class="fs-yellow s-yellow sw-2"/>
+      <text x="430" y="262" text-anchor="middle" class="t-xs t-bold">loop ends</text>
+      <text x="430" y="280" text-anchor="middle" class="t-xs">no tool requested:</text>
+      <text x="430" y="296" text-anchor="middle" class="t-xs">return the text</text>
+    </g>
+
+    <text x="625" y="26" text-anchor="middle" class="t-sm t-bold">history</text>
+    <g data-steps="1-">
+      <rect x="505" y="38" width="240" height="40" rx="6" class="fs-green s-green sw-2"/>
+      <text x="515" y="55" class="t-xs t-bold">user</text>
+      <text x="515" y="70" class="t-xs mono">"Where is order A-1001?"</text>
+    </g>
+    <g data-steps="3-">
+      <rect x="505" y="86" width="240" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+      <text x="515" y="103" class="t-xs t-bold">assistant</text>
+      <text x="515" y="118" class="t-xs mono">tool_use get_order</text>
+    </g>
+    <g data-steps="5-">
+      <rect x="505" y="134" width="240" height="40" rx="6" class="fs-green s-green sw-2"/>
+      <text x="515" y="151" class="t-xs t-bold">user</text>
+      <text x="515" y="166" class="t-xs mono">tool_result {shipped, UPS}</text>
+    </g>
+    <g data-steps="6-">
+      <rect x="505" y="182" width="240" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+      <text x="515" y="199" class="t-xs t-bold">assistant</text>
+      <text x="515" y="214" class="t-xs mono">tool_use track_shipment</text>
+    </g>
+    <g data-steps="7-">
+      <rect x="505" y="230" width="240" height="40" rx="6" class="fs-green s-green sw-2"/>
+      <text x="515" y="247" class="t-xs t-bold">user</text>
+      <text x="515" y="262" class="t-xs mono">tool_result "Out for delivery"</text>
+    </g>
+    <g data-steps="8">
+      <rect x="505" y="278" width="240" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+      <text x="515" y="295" class="t-xs t-bold">assistant</text>
+      <text x="515" y="310" class="t-xs mono">text: final answer</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>The history starts with the question.</strong> Your program holds one message. The model has seen nothing yet, and will see only what you send.</li>
+    <li><strong>Call 1.</strong> The program sends the history and the tool definitions. This is an ordinary stateless request.</li>
+    <li><strong>The model asks for a tool.</strong> The reply has <code>stop_reason: "tool_use"</code> and a <code>get_order</code> request. The assistant message is appended to the history exactly as received.</li>
+    <li><strong>The program runs the tool.</strong> It looks up <code>get_order</code> in its own registry, calls the real function with the model's arguments and gets a result. The model played no part in this step.</li>
+    <li><strong>The result is appended.</strong> A user message with a <code>tool_result</code> block, tied to the request by id, joins the history. Nothing has been sent to the model yet.</li>
+    <li><strong>Call 2.</strong> The whole, longer history is sent again. The model reads the order, sees a carrier, and asks for <code>track_shipment</code>. Another assistant message is appended.</li>
+    <li><strong>Second tool run.</strong> The program runs <code>track_shipment</code> and appends its result as another user message.</li>
+    <li><strong>Call 3 ends the loop.</strong> With both facts in the history the model answers in text. The stop reason is <code>end_turn</code>, no tool is requested, and the program returns the answer. Three calls, each longer than the last.</li>
+  </ol>
+</div>
+
+<h2>When a tool fails</h2>
+
+<p>Tools fail: an id does not exist, a service times out, the arguments do not fit. What should the loop do? The robust answer is to <strong>return the failure to the model as a tool result</strong> with <code>is_error: true</code> and a message it can act on. The model is good at reading an error, and often corrects its own mistake on the next turn. Raising the exception and killing the run wastes the whole conversation so far.</p>
+
+<pre class="terminal" data-title="errors.py (imports the loop above)"><code>import json
+from llm import ScriptedModel, tool_use, text_of
+from loop import agent_loop
+
+# The model first asks for an order that does not exist, reads the error, and corrects itself.
+model = ScriptedModel([
+    [tool_use("get_order", {"order_id": "A-9999"}, id="t1")],
+    [tool_use("get_order", {"order_id": "A-1002"}, id="t2")],
+    "I could not find A-9999, but A-1002 is still processing.",
+])
+messages, status = agent_loop(model, "Check order A-9999 for me")
+print(json.dumps(messages[2]["content"][0], indent=1))</code></pre>
+<pre class="terminal" data-title="output"><code>[1] stop_reason=tool_use text='' calls=['get_order{"order_id": "A-9999"}']
+[2] stop_reason=tool_use text='' calls=['get_order{"order_id": "A-1002"}']
+[3] stop_reason=end_turn text='I could not find A-9999, but A-1002 is still processing.' calls=[]
+{
+ "type": "tool_result",
+ "tool_use_id": "t1",
+ "content": "KeyError: 'A-9999'",
+ "is_error": true
+}</code></pre>
+
+<p>That error text, <code>KeyError: 'A-9999'</code>, is poor: it exposes an implementation detail and says nothing about what to do next. A better tool returns "No order with id A-9999. Order ids look like A-1001; use search_orders to find one by customer email." Error messages are part of the tool's interface, and <a href="05-tool-design.html">chapter 5</a> treats them as such. Two further rules belong in <code>run_tool</code> in any real system:</p>
+
+<ul>
+  <li><strong>Validate before you run.</strong> Check the model's <code>input</code> against the tool's schema, and check the tool <em>name</em> is in your registry. A hallucinated tool name or an argument of the wrong type should come back as an error result, not crash the harness. The tools example above uses <code>REGISTRY[call["name"]]</code>, which would raise <code>KeyError</code> on an unknown name before the <code>try</code> block; a production version looks the name up inside the guarded region.</li>
+  <li><strong>Never turn the model's text into code.</strong> Passing a model-written string to <code>eval</code>, a shell or a SQL string concatenation is injection with a language model as the author. Use fixed functions with typed arguments, as in <a href="../../security/chapters/09-injection.html">security chapter 9</a>.</li>
+</ul>
+
+<h2>Several tool calls in one turn</h2>
+
+<p>A model may request several tools in a single reply when the calls do not depend on each other: the status of two orders, the weather in three cities. The reply then contains several <code>tool_use</code> blocks. Your obligation is to answer <em>all</em> of them in the <em>one</em> next user message. Because they are independent, you can run them concurrently and save wall-clock time.</p>
+
+<pre class="terminal" data-title="parallel.py (imports the loop above)"><code>import json
+from concurrent.futures import ThreadPoolExecutor
+from llm import ScriptedModel, tool_use, text_of, tool_calls, tool_result
+from loop import TOOL_DEFS, run_tool
+
+def check_pairing(messages):
+    """Every tool_use id in an assistant turn needs a tool_result in the very next user turn."""
+    for i, m in enumerate(messages):
+        if m["role"] != "assistant" or isinstance(m["content"], str):
+            continue
+        wanted = {b["id"] for b in m["content"] if b["type"] == "tool_use"}
+        if not wanted:
+            continue
+        nxt = messages[i + 1]["content"] if i + 1 &lt; len(messages) else []
+        got = {b["tool_use_id"] for b in nxt if b["type"] == "tool_result"}
+        if wanted - got:
+            return f"turn {i}: no tool_result for {sorted(wanted - got)}"
+    return "pairing ok"
+
+model = ScriptedModel([
+    [tool_use("get_order", {"order_id": "A-1001"}, id="ta"), tool_use("get_order", {"order_id": "A-1002"}, id="tb")],
+    "A-1001 shipped; A-1002 is processing.",
+])
+messages = [{"role": "user", "content": "Status of A-1001 and A-1002?"}]
+reply = model.complete(messages, tools=TOOL_DEFS)
+messages.append(reply.as_message())
+calls = tool_calls(reply)
+print("one assistant turn asked for", len(calls), "tools:", [c["id"] for c in calls])
+with ThreadPoolExecutor() as pool:                     # independent calls can run concurrently
+    results = list(pool.map(run_tool, calls))          # map keeps the order of `calls`
+messages.append({"role": "user", "content": results})  # ONE user message carries ALL results
+print(check_pairing(messages))
+broken = messages[:-1] + [{"role": "user", "content": results[:1]}]
+print(check_pairing(broken))
+print(text_of(model.complete(messages, tools=TOOL_DEFS)))</code></pre>
+<pre class="terminal" data-title="output"><code>one assistant turn asked for 2 tools: ['ta', 'tb']
+pairing ok
+turn 1: no tool_result for ['tb']
+A-1001 shipped; A-1002 is processing.</code></pre>
+
+<p>The <code>check_pairing</code> helper is worth keeping in a test suite: it catches the single most common loop bug, dropping a result when two calls fail or one is skipped. Two cautions about parallelism. First, concurrency is safe only for calls without side-effect ordering: "create the folder" then "write the file" cannot run at once, and the model cannot always tell. Second, if one call is a payment or a deletion, think about what happens if the other fails; you are back in <a href="../../architecture/chapters/15-sagas.html">saga</a> territory. For tools with side effects, the safe default is to run them one at a time, in the order the model listed them.</p>
+
+<h2>Stopping: the loop must be able to end</h2>
+
+<p>Left alone, a model may keep calling tools forever: it cannot find the answer, a tool keeps returning an error, or two steps undo each other. A loop therefore needs <span class="term">stop conditions</span> that your code enforces, not ones you hope the model respects. There is one natural exit and several forced ones.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 320" role="img" aria-label="Flowchart of one loop iteration. Call the model. If the stop reason is not tool_use, return the answer. Otherwise check budgets: iteration count, token total, time and repeated identical calls. If a budget is exceeded, stop and return a partial result with the reason. Otherwise validate and run the tools, append results, and go back to call the model.">
+    <defs><marker id="ahAG02c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="130" width="130" height="50" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="85" y="160" text-anchor="middle" class="t-sm t-bold">Call model</text>
+    <line x1="150" y1="155" x2="208" y2="155" class="line" marker-end="url(#ahAG02c)"/>
+    <path d="M290,112 L372,155 L290,198 L208,155 Z" class="box"/>
+    <text x="290" y="152" text-anchor="middle" class="t-xs t-bold">stop_reason</text>
+    <text x="290" y="167" text-anchor="middle" class="t-xs t-bold">= tool_use?</text>
+    <rect x="210" y="14" width="160" height="46" rx="8" class="fs-green s-green sw-2"/>
+    <text x="290" y="34" text-anchor="middle" class="t-xs t-bold">Return the answer</text>
+    <text x="290" y="50" text-anchor="middle" class="t-xs t-muted">the natural exit</text>
+    <line x1="290" y1="112" x2="290" y2="62" class="line" marker-end="url(#ahAG02c)"/>
+    <text x="298" y="90" class="t-xs">no</text>
+    <line x1="372" y1="155" x2="440" y2="155" class="line" marker-end="url(#ahAG02c)"/>
+    <text x="406" y="147" text-anchor="middle" class="t-xs">yes</text>
+    <path d="M520,112 L602,155 L520,198 L438,155 Z" class="box"/>
+    <text x="520" y="152" text-anchor="middle" class="t-xs t-bold">budgets</text>
+    <text x="520" y="167" text-anchor="middle" class="t-xs t-bold">still ok?</text>
+    <line x1="602" y1="155" x2="628" y2="155" class="line" marker-end="url(#ahAG02c)"/>
+    <text x="615" y="147" text-anchor="middle" class="t-xs">yes</text>
+    <rect x="630" y="125" width="120" height="60" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="690" y="150" text-anchor="middle" class="t-xs t-bold">Validate, run</text>
+    <text x="690" y="166" text-anchor="middle" class="t-xs t-bold">tools, append</text>
+    <path d="M690,185 V232 H85 V182" class="line" fill="none" marker-end="url(#ahAG02c)"/>
+    <text x="390" y="226" text-anchor="middle" class="t-xs t-muted">next iteration</text>
+    <line x1="520" y1="198" x2="520" y2="256" class="line" marker-end="url(#ahAG02c)"/>
+    <text x="528" y="222" class="t-xs">no</text>
+    <rect x="410" y="258" width="220" height="50" rx="8" class="fs-red s-red sw-2"/>
+    <text x="520" y="279" text-anchor="middle" class="t-xs t-bold">Stop: report what was done</text>
+    <text x="520" y="296" text-anchor="middle" class="t-xs t-muted">and which limit was hit</text>
+    <text x="30" y="260" class="t-xs t-muted">limits: iterations, tokens, time,</text>
+    <text x="30" y="276" class="t-xs t-muted">identical repeated calls, cost</text>
+  </svg>
+  <figcaption><strong>One exit the model controls, several the harness controls.</strong> The model ends the loop by answering; the harness ends it by running out of budget. The second path must always return something useful, not silence.</figcaption>
+</figure>
+
+<p>The usual forced stops, and what each protects against:</p>
+
+<dl class="terms">
+  <dt><span class="term">Iteration cap</span></dt><dd>Maximum model calls per task (5 to 50 is typical; the right value comes from measuring how many your tasks need). It bounds cost and time and is the simplest backstop.</dd>
+  <dt><span class="term">Token or cost budget</span></dt><dd>A cap on total input plus output tokens, or on money. Needed because iterations are not equal: the twentieth call carries a far longer history than the second.</dd>
+  <dt><span class="term">Wall-clock timeout</span></dt><dd>A deadline for the whole task, plus a timeout on each tool call. Users give up long before a budget runs out.</dd>
+  <dt><span class="term">Loop detection</span></dt><dd>Stop when the same tool is called with identical arguments more than a few times. A model stuck on one failing call burns its iteration budget for nothing.</dd>
+  <dt><span class="term">Human checkpoint</span></dt><dd>Pause for approval before a consequential action (a refund, a deletion, an email). This is a stop condition too: the loop halts until a person answers.</dd>
+</dl>
+
+<pre class="terminal" data-title="budget.py (imports the pieces above)"><code>import json
+from llm import ScriptedModel, tool_use, tool_calls
+from loop import TOOL_DEFS, run_tool
+
+def guarded_loop(model, question, max_iterations=8, max_input_tokens=600, max_repeats=2):
+    messages, seen, spent = [{"role": "user", "content": question}], {}, 0
+    for i in range(1, max_iterations + 1):
+        reply = model.complete(messages, tools=TOOL_DEFS)
+        spent += reply.usage["input_tokens"]
+        messages.append(reply.as_message())
+        if reply.stop_reason != "tool_use":
+            return f"done after {i} calls, {spent} input tokens"
+        if spent &gt; max_input_tokens:
+            return f"stopped: token budget ({spent} &gt; {max_input_tokens}) after {i} calls"
+        results = []
+        for c in tool_calls(reply):
+            key = (c["name"], json.dumps(c["input"], sort_keys=True))
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] &gt; max_repeats:
+                return f"stopped: {c['name']} called with identical input {seen[key]} times (loop) after {i} calls"
+            results.append(run_tool(c))
+        messages.append({"role": "user", "content": results})
+    return f"stopped: iteration budget ({max_iterations}) after {max_iterations} calls, {spent} input tokens"
+
+def stuck(i=0):                       # a model that never gives up on the same call
+    return ScriptedModel(lambda m, t, s: [tool_use("get_order", {"order_id": "A-1001"})])
+
+def wanderer():                       # a model that keeps trying new things
+    n = {"i": 0}
+    def fn(m, t, s):
+        n["i"] += 1
+        return [tool_use("track_shipment", {"carrier": f"carrier-{n['i']}"})]
+    return ScriptedModel(fn)
+
+print(guarded_loop(stuck(), "Where is A-1001?"))
+print(guarded_loop(wanderer(), "Where is A-1001?"))
+print(guarded_loop(wanderer(), "Where is A-1001?", max_input_tokens=100000))</code></pre>
+<pre class="terminal" data-title="output"><code>stopped: get_order called with identical input 3 times (loop) after 3 calls
+stopped: token budget (625 &gt; 600) after 5 calls
+stopped: iteration budget (8) after 8 calls, 1144 input tokens</code></pre>
+
+<p>Three different stops, each reported with its reason. The reason matters: when a budget ends the run, the harness should return the partial result and say which limit was hit, so the caller (or a person) can decide whether to retry with a larger budget, hand over, or give up. A silent timeout is the worst outcome, because nobody knows whether the work was done.</p>
+
+<h2>What the loop costs</h2>
+
+<p>Return to the stateless fact from chapter 1: every iteration re-sends the whole history. Suppose the fixed part of the prompt (system prompt plus tool schemas) is 2,000 tokens and each iteration adds 700 tokens (the model's request plus the tool's result). Iteration <em>k</em> then sends 2,000 + 700(<em>k</em> &minus; 1) tokens, and the total over <em>n</em> iterations is the sum of an arithmetic series: <em>n</em> &times; 2,000 + 700 &times; <em>n</em>(<em>n</em> &minus; 1) / 2. The second term grows with the <em>square</em> of <em>n</em>.</p>
+
+<pre class="terminal" data-title="cost.py"><code># Every iteration re-sends the whole history, so input tokens grow quadratically with iterations.
+BASE, DELTA = 2000, 700          # assumptions: system prompt + tool schemas; tokens added per iteration
+
+def input_tokens(n):
+    return sum(BASE + (k - 1) * DELTA for k in range(1, n + 1))
+
+print(" iters  total input tokens  context at last call")
+for n in (1, 5, 10, 20, 40):
+    print(f"{n:&gt;6}  {input_tokens(n):&gt;18,}  {BASE + (n - 1) * DELTA:&gt;20,}")</code></pre>
+<pre class="terminal" data-title="output"><code> iters  total input tokens  context at last call
+     1               2,000                 2,000
+     5              17,000                 4,800
+    10              51,500                 8,300
+    20             173,000                15,300
+    40             626,000                29,300</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 256" role="img" aria-label="Bar chart of input tokens sent on each of ten iterations. Each bar has a constant lower part for the system prompt and tool schemas, and an upper part for history that grows by 700 tokens a call. Bars rise from 2.0k on call 1 to 8.3k on call 10.">
+    <rect x="70" y="26" width="14" height="14" class="fs-cyan s-cyan"/>
+    <text x="90" y="38" class="t-xs">system prompt and tool schemas (2,000)</text>
+    <rect x="70" y="48" width="14" height="14" class="fs-blue s-blue"/>
+    <text x="90" y="60" class="t-xs">history added by earlier iterations (700 each)</text>
+    <line x1="56" y1="210.0" x2="736" y2="210.0" class="line-thin"/>
+<text x="50" y="214.0" text-anchor="end" class="t-xs t-faint">0</text>
+<line x1="56" y1="146.7" x2="736" y2="146.7" class="line-thin"/>
+<text x="50" y="150.7" text-anchor="end" class="t-xs t-faint">3k</text>
+<line x1="56" y1="83.3" x2="736" y2="83.3" class="line-thin"/>
+<text x="50" y="87.3" text-anchor="end" class="t-xs t-faint">6k</text>
+<line x1="56" y1="20.0" x2="736" y2="20.0" class="line-thin"/>
+<text x="50" y="24.0" text-anchor="end" class="t-xs t-faint">9k</text>
+<rect x="74.2" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<text x="98.2" y="162.8" text-anchor="middle" class="t-xs">2.0k</text>
+<text x="98.2" y="226" text-anchor="middle" class="t-xs t-muted">1</text>
+<rect x="140.4" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="140.4" y="153.0" width="48" height="14.8" class="fs-blue s-blue"/>
+<text x="164.4" y="148.0" text-anchor="middle" class="t-xs">2.7k</text>
+<text x="164.4" y="226" text-anchor="middle" class="t-xs t-muted">2</text>
+<rect x="206.5" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="206.5" y="138.2" width="48" height="29.6" class="fs-blue s-blue"/>
+<text x="230.5" y="133.2" text-anchor="middle" class="t-xs">3.4k</text>
+<text x="230.5" y="226" text-anchor="middle" class="t-xs t-muted">3</text>
+<rect x="272.7" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="272.7" y="123.4" width="48" height="44.3" class="fs-blue s-blue"/>
+<text x="296.7" y="118.4" text-anchor="middle" class="t-xs">4.1k</text>
+<text x="296.7" y="226" text-anchor="middle" class="t-xs t-muted">4</text>
+<rect x="338.9" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="338.9" y="108.7" width="48" height="59.1" class="fs-blue s-blue"/>
+<text x="362.9" y="103.7" text-anchor="middle" class="t-xs">4.8k</text>
+<text x="362.9" y="226" text-anchor="middle" class="t-xs t-muted">5</text>
+<rect x="405.1" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="405.1" y="93.9" width="48" height="73.9" class="fs-blue s-blue"/>
+<text x="429.1" y="88.9" text-anchor="middle" class="t-xs">5.5k</text>
+<text x="429.1" y="226" text-anchor="middle" class="t-xs t-muted">6</text>
+<rect x="471.3" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="471.3" y="79.1" width="48" height="88.7" class="fs-blue s-blue"/>
+<text x="495.3" y="74.1" text-anchor="middle" class="t-xs">6.2k</text>
+<text x="495.3" y="226" text-anchor="middle" class="t-xs t-muted">7</text>
+<rect x="537.5" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="537.5" y="64.3" width="48" height="103.4" class="fs-blue s-blue"/>
+<text x="561.5" y="59.3" text-anchor="middle" class="t-xs">6.9k</text>
+<text x="561.5" y="226" text-anchor="middle" class="t-xs t-muted">8</text>
+<rect x="603.6" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="603.6" y="49.6" width="48" height="118.2" class="fs-blue s-blue"/>
+<text x="627.6" y="44.6" text-anchor="middle" class="t-xs">7.6k</text>
+<text x="627.6" y="226" text-anchor="middle" class="t-xs t-muted">9</text>
+<rect x="669.8" y="167.8" width="48" height="42.2" class="fs-cyan s-cyan"/>
+<rect x="669.8" y="34.8" width="48" height="133.0" class="fs-blue s-blue"/>
+<text x="693.8" y="29.8" text-anchor="middle" class="t-xs">8.3k</text>
+<text x="693.8" y="226" text-anchor="middle" class="t-xs t-muted">10</text>
+
+    <text x="396" y="248" text-anchor="middle" class="t-xs t-muted">iteration (model call) number</text>
+  </svg>
+  <figcaption><strong>The history is the part that grows.</strong> Illustrative numbers from the script above (assumptions, not measurements). Ten iterations send 51,500 input tokens in total, even though no single call sends more than 8,300.</figcaption>
+</figure>
+
+<p>Two things follow. First, <strong>cost per task is superlinear in the number of steps</strong>, so an agent that takes 40 steps costs far more than twice one that takes 20 (626,000 versus 173,000 input tokens here, about 3.6 times). Reducing the number of iterations, and keeping each result short, are the two biggest levers. Second, <span class="term">prompt caching</span> changes the arithmetic. Providers can store the processed form of a repeated prefix (the key-value cache, <a href="../../llm-training/chapters/18-kv-cache.html">A3 chapter 18</a>) and bill reads of it at a fraction of the normal input price. Because an agent loop re-sends an ever-growing but unchanging prefix, it is close to the ideal customer. Try the numbers yourself:</p>
+
+<div class="widget" id="agt02-budget"></div>
+
+<p>With the defaults, ten iterations at an assumed $3 per million input tokens cost about 15 cents without caching; with caching modelled at 0.1&times; for reads and 1.25&times; for writes, the billed-equivalent total falls from 51,500 to about 14,700 tokens, roughly a 70 per cent saving. Those multipliers are assumptions modelled on typical published prices; check your provider's current pricing and cache lifetimes before you plan around them. Note also the last line of the widget output: at 97 per cent reliability per step, ten steps succeed about 74 per cent of the time, and twenty steps (move the slider) about 54 per cent, the compounding from <a href="00-start-here.html">chapter 0</a>. A cheaper loop is not a more reliable one.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The tool_use and tool_result structure is shared in spirit across the major providers, but names and details differ and keep changing. Anthropic's SDKs include helper "tool runner" loops, and OpenAI's and Google's SDKs offer equivalents; use them in production if you like, but write the loop by hand once so that you know what they do for you (the advice in Anthropic's "Building effective agents" about not hiding behind a framework applies). Providers also now offer hosted tools such as web search and code execution, where the provider runs the tool and the results appear inside the same response. Model tool-calling accuracy has improved a great deal since 2023, yet argument errors and wrong-tool choices remain the main loop failure, which is why validation and error results stay mandatory.</p>
+</div>
+
+<h2>How loops go wrong</h2>
+
+<p>Before adding safety machinery it helps to know what actually breaks. These are the failures that recur in real transcripts, with the first thing to check for each. Reading a handful of failed runs end to end is the best way to learn them; <a href="../../evals/chapters/01-error-analysis.html">A6 chapter 1</a> turns that habit into a method.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Failure</th><th>What you see in the transcript</th><th>First thing to check</th></tr></thead>
+  <tbody>
+    <tr><td>Wrong tool</td><td>The model calls a search tool when a lookup tool was right.</td><td>Are the descriptions distinguishable? Do two tools overlap?</td></tr>
+    <tr><td>Bad arguments</td><td>A string where an integer is needed; an invented id; a date in the wrong format.</td><td>Schema types and examples; add validation with a corrective error message.</td></tr>
+    <tr><td>Invented result</td><td>The model states a tool outcome it never requested, or continues a "pretend" observation.</td><td>The loop must append real results only; use stop sequences in text-format ReAct (chapter 3).</td></tr>
+    <tr><td>Lost result</td><td>A 400 error about a <code>tool_use</code> without a <code>tool_result</code>.</td><td>The pairing check; exceptions that skip appending.</td></tr>
+    <tr><td>Runaway loop</td><td>The same call repeated, or alternating calls that undo each other.</td><td>Iteration cap and repeated-call detection; a hint in the error text.</td></tr>
+    <tr><td>Giant output</td><td>One tool result of 50,000 tokens pushes everything else out.</td><td>Truncate or paginate inside the tool (chapter 5); a size limit in <code>run_tool</code>.</td></tr>
+    <tr><td>Premature finish</td><td>The model answers before it has checked the facts.</td><td>The system prompt's instructions about verification; a final-answer validator.</td></tr>
+    <tr><td>Repeated side effect</td><td>Two emails sent, two refunds issued.</td><td>Idempotency keys; whether a retry was the harness's or the model's.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Notice how few of these are the model being "unintelligent". Most are interface problems: an unclear tool description, a vague error, a missing limit. That is why <a href="05-tool-design.html">tool design</a> gets its own deep chapter, and why Anthropic reports spending more time optimising tools than the overall prompt when building its SWE-bench agent ("Building effective agents", 2024).</p>
+
+<h2>The history is the state</h2>
+
+<p>Look again at <code>agent_loop</code>. Its entire state is the <code>messages</code> list (plus a few counters). If you saved that list after each iteration, a crashed process could load it and call the model again; the model would see exactly what it saw before and carry on. This is why the loop is easy to checkpoint, to replay in tests with a scripted model, to hand to another worker, and to inspect when something goes wrong. It is also why compacting the history (summarising old turns, <a href="10-context-engineering.html">chapter 10</a>) changes what the agent "remembers": there is no other memory.</p>
+
+<p>Two refinements follow for production. Persist <em>before</em> running a side-effecting tool, with its idempotency key, so a restart does not repeat it. And record which tool calls have already produced results, so a resumed run does not ask the model to redo them. <a href="15-durable-execution.html">Chapter 15</a> builds this into an event-sourced agent.</p>
+
+<h2>Telling the model how to behave in the loop</h2>
+
+<p>Code enforces limits; the prompt shapes behaviour inside them. A few instructions in the system prompt reliably help. State how much effort a task deserves, since models over-invest without guidance: Anthropic's account of its multi-agent research system describes early versions spawning dozens of sub-agents for simple queries until effort-scaling rules were written into the prompt. Say when to stop ("answer as soon as you have the order status; do not look up unrelated orders"). Say what to do on failure ("if a tool returns an error twice, explain the problem to the user instead of trying a third time"). And ask for short reasoning before tool choices when accuracy matters, which is the subject of <a href="03-reasoning-planning.html">chapter 3</a>. Prompts are tested, not hoped over: <a href="04-prompting.html">chapter 4</a> shows how.</p>
+
+<details class="deeper"><summary>Go deeper <span class="hint">the same loop in OpenAI Chat Completions format</span></summary>
+<p>The loop is identical; only the message shapes differ. In OpenAI's Chat Completions API the assistant message carries a <code>tool_calls</code> list, each entry with an <code>id</code>, a <code>type</code> of <code>"function"</code> and a <code>function</code> object holding the <code>name</code> and <code>arguments</code>. The arguments are a <strong>JSON-encoded string</strong>, not an object, so you must <code>json.loads</code> them (and they may be invalid JSON, which is another reason to validate). Each result goes back as its own message with <code>role: "tool"</code>, the matching <code>tool_call_id</code> and a string <code>content</code>. The stop signal is <code>finish_reason: "tool_calls"</code> rather than <code>stop_reason: "tool_use"</code>. The shared module <code>lab-support/llm.py</code> converts the content-block format to this one inside <code>RealModel</code>, so a loop written once runs against either provider; <a href="06-function-calling.html">chapter 6</a> writes that adapter by hand.</p>
+</details>
+
+<h2>Making the loop safe to run</h2>
+
+<p>A loop that works in a demo needs four more properties before it touches anything that matters.</p>
+
+<h3>Side effects need idempotency</h3>
+
+<p>Model mistakes and network faults both cause repeats: a timeout on a "charge card" call, a retry, and the customer is charged twice. The remedy is the one from <a href="../../networking/chapters/16-failure.html">Failure, Timeouts &amp; Retries</a>: give each side-effecting call an <span class="term">idempotency key</span>, a unique value the server remembers so that the second request with the same key returns the first result instead of acting again. For a tool, derive the key from the task and the step, not from a fresh random value on each attempt. Long-running agents take this further with durable logs, covered in <a href="15-durable-execution.html">chapter 15</a> and <a href="../../distributed/chapters/17-logs-exactly-once.html">distributed chapter 17</a>.</p>
+
+<h3>Least privilege per tool</h3>
+
+<p>Expose the narrowest tool that does the job. <code>refund(order_id, amount)</code> with a server-side limit is safer than <code>run_sql(query)</code>. The loop should run tools with the end user's permissions, not a super-user's, so a confused or manipulated model cannot do more than the user could (<a href="../../security/chapters/08-authorization.html">security chapter 8</a>). Chapter 20 develops this into sandboxes and approval prompts.</p>
+
+<h3>Log every iteration</h3>
+
+<p>An agent run is a trace: each model call, each tool call, arguments, results, token counts, durations and the stop reason. Record them as structured events from day one (<a href="../../reliability/chapters/06-tracing.html">distributed tracing</a> gives the vocabulary of spans). When a run goes wrong, reading the transcript is the fastest diagnosis, and the same logs become your evaluation data (<a href="../../evals/chapters/01-error-analysis.html">A6 chapter 1</a>).</p>
+
+<h3>Treat tool output as untrusted</h3>
+
+<p>Whatever a tool returns goes into the model's context, including a web page or an email body that an attacker wrote. The model may follow instructions inside it. Never grant a tool-reading agent both private data and an outward channel without a control in between; the lethal-trifecta analysis is in <a href="19-agent-security.html">chapter 19</a>.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>The harness around the loop is an ordinary service: it needs timeouts, retries with backoff and jitter, circuit breakers on flaky tools, and idempotent writes (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>). Running tools concurrently is a threading question from <a href="../../systems/chapters/21-parallelism-gpus.html">systems chapter 21</a>. And an agent that crashes halfway through a ten-step task raises the question that <a href="../../architecture/chapters/15-sagas.html">sagas</a> answer for services: what do we undo, and how do we resume without repeating?</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Run <code>loop.py</code>, then break it on purpose and predict the outcome each time. (1) Delete the line that appends the user message with the results, so the next call has an assistant <code>tool_use</code> with no <code>tool_result</code>; run <code>check_pairing</code> on the history to see the message it reports, and say what a real provider would do. (2) Give the scripted model a reply that asks for a tool called <code>delete_everything</code> and see where the harness fails; then move the lookup inside the guarded region. (3) In the widget above, set the added tokens per iteration to 3,000 and the context limit to 32,000, and find at which iteration the first call overflows.</p>
+  <pre class="terminal"><code><span class="prompt">$</span> <span class="cmd">cp lab-support/llm.py . &amp;&amp; python3 loop.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 budget.py</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A tool is a name, a description and a JSON Schema. The model sees these and writes requests; <strong>your program</strong> decides whether to run them.</li>
+    <li>The loop: call the model; if <code>stop_reason</code> is <code>tool_use</code>, run every requested tool, append the assistant message and one user message holding a <code>tool_result</code> for each id, and call again.</li>
+    <li>Return tool failures to the model as <code>is_error</code> results with actionable text; validate names and arguments before running anything.</li>
+    <li>Independent calls in one turn can run concurrently, but all must be answered together; keep side-effecting calls sequential.</li>
+    <li>Enforce stop conditions in code: iteration cap, token or cost budget, timeout, repeated-call detection and human checkpoints, and always report which one fired.</li>
+    <li>Input cost grows roughly with the square of the iteration count because the history is re-sent; caching and shorter results are the levers, and per-step errors still compound.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview" target="_blank" rel="noopener">Anthropic, "Tool use with Claude" (documentation)</a>. The tool_use and tool_result contract, parallel calls and tool choice, as implemented by one provider.</li>
+  <li><a href="https://platform.openai.com/docs/guides/function-calling" target="_blank" rel="noopener">OpenAI, "Function calling" (documentation)</a>. The same loop with different message shapes; compare it with the Anthropic version.</li>
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic, "Building effective agents" (December 2024)</a>. Why to keep the loop simple, add stopping conditions and human checkpoints, and invest in tool documentation.</li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Anthropic, "Writing effective tools for agents" (2025)</a>. How tool descriptions, errors and output shape change agent success; the basis of chapter 5.</li>
+  <li><a href="https://arxiv.org/abs/2302.04761" target="_blank" rel="noopener">Schick et al., "Toolformer: Language Models Can Teach Themselves to Use Tools" (2023)</a>. An early paper on training models to decide when and how to call APIs.</li>
+  <li><a href="https://json-schema.org/understanding-json-schema/" target="_blank" rel="noopener">JSON Schema, "Understanding JSON Schema"</a>. The vocabulary behind every tool's <code>input_schema</code>.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">Where does the code of a tool, such as <code>get_order</code>, run in a client-side tool-calling loop?</p>
+    <ol class="q-options"><li>Inside the model, which has been given the function</li><li>In your own program, which executes it when the model's request arrives</li><li>On the model provider's servers, from the schema alone</li><li>Wherever the model chooses, because it picks the runtime</li></ol>
+    <div class="q-explain">The model only sees a name, a description and a schema and writes a request. Your program looks up the real function and runs it, which is why all validation, permissions and approvals can live in your code. Providers do run a few hosted tools themselves, but that is a different mechanism.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">The model's reply contains two <code>tool_use</code> blocks, ids <code>ta</code> and <code>tb</code>. Your code runs only <code>ta</code> and sends a user message with one <code>tool_result</code>. What should you expect?</p>
+    <ol class="q-options"><li>The model infers <code>tb</code> was skipped and continues normally</li><li>The model reruns <code>tb</code> itself</li><li>The result for <code>ta</code> is accepted and <code>tb</code> is quietly dropped</li><li>The provider rejects the request, because every <code>tool_use</code> needs a matching <code>tool_result</code></li></ol>
+    <div class="q-explain">The pairing rule is enforced: an unanswered tool_use leaves the history invalid and the call fails with an error. The model cannot run tools and nothing is silently dropped. A test like <code>check_pairing</code> catches this before it reaches the provider.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A tool raises <code>TimeoutError</code> while fetching an order. What is the best handling inside the loop?</p>
+    <ol class="q-options"><li>Return a <code>tool_result</code> with <code>is_error</code> true and a clear message so the model can retry, change course or tell the user</li><li>Let the exception propagate and end the whole run</li><li>Return an empty string so the loop carries on</li><li>Retry silently forever until it works</li></ol>
+    <div class="q-explain">The model can act on a clear error, and the run's earlier work is preserved. An empty result hides the failure and invites a wrong answer. Infinite silent retries ignore the budget, and crashing throws away the conversation. A bounded harness-level retry for transient errors is fine, but it still reports the final failure.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">With a fixed prompt of 2,000 tokens and 700 tokens added per iteration, roughly how many input tokens are sent in total over 20 iterations?</p>
+    <ol class="q-options"><li>About 54,000</li><li>About 40,000</li><li>About 173,000</li><li>About 15,000</li></ol>
+    <div class="q-explain">The total is 20 &times; 2,000 + 700 &times; (20 &times; 19 / 2) = 40,000 + 133,000 = 173,000. 40,000 counts only the fixed prompt and ignores the history that is re-sent; 15,000 is roughly the size of the last call alone, which ignores all the earlier calls.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">An agent keeps calling <code>search("annual report")</code> with the same arguments and gets the same empty result. Which stop condition catches this earliest?</p>
+    <ol class="q-options"><li>A wall-clock timeout of ten minutes</li><li>A cap of 50 iterations</li><li>A token budget of one million tokens</li><li>Repeated-call detection that stops after the same call recurs a few times</li></ol>
+    <div class="q-explain">All the others eventually stop the run, but only after wasting most of their budget. Repeated-call detection fires after two or three identical calls. The other limits remain useful as backstops for other failure patterns, such as a model wandering through new but useless calls.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A tool charges a card. The call times out, and the loop retries it. What design prevents a double charge?</p>
+    <ol class="q-options"><li>Lower the model's temperature to 0</li><li>Send an idempotency key derived from the task and step, so a repeat returns the first result</li><li>Ask the model to remember whether it already charged</li><li>Never retry, and tell the user to try again</li></ol>
+    <div class="q-explain">The server must recognise a repeat, and an idempotency key lets it do that. Temperature does not control whether a harness retries, and the model has no reliable memory of a call whose outcome it never saw. Never retrying leaves the customer unsure whether they were charged at all.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/agt02-budget.js"></script>
+</body>
+</html>

@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mixed-Precision Training &middot; Math &amp; Code for Machine Learning</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="mlf" data-case="C4">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Mixed-Precision Training</h1>
+  <p class="lede">Half-precision numbers take half the memory and, on suitable GPUs, move through arithmetic units several times faster, but they have a tiny range: anything below about 6 &times; 10<sup>&minus;8</sup> becomes zero. In "Mixed Precision Training" (Micikevicius et al., ICLR 2018) researchers at NVIDIA and Baidu showed that three small changes (a float32 master copy of the weights, scaling the loss, and accumulating products in float32) let networks train in half precision with the same accuracy and the same hyperparameters. This case walks through why each change is needed and what the paper did and did not show.</p>
+</header>
+
+<div class="callout note">
+  <p class="callout-title">What I could and could not read</p>
+  <p>I fetched and read the full text of the paper (arXiv:1710.03740, version 3, 15 February 2018, the ICLR 2018 version): the method, all result tables and the figure captions (I could not view the figures themselves, so I rely on the captions and text). For the memory accounting I fetched and read the relevant sections of Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (arXiv:1910.02054, version 3, 13 May 2020), and for current practice the PyTorch automatic mixed precision documentation (version 2.14, October 2026). I did <strong>not</strong> read NVIDIA's later documentation, the bfloat16 or fp8 training papers, or any independent reproduction. <strong>The paper reports no end-to-end training times</strong>: its speed argument is that half-precision arithmetic throughput on recent GPUs is "2&times; to 8&times; higher than for single-precision", and my own experiments below run on a CPU in NumPy, so I measure accuracy-related effects only, never speed.</p>
+</div>
+
+<div class="callout why">
+  <p class="callout-title">The pattern in one sentence</p>
+  <p><strong>Spend bits where the arithmetic needs them: store and multiply in a cheap format, but keep the quantities that accumulate tiny changes (the weights, the sums) in a precise one, and rescale values that would otherwise fall out of the cheap format's range.</strong></p>
+</div>
+
+<h2>Context: why fewer bits help</h2>
+<p>By 2017 models were growing: the paper notes that the speech networks it trained grew from 11 million parameters (Hannun et al., 2014) to about 116 million (Amodei et al., 2016). It identifies three limits on the speed of any program: arithmetic bandwidth, memory bandwidth and latency, and says reduced precision "addresses two of these limiters": fewer bits means fewer bytes to move, and some processors offer higher throughput for narrower formats. It also halves the memory needed for stored tensors. NVIDIA's Volta GPUs, the paper notes, introduced <em>Tensor Cores</em>, units that multiply float16 matrices and accumulate the products into float16 or float32 outputs. For the underlying hardware picture, see <a href="../chapters/17-compute-costs.html">chapter 17, GPUs, clouds and what compute costs</a>, and the Systems course on <a href="../../systems/chapters/21-parallelism-gpus.html">parallelism and GPUs</a>.</p>
+<p>The obstacle is range. <a href="../chapters/11-numerics.html">Chapter 11</a> showed that float16 has a 5-bit exponent and 10-bit mantissa; the numbers that matter here are its largest value (65,504), its smallest normal value (2<sup>&minus;14</sup>, about 6.1 &times; 10<sup>&minus;5</sup>), its smallest subnormal value (2<sup>&minus;24</sup>, about 6.0 &times; 10<sup>&minus;8</sup>) and the gap between neighbours near 1.0 (2<sup>&minus;10</sup>, about 0.001). The paper observes that "gradient values in practice tend to be dominated by small magnitudes", so a straightforward switch to float16 loses them.</p>
+
+<dl class="terms">
+  <dt>FP32 and FP16</dt><dd>The IEEE single-precision (32-bit) and half-precision (16-bit) floating-point formats. The paper writes FP32 and FP16.</dd>
+  <dt>Master weights</dt><dd>A float32 copy of the weights that receives the optimiser's updates; a float16 copy is derived from it for each forward and backward pass.</dd>
+  <dt>Loss scaling</dt><dd>Multiplying the loss by a constant S before backpropagation, so every gradient is S times larger and fewer fall below float16's range; the gradients are divided by S before the update.</dd>
+  <dt>Underflow and overflow</dt><dd>A value too small for the format becomes zero (underflow); too large becomes infinity (overflow).</dd>
+  <dt>Accumulation</dt><dd>Summing many products, as in a dot product. Doing the running sum in a wider format than the inputs is what the paper calls FP16 arithmetic "that accumulates into single-precision outputs".</dd>
+</dl>
+
+<h2>The recipe, one technique at a time</h2>
+<figure class="diagram">
+<svg viewBox="0 0 760 330" role="img" aria-label="One mixed-precision training step. A float32 master copy of the weights is rounded to a float16 copy; the forward pass produces float16 activations and the loss; the loss is multiplied by a scale S; the backward pass produces float16 gradients; the gradients are divided by S in float32 and the optimiser updates the float32 master weights.">
+<defs><marker id="ahMFC4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="20" y="22" class="t-xs t-bold">float32 (4 bytes per value)</text>
+<text x="20" y="150" class="t-xs t-bold">float16 (2 bytes per value)</text>
+<rect x="20" y="40" width="150" height="56" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="95.0" y="65.0" text-anchor="middle" class="t-sm t-bold">Master weights</text>
+<text x="95.0" y="82.0" text-anchor="middle" class="t-xs t-muted">kept in float32</text>
+<rect x="300" y="40" width="150" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="375.0" y="65.0" text-anchor="middle" class="t-sm t-bold">Optimiser</text>
+<text x="375.0" y="82.0" text-anchor="middle" class="t-xs t-muted">update + moments</text>
+<rect x="560" y="40" width="180" height="56" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="650.0" y="65.0" text-anchor="middle" class="t-sm t-bold">Unscale: g / S</text>
+<text x="650.0" y="82.0" text-anchor="middle" class="t-xs t-muted">before clipping or decay</text>
+<rect x="20" y="170" width="150" height="56" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="95.0" y="195.0" text-anchor="middle" class="t-sm t-bold">Weights (copy)</text>
+<text x="95.0" y="212.0" text-anchor="middle" class="t-xs t-muted">rounded to float16</text>
+<rect x="210" y="170" width="140" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="280.0" y="195.0" text-anchor="middle" class="t-sm t-bold">Forward</text>
+<text x="280.0" y="212.0" text-anchor="middle" class="t-xs t-muted">activations in float16</text>
+<rect x="390" y="170" width="120" height="56" rx="8" class="fs-yellow s-yellow sw-2"/>
+<text x="450.0" y="195.0" text-anchor="middle" class="t-sm t-bold">Loss &#215; S</text>
+<text x="450.0" y="212.0" text-anchor="middle" class="t-xs t-muted">scaled in float32</text>
+<rect x="550" y="170" width="190" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="645.0" y="195.0" text-anchor="middle" class="t-sm t-bold">Backward</text>
+<text x="645.0" y="212.0" text-anchor="middle" class="t-xs t-muted">gradients in float16</text>
+<line x1="95" y1="96" x2="95" y2="168" class="line" marker-end="url(#ahMFC4a)"/>
+<line x1="170" y1="198" x2="208" y2="198" class="line" marker-end="url(#ahMFC4a)"/>
+<line x1="350" y1="198" x2="388" y2="198" class="line" marker-end="url(#ahMFC4a)"/>
+<line x1="510" y1="198" x2="548" y2="198" class="line" marker-end="url(#ahMFC4a)"/>
+<line x1="645" y1="168" x2="645" y2="98" class="line" marker-end="url(#ahMFC4a)"/>
+<line x1="560" y1="68" x2="452" y2="68" class="line" marker-end="url(#ahMFC4a)"/>
+<line x1="300" y1="68" x2="172" y2="68" class="line" marker-end="url(#ahMFC4a)"/>
+<text x="108" y="140" class="t-xs">round</text>
+<text x="656" y="140" class="t-xs">g &#215; S</text>
+<text x="380" y="262" text-anchor="middle" class="t-xs">If any scaled gradient is inf or NaN, skip this update and lower S.</text>
+<text x="380" y="282" text-anchor="middle" class="t-xs">Dot products inside Forward and Backward accumulate in float32, then round to float16.</text>
+<text x="380" y="310" text-anchor="middle" class="t-xs t-muted">After Figure 1 of Micikevicius et al. (2018); drawing mine.</text>
+</svg>
+  <figcaption><strong>One training step.</strong> Compute-heavy tensors (activations, weight copy, gradients) are float16. The master weights, the unscaling and the optimiser update are float32. Drawing mine, following the paper's Figure 1.</figcaption>
+</figure>
+
+<h3>1. A float32 master copy of the weights</h3>
+<p>The optimiser's update is tiny compared with the weight: learning rate times gradient, often 10<sup>&minus;4</sup> of the weight or less. Adding a small update to a float16 weight fails in two ways, both given in the paper. First, "any value whose magnitude is smaller than 2<sup>&minus;24</sup> becomes zero in FP16"; in the Mandarin speech model it examined, approximately 5% of weight-gradient values had exponents smaller than &minus;24 (its Figure 2b). Second, even a representable update can vanish when added: float16 has a 10-bit mantissa, so if a weight is at least 2,048 times larger than the update, the update is shifted out of the mantissa when the addition aligns the binary points. Both failures vanish if the update is applied to a float32 copy.</p>
+<p>The paper tested this directly on a Mandarin speech-recognition model trained on about 800 hours of speech for 20 epochs: with a float32 master copy it matched float32 training, and "updating FP16 weights results in 80% relative accuracy loss". The cost is memory: the master copy "increases the memory requirements for the weights by 50% compared with single precision training", though the authors argue that the impact on overall memory is much smaller because activations dominate training memory, an issue I return to below.</p>
+
+<h3>2. Loss scaling</h3>
+<p>The paper's Figure 3 is a histogram of activation-gradient values collected across all layers during float32 training of a Multibox SSD object detector. It shows that "much of the FP16 representable range was left unused, while many values were below the minimum representable range and became zeros": the caption says 67% of the values were zero in that format. The remedy is to shift the whole distribution up. Because backpropagation obeys the chain rule, multiplying the loss by S multiplies every gradient in the network by S, with no extra operations in the backward pass. Before the weight update, the weight gradients are divided by S in float32. The paper advises unscaling "right after the backward pass but before gradient clipping or any other gradient-related computations, ensuring that no hyper-parameters (such as gradient clipping threshold, weight decay, etc.) have to be adjusted". (This is the same discipline as <a href="case-03-adamw.html">the AdamW case</a>: keep the regulariser and the clipping threshold in the units you tuned them in.)</p>
+<p>Choosing S is a trade-off with overflow. The authors trained with constant factors from 8 to 32K, and suggest choosing S so that S times the largest gradient is below 65,504, the float16 maximum. "There is no downside to choosing a large scaling factor as long as it does not cause overflow", because an overflow produces infinities or NaNs that "will irreversibly damage the weights after an update". Overflows can be detected cheaply by inspecting the gradients, and the update can be skipped. In the SSD detector, a factor of 8 (three extra bits of exponent) was enough to match float32 training; the bigLSTM language model needed 128.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 362" role="img" aria-label="Histograms of the base-2 exponent of 640 weight-gradient values of a small network. Unscaled, they sit between 2 to the minus 31 and 2 to the minus 17, and the part below 2 to the minus 24 flushes to zero in float16. Scaled by 2 to the 20, they all sit inside the float16 range.">
+<rect x="60.0" y="40" width="112.5" height="100" class="fs-red" style="opacity:.25"/>
+<rect x="172.5" y="40" width="137.5" height="100" class="fs-yellow" style="opacity:.25"/>
+<rect x="310.0" y="40" width="375.0" height="100" class="fs-green" style="opacity:.25"/>
+<rect x="685.0" y="40" width="25.0" height="100" class="fs-red" style="opacity:.25"/>
+<rect x="198.5" y="48.0" width="10.5" height="92.0" class="f-blue"/>
+<rect x="211.0" y="92.4" width="10.5" height="47.6" class="f-blue"/>
+<rect x="186.0" y="77.4" width="10.5" height="62.6" class="f-blue"/>
+<rect x="161.0" y="116.5" width="10.5" height="23.5" class="f-blue"/>
+<rect x="173.5" y="107.4" width="10.5" height="32.6" class="f-blue"/>
+<rect x="148.5" y="127.2" width="10.5" height="12.8" class="f-blue"/>
+<rect x="123.5" y="137.9" width="10.5" height="2.1" class="f-blue"/>
+<rect x="111.0" y="139.5" width="10.5" height="0.5" class="f-blue"/>
+<rect x="223.5" y="125.0" width="10.5" height="15.0" class="f-blue"/>
+<rect x="136.0" y="137.9" width="10.5" height="2.1" class="f-blue"/>
+<rect x="98.5" y="138.9" width="10.5" height="1.1" class="f-blue"/>
+<rect x="248.5" y="120.2" width="10.5" height="19.8" class="f-blue"/>
+<rect x="261.0" y="122.9" width="10.5" height="17.1" class="f-blue"/>
+<rect x="236.0" y="127.2" width="10.5" height="12.8" class="f-blue"/>
+<rect x="273.5" y="139.5" width="10.5" height="0.5" class="f-blue"/>
+<line x1="60" y1="140" x2="710" y2="140" class="line"/>
+<text x="60" y="34" class="t-xs t-bold">Unscaled gradients</text>
+<text x="116.2" y="56" text-anchor="middle" class="t-xs tc-red">79 values</text>
+<text x="116.2" y="70" text-anchor="middle" class="t-xs tc-red">flush to 0</text>
+<rect x="60.0" y="190" width="112.5" height="100" class="fs-red" style="opacity:.25"/>
+<rect x="172.5" y="190" width="137.5" height="100" class="fs-yellow" style="opacity:.25"/>
+<rect x="310.0" y="190" width="375.0" height="100" class="fs-green" style="opacity:.25"/>
+<rect x="685.0" y="190" width="25.0" height="100" class="fs-red" style="opacity:.25"/>
+<rect x="448.5" y="198.0" width="10.5" height="92.0" class="f-blue"/>
+<rect x="461.0" y="242.4" width="10.5" height="47.6" class="f-blue"/>
+<rect x="436.0" y="227.4" width="10.5" height="62.6" class="f-blue"/>
+<rect x="411.0" y="266.5" width="10.5" height="23.5" class="f-blue"/>
+<rect x="423.5" y="257.4" width="10.5" height="32.6" class="f-blue"/>
+<rect x="398.5" y="277.2" width="10.5" height="12.8" class="f-blue"/>
+<rect x="373.5" y="287.9" width="10.5" height="2.1" class="f-blue"/>
+<rect x="361.0" y="289.5" width="10.5" height="0.5" class="f-blue"/>
+<rect x="473.5" y="275.0" width="10.5" height="15.0" class="f-blue"/>
+<rect x="386.0" y="287.9" width="10.5" height="2.1" class="f-blue"/>
+<rect x="348.5" y="288.9" width="10.5" height="1.1" class="f-blue"/>
+<rect x="498.5" y="270.2" width="10.5" height="19.8" class="f-blue"/>
+<rect x="511.0" y="272.9" width="10.5" height="17.1" class="f-blue"/>
+<rect x="486.0" y="277.2" width="10.5" height="12.8" class="f-blue"/>
+<rect x="523.5" y="289.5" width="10.5" height="0.5" class="f-blue"/>
+<line x1="60" y1="290" x2="710" y2="290" class="line"/>
+<text x="60" y="184" class="t-xs t-bold">Loss scale 2^20</text>
+<line x1="110.0" y1="290" x2="110.0" y2="295" class="line-thin"/>
+<text x="110.0" y="309" text-anchor="middle" class="t-xs t-muted">-30</text>
+<line x1="235.0" y1="290" x2="235.0" y2="295" class="line-thin"/>
+<text x="235.0" y="309" text-anchor="middle" class="t-xs t-muted">-20</text>
+<line x1="360.0" y1="290" x2="360.0" y2="295" class="line-thin"/>
+<text x="360.0" y="309" text-anchor="middle" class="t-xs t-muted">-10</text>
+<line x1="485.0" y1="290" x2="485.0" y2="295" class="line-thin"/>
+<text x="485.0" y="309" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="610.0" y1="290" x2="610.0" y2="295" class="line-thin"/>
+<text x="610.0" y="309" text-anchor="middle" class="t-xs t-muted">10</text>
+<line x1="60" y1="290" x2="710" y2="290" class="line-thin"/>
+<text x="385.0" y="328" text-anchor="middle" class="t-xs">exponent: a value of 2^k has exponent k (float16 holds 2^-24 up to just under 2^16)</text>
+<rect x="60" y="340" width="12" height="12" class="fs-red" style="opacity:.5"/><text x="78" y="350" class="t-xs">becomes 0 (left) or inf (right)</text>
+<rect x="300" y="340" width="12" height="12" class="fs-yellow" style="opacity:.5"/><text x="318" y="350" class="t-xs">subnormal: coarse</text>
+<rect x="480" y="340" width="12" height="12" class="fs-green" style="opacity:.5"/><text x="498" y="350" class="t-xs">normal range</text>
+</svg>
+  <figcaption><strong>What loss scaling does to a gradient histogram.</strong> My own measurement on a small NumPy network (640 weight-gradient values, from the script below), not the paper's SSD data. Top: unscaled, about one value in eight lies below float16's smallest subnormal and flushes to zero. Bottom: the same values multiplied by 2<sup>20</sup> sit in the normal range.</figcaption>
+</figure>
+
+<h3>3. Accumulate in float32</h3>
+<p>A dot product adds many products; a float16 running sum soon stops absorbing small terms (<a href="../chapters/11-numerics.html">chapter 11</a> shows a float16 accumulator stalling at 4,096). The paper found that "some networks require that FP16 vector dot-product accumulates the partial products into an FP32 value, which is converted to FP16 before writing to memory", and that without this "some FP16 models did not match the accuracy of the baseline models". Tensor Cores do this natively. It also recommends large reductions (batch-normalisation statistics, softmax sums) be done in float32, which cost nothing in speed because those layers are limited by memory bandwidth, and notes pointwise operations such as nonlinearities may use either precision.</p>
+
+<h2>What the paper showed</h2>
+<p>The experiments cover image classification, detection, speech recognition, translation, language modelling and a GAN. Baselines are float32; mixed-precision runs use float16 storage with a float32 master copy, and loss scaling where needed. Numbers below are the paper's, from its tables (I did not rerun them):</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Task / model</th><th>Metric</th><th>FP32 baseline</th><th>Mixed precision</th></tr></thead>
+  <tbody>
+    <tr><td>AlexNet (ILSVRC)</td><td>top-1 accuracy</td><td>56.77%</td><td>56.93%</td></tr>
+    <tr><td>VGG-D</td><td>top-1 accuracy</td><td>65.40%</td><td>65.43%</td></tr>
+    <tr><td>ResNet-50</td><td>top-1 accuracy</td><td>75.92%</td><td>76.04%</td></tr>
+    <tr><td>Faster R-CNN (VOC 2007)</td><td>mAP</td><td>69.1%</td><td>68.6% without loss scale; 69.7% with</td></tr>
+    <tr><td>Multibox SSD</td><td>mAP</td><td>76.9%</td><td>diverges without loss scale; 77.1% with</td></tr>
+    <tr><td>DeepSpeech 2, English (about 115M parameters)</td><td>character error rate (lower is better)</td><td>2.20</td><td>1.99</td></tr>
+    <tr><td>DeepSpeech 2, Mandarin (about 215M parameters)</td><td>character error rate</td><td>15.82</td><td>15.01</td></tr>
+  </tbody>
+</table></div>
+
+<p>For the image classifiers the paper reports that loss scaling "was not required". The detection and language-model results are the ones that need it: the SSD detector "diverges" without scaling, and the bigLSTM language model's training perplexity diverges from the float32 curve after 300,000 iterations unless a factor of 128 is used. For translation the authors saw "a slight degradation" without loss scaling and noted large run-to-run variation (three float32 curves in Figure 4 differ). For the DCGAN, outputs looked comparable, with no scaling needed, but the authors note that GANs have no widely accepted quality measure.</p>
+<p>Two cautions from the paper itself. First, the speech models were not run on Volta Tensor Cores: "the mixed precision speech recognition experiments ... were conducted using Maxwell GPUs using FP16 storage only", an emulation that the authors argue gives equivalent accuracy because the arithmetic accumulates in float32. Second, the speech results were 5 to 10% better than baseline, which the authors say "suggests that the half-precision storage format may act as a regularizer". That is a hypothesis in the paper, not a tested result, and with unreplicated single runs it would be unwise to expect an accuracy gain.</p>
+
+<h2>Where the saving comes from: a memory ledger</h2>
+<p>The paper says memory is "roughly halved", and a common summary is that mixed precision makes training twice as cheap. Both are true only in a specific sense, and the ledger shows why. Count the bytes per parameter with Adam. In float32 training: weights 4, gradients 4, and Adam's two moments 8, a total of 16 bytes per parameter (my arithmetic). In mixed precision: float16 weights 2 and gradients 2, a float32 master copy 4, and Adam's moments (kept in float32) 8, again 16. The ZeRO paper's accounting agrees: for mixed-precision Adam, "2&Psi; + 2&Psi; + K&Psi; = 16&Psi; bytes" with K = 12 for the float32 copy, momentum and variance, which for a 1.5-billion-parameter GPT-2 is "at least 24 GB".</p>
+<p><strong>So the model state does not shrink at all. The saving is in the activations</strong>, which the backward pass must keep and which are stored in float16. The ZeRO paper estimates that the same 1.5B GPT-2 at sequence length 1,024 and batch size 32 needs about 60 GB of activations (before checkpointing). That matches the mixed-precision paper's own statement that training "memory consumption is dominated by activations".</p>
+
+<pre class="terminal" data-title="memory.py"><code>params = 1e9                      # a 1-billion-parameter model (illustrative)
+act_fp32_gb = 24                  # ASSUMED activation memory at fp32 for some batch size (illustrative)
+rows = {
+    "fp32 training":  dict(weights=4, grads=4, master=0, adam=8, act=act_fp32_gb),
+    "mixed (fp16)":   dict(weights=2, grads=2, master=4, adam=8, act=act_fp32_gb / 2),
+}
+print(f"{'':&lt;16}{'weights':&gt;8}{'grads':&gt;7}{'master':&gt;8}{'adam m+v':&gt;10}{'states GB':&gt;11}{'act GB':&gt;8}{'total GB':&gt;10}")
+for name, r in rows.items():
+    states = (r['weights'] + r['grads'] + r['master'] + r['adam']) * params / 1e9
+    print(f"{name:&lt;16}{r['weights']:&gt;6} B{r['grads']:&gt;5} B{r['master']:&gt;6} B{r['adam']:&gt;8} B{states:&gt;11.0f}{r['act']:&gt;8.0f}{states + r['act']:&gt;10.0f}")</code></pre>
+<pre class="terminal" data-title="output"><code>                 weights  grads  master  adam m+v  states GB  act GB  total GB
+fp32 training        4 B    4 B     0 B       8 B         16      24        40
+mixed (fp16)         2 B    2 B     4 B       8 B         16      12        28</code></pre>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 250" role="img" aria-label="Stacked bars of training memory for a 1-billion-parameter model with Adam. fp32 training: 16 GB of weights, gradients and optimiser state plus an assumed 24 GB of activations, 40 GB in all. Mixed precision: the same 16 GB of model state plus 12 GB of activations, 28 GB in all.">
+<text x="380" y="20" text-anchor="middle" class="t-xs t-bold">Gigabytes for a 1-billion-parameter model trained with Adam (activations assumed)</text>
+<text x="140" y="80" text-anchor="end" class="t-sm t-bold">fp32 training</text>
+<rect x="150" y="50" width="50.0" height="44" class="f-purple" style="opacity:.8"/>
+<rect x="150" y="50" width="50.0" height="44" fill="none" class="line-thin"/>
+<text x="175.0" y="76" text-anchor="middle" class="t-xs t-bold t-dark">4</text>
+<rect x="200.0" y="50" width="50.0" height="44" class="f-orange" style="opacity:.8"/>
+<rect x="200.0" y="50" width="50.0" height="44" fill="none" class="line-thin"/>
+<text x="225.0" y="76" text-anchor="middle" class="t-xs t-bold t-dark">4</text>
+<rect x="250.0" y="50" width="100.0" height="44" class="f-cyan" style="opacity:.8"/>
+<rect x="250.0" y="50" width="100.0" height="44" fill="none" class="line-thin"/>
+<text x="300.0" y="76" text-anchor="middle" class="t-xs t-bold t-dark">8</text>
+<rect x="350.0" y="50" width="300.0" height="44" class="f-blue" style="opacity:.8"/>
+<rect x="350.0" y="50" width="300.0" height="44" fill="none" class="line-thin"/>
+<text x="500.0" y="76" text-anchor="middle" class="t-xs t-bold t-dark">24</text>
+<text x="658.0" y="77" class="t-sm t-bold">40 GB</text>
+<text x="140" y="160" text-anchor="end" class="t-sm t-bold">mixed precision</text>
+<rect x="150" y="130" width="25.0" height="44" class="f-purple" style="opacity:.8"/>
+<rect x="150" y="130" width="25.0" height="44" fill="none" class="line-thin"/>
+<rect x="175.0" y="130" width="25.0" height="44" class="f-orange" style="opacity:.8"/>
+<rect x="175.0" y="130" width="25.0" height="44" fill="none" class="line-thin"/>
+<rect x="200.0" y="130" width="50.0" height="44" class="f-green" style="opacity:.8"/>
+<rect x="200.0" y="130" width="50.0" height="44" fill="none" class="line-thin"/>
+<text x="225.0" y="156" text-anchor="middle" class="t-xs t-bold t-dark">4</text>
+<rect x="250.0" y="130" width="100.0" height="44" class="f-cyan" style="opacity:.8"/>
+<rect x="250.0" y="130" width="100.0" height="44" fill="none" class="line-thin"/>
+<text x="300.0" y="156" text-anchor="middle" class="t-xs t-bold t-dark">8</text>
+<rect x="350.0" y="130" width="150.0" height="44" class="f-blue" style="opacity:.8"/>
+<rect x="350.0" y="130" width="150.0" height="44" fill="none" class="line-thin"/>
+<text x="425.0" y="156" text-anchor="middle" class="t-xs t-bold t-dark">12</text>
+<text x="508.0" y="157" class="t-sm t-bold">28 GB</text>
+<rect x="150" y="206" width="12" height="12" class="f-purple" style="opacity:.8"/><text x="168" y="216" class="t-xs">weights</text>
+<rect x="237" y="206" width="12" height="12" class="f-orange" style="opacity:.8"/><text x="255" y="216" class="t-xs">gradients</text>
+<rect x="338" y="206" width="12" height="12" class="f-green" style="opacity:.8"/><text x="356" y="216" class="t-xs">fp32 master</text>
+<rect x="453" y="206" width="12" height="12" class="f-cyan" style="opacity:.8"/><text x="471" y="216" class="t-xs">Adam m, v</text>
+<rect x="554" y="206" width="12" height="12" class="f-blue" style="opacity:.8"/><text x="572" y="216" class="t-xs">activations</text>
+<text x="380" y="242" text-anchor="middle" class="t-xs t-muted">Model state is 16 GB either way; the 24 GB of activations is my assumption, for illustration.</text>
+</svg>
+  <figcaption><strong>Same model state, smaller activations.</strong> The 24 GB of float32 activations is an illustrative assumption of mine; the 16 bytes per parameter of model state is the ZeRO paper's figure for mixed-precision Adam, and the same arithmetic for float32. The real activation size depends on batch size, sequence length and recomputation. A speed gain comes separately, from hardware that runs half-precision arithmetic faster (the paper cites 2&times; to 8&times; throughput).</figcaption>
+</figure>
+
+<h2>Try it yourself: the three failures, with real numbers</h2>
+<p>The script below shows, with NumPy's float16 on a CPU, (1) the range facts, (2) an SGD fit in which the weights are large and the updates small, run in float32, in float16 weights only, and with a float32 master copy, and (3) the weight gradients of a small network counted in float16 at several loss scales. Part 3 uses heavy-tailed errors (a Student-t draw) so that most gradients are tiny and a few are large, and I chose the sizes to land in the interesting range; it is a demonstration, not a measurement of any real network. NumPy rounds each float16 operation, which is not the same as a GPU's Tensor Core, so this is an emulation of the idea.</p>
+
+<pre class="terminal" data-title="mixed.py"><code>import numpy as np
+h = lambda a: np.asarray(a, dtype=np.float16)          # round to half precision
+f = lambda a: np.asarray(a, dtype=np.float32)
+
+# 1. float16 facts
+fi = np.finfo(np.float16)
+print(f"float16: max {float(fi.max):.0f}, smallest normal {2.0**-14:.3e} (2^-14), "
+      f"smallest subnormal {2.0**-24:.3e} (2^-24), spacing at 1.0 {float(fi.eps):.3e} (2^-10)")
+with np.errstate(over="ignore"):
+    print("1e-8 -&gt; float16:", h(1e-8), "| 1e-8 * 1024 -&gt; float16:", h(1e-8 * 1024), "| 70000 -&gt; float16:", h(np.float32(70000)))
+print("2.0 + 0.0004 in float16:", h(np.float32(2.0) + np.float32(0.0004)), "(update smaller than half the spacing is lost)")
+
+# 2. Why a float32 master copy: SGD on a regression whose weights are large, in three precisions.
+rng = np.random.default_rng(0)
+N, d = 256, 8
+X = rng.normal(size=(N, d)).astype(np.float32)
+w_true = rng.uniform(1.5, 3.0, d).astype(np.float32)
+y = X @ w_true + 0.01 * rng.normal(size=N).astype(np.float32)
+
+def sgd(mode, lr=0.05, steps=400):
+    w32 = np.zeros(d, np.float32); w16 = h(w32)
+    for _ in range(steps):
+        w = w32 if mode == "fp32" else w16
+        pred = h(f(h(X)) @ f(w)) if mode != "fp32" else X @ w
+        g = f(h(f(h(X)).T @ (f(pred) - y) / N)) if mode != "fp32" else X.T @ (pred - y) / N
+        if mode == "fp16_only": w16 = h(f(w16) - lr * g)               # update lands in a float16 weight
+        elif mode == "master": w32 = w32 - lr * g; w16 = h(w32)        # update the float32 copy, then round
+        else: w32 = w32 - lr * g
+    wf = f(w16) if mode != "fp32" else w32
+    return float(np.max(np.abs(wf - w_true)))
+print("\nmax |w - w_true| after 400 SGD steps (lr 0.05):")
+for name, mode in [("float32", "fp32"), ("float16 weights only", "fp16_only"), ("float16 + float32 master", "master")]:
+    print(f"  {name:&lt;26}{sgd(mode):.4f}")
+
+# 3. Why loss scaling: weight gradients of a small network, counted in float16.
+din, hid, dout, B = 16, 32, 4, 1024
+X = rng.normal(size=(B, din)).astype(np.float32)
+W1 = f(rng.normal(size=(din, hid)) * np.sqrt(2 / din)); W2 = f(rng.normal(size=(hid, dout)) * 0.05)
+a1 = X @ W1; r1 = np.maximum(a1, 0); out = r1 @ W2
+err = (rng.standard_t(2, size=out.shape) * 3e-5).astype(np.float32)   # small late-training errors, heavy tail
+d_out = err / B                                                      # gradient of the mean loss
+gW2 = r1.T @ d_out; gW1 = X.T @ ((d_out @ W2.T) * (a1 &gt; 0))
+g = np.concatenate([gW1.ravel(), gW2.ravel()])
+print(f"\n{g.size} weight-gradient entries; median |g| = {np.median(np.abs(g)):.2e}, max |g| = {np.abs(g).max():.2e}")
+print(f"largest safe scale = 65504 / max|g| = {65504 / np.abs(g).max():.2e}  (2^32 = {2.0**32:.2e})")
+print(f"{'loss scale':&gt;12}{'-&gt; zero in fp16':&gt;18}{'-&gt; inf in fp16':&gt;16}")
+for s in [1, 2**8, 2**16, 2**24, 2**32, 2**34]:
+    with np.errstate(over="ignore"):
+        q = h(g * np.float32(s))
+    print(f"{s:&gt;12}{np.mean(q == 0):&gt;18.1%}{np.mean(np.isinf(q)):&gt;16.1%}")
+np.save("g_mixed.npy", g)     # saved for the figure, not part of the listing</code></pre>
+<pre class="terminal" data-title="output"><code>float16: max 65504, smallest normal 6.104e-05 (2^-14), smallest subnormal 5.960e-08 (2^-24), spacing at 1.0 9.766e-04 (2^-10)
+1e-8 -&gt; float16: 0.0 | 1e-8 * 1024 -&gt; float16: 1.025e-05 | 70000 -&gt; float16: inf
+2.0 + 0.0004 in float16: 2.0 (update smaller than half the spacing is lost)
+
+max |w - w_true| after 400 SGD steps (lr 0.05):
+  float32                   0.0016
+  float16 weights only      0.0225
+  float16 + float32 master  0.0012
+
+640 weight-gradient entries; median |g| = 1.58e-07, max |g| = 9.07e-06
+largest safe scale = 65504 / max|g| = 7.22e+09  (2^32 = 4.29e+09)
+  loss scale   -&gt; zero in fp16  -&gt; inf in fp16
+           1             12.3%            0.0%
+         256              0.0%            0.0%
+       65536              0.0%            0.0%
+    16777216              0.0%            0.0%
+  4294967296              0.0%            0.0%
+ 17179869184              0.0%            5.2%</code></pre>
+
+<p>Part 1 gives the range numbers I quoted (65,504; 2<sup>&minus;24</sup>; spacing 2<sup>&minus;10</sup> near 1) and shows the small cases: 10<sup>&minus;8</sup> is zero in float16 but 10<sup>&minus;8</sup> &times; 1024 is not, and adding 0.0004 to 2.0 leaves 2.0. Part 2 shows the master copy at work: after 400 steps the float16-only weights are off by 0.0225, about fourteen times the float32 error of 0.0016, while the float16-plus-master run is as accurate as float32 (0.0012, slightly below float32's 0.0016; a difference that small is rounding noise, not a sign that half precision is better). The gap in this toy is modest, I expect because the updates only just fall below float16's spacing; in the paper's speech model the same mechanism produced an 80% relative accuracy loss. Part 3: unscaled, 12.3% of the weight gradients flush to zero. By a scale of 256 none do. The largest safe scale is 65,504 divided by the largest gradient, about 7.2 &times; 10<sup>9</sup>, between 2<sup>32</sup> and 2<sup>33</sup>: at 2<sup>32</sup> nothing overflows, and at 2<sup>34</sup> 5.2% of values become infinity. That is why dynamic scaling, which raises S while steps succeed and lowers it after an overflow, is standard practice (<a href="../chapters/11-numerics.html">chapter 11</a> describes it).</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a magnifying glass over fine print</p>
+  <p>Imagine reading very small print on a screen with limited resolution. You enlarge the page to read it, note the numbers, and divide by the enlargement before you write them in your accounts. Enlarging too far pushes the headlines off the screen. Loss scaling is the enlargement, the master weights are the accounts you keep in full precision, and the overflow check is noticing that headlines have gone off the edge.</p>
+  <p><em>Where it breaks down:</em> enlarging a page enlarges everything equally, while a gradient's relevant size varies by layer and moment in training, so one factor cannot be perfect everywhere. That is why practice moved to adjusting the factor as training runs.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Mixed precision halves everything." As the ledger shows, with Adam the model state is the same 16 bytes per parameter in both setups; only activations (and, on suitable hardware, arithmetic time and memory traffic) improve. A second misconception is that you can simply cast a float32 model to float16: the paper's point is that weights, gradient range and sums each need separate treatment, and that some networks (the image classifiers) were fine without scaling while others (the SSD detector) diverged without it.</p>
+</div>
+
+<h2>What came after</h2>
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>PyTorch's automatic mixed precision documentation (version 2.14) describes <code>torch.autocast</code>, which runs eligible operations such as linear layers and convolutions in a lower-precision type (float16 by default on CUDA, bfloat16 on CPU) and says that for float16 training autocast and <code>GradScaler</code> are ordinarily used together. The scaler exists, in the documentation's words, because small float16 gradients can underflow to zero and lose updates; gradients are unscaled before the optimiser step so the learning rate is unaffected. The page frames gradient scaling entirely around float16. It does not say whether bfloat16 never needs scaling; <a href="../chapters/11-numerics.html">chapter 11</a> explains that bfloat16 has float32's exponent range, which is why it usually does not. The page also warns that models pretrained in bfloat16 may overflow in float16's range.</p>
+  <p>Narrower formats (fp8 and below) and block-scaled variants are active areas; I did not research their current state for this case, so see <a href="../chapters/11-numerics.html">chapter 11</a>, <a href="../../deep-learning/chapters/17-training-stability.html">A2, chapter 17</a> on bf16 training and stability and <a href="../../llm-training/chapters/19-quantisation.html">A3, chapter 19</a> on quantisation, and check the dates of any source.</p>
+</div>
+
+<h2>Lessons, and where they return</h2>
+<ul>
+  <li><strong>Name the failure before the fix.</strong> Each of the three techniques answers a measured failure (lost updates, underflowing gradients, stalled sums). When mixed-precision training misbehaves, check which of the three it is: a NaN suggests overflow, a stalled loss suggests underflow or lost updates. <a href="../chapters/11-numerics.html">Chapter 11's</a> NaN-hunting section starts from the same questions.</li>
+  <li><strong>Memory arithmetic needs the whole ledger.</strong> Do not assume a format change halves everything; add up weights, gradients, optimiser state and activations. <a href="../chapters/17-compute-costs.html">Chapter 17</a> and <a href="../../llm-training/chapters/02-gpu-memory.html">A3, chapter 2</a> do this for real models.</li>
+  <li><strong>"Same hyperparameters" is a strong claim, tested on particular models.</strong> The paper tested CNNs, RNNs and a GAN of up to a few hundred million parameters on 2017 hardware. It does not test modern transformer training; do not extrapolate without evidence for your setup.</li>
+  <li><strong>Units matter for the rest of the optimiser.</strong> Unscale before clipping and before weight decay, as the paper insists, or your tuned thresholds change meaning. See also <a href="../chapters/10-optimisers.html">chapter 10</a> on clipping and <a href="case-03-adamw.html">the AdamW case</a> on what weight decay means.</li>
+  <li><strong>Report speed separately from accuracy.</strong> The paper establishes that accuracy holds; it gives hardware throughput ratios rather than measured training times. When you hear "twice as fast", ask what was measured, on what hardware.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>The speed argument is memory bandwidth and arithmetic throughput, the same ideas as in the Systems course: fewer bytes moved per useful operation. See <a href="../../systems/chapters/22-performance-engineering.html">performance engineering</a> for how to tell whether a program is limited by compute or by memory, and <a href="../../design/chapters/20-ml-systems.html">Designing with ML and LLMs</a> for the cost side of a serving or training system.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself (again)</p>
+  <ol class="steps">
+    <li>In part 2 of <code>mixed.py</code>, change the true weights from the range 1.5 to 3.0 to the range 0.05 to 0.1. What happens to the float16-only error? Why do small weights hide the master-copy problem?</li>
+    <li>In part 3, change the error scale <code>3e-5</code> to <code>3e-3</code>. At what loss scale does overflow begin now, and does the 12.3% unscaled underflow disappear?</li>
+    <li>Compute by hand which scale, as a power of two, puts the median gradient (1.58e-07) at the geometric middle of float16's normal range, and check it against the script.</li>
+  </ol>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Mixed precision stores a weight copy, activations and gradients in float16, with a float32 master copy of the weights, loss scaling and float32 accumulation (Micikevicius et al., 2018).</li>
+    <li>Each technique fixes one measured failure: lost updates (an 80% relative accuracy loss in a Mandarin speech model without the master copy), underflowing gradients (an SSD detector diverged without scaling) and stalled sums.</li>
+    <li>With Adam, model state is 16 bytes per parameter either way; the memory saving is in activations. The paper reports accuracy parity, not measured training times.</li>
+    <li>Scale so that the largest gradient times S stays under 65,504; skip the update on overflow; unscale before clipping and decay.</li>
+    <li>Current frameworks automate all of this (autocast plus a gradient scaler for float16), but the failures they hide are the ones to look for when a run goes wrong.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A weight of 2.0 is stored in float16 and an optimiser update of +0.0004 is applied to it. What happens, and what is the fix?</p>
+    <ol class="q-options">
+      <li>The weight becomes 2.0004; no fix is needed</li>
+      <li>The weight stays 2.0 because the update is smaller than half the spacing between float16 values near 2; apply updates to a float32 master copy</li>
+      <li>The update overflows to infinity; apply loss scaling</li>
+      <li>The weight becomes zero; use a smaller learning rate</li>
+    </ol>
+    <div class="q-explain">The gap between neighbouring float16 values at 2.0 is 2<sup>&minus;9</sup> (about 0.002), so an update of 0.0004 rounds away. That is lost updates, which the master copy fixes. Loss scaling addresses gradients that underflow, a different problem, and nothing overflows here.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A detector trains fine in float32 but its float16 run diverges, and inspection shows many weight gradients are exactly zero. Which change is most targeted?</p>
+    <ol class="q-options">
+      <li>Halve the learning rate</li>
+      <li>Add a float32 master copy of the weights only</li>
+      <li>Switch the dot products to float64</li>
+      <li>Multiply the loss by a constant such as 128 before backpropagation, and divide the gradients by it before the update</li>
+    </ol>
+    <div class="q-explain">Zeros in the gradients point to underflow, which loss scaling fixes (in the paper the SSD detector needed a factor of 8). A master copy handles lost updates, which can coexist but do not create zero gradients. Lowering the learning rate does not bring gradients back into range.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">You train with Adam in mixed precision on a 1-billion-parameter model. Roughly how much memory do weights, gradients, master copy and Adam's moments take together, compared with float32 Adam?</p>
+    <ol class="q-options">
+      <li>About 16 GB in both cases (2+2+4+8 bytes against 4+4+8 per parameter)</li>
+      <li>About 8 GB against 16 GB</li>
+      <li>About 12 GB against 16 GB</li>
+      <li>About 32 GB against 16 GB</li>
+    </ol>
+    <div class="q-explain">The float32 master copy and the moments keep the optimiser-related memory at 12 bytes per parameter, so with 2+2 for the float16 weights and gradients the total is 16, as in float32. The savings come from activations. The ZeRO paper's formula is 2&Psi; + 2&Psi; + K&Psi; with K = 12.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">The paper reports that mixed-precision speech models had a character error rate 5 to 10% lower than baseline. What is the right way to treat that?</p>
+    <ol class="q-options">
+      <li>As proof that half precision improves accuracy</li>
+      <li>As an error, since mixed precision can only lose information</li>
+      <li>As an observation the authors say "suggests" a regularising effect of half-precision storage, which is a hypothesis; with single runs and noted run-to-run variation, do not expect a gain</li>
+      <li>As irrelevant, because the models were only emulated</li>
+    </ol>
+    <div class="q-explain">The authors hedge the interpretation. The runs were emulations of Tensor Core arithmetic (float16 storage on older GPUs), which is a limit on the speed claims, but they were real training runs, so the accuracy numbers are not irrelevant. The result is neither proof nor an error.</div>
+  </div>
+</section>
+
+<h2>Sources</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia, Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh and Hao Wu, "Mixed Precision Training" (arXiv October 2017; ICLR 2018; version 3 of 15 February 2018)</a>. Fetched and read in full (text from the PDF; figures not viewed). Source of the three techniques, Tables 1 to 3 and every attributed number about the experiments.</li>
+  <li><a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase and Yuxiong He, "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (arXiv October 2019; version 3 of 13 May 2020)</a>. Fetched; read the memory-accounting sections. Source of the 16&Psi;-byte formula and the GPT-2 examples.</li>
+  <li><a href="https://docs.pytorch.org/docs/2.14/amp.html" target="_blank" rel="noopener">PyTorch documentation, "Automatic Mixed Precision package" (version 2.14)</a>. Fetched and read. Source of the autocast and GradScaler description in the dated note.</li>
+  <li>NVIDIA Volta and Tensor Core documentation, bfloat16 and fp8 training papers, independent reproductions: not fetched.</li>
+  <li>The scripts, figures, analogy and the 24 GB activation assumption are my own.</li>
+</ul>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

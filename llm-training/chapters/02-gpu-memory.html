@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Memory &amp; Why Training Runs Out of It · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/llm02-memory.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="02">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>GPU Memory &amp; Why Training Runs Out of It</h1>
+  <p class="lede">The first error most people meet when they train a model is "CUDA out of memory", usually long before the GPU is busy. This chapter does the accounting: where every byte of a training step goes (weights, gradients, optimiser state and activations), why a model that fits for inference does not fit for training, and the tricks that trade compute, precision or speed for memory.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Memory, not arithmetic, decides what you can train on a given machine. A 7-billion-parameter model needs about 14 GB just to hold its weights in 16-bit numbers and roughly 105 GB to train with a standard recipe. If you cannot predict that number before you rent the GPUs, you will find out by crashing, one expensive attempt at a time. After this chapter you will be able to estimate the memory of a training job on paper, read a memory timeline, choose between gradient accumulation, activation checkpointing, lower-precision optimisers and parameter-efficient methods, and say what fits on one 24 GB GPU. The next chapter shows what to do when even that is not enough.</p>
+</div>
+
+<h2>The four things that live in GPU memory</h2>
+
+<p>A GPU has its own memory, called <span class="term">HBM</span> (high-bandwidth memory) on data-centre cards and <span class="term">VRAM</span> in everyday speech. Its capacity is fixed: NVIDIA lists 80 GB for both the A100 80 GB and the H100 SXM, and 24 GB for the consumer RTX 4090 (NVIDIA product pages, fetched October 2026). Anything the GPU computes on must be in it. When the sum of what you ask for exceeds the capacity, the framework raises an out-of-memory (OOM) error.
+
+During training, four categories of data share that memory. Chapter 16 of <a href="../../deep-learning/chapters/16-resource-accounting.html">A2</a> counted parameters and FLOPs; here we count bytes.</p>
+
+<dl class="terms">
+  <dt>Weights (parameters)</dt><dd>The numbers the model learns. Needed for the forward pass, the backward pass and the update. Size: number of parameters &times; bytes per number.</dd>
+  <dt>Gradients</dt><dd>One number per trainable weight, produced by the backward pass: how the loss changes if that weight changes. Same count as the weights.</dd>
+  <dt>Optimiser state</dt><dd>The extra memory an optimiser keeps for each weight. Adam keeps two running averages per weight (moments), and in mixed-precision training also a full-precision master copy of the weights.</dd>
+  <dt>Activations</dt><dd>The intermediate outputs of every layer during the forward pass, kept because the backward pass needs them. They scale with batch size and sequence length, not just with the model.</dd>
+</dl>
+
+<p>The first three scale with the <em>number of parameters</em> and are the same whether your batch is 1 or 1,000. Together they are called the <span class="term">model states</span>. The fourth scales with the <em>work</em> done in one step and is the one you can change without changing the model. Everything in this chapter is a way to shrink one of these four, or to move it somewhere else.</p>
+
+<h2>Model states: the 16-bytes-per-parameter rule</h2>
+
+<h3>Weights and gradients</h3>
+
+<p>Modern training stores weights and gradients in a 16-bit format, usually <span class="term">bfloat16</span> (bf16): 2 bytes per number, the same exponent range as 32-bit floats but only 8 significant bits (see <a href="../../ml-foundations/chapters/11-numerics.html">floating point in A0</a>). So a model with N parameters needs 2N bytes for weights and 2N for gradients. For a 7-billion-parameter model that is 14 GB each.</p>
+
+<h3>Optimiser state</h3>
+
+<p>Plain gradient descent updates a weight with <em>w &larr; w &minus; lr &times; g</em> and needs nothing extra. <span class="term">Adam</span>, the optimiser that almost all language-model training uses (and its AdamW variant; see <a href="../../ml-foundations/chapters/10-optimisers.html">optimisers in A0</a>), keeps for every weight a running average of the gradient (the first moment, m) and of its square (the second moment, v), and divides one by the root of the other. These two numbers per weight are what make it behave well, and they are kept in 32-bit floats, 4 bytes each: 8 bytes per parameter.
+
+There is one more copy. A weight of 1.0 stored in bf16 can only move in steps of about 0.004 to 0.008 (below and above 1.0 respectively): bf16 has 8 significant bits, so its gap above 1.0 is 2<sup>&minus;7</sup>. A learning-rate-sized update of 0.001 is below half that gap and rounds away to nothing. The standard fix, introduced in mixed-precision training (Micikevicius et al., 2018), is to keep a <span class="term">master copy</span> of the weights in 32 bits, apply updates to it, and derive the 16-bit working copy from it after each step. That is another 4 bytes per parameter. You can see the failure and the fix in a few lines of NumPy, with bf16 emulated by rounding a 32-bit float to its top 16 bits:</p>
+
+<pre class="terminal" data-title="bf16_master.py"><code>import numpy as np
+
+def to_bf16(x):
+    """Round float32 to bfloat16 (keep the top 16 bits, round to nearest even), returned as float32."""
+    x = np.asarray(x, dtype=np.float32)
+    u = x.view(np.uint32)
+    rounded = (u + 0x7FFF + ((u &gt;&gt; 16) &amp; 1)) &amp; 0xFFFF0000
+    return rounded.astype(np.uint32).view(np.float32)
+
+print("gap between bf16 numbers just above 1.0:", float(to_bf16(1.0 + 2**-7) - 1.0), "(2^-7)")
+w_bf16 = to_bf16(1.0)          # weight kept only in bf16
+w_master = np.float32(1.0)     # fp32 master copy; bf16 copy is derived from it
+lr, g = 1e-3, 1.0              # a constant update of 0.001 per step
+for step in range(1000):
+    w_bf16 = to_bf16(w_bf16 - lr * g)             # update applied directly to the bf16 weight
+    w_master = np.float32(w_master - lr * g)       # update applied to the fp32 master
+print("after 1000 steps of -0.001:")
+print("  weight stored only in bf16 :", float(w_bf16))
+print("  fp32 master weight         :", float(w_master), "-&gt; bf16 copy used in matmuls:", float(to_bf16(w_master)))</code></pre>
+<pre class="terminal" data-title="output"><code>gap between bf16 numbers just above 1.0: 0.0078125 (2^-7)
+after 1000 steps of -0.001:
+  weight stored only in bf16 : 1.0
+  fp32 master weight         : 9.324634447693825e-06 -&gt; bf16 copy used in matmuls: 9.298324584960938e-06</code></pre>
+
+<p>Without a master copy the weight never moves: every update is smaller than half the gap to the next representable number. With one, the weight travels from 1.0 to almost 0 over a thousand steps, as it should (the tiny residue near 9 &times; 10<sup>&minus;6</sup> is float32 rounding of the repeated subtraction). This is why the bytes are counted as they are.</p>
+
+<h3>The total</h3>
+
+<p>Adding up, mixed-precision training with Adam needs, per parameter:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="A bar of 16 bytes per parameter divided into bf16 weights 2 bytes, bf16 gradients 2 bytes, fp32 master weights 4 bytes, Adam first moment 4 bytes and Adam second moment 4 bytes. The first two are labelled the working copy and the last three the optimiser, 12 bytes.">
+    <text x="20" y="24" class="t-xs t-faint">BYTES PER PARAMETER, MIXED-PRECISION TRAINING WITH ADAM (RAJBHANDARI ET AL., 2019)</text>
+    <rect x="20" y="44" width="80" height="54" class="f-purple"/>
+    <rect x="100" y="44" width="80" height="54" class="f-orange"/>
+    <rect x="180" y="44" width="160" height="54" class="f-green"/>
+    <rect x="340" y="44" width="160" height="54" class="f-red"/>
+    <rect x="500" y="44" width="160" height="54" class="f-red"/>
+    <text x="60" y="68" text-anchor="middle" class="t-sm t-bold t-dark">weights</text>
+    <text x="60" y="86" text-anchor="middle" class="t-xs t-dark">bf16 · 2 B</text>
+    <text x="140" y="68" text-anchor="middle" class="t-sm t-bold t-dark">grads</text>
+    <text x="140" y="86" text-anchor="middle" class="t-xs t-dark">bf16 · 2 B</text>
+    <text x="260" y="68" text-anchor="middle" class="t-sm t-bold t-dark">master weights</text>
+    <text x="260" y="86" text-anchor="middle" class="t-xs t-dark">fp32 · 4 B</text>
+    <text x="420" y="68" text-anchor="middle" class="t-sm t-bold t-dark">Adam m</text>
+    <text x="420" y="86" text-anchor="middle" class="t-xs t-dark">fp32 · 4 B</text>
+    <text x="580" y="68" text-anchor="middle" class="t-sm t-bold t-dark">Adam v</text>
+    <text x="580" y="86" text-anchor="middle" class="t-xs t-dark">fp32 · 4 B</text>
+    <path d="M20,112 H178" class="line s-blue sw-2"/>
+    <text x="99" y="132" text-anchor="middle" class="t-xs">2 + 2 = 4 B: the working copy</text>
+    <path d="M182,112 H660" class="line s-red sw-2"/>
+    <text x="421" y="132" text-anchor="middle" class="t-xs">K = 12 B: optimiser state, incl. master weights</text>
+    <text x="20" y="168" class="t-sm t-bold">Total: 16 bytes per parameter</text>
+    <text x="20" y="188" class="t-xs t-muted">A 7B-parameter model: 7 &times; 10&#8313; &times; 16 = 112 GB before a single activation is stored.</text>
+  </svg>
+  <figcaption><strong>The bf16 working copy is only a quarter of the bill.</strong> Three quarters is optimiser state, which is why shrinking or sharding the optimiser (below, and in the next chapter) saves the most.</figcaption>
+</figure>
+
+<p>This is the accounting in the ZeRO paper (Rajbhandari et al., 2019, "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models"): 2 bytes for weights, 2 for gradients and K for the optimiser, where K = 12 for mixed-precision Adam, giving 16 bytes per parameter. Their example is the 1.5-billion-parameter GPT-2: its weights occupy 3 GB in 16 bits, but training it needs at least 24 GB, which is why a model that downloads and runs happily may not train on the same card. Here is the same calculation for five model shapes, using the standard approximation that a decoder-only Transformer has 12&middot;L&middot;h&sup2; parameters in its blocks plus V&middot;h in its embedding table (L layers, hidden size h, vocabulary V; see <a href="../../deep-learning/chapters/10-transformer-block.html">the Transformer block</a>):</p>
+
+<pre class="terminal" data-title="memory_budget.py"><code>GB = 1e9
+
+def n_params(L, h, V):
+    """Decoder-only Transformer, tied embeddings: 12*L*h^2 for blocks + V*h for embeddings."""
+    return 12 * L * h * h + V * h
+
+models = {            # name: (layers, hidden, vocab)   rough shapes, approximations
+    "GPT-2 small": (12, 768, 50257),
+    "1.3B":        (24, 2048, 50257),
+    "7B-class":    (32, 4096, 32000),
+    "13B-class":   (40, 5120, 32000),
+    "70B-class":   (80, 8192, 32000),
+}
+# bytes per parameter for model state under mixed-precision Adam (ZeRO paper: 2 + 2 + K, K = 12)
+weights, grads = 2, 2                      # bf16 copies
+master, adam_m, adam_v = 4, 4, 4           # fp32 master weights and two Adam moments
+state = weights + grads + master + adam_m + adam_v
+print(f"bytes per parameter: weights {weights} + grads {grads} + optimiser {master+adam_m+adam_v} = {state}")
+print(f"\n{'model':12s} {'params':&gt;8s} {'states GB':&gt;10s}  fits 24 GB?  fits 80 GB?  80 GB GPUs for states")
+for name, (L, h, V) in models.items():
+    P = n_params(L, h, V)
+    tot = P * state / GB
+    print(f"{name:12s} {P/1e9:7.2f}B {tot:10.1f}  {str(tot &lt; 24):&gt;11s}  {str(tot &lt; 80):&gt;11s}  {-(-tot // 80):&gt;10.0f}")
+
+print("\nLargest model whose states fit in 20 GB (24 GB card, 4 GB kept for activations and overhead):")
+recipes = {
+    "mixed precision, Adam (16 B/param)":              2 + 2 + 12,
+    "bf16 weights + fp32 Adam, no master (12 B)":      2 + 2 + 8,
+    "bf16 + 8-bit Adam, no master copy (6 B)":         2 + 2 + 2,
+    "frozen bf16 weights only, inference (2 B)":       2,
+    "frozen 4-bit weights only, QLoRA base (0.5 B)":   0.5,
+}
+for name, b in recipes.items():
+    print(f"  {name:48s} -&gt; {20 * GB / b / 1e9:5.1f}B parameters")</code></pre>
+<pre class="terminal" data-title="output"><code>bytes per parameter: weights 2 + grads 2 + optimiser 12 = 16
+
+model          params  states GB  fits 24 GB?  fits 80 GB?  80 GB GPUs for states
+GPT-2 small     0.12B        2.0         True         True           1
+1.3B            1.31B       21.0         True         True           1
+7B-class        6.57B      105.2        False        False           2
+13B-class       12.75B      203.9        False        False           3
+70B-class       64.69B     1035.0        False        False          13
+
+Largest model whose states fit in 20 GB (24 GB card, 4 GB kept for activations and overhead):
+  mixed precision, Adam (16 B/param)               -&gt;   1.2B parameters
+  bf16 weights + fp32 Adam, no master (12 B)       -&gt;   1.7B parameters
+  bf16 + 8-bit Adam, no master copy (6 B)          -&gt;   3.3B parameters
+  frozen bf16 weights only, inference (2 B)        -&gt;  10.0B parameters
+  frozen 4-bit weights only, QLoRA base (0.5 B)    -&gt;  40.0B parameters</code></pre>
+
+<p>Read the table as a first filter. A 7B-class model needs about 105 GB of model state, which is more than any single 80 GB card holds before activations: it cannot be fully fine-tuned with this recipe on one GPU, however large the batch budget. A 70B-class model needs about a terabyte, which is 13 GPUs' worth of memory for state alone. The 1.3B row says "fits" for states, but with 21 of 24 GB gone you have 3 GB for activations and overhead; we return to that squeeze below. (The shapes are approximations: real models differ in details such as grouped-query attention and gated MLPs, which move the totals by a few percent, so the "7B-class" row is 6.6B, not exactly Llama's 6.7B.)</p>
+
+<p>The last block shows how much the recipe matters. With the same 20 GB budget you can <em>train</em> about 1.2 billion parameters with the standard recipe, about 3 billion with an 8-bit optimiser and no master copy (the optimiser from Dettmers et al., 2021, "8-bit Optimizers via Block-wise Quantization", is available in the <code>bitsandbytes</code> library; dropping the master copy risks the failure demonstrated above, so it needs care), or <em>hold</em> a 40-billion-parameter model's weights in 4-bit form and train only small adapters on top (the QLoRA recipe, <a href="11-lora.html">chapter 11</a>). That last row counts weights alone and ignores activations, adapter state and quantisation constants, so it is an upper bound, not a promise.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the workbench</p>
+  <p>Think of GPU memory as a workbench in a workshop and CPU memory and disks as the warehouse next door. The model's weights are the blueprint pinned at the back. Gradients and optimiser state are the notebooks in which you record corrections and your running notes. Activations are the half-finished parts you must keep within reach until the final inspection, because inspecting them is how you find what to fix. The bench has a fixed size. Making room means pinning a smaller blueprint, keeping fewer notebooks, putting some parts back in the warehouse and rebuilding them when needed, or spreading the work across several benches.</p>
+  <p><em>Where it breaks down:</em> a workbench only has an area. GPU memory also has a speed limit: moving data between the warehouse and the bench is 10 to 100 times slower than working on what is already there, so "put it in the warehouse" has a price in time as well as effort.</p>
+</div>
+
+<h2>Activations: the part that grows with your batch</h2>
+
+<p>The backward pass computes how the loss depends on each weight by applying the chain rule layer by layer from the output back to the input (see <a href="../../deep-learning/chapters/02-backpropagation.html">backpropagation in A2</a>). Many of those local derivatives depend on the values that flowed forward through the layer: the derivative of a matrix product needs the input, the derivative of a softmax needs its output. So the forward pass <strong>keeps</strong> the intermediate results of every layer until the backward pass has used them. These saved tensors are the activations.</p>
+
+<p>Their size is easy to state for a Transformer layer. Let s be the sequence length, b the micro-batch size (sequences processed together), h the hidden size and a the number of attention heads. Korthikanti et al. (2022, "Reducing Activation Recomputation in Large Transformer Models") count, for 16-bit activations and no parallelism, the bytes saved in one layer:</p>
+
+<p style="text-align:center">activations per layer = s &middot; b &middot; h &middot; ( 34 + 5 &middot; a &middot; s / h )</p>
+
+<p>Where do the pieces come from? In their accounting, the attention block saves 11&middot;s&middot;b&middot;h bytes (the inputs to the Q, K, V projections, the Q and K themselves, the values, the output projection's input and a dropout mask) plus 5&middot;a&middot;s&sup2;&middot;b bytes for the attention scores, their softmax output and its dropout mask. The MLP saves 19&middot;s&middot;b&middot;h bytes (its two input tensors, the GELU input and a mask). The two layer norms save 4&middot;s&middot;b&middot;h. These add to 34&middot;s&middot;b&middot;h plus the quadratic term. The first part grows linearly with sequence length; the second grows with its <em>square</em>, because each of a heads holds an s&times;s grid of scores.</p>
+
+<p>Two practical consequences follow. First, activation memory is proportional to the micro-batch size b, so halving b halves it. Second, the s&sup2; term makes long sequences expensive, unless the attention implementation avoids storing the score matrix, which is exactly what FlashAttention does (<a href="../../deep-learning/chapters/19-efficient-attention.html">A2 chapter 19</a>): it recomputes scores in the backward pass instead of saving them, so the 5&middot;a&middot;s/h term disappears. Let us compute what this means for a 7B-class shape (32 layers, h = 4096, 32 heads), for three strategies that the next section explains:</p>
+
+<pre class="terminal" data-title="activations.py"><code>GB = 2**30
+def act_bytes_per_layer(s, b, h, a, mode):
+    """Korthikanti et al. (2022) eq. 1, 16-bit activations, no tensor parallelism.
+    none:      s*b*h*(34 + 5*a*s/h)
+    selective: drop the attention-score terms (5*a*s^2*b): s*b*h*34
+    full:      keep only the layer input (2*s*b*h bytes); the layer is recomputed in backward"""
+    if mode == "none":      return s * b * h * (34 + 5 * a * s / h)
+    if mode == "selective": return s * b * h * 34
+    if mode == "full":      return 2 * s * b * h
+
+L, h, a = 32, 4096, 32           # a 7B-class shape
+print(f"7B-class shape: L={L}, h={h}, heads={a}. Activation memory for ALL layers, in GiB")
+print(f"{'seq':&gt;5s} {'batch':&gt;5s} | {'none':&gt;8s} {'selective':&gt;10s} {'full':&gt;7s}")
+for s in (2048, 4096):
+    for b in (1, 4, 8):
+        row = []
+        for mode in ("none", "selective", "full"):
+            tot = L * act_bytes_per_layer(s, b, h, a, mode)
+            if mode == "full": tot += act_bytes_per_layer(s, b, h, a, "none")   # one layer rebuilt at a time
+            row.append(tot / GB)
+        print(f"{s:5d} {b:5d} | {row[0]:8.1f} {row[1]:10.1f} {row[2]:7.2f}")
+s, b = 4096, 1
+attn = 5 * a * s * s * b / (s * b * h * 34 + 5 * a * s * s * b)
+print(f"\nshare of one layer's activations that is the s^2 attention scores at s={s}: {attn:.0%}")</code></pre>
+<pre class="terminal" data-title="output"><code>7B-class shape: L=32, h=4096, heads=32. Activation memory for ALL layers, in GiB
+  seq batch |     none  selective    full
+ 2048     1 |     28.5        8.5    1.39
+ 2048     4 |    114.0       34.0    5.56
+ 2048     8 |    228.0       68.0   11.12
+ 4096     1 |     97.0       17.0    4.03
+ 4096     4 |    388.0       68.0   16.12
+ 4096     8 |    776.0      136.0   32.25
+
+share of one layer's activations that is the s^2 attention scores at s=4096: 82%</code></pre>
+
+<p>The numbers explain a great deal of folklore. At sequence length 4,096 and a micro-batch of just one sequence, a 7B-class model without any saving strategy wants 97 GiB of activations, more than its entire 14 GB of weights times six, and 82 percent of it is the attention-score matrices. A batch of 8 would need 776 GiB. That is why long-context training is hard, why every real run uses the tricks below, and why FlashAttention changed what fits. (The formula assumes the common Megatron-style implementation; frameworks that fuse operations or use different dropout will differ somewhat. Treat it as an estimate within tens of percent, then measure.)</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"If the model fits on the GPU for inference, a smaller batch will make it fit for training." Batch size only shrinks activations. For a 7B model the 105 GB of weights, gradients and optimiser state is there even at batch size 1, so no batch size can rescue it. The right question is which of the four categories is over budget: if the model states are, only sharding, offloading, a smaller optimiser or fewer trainable parameters help; if the activations are, a smaller micro-batch or checkpointing helps.</p>
+</div>
+
+<h2>Trading compute for memory</h2>
+
+<h3>Gradient accumulation: a smaller micro-batch, the same gradient</h3>
+
+<p>Large effective batches (hundreds of sequences, or millions of tokens) matter for stable training, but they do not have to be processed at once. <span class="term">Gradient accumulation</span> splits a batch into micro-batches, runs forward and backward on each in turn, adds the gradients, and takes the optimiser step only after the last. Because the gradient of a mean is the mean of the gradients, the result is the same (up to floating-point rounding) as processing everything together, while only one micro-batch's activations are alive at a time:</p>
+
+<pre class="terminal" data-title="accum.py"><code>import numpy as np
+rng = np.random.default_rng(1)
+X = rng.normal(size=(64, 5)); w_true = np.array([1.0, -2.0, 0.5, 3.0, 0.0])
+y = X @ w_true + 0.1 * rng.normal(size=64)
+w = rng.normal(size=5)
+
+def grad(Xb, yb, w):                       # d/dw of mean squared error over the batch
+    return 2 * Xb.T @ (Xb @ w - yb) / len(yb)
+
+full = grad(X, y, w)
+accum = np.zeros(5)
+steps = 8
+for i in range(steps):                     # 8 micro-batches of 8; each loss is divided by `steps`
+    sl = slice(i * 8, (i + 1) * 8)
+    accum += grad(X[sl], y[sl], w) / steps
+print("full batch of 64 :", np.round(full, 6))
+print("8 x micro-batch 8:", np.round(accum, 6))
+print("max difference   :", f"{np.abs(full - accum).max():.1e}")
+print("activation memory scales with the micro-batch: 8 vs 64 rows live at a time (8x less)")</code></pre>
+<pre class="terminal" data-title="output"><code>full batch of 64 : [-3.634092  3.171117  0.324193 -5.5089    0.727143]
+8 x micro-batch 8: [-3.634092  3.171117  0.324193 -5.5089    0.727143]
+max difference   : 1.8e-15
+activation memory scales with the micro-batch: 8 vs 64 rows live at a time (8x less)</code></pre>
+
+<p>The costs are small but real: smaller matrices use the GPU less efficiently, and the gradient buffer must persist across micro-batches. One subtlety: the equivalence holds for losses that are averages over examples. With variable-length sequences, "mean per sequence" and "mean per token" are different, and accumulating the wrong one subtly changes the weighting. Libraries have had bugs here, so check how your trainer normalises.</p>
+
+<h3>Activation checkpointing: recompute instead of store</h3>
+
+<p>If activations are too big to store, do not store all of them. <span class="term">Activation checkpointing</span> (also called gradient checkpointing or rematerialisation; Chen et al., 2016, "Training Deep Nets with Sublinear Memory Cost") saves the inputs to only some layers, the <em>checkpoints</em>. During the backward pass, when the gradient reaches a segment between two checkpoints, the segment's forward pass is run again from its checkpoint to rebuild the activations, which are used and freed immediately. Memory falls from one stored tensor per layer to one per checkpoint plus one segment's worth during recomputation. With n layers and a checkpoint every k, that is about n/k + k tensors, minimised near k = &radic;n, giving O(&radic;n) memory instead of O(n). The price is one extra forward pass over the network: roughly a third more compute for a training step, since the backward pass costs about twice a forward pass. Chen et al. report 30 percent extra runtime for their sublinear-memory strategy in their experiments.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two rows of eight layers. In the top row every layer's activation is stored, shown as eight filled squares. In the bottom row only layers 1 and 5 store their input as checkpoints. During the backward pass the second segment of four layers is recomputed from its checkpoint, shown in orange, so peak storage is two checkpoints plus three rebuilt tensors of the last segment.">
+    <text x="20" y="24" class="t-xs t-faint">STORE EVERYTHING: 8 TENSORS HELD AT THE END OF THE FORWARD PASS</text>
+    <g>
+    <rect x="30" y="40" width="70" height="34" rx="6" class="box"/><text x="65" y="62" text-anchor="middle" class="t-xs">layer 1</text>
+    <rect x="115" y="40" width="70" height="34" rx="6" class="box"/><text x="150" y="62" text-anchor="middle" class="t-xs">layer 2</text>
+    <rect x="200" y="40" width="70" height="34" rx="6" class="box"/><text x="235" y="62" text-anchor="middle" class="t-xs">layer 3</text>
+    <rect x="285" y="40" width="70" height="34" rx="6" class="box"/><text x="320" y="62" text-anchor="middle" class="t-xs">layer 4</text>
+    <rect x="370" y="40" width="70" height="34" rx="6" class="box"/><text x="405" y="62" text-anchor="middle" class="t-xs">layer 5</text>
+    <rect x="455" y="40" width="70" height="34" rx="6" class="box"/><text x="490" y="62" text-anchor="middle" class="t-xs">layer 6</text>
+    <rect x="540" y="40" width="70" height="34" rx="6" class="box"/><text x="575" y="62" text-anchor="middle" class="t-xs">layer 7</text>
+    <rect x="625" y="40" width="70" height="34" rx="6" class="box"/><text x="660" y="62" text-anchor="middle" class="t-xs">layer 8</text>
+    </g>
+    <g class="f-blue">
+    <rect x="53" y="84" width="24" height="16"/><rect x="138" y="84" width="24" height="16"/><rect x="223" y="84" width="24" height="16"/><rect x="308" y="84" width="24" height="16"/>
+    <rect x="393" y="84" width="24" height="16"/><rect x="478" y="84" width="24" height="16"/><rect x="563" y="84" width="24" height="16"/><rect x="648" y="84" width="24" height="16"/>
+    </g>
+    <text x="710" y="97" class="t-xs t-muted">8 held</text>
+    <line x1="20" y1="124" x2="740" y2="124" class="line-dash"/>
+    <text x="20" y="148" class="t-xs t-faint">CHECKPOINT EVERY 4 LAYERS: 2 SAVED, THEN ONE SEGMENT REBUILT DURING BACKWARD</text>
+    <g>
+    <rect x="30" y="162" width="70" height="34" rx="6" class="box"/><text x="65" y="184" text-anchor="middle" class="t-xs">layer 1</text>
+    <rect x="115" y="162" width="70" height="34" rx="6" class="box"/><text x="150" y="184" text-anchor="middle" class="t-xs">layer 2</text>
+    <rect x="200" y="162" width="70" height="34" rx="6" class="box"/><text x="235" y="184" text-anchor="middle" class="t-xs">layer 3</text>
+    <rect x="285" y="162" width="70" height="34" rx="6" class="box"/><text x="320" y="184" text-anchor="middle" class="t-xs">layer 4</text>
+    <rect x="370" y="162" width="70" height="34" rx="6" class="box"/><text x="405" y="184" text-anchor="middle" class="t-xs">layer 5</text>
+    <rect x="455" y="162" width="70" height="34" rx="6" class="box"/><text x="490" y="184" text-anchor="middle" class="t-xs">layer 6</text>
+    <rect x="540" y="162" width="70" height="34" rx="6" class="box"/><text x="575" y="184" text-anchor="middle" class="t-xs">layer 7</text>
+    <rect x="625" y="162" width="70" height="34" rx="6" class="box"/><text x="660" y="184" text-anchor="middle" class="t-xs">layer 8</text>
+    </g>
+    <rect x="53" y="206" width="24" height="16" class="f-cyan"/>
+    <rect x="393" y="206" width="24" height="16" class="f-cyan"/>
+    <text x="65" y="240" text-anchor="middle" class="t-xs tc-cyan t-bold">checkpoint</text>
+    <text x="405" y="240" text-anchor="middle" class="t-xs tc-cyan t-bold">checkpoint</text>
+    <rect x="478" y="206" width="24" height="16" class="f-orange"/><rect x="563" y="206" width="24" height="16" class="f-orange"/><rect x="648" y="206" width="24" height="16" class="f-orange"/>
+    <text x="575" y="240" text-anchor="middle" class="t-xs tc-orange t-bold">recomputed, then freed</text>
+    <text x="710" y="219" class="t-xs t-muted">2 + 3</text>
+  </svg>
+  <figcaption><strong>Peak storage drops from 8 tensors to about 5 here, and from n to about 2&radic;n for a deep network.</strong> The orange squares exist only while one segment is being differentiated. With 64 layers the same idea needs 16 tensors instead of 64, as the code below shows (it counts a whole segment, k tensors, so it is slightly conservative).</figcaption>
+</figure>
+
+<p>Here is the idea made executable. A chain of 64 tanh layers is differentiated by hand in NumPy, once storing every layer input and then with checkpoints every k layers. The code counts the activation tensors held at peak and the layer forward evaluations performed, and checks that the gradients are identical:</p>
+
+<pre class="terminal" data-title="ckpt_demo.py"><code>import numpy as np
+rng = np.random.default_rng(0)
+n, width, batch = 64, 128, 32
+Ws = [rng.normal(0, 1/np.sqrt(width), (width, width)) for _ in range(n)]
+x = rng.normal(size=(batch, width))
+target = rng.normal(size=(batch, width))
+
+def layer(a, W): return np.tanh(a @ W)
+def layer_back(a_in, W, g_out):
+    pre_grad = g_out * (1 - np.tanh(a_in @ W) ** 2)    # recompute tanh from the saved input
+    return pre_grad @ W.T, a_in.T @ pre_grad            # (grad wrt input, grad wrt W)
+
+def run(keep_every):
+    """keep_every=1 stores every layer input; k&gt;1 stores every k-th and recomputes the rest."""
+    stored, forward_calls = {}, 0
+    a = x
+    for i, W in enumerate(Ws):
+        if i % keep_every == 0: stored[i] = a
+        a = layer(a, W); forward_calls += 1
+    g = 2 * (a - target) / batch                          # d(mean squared error)/d(output)
+    grads = [None] * n
+    for start in range(((n - 1) // keep_every) * keep_every, -1, -keep_every):
+        seg = list(range(start, min(start + keep_every, n)))
+        inputs, a = {}, stored[start]
+        for i in seg:                                      # recompute the segment's inputs
+            inputs[i] = a
+            if i != seg[-1]:
+                a = layer(a, Ws[i]); forward_calls += 1      # extra forward work
+        for i in reversed(seg):
+            g, grads[i] = layer_back(inputs[i], Ws[i], g)
+    peak = len(stored) + keep_every if keep_every &gt; 1 else len(stored)
+    return grads, forward_calls, peak
+
+g1, f1, peak1 = run(1)
+for k in (1, 4, 8, 16):
+    g, f, peak = run(k)
+    err = max(np.abs(a - b).max() for a, b in zip(g, g1))
+    print(f"keep every {k:2d}: activation tensors held at peak {peak:3d}, layer forwards {f:3d}, max grad diff vs stored-all {err:.1e}")</code></pre>
+<pre class="terminal" data-title="output"><code>keep every  1: activation tensors held at peak  64, layer forwards  64, max grad diff vs stored-all 0.0e+00
+keep every  4: activation tensors held at peak  20, layer forwards 112, max grad diff vs stored-all 0.0e+00
+keep every  8: activation tensors held at peak  16, layer forwards 120, max grad diff vs stored-all 0.0e+00
+keep every 16: activation tensors held at peak  20, layer forwards 124, max grad diff vs stored-all 0.0e+00
+</code></pre>
+
+<p>Keeping every 8th layer holds 16 tensors instead of 64 (a four-fold cut) for 120 layer evaluations instead of 64, and the gradients are bit-for-bit the same. Counting the whole step (a forward costs 1 unit, a backward about 2), the extra 56 forward evaluations add 56 / (64 &times; 3), about 29 percent. The curve is also flat near the optimum: k = 4 and k = 16 both hold 20 tensors, which is the n/k + k trade-off at work.</p>
+
+<p><strong>Selective recomputation.</strong> Full checkpointing recomputes everything, including the expensive matrix multiplications, to save memory that is mostly not in them. Korthikanti et al. (2022) observed that the big, cheap-to-recompute part of a layer is the attention-score matrices (the 5&middot;a&middot;s/h term above): they take a lot of memory but little arithmetic. Recomputing only those, and saving the rest, cuts activation memory a lot for a small time cost. The paper reports that, combined with tensor and sequence parallelism, it reduces activation memory by 5 times and cuts the execution-time overhead of recomputation by over 90 percent; for a 530B-parameter model on 2,240 A100 GPUs they report 54.2 percent model FLOPs utilisation against 42.1 percent with full recomputation. FlashAttention achieves the same effect inside the kernel, which is why it is the default in modern training code. The "selective" column in the table above is what you get.</p>
+
+<h3>Other levers</h3>
+
+<ul>
+  <li><strong>Lower-precision optimiser state.</strong> 8-bit Adam stores the two moments in about 2 bytes per parameter instead of 8. It exists in <code>bitsandbytes</code>; quality is generally reported as comparable, but you should check on your task.</li>
+  <li><strong>Fewer trainable parameters.</strong> <a href="11-lora.html">LoRA</a> freezes the weights and trains small low-rank adapters. Gradients and optimiser state exist only for the adapters (a fraction of a percent of the model), so the 12 + 2 bytes per parameter mostly vanish. Activations are still needed to back-propagate through the frozen layers.</li>
+  <li><strong>Lower-precision weights.</strong> Storing a frozen base in 4-bit form cuts its footprint to a quarter of bf16 ( <a href="19-quantisation.html">chapter 19</a> explains how without ruining accuracy).</li>
+  <li><strong>Offloading.</strong> Park optimiser state (and sometimes weights) in CPU RAM or on NVMe disk and move pieces in when needed. ZeRO-Offload and ZeRO-Infinity do this. It trades GPU memory for PCIe and disk bandwidth, which is far slower than HBM, so it is a last resort for small clusters rather than a speed-up.</li>
+  <li><strong>Sharding.</strong> Split the model states across many GPUs so each holds only a slice. This is the subject of <a href="03-parallelism.html">the next chapter</a> and is how 7B-and-up models are trained at all.</li>
+  <li><strong>Avoid materialising the logits.</strong> The output layer produces s &times; b &times; V numbers: at s = 4,096, b = 4 and V = 128,000 that is 2 billion entries, 8 GB in fp32 before the softmax and its gradient. Chunked or fused cross-entropy implementations compute the loss in slices and avoid storing the full tensor. This is why vocabulary size shows up in memory budgets.</li>
+</ul>
+
+<h2>A training step as a memory timeline</h2>
+
+<p>Memory is not constant during a step; it rises and falls, and the <em>peak</em> is what crashes you. Step through one iteration of a 1.3-billion-parameter model (24 layers, h = 2048, vocabulary 50,257), sequence length 2,048 and micro-batch 1, using the mixed-precision recipe. The numbers come from the same formulas as above and ignore logits and fixed overhead for clarity. The dashed line is a 24 GB card.</p>
+
+<div class="widget stepper" data-autoplay-ms="4000">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One training step, memory over time</h4></div>
+  <svg viewBox="0 0 760 310" role="img" aria-label="Six stacked bars of GPU memory for a 1.3 billion parameter model: 18.4 GB at the start of a step, 29.8 GB at the end of the forward pass when activations peak above the 24 GB line, 25.4 GB mid backward, 21.0 GB at the end of backward, 18.4 GB after the update, and a final bar of 19.0 GB at peak when activation checkpointing is used.">
+    <text x="20" y="20" class="t-xs t-faint">GB IN USE (STACKED: WEIGHTS, OPTIMISER, GRADIENTS, ACTIVATIONS)</text>
+    <line x1="56" y1="250" x2="720" y2="250" class="line-thin"/>
+    <line x1="56" y1="96.4" x2="720" y2="96.4" class="line-dash s-green"/>
+    <text x="720" y="90" text-anchor="end" class="t-xs tc-green t-bold">24 GB card</text>
+      <g data-steps="1-" data-active="1">
+        <rect x="70" y="233.2" width="76" height="16.8" class="f-purple"/>
+        <rect x="70" y="132.6" width="76" height="100.7" class="f-red"/>
+        <text x="108" y="126.6" text-anchor="middle" class="t-xs t-bold">18.4 GB</text>
+        <text x="108" y="266" text-anchor="middle" class="t-xs t-muted">Start of step</text>
+      </g>
+      <g data-steps="2-" data-active="2">
+        <rect x="168" y="233.2" width="76" height="16.8" class="f-purple"/>
+        <rect x="168" y="132.6" width="76" height="100.7" class="f-red"/>
+        <rect x="168" y="59.1" width="76" height="73.5" class="f-blue"/>
+        <text x="206" y="53.1" text-anchor="middle" class="t-xs t-bold">29.8 GB</text>
+        <text x="206" y="266" text-anchor="middle" class="t-xs t-muted">End of forward</text>
+      </g>
+      <g data-steps="3-" data-active="3">
+        <rect x="266" y="233.2" width="76" height="16.8" class="f-purple"/>
+        <rect x="266" y="132.6" width="76" height="100.7" class="f-red"/>
+        <rect x="266" y="124.2" width="76" height="8.4" class="f-orange"/>
+        <rect x="266" y="87.4" width="76" height="36.7" class="f-blue"/>
+        <text x="304" y="81.4" text-anchor="middle" class="t-xs t-bold">25.4 GB</text>
+        <text x="304" y="266" text-anchor="middle" class="t-xs t-muted">Mid backward</text>
+      </g>
+      <g data-steps="4-" data-active="4">
+        <rect x="364" y="233.2" width="76" height="16.8" class="f-purple"/>
+        <rect x="364" y="132.6" width="76" height="100.7" class="f-red"/>
+        <rect x="364" y="115.8" width="76" height="16.8" class="f-orange"/>
+        <text x="402" y="109.8" text-anchor="middle" class="t-xs t-bold">21.0 GB</text>
+        <text x="402" y="266" text-anchor="middle" class="t-xs t-muted">End of backward</text>
+      </g>
+      <g data-steps="5-" data-active="5">
+        <rect x="462" y="233.2" width="76" height="16.8" class="f-purple"/>
+        <rect x="462" y="132.6" width="76" height="100.7" class="f-red"/>
+        <text x="500" y="126.6" text-anchor="middle" class="t-xs t-bold">18.4 GB</text>
+        <text x="500" y="266" text-anchor="middle" class="t-xs t-muted">After update</text>
+      </g>
+      <g data-steps="6-" data-active="6">
+        <rect x="560" y="233.2" width="76" height="16.8" class="f-purple"/>
+        <rect x="560" y="132.6" width="76" height="100.7" class="f-red"/>
+        <rect x="560" y="128.2" width="76" height="4.4" class="f-blue"/>
+        <text x="598" y="122.2" text-anchor="middle" class="t-xs t-bold">19.0 GB</text>
+        <text x="598" y="266" text-anchor="middle" class="t-xs t-muted">Peak, checkpointed</text>
+      </g>
+    <rect x="70" y="284" width="10" height="10" class="f-purple"/><text x="84" y="293" class="t-xs t-muted">weights 2.6</text>
+    <rect x="170" y="284" width="10" height="10" class="f-red"/><text x="184" y="293" class="t-xs t-muted">optimiser + master 15.7</text>
+    <rect x="340" y="284" width="10" height="10" class="f-orange"/><text x="354" y="293" class="t-xs t-muted">gradients 2.6</text>
+    <rect x="450" y="284" width="10" height="10" class="f-blue"/><text x="464" y="293" class="t-xs t-muted">activations (11.5 if all stored)</text>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Start of the step: 18.4 GB.</strong> Weights (2.6 GB) and optimiser state with master weights (15.7 GB) are resident all the time. Before any data flows, three quarters of a 24 GB card is gone.</li>
+    <li><strong>End of the forward pass: 29.8 GB.</strong> Every layer has saved its activations: 11.5 GB at sequence length 2,048 and batch 1 with no saving strategy. This is the peak, 5.8 GB above the card. The job crashes here, deep into the first step, with an out-of-memory error.</li>
+    <li><strong>Mid backward: 25.4 GB.</strong> As the backward pass walks from the last layer to the first, it frees each layer's activations after using them, while gradients (2.6 GB when complete) accumulate. Memory is falling but is still above the line.</li>
+    <li><strong>End of backward: 21.0 GB.</strong> All activations are freed, all gradients exist. Notice that this point would have fitted: the problem is only the peak.</li>
+    <li><strong>After the optimiser update: 18.4 GB.</strong> The optimiser reads gradients and updates master weights, moments and the bf16 weights; gradients are zeroed or freed. Back to the start.</li>
+    <li><strong>The same step with activation checkpointing: peak 19.0 GB.</strong> Only each layer's input (0.2 GB in total) plus one layer rebuilt at a time (0.5 GB) is stored. The step now fits with 5 GB to spare, which can buy a larger micro-batch, at the cost of about one extra forward pass of compute.</li>
+  </ol>
+</div>
+
+<p>Real peaks are higher than this idealisation for three reasons. The framework's <span class="term">caching allocator</span> (PyTorch's, for example) keeps freed blocks for reuse rather than returning them to the driver, so <code>nvidia-smi</code> shows <em>reserved</em> memory, which is more than the memory tensors actually use. <span class="term">Fragmentation</span> (free memory in pieces too small for the next large request) can cause an OOM when plenty of bytes are nominally free. And temporary buffers inside kernels and communication libraries add spikes. Hence the fixed 1.5 GB overhead in the calculator below, which is an assumption, not a measured constant.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>This is the <a href="../../systems/chapters/02-memory-hierarchy.html">memory hierarchy</a> with a hard limit and no swap. An operating system faced with too little RAM <a href="../../systems/chapters/06-virtual-memory.html">pages memory out to disk</a> and keeps running slowly; a GPU framework raises an error instead, because paging over PCIe would be so slow that training would appear to hang. The caching allocator and its fragmentation are the same problems a <code>malloc</code> implementation has, and <a href="../../systems/chapters/21-parallelism-gpus.html">chapter 21 of the systems course</a> explains why the GPU's high-bandwidth memory is the resource that matters. Estimating before you launch is capacity planning (<a href="../../reliability/chapters/10-load-testing-capacity.html">Load Testing &amp; Capacity Planning</a>) applied to a single machine.</p>
+</div>
+
+<h2>Calculate it yourself</h2>
+
+<p>The widget below puts the whole chapter in one place. Choose a model shape, a training recipe, sequence length and micro-batch, a recompute strategy and a GPU. It reports the total with the breakdown of the four categories, plus logits and the assumed overhead. It uses the formulas above, so treat its output as an estimate within tens of percent, a first check to run before you rent a machine.</p>
+
+<div class="widget" id="llm02-memory">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Will this training run fit?</h4></div>
+  <p class="widget-help">Bars show gigabytes (10<sup>9</sup> bytes) per category. The green line is the chosen GPU's capacity. Try the 7B-class model on an 80 GB card with each recipe in turn, then change the recompute setting.</p>
+  <div class="mem-ctl">
+    <div><label for="mem-model">Model shape</label>
+      <select id="mem-model" data-act="model">
+        <option value="small">GPT-2 small (L12, h768)</option>
+        <option value="xl13" selected>1.3B (L24, h2048)</option>
+        <option value="b7">7B-class (L32, h4096)</option>
+        <option value="b13">13B-class (L40, h5120)</option>
+        <option value="b70">70B-class (L80, h8192)</option>
+      </select></div>
+    <div><label for="mem-recipe">Training recipe</label>
+      <select id="mem-recipe" data-act="recipe">
+        <option value="mixed" selected>Mixed precision + Adam (2+2+12)</option>
+        <option value="bf16">bf16 weights, fp32 Adam, no master (2+2+8)</option>
+        <option value="adam8">8-bit Adam, no master copy (2+2+2)</option>
+        <option value="lora">LoRA: bf16 base, 0.5% trainable</option>
+        <option value="qlora">QLoRA: 4-bit base, 0.5% trainable</option>
+      </select></div>
+    <div><label for="mem-mode">Activation strategy</label>
+      <select id="mem-mode" data-act="mode">
+        <option value="none" selected>Store everything</option>
+        <option value="selective">Selective (or FlashAttention)</option>
+        <option value="full">Full checkpointing</option>
+      </select></div>
+    <div><label for="mem-cap">GPU memory</label>
+      <select id="mem-cap" data-act="cap">
+        <option value="24" selected>24 GB (RTX 4090 class)</option>
+        <option value="40">40 GB (A100 40 GB class)</option>
+        <option value="80">80 GB (A100 or H100)</option>
+      </select></div>
+    <div><label for="mem-seq">Sequence length s: <output data-act="seq-out">2048</output></label><input id="mem-seq" data-act="seq" type="range" min="512" max="8192" step="512" value="2048"></div>
+    <div><label for="mem-batch">Micro-batch b: <output data-act="batch-out">1</output></label><input id="mem-batch" data-act="batch" type="range" min="1" max="16" step="1" value="1"></div>
+  </div>
+  <svg class="mem-chart" viewBox="0 0 700 150" role="img" aria-label="Stacked bar of GPU memory by category compared with the chosen GPU capacity"></svg>
+  <div class="widget-out mem-summary" aria-live="polite"></div>
+  <div class="table-wrap"><table class="mem-table">
+    <thead><tr><th>Category</th><th>Size</th><th>Share</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+</div>
+
+<h3>Worked example: what fits on one 24 GB GPU</h3>
+
+<p>Use the calculator or the arithmetic above to answer three questions a practitioner asks all the time. All assume sequence length 2,048 and micro-batch 1.</p>
+
+<ul>
+  <li><strong>Full fine-tuning a 1.3B model with standard mixed-precision Adam?</strong> States are 21 GB. With stored activations (11.5 GB) it does not fit. With full checkpointing it needs about 21 + 0.7 + logits (0.4) + overhead (1.5), around 23.6 GB: just fits, with no room for a larger batch. A realistic recommendation: use an 8-bit optimiser or LoRA, or move to an 80 GB card.</li>
+  <li><strong>LoRA on a 7B-class model with a bf16 base?</strong> The frozen weights take 13 GB; adapters, their gradients and their optimiser state add under 1 GB. Activations with selective recomputation at s = 2,048, b = 1 are 8.5 GiB, so the total is about 24.4 GB with the assumed overhead: just over the card. Full checkpointing (1.4 GiB) brings it to about 17 GB, which is comfortable.</li>
+  <li><strong>QLoRA on a 7B-class model?</strong> A 4-bit base is about 3.3 GB. Activations with full checkpointing add 1.4 GiB. This leaves ample room, and even a 13B-class model fits (6.4 GB of 4-bit weights). This is the reason QLoRA made large-model fine-tuning possible on consumer cards.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>NVIDIA's product pages list the A100 80 GB with 80 GB HBM2e and 2,039 GB/s memory bandwidth (SXM), and the H100 SXM with 80 GB and 3.35 TB/s; the RTX 4090 has 24 GB of GDDR6X. The H100 page quotes 1,979 TFLOPS of bf16 tensor throughput with a footnote that this figure assumes structured sparsity; the dense figure is half of that (about 990 TFLOPS), and real training reaches a fraction of it. Llama 3 405B's pretraining ran at 38 to 43 percent model FLOPs utilisation on up to 16,384 H100s (Dubey et al., 2024). Newer accelerators with larger memory, and lower-precision training formats such as fp8, are in use; this chapter's accounting method stays valid but the bytes per parameter change with the recipe, so recompute them for yours. Specifications change with every generation: check the vendor's current datasheet rather than this page.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Predict, then measure. Take the 124M-parameter GPT-2 small shape (L = 12, h = 768) and, if you have a GPU or a free Colab session, run a few training steps with the PyTorch snippet below. Before running, use the calculator to predict the peak for batch 4 and sequence 1,024 with and without checkpointing. Then compare with <code>torch.cuda.max_memory_allocated()</code> (tensors) and <code>max_memory_reserved()</code> (what the allocator holds). If your prediction is off by more than 30 percent, find which of the four categories explains the gap. No GPU? Edit <code>memory_budget.py</code> and answer: for a 24 GB card, which is the largest model shape that fits full fine-tuning with 8-bit Adam and full checkpointing?</p>
+  <pre class="terminal" data-title="measure_memory.py (PyTorch, not run here)"><code>import torch
+torch.cuda.reset_peak_memory_stats()
+for step in range(3):
+    loss = model(batch).loss          # forward: activations accumulate
+    loss.backward()                   # backward: activations freed, grads appear
+    optimizer.step(); optimizer.zero_grad(set_to_none=True)
+    print(step,
+          f"allocated peak {torch.cuda.max_memory_allocated()/1e9:.2f} GB",
+          f"reserved peak {torch.cuda.max_memory_reserved()/1e9:.2f} GB")
+# Expect: step 0 lower than steps 1 and 2, because optimiser state is allocated lazily on the first step.</code></pre>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">nvidia-smi --query-gpu=memory.used,memory.total --format=csv -l 1</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Training memory has four parts: weights, gradients, optimiser state (together the model states) and activations. The first three scale with parameter count, the last with batch and sequence length.</li>
+    <li>Mixed-precision Adam costs 16 bytes per parameter: 2 (bf16 weights) + 2 (bf16 gradients) + 12 (fp32 master weights and two moments). A 7B-class model needs roughly 105 GB of state; a 24 GB card trains about 1.2B parameters with this recipe.</li>
+    <li>The fp32 master copy exists because bf16 cannot represent small updates; without it the weight stops moving.</li>
+    <li>Activation memory per layer is about s&middot;b&middot;h&middot;(34 + 5&middot;a&middot;s/h) bytes; the s&sup2; term is why long sequences blow up and why FlashAttention and selective recomputation matter.</li>
+    <li>Gradient accumulation gives the same gradient with a smaller micro-batch; activation checkpointing trades roughly one extra forward pass for O(&radic;n) activation memory.</li>
+    <li>Peaks, not averages, cause OOM; the peak is usually at the end of the forward pass, and real peaks exceed paper estimates because of caching and fragmentation.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (2019)</a>. Section 3 is the clearest accounting of model-state memory (the 2 + 2 + K rule) and the activation and buffer overheads.</li>
+  <li><a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Korthikanti et al., "Reducing Activation Recomputation in Large Transformer Models" (2022)</a>. Derives the per-layer activation formula used here and introduces selective recomputation.</li>
+  <li><a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">Chen et al., "Training Deep Nets with Sublinear Memory Cost" (2016)</a>. The original checkpointing paper, with the O(&radic;n) result and a 30 percent runtime cost.</li>
+  <li><a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Micikevicius et al., "Mixed Precision Training" (2018)</a>. Why a 32-bit master copy of the weights is kept, and loss scaling.</li>
+  <li><a href="https://arxiv.org/abs/2110.02861" target="_blank" rel="noopener">Dettmers et al., "8-bit Optimizers via Block-wise Quantization" (2021)</a>. Optimiser state in 8 bits, with comparable results reported on the tasks tested.</li>
+  <li><a href="https://pytorch.org/docs/stable/notes/cuda.html#cuda-memory-management" target="_blank" rel="noopener">PyTorch documentation, "CUDA semantics: memory management"</a>. How the caching allocator reserves memory and how to read its statistics.</li>
+  <li><a href="https://cs336.stanford.edu/" target="_blank" rel="noopener">Stanford CS336, "Language Modeling from Scratch"</a>. Lectures and assignments on resource accounting and memory-efficient training.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">You want to fully fine-tune a 3-billion-parameter model with mixed-precision Adam. Roughly how much memory do the weights, gradients and optimiser state need, before activations?</p>
+    <ol class="q-options"><li>6 GB, because bf16 weights take 2 bytes each</li><li>48 GB, from 16 bytes per parameter</li><li>12 GB, because Adam adds 4 bytes</li><li>It depends mostly on the batch size</li></ol>
+    <div class="q-explain">3 &times; 10<sup>9</sup> parameters at 2 + 2 + 12 = 16 bytes is 48 GB. Answer 1 counts only the weights. Model states do not depend on batch size at all; that is the activations' job.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A job runs for the first forward pass, then dies with an out-of-memory error. Reducing the micro-batch from 8 to 2 fixes it. Which category was over budget?</p>
+    <ol class="q-options"><li>Weights</li><li>Optimiser state</li><li>Gradients</li><li>Activations</li></ol>
+    <div class="q-explain">Only activations scale with micro-batch size. The first three are the same at batch 1 or 100. If the model states had been too big, the job would have failed at or before the first optimiser step regardless of the batch.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why is a 32-bit master copy of the weights kept in mixed-precision training?</p>
+    <ol class="q-options"><li>bf16 cannot represent updates much smaller than the weight itself, so they would round to nothing</li><li>The GPU's tensor cores can only multiply 32-bit numbers</li><li>It makes the forward pass faster</li><li>It is needed to compute gradients</li></ol>
+    <div class="q-explain">A bf16 weight near 1.0 has gaps of about 0.004 to 0.008, so an update of 0.001 disappears (the chapter's NumPy run left the weight at exactly 1.0 after 1,000 steps). Tensor cores do multiply in bf16, and the master copy costs memory and time rather than saving it.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Activation checkpointing with a checkpoint every &radic;n layers of an n-layer network changes training how?</p>
+    <ol class="q-options"><li>It lowers parameter memory by &radic;n and costs nothing</li><li>It changes the gradients slightly in exchange for memory</li><li>It cuts stored activations from O(n) to O(&radic;n), gives the same gradients, and adds about one extra forward pass of compute</li><li>It removes the need for the backward pass through checkpointed layers</li></ol>
+    <div class="q-explain">The demo showed identical gradients, 16 tensors instead of 64, and extra layer forwards. Checkpointing does not touch parameters, and every layer still gets a backward pass: the activations are rebuilt first.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A colleague doubles the sequence length from 2,048 to 4,096 and keeps everything else fixed, with no FlashAttention. Which statement about activation memory per layer (Korthikanti's formula) is closest?</p>
+    <ol class="q-options"><li>It exactly doubles, because sequence length is linear in the formula</li><li>It more than doubles, because the attention-score term grows with the square of the sequence length</li><li>It stays the same, because activations depend only on batch size</li><li>It halves, because longer sequences are processed in parallel</li></ol>
+    <div class="q-explain">The 34&middot;s&middot;b&middot;h part doubles, but the 5&middot;a&middot;s&sup2;&middot;b part quadruples. In the chapter's 7B-class table, going from 2,048 to 4,096 at batch 1 raises the stored total from 28.5 to 97.0 GiB, more than three times.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">You must fine-tune a 13B-class model on a single 24 GB GPU. Which plan is the most plausible?</p>
+    <ol class="q-options"><li>QLoRA: a 4-bit frozen base (about 6.4 GB), small adapters, and activation checkpointing</li><li>Full fine-tuning with mixed-precision Adam at batch size 1</li><li>Full fine-tuning with a very small learning rate</li><li>LoRA over a bf16 base, which only needs the weights (about 25 GB)</li></ol>
+    <div class="q-explain">Full fine-tuning needs about 204 GB of states however small the batch or learning rate. LoRA over bf16 weights needs about 25 GB for the weights alone, which already exceeds the card. Only the 4-bit base leaves room for adapters and activations.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/llm02-memory.js"></script>
+</body>
+</html>

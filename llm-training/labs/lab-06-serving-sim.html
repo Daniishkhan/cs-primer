@@ -1,0 +1,1375 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 6: A Serving Simulator · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-lab="L6">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 6: A Serving Simulator</h1>
+  <p class="lede"><a href="../chapters/18-kv-cache.html">Chapter 18</a> said that generating a token moves the whole model through memory, <a href="../chapters/20-serving-engines.html">chapter 20</a> said that an engine is a scheduler that batches one step at a time and manages the KV cache like virtual memory, and <a href="../chapters/22-token-economics.html">chapter 22</a> turned the result into dollars per million tokens. This lab lets you check every one of those claims by building the engine's brain in a few hundred lines. There is no model and no GPU: a clock, a cost model for one forward pass, a pool of cache pages, and a stream of requests. You write the paged allocator, the workload and the percentile metrics, static batching, continuous batching with paged allocation, preemption when the cache is full, and finally the question a capacity planner asks: how many requests a second can this GPU take while still meeting a latency target, and what does a token cost at that point?</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>When a serving system misbehaves, the symptoms are percentiles on a dashboard: first-token latency climbing, tokens per second flat, a sudden wall of "preempted" log lines. The causes are scheduling decisions made thousands of times a second, and reading about them does not tell you how large their effects are. Written as a simulation they become numbers you can change. You will see static batching waste 90% of its slots, a reserve-the-maximum allocator turn away traffic that a paged one serves comfortably, a shrinking cache turn into recomputation, and a TPOT figure that gets <em>better</em> while the system gets worse. The simulator is a model, so every number depends on assumptions that the lab states. What transfers is the shape of the trade-offs, and the habit of reading throughput, time to first token and time per token together, as in <a href="../../reliability/chapters/04-metrics.html">metrics and percentiles</a> and <a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>. Chapter 20's case for vLLM, <a href="../cases/case-04-vllm.html">case 4</a>, is the real system this lab is a miniature of.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Deterministic, small, standard library only</p>
+  <p>Nothing here touches a real clock. The simulator keeps its own clock in milliseconds and advances it by the modelled duration of each forward pass, so 300 requests that take minutes of simulated time run in a few hundredths of a second. The workload comes from <code>random.Random(seed)</code>; the check replays random cases from printed seeds (for example <code>python3 check.py solution 1 7</code> replays the random allocator operations of milestone 1 with seed 7). Python 3.9 or newer, no NumPy, no downloads. The full check takes under a second. The lab does not use <code>llm.py</code>: no model is called.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Assumptions, not measurements</p>
+  <p>The simulated GPU is invented. It is a 24 GB card running an 8-billion-parameter model in bf16 with the Llama 3 8B shape of chapter 18 (32 layers, 8 KV heads of width 128, so 131,072 bytes of cache per token). Take 1.0 TB/s of memory bandwidth at 70% efficiency, 100 TFLOPS usable for prompt processing and 1.5 GB of overhead; chapter 22 derived the same kind of numbers for an H100, and the arithmetic is identical. Reading all 16.06 GB of weights costs 22.9 ms per step; reading one cached token costs 0.000187 ms; processing one prompt token costs 0.1606 ms. The model ignores the arithmetic of attention itself, multi-GPU communication, prefix caching, chunked prefill and speculative decoding. Treat the output as a worked example, not a benchmark of any product.</p>
+</div>
+
+<h2>What you'll build</h2>
+<figure class="diagram">
+<svg viewBox="0 0 760 330" role="img" aria-label="The simulator. A seeded workload of requests with arrival times and lengths enters a scheduler. The scheduler uses a paged KV cache allocator and a per-step cost model, and produces per-request timings that are summarised into throughput, time to first token and time per output token. Three policies are compared: static batching, continuous batching with reserved cache, and continuous batching with paged cache plus preemption.">
+<defs><marker id="ahLT-L6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="20" text-anchor="start" class="t-sm t-bold">A GPU, a clock and a queue</text>
+<rect x="10" y="50" width="150" height="76" rx="8" class="fs-green s-green sw-2"/>
+<text x="85" y="78" text-anchor="middle" class="t-sm t-bold">workload</text>
+<text x="85" y="97" text-anchor="middle" class="t-xs t-muted">Poisson arrivals,</text>
+<text x="85" y="111" text-anchor="middle" class="t-xs t-muted">lognormal lengths: M2</text>
+<rect x="215" y="50" width="190" height="76" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="310" y="78" text-anchor="middle" class="t-sm t-bold">scheduler</text>
+<text x="310" y="97" text-anchor="middle" class="t-xs t-muted">static: M3, continuous: M4,</text>
+<text x="310" y="111" text-anchor="middle" class="t-xs t-muted">preemption: M5</text>
+<rect x="460" y="50" width="130" height="76" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="525" y="78" text-anchor="middle" class="t-sm t-bold">step cost</text>
+<text x="525" y="97" text-anchor="middle" class="t-xs t-muted">base + kv + prefill</text>
+<text x="525" y="111" text-anchor="middle" class="t-xs t-muted">milliseconds: M2</text>
+<rect x="620" y="50" width="130" height="76" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="685" y="78" text-anchor="middle" class="t-sm t-bold">KV cache</text>
+<text x="685" y="97" text-anchor="middle" class="t-xs t-muted">3,070 pages</text>
+<text x="685" y="111" text-anchor="middle" class="t-xs t-muted">allocator: M1</text>
+<line x1="162" y1="88" x2="213" y2="88" class="line sw-2" marker-end="url(#ahLT-L6a)"/>
+<line x1="407" y1="88" x2="458" y2="88" class="line sw-2" marker-end="url(#ahLT-L6a)"/>
+<line x1="592" y1="88" x2="618" y2="88" class="line sw-2" marker-end="url(#ahLT-L6a)"/>
+<rect x="215" y="170" width="190" height="60" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="310" y="196" text-anchor="middle" class="t-sm t-bold">per-request timings</text>
+<text x="310" y="214" text-anchor="middle" class="t-xs t-muted">first token, finish, preemptions</text>
+<line x1="310" y1="128" x2="310" y2="168" class="line sw-2" marker-end="url(#ahLT-L6a)"/>
+<rect x="460" y="170" width="290" height="60" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="605" y="196" text-anchor="middle" class="t-sm t-bold">summary: p50, p95, p99</text>
+<text x="605" y="214" text-anchor="middle" class="t-xs t-muted">throughput, TTFT, TPOT: M2</text>
+<line x1="407" y1="200" x2="458" y2="200" class="line sw-2" marker-end="url(#ahLT-L6a)"/>
+<rect x="10" y="262" width="740" height="52" rx="8" class="fs-yellow s-yellow sw-2"/>
+<text x="380" y="285" text-anchor="middle" class="t-sm t-bold">sweep the arrival rate, find the highest rate that meets the SLO: M6</text>
+<text x="380" y="304" text-anchor="middle" class="t-xs t-muted">static, continuous with reserved cache, continuous with paged cache: same GPU, same requests</text>
+</svg>
+<figcaption><strong>Everything on one clock.</strong> Green is the input, blue the scheduler, orange the physics, purple the cache, cyan the measurements. The same workload is replayed through three policies and only the policy changes.</figcaption>
+</figure>
+
+<p>Six milestones, each building on the previous one:</p>
+<ol class="steps">
+  <li><strong>Sizing and paging:</strong> the bytes of cache per token, how many pages fit beside the weights, and a page allocator with block tables.</li>
+  <li><strong>The cost model, the workload and the metrics:</strong> the duration of a step, seeded Poisson arrivals with lognormal lengths, nearest-rank percentiles and the summary an SLO talks about.</li>
+  <li><strong>Static batching:</strong> run a batch to completion, then take the next.</li>
+  <li><strong>Continuous batching:</strong> schedule at every step, refill slots at once, allocate pages as sequences grow.</li>
+  <li><strong>Preemption:</strong> when the cache is full, evict the youngest request, and recompute it later.</li>
+  <li><strong>Capacity and cost:</strong> sweep the arrival rate, find the knee for each policy, and turn throughput into dollars per million tokens.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are in this guide's folder, <code>llm-training/labs/code/lab06/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab06/starter.py"><code>starter.py</code></a></td><td>Your file. The data classes, the GPU configuration, the per-request state and a few helpers are given; every function you write has a docstring with its contract and raises <code>NotImplementedError</code> until you do.</td></tr>
+    <tr><td><a href="code/lab06/check.py"><code>check.py</code></a></td><td>The self-check: hand-traced scenarios, a second, independently written simulator that must agree with yours exactly, seeded property tests and a scored comparison of the three policies, one group per milestone.</td></tr>
+    <tr><td><a href="code/lab06/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+  </tbody>
+</table></div>
+
+<p>The folder also holds the experiment scripts used on this page (<code>exp_sizing.py</code>, <code>exp_blocks.py</code>, <code>exp_workload.py</code>, <code>exp_static.py</code>, <code>exp_continuous.py</code>, <code>exp_preempt.py</code>, <code>exp_capacity.py</code>). They import from <code>solution.py</code>; change the import to <code>starter</code> to run them on your own code. Open a terminal in the folder and run the check straight away. Everything is unimplemented, and it says so cleanly:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 6 checks against starter.py
+
+  … Milestone 1: sizing and paging: not implemented yet (TODO milestone 1: kv_bytes_per_token)
+  … Milestone 2: the cost model, the workload and the metrics: not implemented yet (TODO milestone 2: step_time_ms)
+  … Milestone 3: static batching: not implemented yet (TODO milestone 3: simulate_static)
+  … Milestone 4: continuous batching: not implemented yet (TODO milestone 4: simulate_continuous)
+  … Milestone 5: preemption when the cache is full: not implemented yet (TODO milestone 5: preempt_one)
+  … Milestone 6: capacity under an SLO, and what a token costs: not implemented yet (TODO milestone 6: cost_per_million)
+
+0/6 milestones passing  (0.0 s)</span></code></pre>
+<p>The check names the first function it ran into in each milestone. Work in order: every later milestone calls the earlier ones.</p>
+
+<h2>Milestone 1: sizing and paging</h2>
+
+<p>Start with the bill of bytes from chapter 18. Every token a request has seen leaves behind one key vector and one value vector in each layer, for each of the KV heads: <code>2 &times; layers &times; kv_heads &times; head_dim &times; bytes</code>. For the Llama 3 8B shape in bf16 that is <code>2 &times; 32 &times; 8 &times; 128 &times; 2 = 131,072</code> bytes, 128 KiB. The memory left for these vectors is what is not the weights and not overhead, and the engine carves it into fixed-size <span class="term">pages</span> of <code>page_tokens</code> tokens (16 here, a common block size in serving engines). The experiment prints the sizing for the lab's card:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_sizing.py</span>
+<span class="out">KV cache per token: 131,072 bytes (128 KiB);  pages of 16 tokens in the budget: 3,070
+ context  pages each  sequences that fit
+     512          32                  95
+    1024          64                  47
+    2048         128                  23
+    4096         256                  11
+    8192         512                   5
+
+bytes per token for other shapes (bf16):
+  8 KV heads, 32 layers          131,072
+  full multi-head, 32 layers     524,288
+  8 KV heads, 80 layers          327,680</span></code></pre>
+<p>3,070 pages of 16 tokens, 49,120 tokens of cache. At 4,096 tokens of context a sequence takes 256 pages, so only 11 fit; at 512 tokens, 95 do. The cache, not the arithmetic, is what limits how many conversations share the card, which is the point of chapter 18. The last rows show why grouped-query attention matters: the same model with 32 KV heads would need four times as much per token.</p>
+
+<p>Now the data structure. Before paging, an engine had to give each sequence one contiguous slab sized for its worst case, because it could not know in advance how long the answer would be; most of the slab went unused. <span class="term">Paged attention</span> (Kwon et al., 2023, "Efficient Memory Management for Large Language Model Serving with PagedAttention") borrows the operating system's trick from <a href="../../systems/chapters/06-virtual-memory.html">virtual memory</a>: a sequence's cache is a list of fixed-size pages anywhere in memory, found through a per-sequence <span class="term">block table</span>, like a page table. Pages are handed out on demand as the sequence grows, so waste is bounded by one partly filled page per sequence. Your <code>PageAllocator</code> is that mechanism. It owns a pool of page numbers, <code>reserve(rid, tokens)</code> grows a request's block table to cover <code>tokens</code> tokens (all or nothing, never shrinking), and <code>release</code> returns the pages. Free pages are handed out lowest-number-first, which makes the behaviour reproducible and makes the scattering visible:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_blocks.py</span>
+<span class="out">start         {'A': [0, 1, 2], 'B': [3, 4], 'C': [5, 6]} free 3
+B finishes    {'A': [0, 1, 2], 'C': [5, 6]} free 5
+A grows, D in {'A': [0, 1, 2, 3, 4], 'C': [5, 6], 'D': [7, 8]} free 1
+a request of 12 tokens needs 3 pages; reserve -&gt; False ( 1 page free)</span></code></pre>
+<p>After B finishes, pages 3 and 4 are free. When A grows by two pages it gets exactly those, so A's block table is [0, 1, 2, 3, 4] by luck; had C been released instead, A's new pages would have been numbered from elsewhere and its table would not be contiguous, and that is fine, because the attention kernel follows the table. The last line is the failure the scheduler will meet in milestone 5: a request that needs three pages when one is free is refused, and nothing is allocated.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>kv_bytes_per_token(layers, kv_heads, head_dim, bytes_per=2)</code>, <code>cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens)</code>, and the methods of <code>PageAllocator</code>: <code>__init__</code>, <code>pages_needed</code>, <code>free_pages</code>, <code>used_pages</code>, <code>block_table</code>, <code>reserve</code> and <code>release</code>, tracking <code>peak_pages</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the 8B, 70B and multi-head shapes, the 3,070-page sizing and its edge cases, a hand-traced allocator (first request gets pages [0, 1, 2]; growth appends the lowest free page; a failed request or a failed growth changes nothing; released pages are reused lowest first, giving [3, 4, 6, 7]), and then eight seeded sequences of 300 random reserve and release calls against a model of the pool, checking after every call that no page is owned twice and that used plus free equals the total.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>pages_needed</code> is ceiling division. <code>-(-tokens // page_tokens)</code> avoids floats; guard <code>tokens &lt;= 0</code>.</li>
+      <li>Keep the free pages in a <code>heapq</code> list: <code>heappop</code> gives the lowest number, <code>heappush</code> returns one. <code>list(range(total_pages))</code> is already a valid heap.</li>
+      <li>Keep a dict from request id to its block table (a list). <code>reserve</code> computes <code>missing = pages_needed(tokens) - len(table)</code>; if that is 0 or less return True, if it exceeds the free pool return False <em>before</em> touching anything, else pop that many pages.</li>
+      <li>Update <code>peak_pages</code> right after pages are taken, not in <code>release</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> kv_bytes_per_token(layers, kv_heads, head_dim, bytes_per=<span class="num">2</span>):
+    <span class="str">""</span>"Bytes of KV cache one token occupies: <span class="num">2</span> (keys <span class="kw">and</span> values) x layers x kv_heads x head_dim x
+    bytes_per number. Llama <span class="num">3</span> 8B <span class="kw">in</span> bf16: kv_bytes_per_token(<span class="num">32</span>, <span class="num">8</span>, <span class="num">128</span>) == <span class="num">131072</span>.<span class="str">""</span>"
+    <span class="kw">return</span> <span class="num">2</span> * layers * kv_heads * head_dim * bytes_per
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    <span class="cmt">#@SOL 1 cache_pages</span>
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+    <span class="cmt">#@END</span>
+
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    <span class="cmt">#@SOL 1 cache_pages</span>
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+    <span class="cmt">#@END</span>
+
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        <span class="cmt">#@SOL 1 PageAllocator.__init__</span>
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> pages_needed(self, tokens):
+        <span class="str">""</span><span class="str">"ceil(tokens / page_tokens); 0 for tokens &lt;= 0."</span><span class="str">""</span>
+        <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> tokens &lt;= <span class="num">0</span> <span class="kw">else</span> -(-tokens // self.page_tokens)
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    <span class="cmt">#@SOL 1 cache_pages</span>
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+    <span class="cmt">#@END</span>
+
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        <span class="cmt">#@SOL 1 PageAllocator.__init__</span>
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> pages_needed(self, tokens):
+        <span class="str">""</span><span class="str">"ceil(tokens / page_tokens); 0 for tokens &lt;= 0."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.pages_needed</span>
+        <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> tokens &lt;= <span class="num">0</span> <span class="kw">else</span> -(-tokens // self.page_tokens)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> free_pages(self):
+        <span class="kw">return</span> len(self._free)
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    <span class="cmt">#@SOL 1 cache_pages</span>
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+    <span class="cmt">#@END</span>
+
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        <span class="cmt">#@SOL 1 PageAllocator.__init__</span>
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> pages_needed(self, tokens):
+        <span class="str">""</span><span class="str">"ceil(tokens / page_tokens); 0 for tokens &lt;= 0."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.pages_needed</span>
+        <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> tokens &lt;= <span class="num">0</span> <span class="kw">else</span> -(-tokens // self.page_tokens)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> free_pages(self):
+        <span class="cmt">#@SOL 1 PageAllocator.free_pages</span>
+        <span class="kw">return</span> len(self._free)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> used_pages(self):
+        <span class="kw">return</span> self.total_pages - len(self._free)
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    <span class="cmt">#@SOL 1 cache_pages</span>
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+    <span class="cmt">#@END</span>
+
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        <span class="cmt">#@SOL 1 PageAllocator.__init__</span>
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> pages_needed(self, tokens):
+        <span class="str">""</span><span class="str">"ceil(tokens / page_tokens); 0 for tokens &lt;= 0."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.pages_needed</span>
+        <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> tokens &lt;= <span class="num">0</span> <span class="kw">else</span> -(-tokens // self.page_tokens)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> free_pages(self):
+        <span class="cmt">#@SOL 1 PageAllocator.free_pages</span>
+        <span class="kw">return</span> len(self._free)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> used_pages(self):
+        <span class="cmt">#@SOL 1 PageAllocator.used_pages</span>
+        <span class="kw">return</span> self.total_pages - len(self._free)
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> block_table(self, rid):
+        <span class="str">""</span><span class="str">"The physical page numbers rid owns, in logical order (a copy); [] if none."</span><span class="str">""</span>
+        <span class="kw">return</span> list(self._tables.get(rid, []))
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    <span class="cmt">#@SOL 1 cache_pages</span>
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+    <span class="cmt">#@END</span>
+
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        <span class="cmt">#@SOL 1 PageAllocator.__init__</span>
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> pages_needed(self, tokens):
+        <span class="str">""</span><span class="str">"ceil(tokens / page_tokens); 0 for tokens &lt;= 0."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.pages_needed</span>
+        <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> tokens &lt;= <span class="num">0</span> <span class="kw">else</span> -(-tokens // self.page_tokens)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> free_pages(self):
+        <span class="cmt">#@SOL 1 PageAllocator.free_pages</span>
+        <span class="kw">return</span> len(self._free)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> used_pages(self):
+        <span class="cmt">#@SOL 1 PageAllocator.used_pages</span>
+        <span class="kw">return</span> self.total_pages - len(self._free)
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> block_table(self, rid):
+        <span class="str">""</span><span class="str">"The physical page numbers rid owns, in logical order (a copy); [] if none."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.block_table</span>
+        <span class="kw">return</span> list(self._tables.get(rid, []))
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> reserve(self, rid, tokens):
+        <span class="str">""</span><span class="str">"Ensure rid owns enough pages for `tokens` tokens. All or nothing. Returns True/False."</span><span class="str">""</span>
+        table = self._tables.get(rid, [])
+        missing = self.pages_needed(tokens) - len(table)
+        <span class="kw">if</span> missing &lt;= <span class="num">0</span>:
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="kw">if</span> missing &gt; len(self._free):
+            <span class="kw">return</span> <span class="kw">False</span>
+        table = self._tables.setdefault(rid, table)
+        <span class="kw">for</span> _ <span class="kw">in</span> range(missing):
+            table.append(heapq.heappop(self._free))
+        self.peak_pages = max(self.peak_pages, self.used_pages)
+        <span class="kw">return</span> <span class="kw">True</span>
+
+<span class="kw">def</span> cache_pages(gpu_bytes, weight_bytes, overhead_bytes, kv_bytes_tok, page_tokens):
+    <span class="str">""</span>"How many whole pages of KV cache fit once weights <span class="kw">and</span> overhead are subtracted <span class="kw">from</span> the GPU's
+    memory: floor((gpu - weights - overhead) / (kv_bytes_tok * page_tokens)), never negative.
+
+    cache_pages(<span class="num">24e9</span>, <span class="num">16.06e9</span>, <span class="num">1.5e9</span>, <span class="num">131072</span>, <span class="num">16</span>) == <span class="num">3070</span><span class="str">""</span>"
+    <span class="cmt">#@SOL 1 cache_pages</span>
+    free = gpu_bytes - weight_bytes - overhead_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // (kv_bytes_tok * page_tokens)))
+    <span class="cmt">#@END</span>
+
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        <span class="cmt">#@SOL 1 PageAllocator.__init__</span>
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> pages_needed(self, tokens):
+        <span class="str">""</span><span class="str">"ceil(tokens / page_tokens); 0 for tokens &lt;= 0."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.pages_needed</span>
+        <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> tokens &lt;= <span class="num">0</span> <span class="kw">else</span> -(-tokens // self.page_tokens)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> free_pages(self):
+        <span class="cmt">#@SOL 1 PageAllocator.free_pages</span>
+        <span class="kw">return</span> len(self._free)
+        <span class="cmt">#@END</span>
+
+    @property
+    <span class="kw">def</span> used_pages(self):
+        <span class="cmt">#@SOL 1 PageAllocator.used_pages</span>
+        <span class="kw">return</span> self.total_pages - len(self._free)
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> block_table(self, rid):
+        <span class="str">""</span><span class="str">"The physical page numbers rid owns, in logical order (a copy); [] if none."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.block_table</span>
+        <span class="kw">return</span> list(self._tables.get(rid, []))
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> reserve(self, rid, tokens):
+        <span class="str">""</span><span class="str">"Ensure rid owns enough pages for `tokens` tokens. All or nothing. Returns True/False."</span><span class="str">""</span>
+        <span class="cmt">#@SOL 1 PageAllocator.reserve</span>
+        table = self._tables.get(rid, [])
+        missing = self.pages_needed(tokens) - len(table)
+        <span class="kw">if</span> missing &lt;= <span class="num">0</span>:
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="kw">if</span> missing &gt; len(self._free):
+            <span class="kw">return</span> <span class="kw">False</span>
+        table = self._tables.setdefault(rid, table)
+        <span class="kw">for</span> _ <span class="kw">in</span> range(missing):
+            table.append(heapq.heappop(self._free))
+        self.peak_pages = max(self.peak_pages, self.used_pages)
+        <span class="kw">return</span> <span class="kw">True</span>
+        <span class="cmt">#@END</span>
+
+    <span class="kw">def</span> release(self, rid):
+        <span class="str">""</span><span class="str">"Return all of rid's pages to the pool; the number of pages freed."</span><span class="str">""</span>
+        table = self._tables.pop(rid, [])
+        <span class="kw">for</span> page <span class="kw">in</span> table:
+            heapq.heappush(self._free, page)
+        <span class="kw">return</span> len(table)
+
+<span class="kw">class</span> PageAllocator:
+    <span class="str">""</span>"A pool of `total_pages` physical pages of `page_tokens` tokens each, handed out like virtual
+    memory: each request owns a BLOCK TABLE, a list of physical page numbers that need <span class="kw">not</span> be
+    contiguous.
+
+    * Free pages are handed out lowest-numbered first (use a heap), <span class="kw">and</span> released pages go back.
+    * reserve(rid, tokens) makes sure rid owns at least pages_needed(tokens) pages, adding pages to
+      the end of its block table <span class="kw">as</span> needed. Pages are never taken away by reserve. If the pool cannot
+      supply all the missing pages it changes NOTHING <span class="kw">and</span> returns <span class="kw">False</span>; otherwise <span class="kw">True</span>.
+    * release(rid) returns all of rid's pages to the pool <span class="kw">and</span> reports how many (<span class="num">0</span> <span class="kw">if</span> unknown).
+    * peak_pages <span class="kw">is</span> the largest used_pages value ever seen (update it inside reserve).
+    <span class="str">""</span>"
+    <span class="kw">def</span> __init__(self, total_pages, page_tokens):
+        self.total_pages = total_pages
+        self.page_tokens = page_tokens
+        self._free = list(range(total_pages))          <span class="cmt"># a sorted list is already a valid heap</span>
+        self._tables = {}
+        self.peak_pages = <span class="num">0</span>
+
+    <span class="kw">def</span> pages_needed(self, tokens):
+        <span class="str">""</span><span class="str">"ceil(tokens / page_tokens); 0 for tokens &lt;= 0."</span><span class="str">""</span>
+        <span class="kw">return</span> <span class="num">0</span> <span class="kw">if</span> tokens &lt;= <span class="num">0</span> <span class="kw">else</span> -(-tokens // self.page_tokens)
+
+    @property
+    <span class="kw">def</span> free_pages(self):
+        <span class="kw">return</span> len(self._free)
+
+    @property
+    <span class="kw">def</span> used_pages(self):
+        <span class="kw">return</span> self.total_pages - len(self._free)
+
+    <span class="kw">def</span> block_table(self, rid):
+        <span class="str">""</span><span class="str">"The physical page numbers rid owns, in logical order (a copy); [] if none."</span><span class="str">""</span>
+        <span class="kw">return</span> list(self._tables.get(rid, []))
+
+    <span class="kw">def</span> reserve(self, rid, tokens):
+        <span class="str">""</span><span class="str">"Ensure rid owns enough pages for `tokens` tokens. All or nothing. Returns True/False."</span><span class="str">""</span>
+        table = self._tables.get(rid, [])
+        missing = self.pages_needed(tokens) - len(table)
+        <span class="kw">if</span> missing &lt;= <span class="num">0</span>:
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="kw">if</span> missing &gt; len(self._free):
+            <span class="kw">return</span> <span class="kw">False</span>
+        table = self._tables.setdefault(rid, table)
+        <span class="kw">for</span> _ <span class="kw">in</span> range(missing):
+            table.append(heapq.heappop(self._free))
+        self.peak_pages = max(self.peak_pages, self.used_pages)
+        <span class="kw">return</span> <span class="kw">True</span>
+
+    <span class="kw">def</span> release(self, rid):
+        <span class="str">""</span><span class="str">"Return all of rid's pages to the pool; the number of pages freed."</span><span class="str">""</span>
+        table = self._tables.pop(rid, [])
+        <span class="kw">for</span> page <span class="kw">in</span> table:
+            heapq.heappush(self._free, page)
+        <span class="kw">return</span> len(table)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: the cost model, the workload and the metrics</h2>
+
+<p>A simulator needs three pieces of physics and one piece of statistics. The physics first. <code>step_time_ms(cfg, kv_tokens, prefill_tokens)</code> is the duration of one forward pass of the whole batch:</p>
+<p style="text-align:center"><code>step = base_ms + kv_ms &times; (cached tokens read by decoding requests) + prefill_ms &times; (prompt tokens processed in this step)</code></p>
+<p>The <code>base_ms</code> term is the weights streaming out of HBM, paid once per step however many requests are in it: this is why a bigger batch is cheaper per token (chapter 18's memory-bound argument, and the "airline seat" of chapter 22). The <code>kv_ms</code> term is each decoding request's cache being read, so it grows with batch size and context, and is the part that does <em>not</em> amortise. The <code>prefill_ms</code> term is prompt processing, compute-bound and proportional to prompt tokens. Chapter 22 used a <code>max</code> of the memory time and compute time; the lab adds them, which is simpler and slightly pessimistic for steps that mix a prefill with decoding.</p>
+
+<p>Now the load. Requests do not come in neat batches. <code>make_workload(n, rate_per_s, seed)</code> draws, for each request in turn, the gap to the previous arrival from an exponential distribution with mean <code>1000/rate</code> ms (the signature of independent users: a <span class="term">Poisson process</span>), a prompt length from a lognormal distribution (median about 245 tokens, a long right tail), and an output length from a second lognormal (median about 73, mean about 100, as in chapter 20's simulation), clamped to sensible ranges. The recipe is fixed down to the order of the three random draws so that the check can regenerate your workload. Each request also carries <code>max_new</code>, the limit its client put on the answer (<code>max_tokens</code> in an API call), which is typically far larger than what the model actually writes. The scheduler never sees <code>output_len</code> in advance, but a reserve-the-worst-case allocator is forced to plan around <code>max_new</code>. Look at what the generator makes:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_workload.py</span>
+<span class="out">5,000 requests at 8 per second, seed 1
+prompt tokens  mean  333.5   p50   247   p95   888   p99  1507   max  2048
+output tokens  mean  105.4   p50    73   p95   323   p99   500   max   500
+gap between arrivals: mean 125.4 ms (1000 / 8 = 125), p95 384 ms, longest 885 ms
+the client allows max_new = 1024; the largest output actually generated is 500
+average context while decoding is about 386 tokens, but a reserve-everything allocator holds 1357 tokens per request</span></code></pre>
+<p>The average decoding context is about 386 tokens, while a reserve-everything allocator would hold 1,357 tokens per request, 3.5 times as much. Notice the tails too: the 99th percentile prompt is 1,507 tokens, six times the median, and one such prompt costs 0.16 ms &times; 1,507 = 242 ms of prefill, during which every decoding request in that step waits.</p>
+
+<p>Now the statistics. Averages hide what users feel, so serving is judged by <span class="term">percentiles</span> (<a href="../../reliability/chapters/04-metrics.html">metrics, percentiles and histograms</a>): p95 of time to first token is the value 95% of requests beat. The lab fixes the nearest-rank rule so the numbers are unambiguous: sort ascending and take the value at rank <code>ceil(q/100 &times; n)</code>. <code>summarise</code> then reduces a finished simulation to the three quantities of chapter 20: <span class="term">TTFT</span>, time to first token (<code>first_token_ms &minus; arrival_ms</code>), which includes waiting in the queue and the prefill; <span class="term">TPOT</span>, time per output token, here <code>(finish &minus; first token) / (output_len &minus; 1)</code> per request, which is what a reader sees as typing speed; and throughput, the output tokens per second of simulated time.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>step_time_ms</code>, <code>make_workload</code>, <code>percentile</code> (raise <code>ValueError</code> on an empty list) and <code>summarise</code>, which returns a dictionary with the keys listed in its docstring.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the step cost by hand, your workload against the exact draw order for five seeds, that the same seed at twice the rate gives identical lengths and arrivals compressed by exactly 2, the mean gap and mean output length over 5,000 requests, the percentile rule on small lists (including <code>q = 0</code> and <code>q = 100</code>), and every key of <code>summarise</code> on a three-request result whose answers were worked out by hand.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>rng.expovariate(lambd)</code> takes a rate. Arrivals per millisecond is <code>rate_per_s / 1000</code>. Accumulate the gaps: <code>t += gap</code>.</li>
+      <li>Draw gap, prompt, output in that order for every request, even if you later clamp; a different order gives a different workload.</li>
+      <li><code>percentile</code>: <code>ordered[max(1, math.ceil(q / 100 * n)) - 1]</code>.</li>
+      <li><code>summarise</code>: build the TTFT, TPOT (skip <code>output_len == 1</code>) and end-to-end lists first, then apply <code>percentile</code> in a loop. The throughput span runs from the earliest arrival to <code>end_ms</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> step_time_ms(cfg, kv_tokens, prefill_tokens):
+    <span class="str">""</span>"Duration of one forward pass of the batch, <span class="kw">in</span> ms.
+
+    cfg.base_ms + cfg.kv_ms * kv_tokens + cfg.prefill_ms * prefill_tokens, where kv_tokens <span class="kw">is</span> the
+    total number of cached tokens that attention reads <span class="kw">in</span> this step (the contexts of the requests
+    that are DECODING) <span class="kw">and</span> prefill_tokens the prompt tokens being processed <span class="kw">in</span> this step. The base
+    <span class="kw">is</span> paid once per step however many requests run: that <span class="kw">is</span> the weights being read <span class="kw">from</span> HBM, <span class="kw">and</span>
+    why batching <span class="kw">is</span> cheap (chapter <span class="num">18</span>).<span class="str">""</span>"
+    <span class="kw">return</span> cfg.base_ms + cfg.kv_ms * kv_tokens + cfg.prefill_ms * prefill_tokens
+
+<span class="kw">def</span> make_workload(n, rate_per_s, seed, max_new=<span class="num">1024</span>):
+    <span class="str">""</span>"n requests <span class="kw">with</span> Poisson arrivals <span class="kw">and</span> lognormal lengths, <span class="kw">from</span> random.Random(seed).
+
+    For each request i, <span class="kw">in</span> this order, make exactly three draws:
+        gap    = rng.expovariate(rate_per_s / <span class="num">1000.0</span>)         <span class="cmt"># ms between arrivals; t += gap</span>
+        prompt = min(<span class="num">2048</span>, max(<span class="num">16</span>, int(rng.lognormvariate(<span class="num">5.5</span>, <span class="num">0.8</span>))))
+        output = min(<span class="num">500</span>, max(<span class="num">5</span>, int(rng.lognormvariate(<span class="num">4.3</span>, <span class="num">0.9</span>))))
+    Request(i, t, prompt, output, max_new). The first arrival <span class="kw">is</span> at t = gap, <span class="kw">not</span> <span class="num">0</span>.<span class="str">""</span>"
+    rng = random.Random(seed)
+    t, out = <span class="num">0.0</span>, []
+    <span class="kw">for</span> i <span class="kw">in</span> range(n):
+        t += rng.expovariate(rate_per_s / <span class="num">1000.0</span>)
+        prompt = min(<span class="num">2048</span>, max(<span class="num">16</span>, int(rng.lognormvariate(<span class="num">5.5</span>, <span class="num">0.8</span>))))
+        output = min(<span class="num">500</span>, max(<span class="num">5</span>, int(rng.lognormvariate(<span class="num">4.3</span>, <span class="num">0.9</span>))))
+        out.append(Request(i, t, prompt, output, max_new))
+    <span class="kw">return</span> out
+
+<span class="kw">def</span> percentile(values, q):
+    <span class="str">""</span>"The q-th percentile (<span class="num">0</span> &lt;= q &lt;= <span class="num">100</span>) by the NEAREST-RANK rule: sort ascending, take the value
+    at rank ceil(q / <span class="num">100</span> * n), <span class="kw">with</span> rank at least <span class="num">1</span>. percentile([<span class="num">15</span>, <span class="num">20</span>, <span class="num">35</span>, <span class="num">40</span>, <span class="num">50</span>], <span class="num">40</span>) == <span class="num">20</span>.
+    Raise ValueError on an empty list.<span class="str">""</span>"
+    <span class="kw">if</span> <span class="kw">not</span> values:
+        <span class="kw">raise</span> ValueError(<span class="str">"percentile of an empty list"</span>)
+    ordered = sorted(values)
+    rank = max(<span class="num">1</span>, math.ceil(q / <span class="num">100.0</span> * len(ordered)))
+    <span class="kw">return</span> ordered[rank - <span class="num">1</span>]
+
+<span class="kw">def</span> summarise(sim):
+    <span class="str">""</span>"Reduce a SimResult to the numbers an SLO talks about. Returns a dict <span class="kw">with</span> the keys
+
+      completed, tokens, preemptions, peak_pages          copied <span class="kw">or</span> counted <span class="kw">from</span> sim
+      throughput_tok_s    tokens / ((end_ms - earliest arrival) / <span class="num">1000</span>)
+      tokens_per_step     tokens / steps
+      ttft_p50, ttft_p95, ttft_p99    percentiles of first_token_ms - arrival_ms
+      tpot_p50, tpot_p95, tpot_p99    percentiles of (finish_ms - first_token_ms) / (output_len - <span class="num">1</span>),
+                                      over requests <span class="kw">with</span> output_len &gt;= <span class="num">2</span> (<span class="num">0.0</span> <span class="kw">if</span> there are none)
+      e2e_p50, e2e_p95                percentiles of finish_ms - arrival_ms
+    <span class="str">""</span>"
+    d = sim.done
+    ttft = [x.first_token_ms - x.arrival_ms <span class="kw">for</span> x <span class="kw">in</span> d]
+    tpot = [(x.finish_ms - x.first_token_ms) / (x.output_len - <span class="num">1</span>) <span class="kw">for</span> x <span class="kw">in</span> d <span class="kw">if</span> x.output_len &gt;= <span class="num">2</span>]
+    e2e = [x.finish_ms - x.arrival_ms <span class="kw">for</span> x <span class="kw">in</span> d]
+    span = sim.end_ms - min(x.arrival_ms <span class="kw">for</span> x <span class="kw">in</span> d)
+    out = {<span class="str">"completed"</span>: len(d), <span class="str">"tokens"</span>: sim.tokens, <span class="str">"preemptions"</span>: sim.preemptions,
+           <span class="str">"peak_pages"</span>: sim.peak_pages,
+           <span class="str">"throughput_tok_s"</span>: sim.tokens / (span / <span class="num">1000.0</span>),
+           <span class="str">"tokens_per_step"</span>: sim.tokens / sim.steps}
+    <span class="kw">for</span> name, series <span class="kw">in</span> ((<span class="str">"ttft"</span>, ttft), (<span class="str">"tpot"</span>, tpot)):
+        <span class="kw">for</span> q <span class="kw">in</span> (<span class="num">50</span>, <span class="num">95</span>, <span class="num">99</span>):
+            out[<span class="str">f"{name}_p{q}"</span>] = percentile(series, q) <span class="kw">if</span> series <span class="kw">else</span> <span class="num">0.0</span>
+    out[<span class="str">"e2e_p50"</span>], out[<span class="str">"e2e_p95"</span>] = percentile(e2e, <span class="num">50</span>), percentile(e2e, <span class="num">95</span>)
+    <span class="kw">return</span> out</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 3: static batching</h2>
+
+<p>The textbook way to batch is <span class="term">static batching</span>: collect up to <code>max_batch</code> requests, run them together until every one has finished, return, and collect the next. Your simulator forms a batch from the requests that have already arrived (it does not wait to fill a batch, which would only make things worse), runs one prefill step for all their prompts, and then decode steps until the longest output is done. Three details define the model. First, a finished request keeps its slot until the batch ends and a newcomer cannot take it: the idle slots are the waste chapter 20 measured. Second, a static engine cannot grow a cache in the middle of a batch, so it reserves <code>prompt_len + max_new</code> tokens per request up front (milestone 1's allocator again), and the number of requests per batch is limited by the cache as well as by <code>max_batch</code>. Third, tokens stream out as they are produced, so a request's finish time is the step of its own last token, not the end of the batch, but its <em>slot</em> is not freed until then.</p>
+
+<p>Work the smallest example by hand before coding it. Request A arrives at 0 with a 20-token prompt and 3 output tokens; B arrives at 5 with a 10-token prompt and 2 output tokens. The test configuration has <code>base_ms = 10</code>, <code>prefill_ms = 1</code> and no cache term. At t = 0 only A has arrived, so the batch is [A]: prefill costs 10 + 20 = 30 ms and A's first token appears at 30. Two decode steps of 10 ms each give tokens at 40 and 50, and A finishes at 50. B has been waiting since t = 5; the next batch starts at 50: prefill 10 + 10 = 20, first token at 70, one decode step, finish at 80. B waited 65 ms for its first token, 45 of them for A's batch to end. Now sweep the batch limit on a busier workload:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_static.py</span>
+<span class="out">static batching, 300 requests at 3 per second
+max batch   tok/s  tok/step  ttft p50  ttft p95  peak pages
+        1      43       1.0    314693    592542         192
+        4      82       2.0    136198    256048         425
+        8     120       3.0     76696    141262         873
+       16     178       4.5     32588     59685        1545
+       32     261       7.1      7985     14294        2878
+       64     255       6.9      7986     14301        3030</span></code></pre>
+<p>A batch limit of 1 gives 43 tokens per second, one token per 23 ms step. Raising the limit raises throughput, as chapter 18 predicts, but the gain stops: 32 and 64 are the same, because 3,070 pages cannot hold more than about 37 worst-case reservations of 1,300 tokens, so a batch of 64 is never formed (peak pages 3,030). Throughput stays under 270 tokens per second and the system cannot keep up with 3 requests a second (about 315 tokens per second of demand), so the queue grows for the whole run and the median TTFT is 8 seconds. The slot waste shows in the <code>tok/step</code> column: 7 tokens per step from a batch that nominally holds up to 64.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>simulate_static(requests, cfg)</code> as specified in its docstring and return a <code>SimResult</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the A and B example above (first tokens at 30 and 70, finishes at 50 and 80), a three-request case with <code>max_batch = 2</code> in which a request with one output token finishes in its prefill step, that the cache term is paid only for active requests, a two-page cache that forces one request per batch even when <code>cfg.alloc</code> says paged, an idle gap before the first arrival, a <code>ValueError</code> for a request that can never fit, and then twelve seeded workloads against an independently written reference, step for step.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Sort by <code>(arrival_ms, rid)</code>. Keep an index <code>i</code> of the next unserved request. At the top of the loop <code>t = max(t, reqs[i].arrival_ms)</code> handles both the idle jump and the back-to-back case.</li>
+      <li>Form the batch with one <code>while</code> loop whose conditions are, in order: more requests, batch not full, the request has arrived, and <code>alloc.reserve(...)</code> succeeded. Put <code>reserve</code> last in the condition so that it is only called when the request would otherwise be taken.</li>
+      <li>Loop <code>s</code> from 1 to <code>max(output_len) - 1</code>. The active requests at step <code>s</code> have <code>output_len &gt; s</code>, and each reads <code>prompt_len + s</code> cached tokens.</li>
+      <li>Record <code>first_token_ms</code> for the whole batch as the clock after the prefill step, and a request's finish as the clock after the step where <code>output_len == s + 1</code> (or after the prefill, if <code>output_len == 1</code>).</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> simulate_static(requests, cfg):
+    <span class="str">""</span>"Static batching: take a batch, run it until EVERY request <span class="kw">in</span> it has finished, then the next.
+
+    requests are served first come first served (order by arrival_ms, then rid). The clock starts
+    at <span class="num">0</span>. Loop until every request <span class="kw">is</span> done:
+      <span class="num">1</span>. If the GPU <span class="kw">is</span> idle, jump the clock forward to the next request's arrival <span class="kw">if</span> it <span class="kw">is</span> later.
+      <span class="num">2</span>. Form a batch: take waiting requests <span class="kw">in</span> order (arrival_ms &lt;= clock) <span class="kw">while</span> there are fewer
+         than cfg.max_batch <span class="kw">and</span> allocator.reserve(rid, prompt_len + max_new) succeeds. Static
+         batching cannot grow a cache mid-batch, so it always reserves the worst case up front,
+         whatever cfg.alloc says. Release every reservation when the batch ends.
+      <span class="num">3</span>. One PREFILL step <span class="kw">for</span> the whole batch: step_time_ms(cfg, <span class="num">0</span>, sum of prompt_len). Every
+         request emits its first token at the end of it.
+      <span class="num">4</span>. Then decode steps s = <span class="num">1</span>, <span class="num">2</span>, ... up to max(output_len) - <span class="num">1</span>. In step s the ACTIVE requests
+         are those <span class="kw">with</span> output_len &gt; s; each reads a cache of prompt_len + s tokens, so the step
+         lasts step_time_ms(cfg, sum of (prompt_len + s) over active requests, <span class="num">0</span>). Each active
+         request emits one token at the end of the step; a request whose output_len == s + <span class="num">1</span>
+         finishes then. A finished request still holds its slot until the batch ends, <span class="kw">and</span> nothing
+         new can join.
+    A request <span class="kw">with</span> output_len == <span class="num">1</span> finishes at the end of the prefill step.
+    Raise ValueError (via check_fits) <span class="kw">if</span> a request could never fit. Return a SimResult.<span class="str">""</span>"
+    reqs = sorted(requests, key=<span class="kw">lambda</span> r: (r.arrival_ms, r.rid))
+    alloc = PageAllocator(cfg.total_pages, cfg.page_tokens)
+    check_fits([r <span class="kw">for</span> r <span class="kw">in</span> reqs], cfg._replace(alloc=<span class="str">"reserve"</span>), alloc)
+    done, t, i, steps, tokens = [], <span class="num">0.0</span>, <span class="num">0</span>, <span class="num">0</span>, <span class="num">0</span>
+    <span class="kw">while</span> i &lt; len(reqs):
+        t = max(t, reqs[i].arrival_ms)                     <span class="cmt"># idle: wait for the next arrival</span>
+        batch = []
+        <span class="kw">while</span> (i &lt; len(reqs) <span class="kw">and</span> len(batch) &lt; cfg.max_batch <span class="kw">and</span> reqs[i].arrival_ms &lt;= t
+               <span class="kw">and</span> alloc.reserve(reqs[i].rid, reqs[i].prompt_len + reqs[i].max_new)):
+            batch.append(reqs[i])
+            i += <span class="num">1</span>
+        t += step_time_ms(cfg, <span class="num">0</span>, sum(r.prompt_len <span class="kw">for</span> r <span class="kw">in</span> batch))          <span class="cmt"># prefill</span>
+        steps += <span class="num">1</span>
+        first = t
+        finish = {r.rid: t <span class="kw">for</span> r <span class="kw">in</span> batch <span class="kw">if</span> r.output_len == <span class="num">1</span>}
+        <span class="kw">for</span> s <span class="kw">in</span> range(<span class="num">1</span>, max(r.output_len <span class="kw">for</span> r <span class="kw">in</span> batch)):
+            active = [r <span class="kw">for</span> r <span class="kw">in</span> batch <span class="kw">if</span> r.output_len &gt; s]
+            t += step_time_ms(cfg, sum(r.prompt_len + s <span class="kw">for</span> r <span class="kw">in</span> active), <span class="num">0</span>)  <span class="cmt"># one token each</span>
+            steps += <span class="num">1</span>
+            <span class="kw">for</span> r <span class="kw">in</span> active:
+                <span class="kw">if</span> r.output_len == s + <span class="num">1</span>:
+                    finish[r.rid] = t
+        <span class="kw">for</span> r <span class="kw">in</span> batch:
+            done.append(Done(r.rid, r.arrival_ms, first, finish[r.rid], r.output_len, <span class="num">0</span>))
+            tokens += r.output_len
+            alloc.release(r.rid)
+    done.sort(key=<span class="kw">lambda</span> d: d.rid)
+    <span class="kw">return</span> SimResult(done, t, steps, tokens, <span class="num">0</span>, alloc.peak_pages)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: continuous batching</h2>
+
+<p>The fix named in chapter 20 is to make the scheduling decision after every <em>step</em>, not after every batch: <span class="term">continuous batching</span>, or iteration-level scheduling (Yu et al., 2022, "Orca"). The batch is whoever is running right now. A request that emits its last token leaves at once and its pages are freed; a waiting request takes a slot in the very next step. The scheduler becomes a loop with a fixed shape, and the figure shows one iteration of it, which your <code>simulate_continuous</code> repeats until the work is done.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 330" role="img" aria-label="One iteration of the continuous batching loop. Step zero moves arrivals into the waiting queue. Phase A grows each running request's cache by one token, and if the allocator has no free page it preempts the youngest running request and puts it at the front of the waiting queue. Phase B admits requests from the head of the waiting queue while there is a free slot and enough pages, unless a preemption happened. Phase C runs one forward pass for the new requests' prompts and the other requests' decoding, advances the clock, emits one token for every running request and retires finished ones.">
+<defs><marker id="ahLT-L6b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="20" text-anchor="start" class="t-sm t-bold">One iteration of the scheduler</text>
+<rect x="10" y="40" width="120" height="64" rx="8" class="fs-green s-green sw-2"/>
+<text x="70" y="66" text-anchor="middle" class="t-sm t-bold">pending</text>
+<text x="70" y="85" text-anchor="middle" class="t-xs t-muted">not yet arrived</text>
+<rect x="170" y="40" width="130" height="64" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="235" y="66" text-anchor="middle" class="t-sm t-bold">waiting</text>
+<text x="235" y="85" text-anchor="middle" class="t-xs t-muted">first come first served</text>
+<line x1="132" y1="72" x2="168" y2="72" class="line sw-2" marker-end="url(#ahLT-L6b)"/>
+<text x="150" y="36" text-anchor="middle" class="t-xs t-muted">0</text>
+<rect x="340" y="40" width="190" height="64" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="435" y="66" text-anchor="middle" class="t-sm t-bold">running</text>
+<text x="435" y="85" text-anchor="middle" class="t-xs t-muted">at most max_batch, oldest first</text>
+<line x1="302" y1="64" x2="338" y2="64" class="line sw-2" marker-end="url(#ahLT-L6b)"/>
+<text x="320" y="56" text-anchor="middle" class="t-xs tc-blue">B</text>
+<path d="M435,106 L435,140 L235,140 L235,106" fill="none" class="line s-red sw-2" marker-end="url(#ahLT-L6b)"/>
+<text x="335" y="134" text-anchor="middle" class="t-xs tc-red">A: no free page, evict the youngest</text>
+<rect x="570" y="40" width="180" height="64" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="660" y="66" text-anchor="middle" class="t-sm t-bold">page allocator</text>
+<text x="660" y="85" text-anchor="middle" class="t-xs t-muted">reserve, release</text>
+<line x1="532" y1="72" x2="568" y2="72" class="line-dash" marker-end="url(#ahLT-L6b)"/>
+<rect x="10" y="170" width="236" height="132" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="128" y="194" text-anchor="middle" class="t-sm t-bold">A. grow</text>
+<text x="128" y="214" text-anchor="middle" class="t-xs t-muted">each running request needs room</text>
+<text x="128" y="230" text-anchor="middle" class="t-xs t-muted">for context + 1 tokens</text>
+<text x="128" y="250" text-anchor="middle" class="t-xs t-muted">full? preempt_one, retry</text>
+<text x="128" y="268" text-anchor="middle" class="t-xs t-muted">(milestone 5)</text>
+<rect x="262" y="170" width="236" height="132" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="380" y="194" text-anchor="middle" class="t-sm t-bold">B. admit</text>
+<text x="380" y="214" text-anchor="middle" class="t-xs t-muted">head of waiting, while a slot and</text>
+<text x="380" y="230" text-anchor="middle" class="t-xs t-muted">pages are free; stop at the first</text>
+<text x="380" y="246" text-anchor="middle" class="t-xs t-muted">that does not fit. Skipped if</text>
+<text x="380" y="262" text-anchor="middle" class="t-xs t-muted">A had to preempt.</text>
+<rect x="514" y="170" width="236" height="132" rx="8" class="fs-yellow s-yellow sw-2"/>
+<text x="632" y="194" text-anchor="middle" class="t-sm t-bold">C. run one step</text>
+<text x="632" y="214" text-anchor="middle" class="t-xs t-muted">cost = base + kv_ms x decoding ctx</text>
+<text x="632" y="230" text-anchor="middle" class="t-xs t-muted">+ prefill_ms x new prompt tokens</text>
+<text x="632" y="250" text-anchor="middle" class="t-xs t-muted">every running request emits a token;</text>
+<text x="632" y="266" text-anchor="middle" class="t-xs t-muted">finished ones release their pages</text>
+<line x1="248" y1="236" x2="260" y2="236" class="line sw-2" marker-end="url(#ahLT-L6b)"/>
+<line x1="500" y1="236" x2="512" y2="236" class="line sw-2" marker-end="url(#ahLT-L6b)"/>
+</svg>
+<figcaption><strong>Three phases, one clock tick.</strong> The loop never waits for a batch to finish: whatever is running is the batch. Preemption (red) is the escape valve when the cache is full, and a step that preempted does not also admit, which stops the scheduler from evicting one request to let in another.</figcaption>
+</figure>
+
+<p>Three decisions in the loop deserve a sentence each, because the check pins them down. <strong>What a request must own.</strong> In <code>"paged"</code> mode it needs room for its context plus the one token this step adds, so the allocation grows a page at a time as the sequence does; in <code>"reserve"</code> mode it claims <code>prompt_len + max_new</code> once, at admission, and never grows. The helper <code>tokens_needed</code> (given) returns the right number for either mode, so one loop serves both. <strong>First come first served.</strong> If the request at the head of the queue does not fit, the scheduler stops, even if a smaller request behind it would fit; skipping ahead would starve large requests. <strong>A prefill step is also a decode step.</strong> A newly admitted request processes its whole prompt and emits its first token in that same step, so its TTFT is its queueing time plus one step that contains its prefill, and every decoding request in that step is delayed by the prefill's cost.</p>
+
+<p>Take the A and B example again with continuous batching. At t = 0 A is admitted: prefill 10 + 20 = 30 ms, first token at 30. B (arrived at 5) is admitted in the next step, which also decodes A: 10 + 10 = 20 ms, B's first token at 50, A's second. The third step decodes both for 10 ms and both finish at 60. B's TTFT is 45 ms where static batching gave 65, and the whole run ends at 60 instead of 80. Now the same comparison at scale, with all three policies as the arrival rate grows:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_continuous.py</span>
+<span class="out">static
+ req/s   tok/s tok/step  ttft p95  tpot p95 preempt peak pg
+   2.0     186      4.8     11640      24.7       0    2504
+   4.0     265      7.2     29795      25.2       0    3065
+   6.0     271      7.4     52722      25.2       0    3057
+   8.0     271      7.4     63408      25.6       0    3068
+  10.0     286      7.9     65188      25.4       0    3068
+  12.0     303      8.4     66699      25.4       0    3044
+
+continuous, reserve
+ req/s   tok/s tok/step  ttft p95  tpot p95 preempt peak pg
+   2.0     196      5.1       223      30.0       0     963
+   4.0     362     10.5       250      37.1       0    2174
+   6.0     506     16.5       312      47.5       0    3005
+   8.0     630     22.9      1382      53.9       0    3070
+  10.0     655     24.4      5584      54.7       0    3070
+  12.0     660     24.7     10033      57.0       0    3070
+
+continuous, paged
+ req/s   tok/s tok/step  ttft p95  tpot p95 preempt peak pg
+   2.0     196      5.1       223      30.0       0     463
+   4.0     362     10.5       250      37.1       0     726
+   6.0     506     16.5       312      47.5       0    1044
+   8.0     630     22.9       363      61.2       0    1641
+  10.0     737     29.8       533      71.4       0    1792
+  12.0     794     34.1      2157      82.6       0    1846</span></code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 760 330" role="img" aria-label="Two plots against arrival rate from 1 to 12 requests per second for three policies. Left: throughput in tokens per second. Static batching stays near 270, continuous batching with a reserved cache levels off near 660, continuous batching with a paged cache reaches 794. Right: time to first token p95 on a log scale. Static is above ten seconds from 2 requests per second, reserved continuous batching rises past one second at 8, and paged continuous batching stays below one second until 10.">
+<text x="50" y="22" class="t-sm t-bold">Throughput (tokens per second)</text>
+<line x1="50" y1="230.0" x2="360" y2="230.0" class="line-thin"/><text x="44" y="234.0" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="50" y1="182.5" x2="360" y2="182.5" class="line-thin"/><text x="44" y="186.5" text-anchor="end" class="t-xs t-muted">225</text>
+<line x1="50" y1="135.0" x2="360" y2="135.0" class="line-thin"/><text x="44" y="139.0" text-anchor="end" class="t-xs t-muted">450</text>
+<line x1="50" y1="87.5" x2="360" y2="87.5" class="line-thin"/><text x="44" y="91.5" text-anchor="end" class="t-xs t-muted">675</text>
+<line x1="50" y1="40.0" x2="360" y2="40.0" class="line-thin"/><text x="44" y="44.0" text-anchor="end" class="t-xs t-muted">900</text>
+<text x="78.2" y="246" text-anchor="middle" class="t-xs t-muted">2</text>
+<text x="134.5" y="246" text-anchor="middle" class="t-xs t-muted">4</text>
+<text x="190.9" y="246" text-anchor="middle" class="t-xs t-muted">6</text>
+<text x="247.3" y="246" text-anchor="middle" class="t-xs t-muted">8</text>
+<text x="303.6" y="246" text-anchor="middle" class="t-xs t-muted">10</text>
+<text x="360.0" y="246" text-anchor="middle" class="t-xs t-muted">12</text>
+<line x1="50" y1="40" x2="50" y2="230" class="line"/><line x1="50" y1="230" x2="360" y2="230" class="line"/>
+<text x="205.0" y="264" text-anchor="middle" class="t-xs t-muted">arrival rate (requests per second)</text>
+<polyline points="50.0,209.1 78.2,190.8 106.4,176.3 134.5,174.0 162.7,172.8 190.9,172.8 247.3,172.8 303.6,169.5 360.0,166.1" fill="none" class="s-red sw-2"/>
+<circle cx="50.0" cy="209.1" r="3" class="f-red"/>
+<circle cx="78.2" cy="190.8" r="3" class="f-red"/>
+<circle cx="106.4" cy="176.3" r="3" class="f-red"/>
+<circle cx="134.5" cy="174.0" r="3" class="f-red"/>
+<circle cx="162.7" cy="172.8" r="3" class="f-red"/>
+<circle cx="190.9" cy="172.8" r="3" class="f-red"/>
+<circle cx="247.3" cy="172.8" r="3" class="f-red"/>
+<circle cx="303.6" cy="169.5" r="3" class="f-red"/>
+<circle cx="360.0" cy="166.1" r="3" class="f-red"/>
+<polyline points="50.0,208.7 78.2,188.7 106.4,170.4 134.5,153.5 162.7,137.8 190.9,123.2 247.3,97.1 303.6,91.8 360.0,90.6" fill="none" class="s-orange sw-2"/>
+<circle cx="50.0" cy="208.7" r="3" class="f-orange"/>
+<circle cx="78.2" cy="188.7" r="3" class="f-orange"/>
+<circle cx="106.4" cy="170.4" r="3" class="f-orange"/>
+<circle cx="134.5" cy="153.5" r="3" class="f-orange"/>
+<circle cx="162.7" cy="137.8" r="3" class="f-orange"/>
+<circle cx="190.9" cy="123.2" r="3" class="f-orange"/>
+<circle cx="247.3" cy="97.1" r="3" class="f-orange"/>
+<circle cx="303.6" cy="91.8" r="3" class="f-orange"/>
+<circle cx="360.0" cy="90.6" r="3" class="f-orange"/>
+<polyline points="50.0,208.7 78.2,188.7 106.4,170.4 134.5,153.5 162.7,137.8 190.9,123.2 247.3,97.1 303.6,74.5 360.0,62.3" fill="none" class="s-blue sw-2"/>
+<circle cx="50.0" cy="208.7" r="3" class="f-blue"/>
+<circle cx="78.2" cy="188.7" r="3" class="f-blue"/>
+<circle cx="106.4" cy="170.4" r="3" class="f-blue"/>
+<circle cx="134.5" cy="153.5" r="3" class="f-blue"/>
+<circle cx="162.7" cy="137.8" r="3" class="f-blue"/>
+<circle cx="190.9" cy="123.2" r="3" class="f-blue"/>
+<circle cx="247.3" cy="97.1" r="3" class="f-blue"/>
+<circle cx="303.6" cy="74.5" r="3" class="f-blue"/>
+<circle cx="360.0" cy="62.3" r="3" class="f-blue"/>
+<text x="430" y="22" class="t-sm t-bold">TTFT p95 (ms, log scale)</text>
+<line x1="430" y1="230.0" x2="740" y2="230.0" class="line-thin"/><text x="424" y="234.0" text-anchor="end" class="t-xs t-muted">100</text>
+<line x1="430" y1="166.7" x2="740" y2="166.7" class="line-thin"/><text x="424" y="170.7" text-anchor="end" class="t-xs t-muted">1,000</text>
+<line x1="430" y1="103.3" x2="740" y2="103.3" class="line-thin"/><text x="424" y="107.3" text-anchor="end" class="t-xs t-muted">10,000</text>
+<line x1="430" y1="40.0" x2="740" y2="40.0" class="line-thin"/><text x="424" y="44.0" text-anchor="end" class="t-xs t-muted">100,000</text>
+<text x="458.2" y="246" text-anchor="middle" class="t-xs t-muted">2</text>
+<text x="514.5" y="246" text-anchor="middle" class="t-xs t-muted">4</text>
+<text x="570.9" y="246" text-anchor="middle" class="t-xs t-muted">6</text>
+<text x="627.3" y="246" text-anchor="middle" class="t-xs t-muted">8</text>
+<text x="683.6" y="246" text-anchor="middle" class="t-xs t-muted">10</text>
+<text x="740.0" y="246" text-anchor="middle" class="t-xs t-muted">12</text>
+<line x1="430" y1="40" x2="430" y2="230" class="line"/><line x1="430" y1="230" x2="740" y2="230" class="line"/>
+<text x="585.0" y="264" text-anchor="middle" class="t-xs t-muted">arrival rate (requests per second)</text>
+<polyline points="430.0,104.9 458.2,99.2 486.4,93.5 514.5,73.3 542.7,62.4 570.9,57.6 627.3,52.5 683.6,51.8 740.0,51.1" fill="none" class="s-red sw-2"/>
+<circle cx="430.0" cy="104.9" r="3" class="f-red"/>
+<circle cx="458.2" cy="99.2" r="3" class="f-red"/>
+<circle cx="486.4" cy="93.5" r="3" class="f-red"/>
+<circle cx="514.5" cy="73.3" r="3" class="f-red"/>
+<circle cx="542.7" cy="62.4" r="3" class="f-red"/>
+<circle cx="570.9" cy="57.6" r="3" class="f-red"/>
+<circle cx="627.3" cy="52.5" r="3" class="f-red"/>
+<circle cx="683.6" cy="51.8" r="3" class="f-red"/>
+<circle cx="740.0" cy="51.1" r="3" class="f-red"/>
+<polyline points="430.0,209.2 458.2,208.0 486.4,207.1 514.5,204.8 542.7,202.0 570.9,198.7 627.3,157.8 683.6,119.4 740.0,103.2" fill="none" class="s-orange sw-2"/>
+<circle cx="430.0" cy="209.2" r="3" class="f-orange"/>
+<circle cx="458.2" cy="208.0" r="3" class="f-orange"/>
+<circle cx="486.4" cy="207.1" r="3" class="f-orange"/>
+<circle cx="514.5" cy="204.8" r="3" class="f-orange"/>
+<circle cx="542.7" cy="202.0" r="3" class="f-orange"/>
+<circle cx="570.9" cy="198.7" r="3" class="f-orange"/>
+<circle cx="627.3" cy="157.8" r="3" class="f-orange"/>
+<circle cx="683.6" cy="119.4" r="3" class="f-orange"/>
+<circle cx="740.0" cy="103.2" r="3" class="f-orange"/>
+<polyline points="430.0,209.2 458.2,208.0 486.4,207.1 514.5,204.8 542.7,202.0 570.9,198.7 627.3,194.5 683.6,184.0 740.0,145.5" fill="none" class="s-blue sw-2"/>
+<circle cx="430.0" cy="209.2" r="3" class="f-blue"/>
+<circle cx="458.2" cy="208.0" r="3" class="f-blue"/>
+<circle cx="486.4" cy="207.1" r="3" class="f-blue"/>
+<circle cx="514.5" cy="204.8" r="3" class="f-blue"/>
+<circle cx="542.7" cy="202.0" r="3" class="f-blue"/>
+<circle cx="570.9" cy="198.7" r="3" class="f-blue"/>
+<circle cx="627.3" cy="194.5" r="3" class="f-blue"/>
+<circle cx="683.6" cy="184.0" r="3" class="f-blue"/>
+<circle cx="740.0" cy="145.5" r="3" class="f-blue"/>
+<rect x="60" y="300" width="16" height="4" class="f-red"/><text x="82" y="306" class="t-xs">static</text>
+<rect x="280" y="300" width="16" height="4" class="f-orange"/><text x="302" y="306" class="t-xs">continuous, reserve</text>
+<rect x="500" y="300" width="16" height="4" class="f-blue"/><text x="522" y="306" class="t-xs">continuous, paged</text>
+</svg>
+<figcaption><strong>Same GPU, same requests, three policies.</strong> Left: throughput saturates at 270 tokens per second for static batching, about 660 for continuous batching that reserves worst-case cache, and keeps rising to 794 with paging. Right: the time to first token (log scale) is where saturation shows up first. Values are taken from the tables above (300 requests per rate, seed 1).</figcaption>
+</figure>
+<p>Read the three tables. Static batching saturates near 270 tokens per second and its TTFT p95 is 12 seconds at 2 requests a second and tens of seconds beyond: it is queueing behind batches that run for as long as their longest answer. Continuous batching with a reserved cache keeps TTFT near a quarter of a second until about 6 requests a second, then hits a wall: at 8 requests a second the cache is full of reservations (peak 3,070 pages) and TTFT p95 jumps to 1.4 seconds, then 5.6 and 10. Continuous batching with a paged cache holds the same worst-case promise to the client with 1,641 pages at 8 requests a second, and keeps climbing in throughput to 794 tokens per second at 12. Look at the TPOT column as well: it rises from 30 ms to 83 ms as the batch grows, because each step now reads more cache and, more importantly, interleaves more prefills. That is the price of the throughput, and the reason chapter 20 discusses chunked prefill.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>simulate_continuous(requests, cfg)</code> as specified in its docstring. When growing a running request fails, call <code>preempt_one(running, waiting, alloc)</code> (milestone 5) and count the event; with an ample cache that call is never reached, so you can finish this milestone first.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the A and B example (first tokens at 30 and 50, both finishing at 60, three steps), the same with a cache term, <code>max_batch = 1</code> and <code>2</code> (including a freed slot being refilled in the next step), the reserve mode in which a 4-page reservation blocks the queue in order while paged mode admits all three requests at once, a <code>ValueError</code> for an impossible request, then six seeded workloads in both modes against an independently written reference (every timing, step count and the peak page count must match to a microsecond), and finally that continuous batching beats static on throughput and on TTFT p95.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Keep three containers: a <code>deque</code> of <code>Live</code> objects not yet arrived (sorted by arrival), a <code>deque</code> for waiting, and a plain <code>list</code> for running in admission order. A <code>Live</code> knows its own context length as <code>live.ctx</code>.</li>
+      <li>If nothing is waiting or running, set the clock to the next arrival and <code>continue</code>; otherwise the loop would spin without advancing time.</li>
+      <li>Phase A with a retry loop: <code>while not alloc.reserve(rid, tokens_needed(s, cfg))</code>, preempt, and <code>break</code> if the victim was <code>s</code> itself. Only move to the next index when the reserve succeeded. Because the milestone-4 tests never run out of cache, this branch is exercised only after milestone 5.</li>
+      <li>Compute <code>prefill</code> and <code>kv</code> <em>before</em> you increment <code>generated</code>: the context a step reads is the context before the new token. New requests contribute their whole <code>ctx</code> to the prefill and nothing to <code>kv</code>.</li>
+      <li>Iterate over a copy (<code>list(running)</code>) when you remove finished requests inside the loop.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> simulate_continuous(requests, cfg):
+    <span class="str">""</span>"Continuous (iteration-level) batching <span class="kw">with</span> a paged <span class="kw">or</span> reserved KV cache.
+
+    State: `pending` (<span class="kw">not</span> yet arrived), `waiting` (arrived, <span class="kw">not</span> running; a deque), `running` (a
+    list <span class="kw">in</span> admission order), one PageAllocator, the clock t = <span class="num">0.0</span>, <span class="kw">and</span> counters. Validate <span class="kw">with</span>
+    check_fits first. Repeat until nothing <span class="kw">is</span> pending, waiting <span class="kw">or</span> running:
+
+      <span class="num">0</span>. Move requests <span class="kw">from</span> pending to waiting when arrival_ms &lt;= t. If nothing <span class="kw">is</span> waiting <span class="kw">or</span>
+         running, set t to the next pending arrival <span class="kw">and</span> start the loop again.
+      A. GROW. For each request s <span class="kw">in</span> `running`, <span class="kw">in</span> order, make sure the allocator holds
+         tokens_needed(s, cfg) tokens <span class="kw">for</span> it. If allocator.reserve fails, call
+         preempt_one(running, waiting, alloc) <span class="kw">and</span> count it; repeat until the reserve succeeds <span class="kw">or</span>
+         the victim was s itself (then s <span class="kw">is</span> gone <span class="kw">from</span> `running`).
+      B. ADMIT. Only <span class="kw">if</span> nothing was preempted <span class="kw">in</span> this step (<span class="kw">or</span> running <span class="kw">is</span> empty): <span class="kw">while</span> waiting <span class="kw">is</span>
+         non-empty <span class="kw">and</span> len(running) &lt; cfg.max_batch, <span class="kw">try</span> alloc.reserve(rid, tokens_needed(head,
+         cfg)) <span class="kw">for</span> the head of the queue. On success move it to the END of `running` <span class="kw">and</span> remember
+         it <span class="kw">as</span> new; on failure stop (first come first served: a big request blocks the ones behind).
+      C. RUN one step. prefill_tokens = sum of ctx over the NEW requests (their whole prompt, <span class="kw">or</span>, <span class="kw">for</span>
+         a request resuming after preemption, prompt plus the tokens it had already generated);
+         kv_tokens = sum of ctx over the other (decoding) requests. t += step_time_ms(cfg,
+         kv_tokens, prefill_tokens). EVERY running request then emits one token (generated += <span class="num">1</span>;
+         the first time, first_token_ms = t). One that has emitted output_len tokens finishes at t:
+         release its pages <span class="kw">and</span> record to_done(live, t).
+    Return a SimResult (done sorted by rid; preemptions = number of preempt_one calls).<span class="str">""</span>"
+    reqs = sorted(requests, key=<span class="kw">lambda</span> r: (r.arrival_ms, r.rid))
+    alloc = PageAllocator(cfg.total_pages, cfg.page_tokens)
+    check_fits(reqs, cfg, alloc)
+    pending = deque(Live(r) <span class="kw">for</span> r <span class="kw">in</span> reqs)
+    waiting, running, done = deque(), [], []
+    t, steps, tokens, preemptions = <span class="num">0.0</span>, <span class="num">0</span>, <span class="num">0</span>, <span class="num">0</span>
+    <span class="kw">while</span> pending <span class="kw">or</span> waiting <span class="kw">or</span> running:
+        <span class="kw">while</span> pending <span class="kw">and</span> pending[<span class="num">0</span>].req.arrival_ms &lt;= t:
+            waiting.append(pending.popleft())
+        <span class="kw">if</span> <span class="kw">not</span> waiting <span class="kw">and</span> <span class="kw">not</span> running:
+            t = pending[<span class="num">0</span>].req.arrival_ms
+            <span class="kw">continue</span>
+        <span class="cmt"># A. grow the running requests, preempting the youngest when the cache is full</span>
+        preempted = <span class="kw">False</span>
+        i = <span class="num">0</span>
+        <span class="kw">while</span> i &lt; len(running):
+            s = running[i]
+            <span class="kw">while</span> <span class="kw">not</span> alloc.reserve(s.req.rid, tokens_needed(s, cfg)):
+                victim = preempt_one(running, waiting, alloc)
+                preemptions += <span class="num">1</span>
+                preempted = <span class="kw">True</span>
+                <span class="kw">if</span> victim <span class="kw">is</span> s:
+                    <span class="kw">break</span>
+            <span class="kw">else</span>:
+                i += <span class="num">1</span>
+        <span class="cmt"># B. admit from the head of the queue while there is a slot and room</span>
+        new = []
+        <span class="kw">if</span> <span class="kw">not</span> preempted <span class="kw">or</span> <span class="kw">not</span> running:
+            <span class="kw">while</span> waiting <span class="kw">and</span> len(running) &lt; cfg.max_batch:
+                head = waiting[<span class="num">0</span>]
+                <span class="kw">if</span> <span class="kw">not</span> alloc.reserve(head.req.rid, tokens_needed(head, cfg)):
+                    <span class="kw">break</span>
+                running.append(waiting.popleft())
+                new.append(head)
+        <span class="cmt"># C. one forward pass: prefill for the new, one decode token for the others</span>
+        prefill = sum(s.ctx <span class="kw">for</span> s <span class="kw">in</span> new)
+        kv = sum(s.ctx <span class="kw">for</span> s <span class="kw">in</span> running <span class="kw">if</span> s <span class="kw">not</span> <span class="kw">in</span> new)
+        t += step_time_ms(cfg, kv, prefill)
+        steps += <span class="num">1</span>
+        <span class="kw">for</span> s <span class="kw">in</span> list(running):
+            s.generated += <span class="num">1</span>
+            tokens += <span class="num">1</span>
+            <span class="kw">if</span> s.first_token_ms <span class="kw">is</span> <span class="kw">None</span>:
+                s.first_token_ms = t
+            <span class="kw">if</span> s.generated == s.req.output_len:
+                running.remove(s)
+                alloc.release(s.req.rid)
+                done.append(to_done(s, t))
+    done.sort(key=<span class="kw">lambda</span> d: d.rid)
+    <span class="kw">return</span> SimResult(done, t, steps, tokens, preemptions, alloc.peak_pages)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: preemption when the cache is full</h2>
+
+<p>Paged allocation admits requests on the promise of a short prompt and a short answer, and the promise can fail: ten requests that were comfortable at 400 tokens each may all need a new page in the same step with none left. The engine must then free memory, and the simplest policy that always works is <span class="term">preemption by recomputation</span>. Pick a victim, release its pages, put it back at the front of the queue, and when it is admitted again process its entire context (prompt plus the tokens it had already generated) as a fresh prefill. The tokens already sent to the user stay sent, so the user sees a stall, not a restart. The alternative is to copy the victim's pages to host memory and back, which saves the recomputation and costs bandwidth; the lab implements the first.</p>
+
+<p>Which victim? The youngest running request (the last in <code>running</code>), for two reasons: it has the least progress to throw away, and the oldest requests are the nearest to finishing and to freeing their pages. Choosing the oldest would evict the request closest to done, make it redo the most work, and delay the user who has already waited longest. Step through the smallest case that forces it: a cache of 4 pages of 4 tokens, and two requests that each have a 6-token prompt and 6 output tokens (the test configuration: 10 ms a step, 1 ms per prompt token).</p>
+
+<div class="widget stepper" data-autoplay-ms="4500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">Preempting B so that A can grow</h4></div>
+  <svg viewBox="0 0 760 270" role="img" aria-label="A four-page cache shared by request A and request B across five moments. Both are admitted and fill the cache with two pages each. Both decode until their contexts reach eight tokens. A needs a third page, B is preempted and its pages are freed. A runs alone and finishes. B is admitted again with eight tokens of context and finishes.">
+    <defs><marker id="ahLT-L6c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="10" y="20" text-anchor="start" class="t-sm t-bold">The 4-page cache (each box is a page of 4 tokens)</text>
+    <g>
+      <text x="40" y="70" text-anchor="start" class="t-xs t-muted">page</text>
+      <text x="145" y="70" text-anchor="middle" class="t-xs t-muted">0</text><text x="235" y="70" text-anchor="middle" class="t-xs t-muted">1</text>
+      <text x="325" y="70" text-anchor="middle" class="t-xs t-muted">2</text><text x="415" y="70" text-anchor="middle" class="t-xs t-muted">3</text>
+    </g>
+    <g data-steps="1-2">
+      <rect x="100" y="80" width="90" height="56" rx="6" class="fs-blue s-blue sw-2"/><text x="145" y="114" text-anchor="middle" class="t-sm t-bold">A</text>
+      <rect x="190" y="80" width="90" height="56" rx="6" class="fs-blue s-blue sw-2"/><text x="235" y="114" text-anchor="middle" class="t-sm t-bold">A</text>
+      <rect x="280" y="80" width="90" height="56" rx="6" class="fs-orange s-orange sw-2"/><text x="325" y="114" text-anchor="middle" class="t-sm t-bold">B</text>
+      <rect x="370" y="80" width="90" height="56" rx="6" class="fs-orange s-orange sw-2"/><text x="415" y="114" text-anchor="middle" class="t-sm t-bold">B</text>
+    </g>
+    <g data-steps="3">
+      <rect x="100" y="80" width="90" height="56" rx="6" class="fs-blue s-blue sw-2"/><text x="145" y="114" text-anchor="middle" class="t-sm t-bold">A</text>
+      <rect x="190" y="80" width="90" height="56" rx="6" class="fs-blue s-blue sw-2"/><text x="235" y="114" text-anchor="middle" class="t-sm t-bold">A</text>
+      <rect x="280" y="80" width="90" height="56" rx="6" class="fs-blue s-blue sw-2"/><text x="325" y="114" text-anchor="middle" class="t-sm t-bold">A</text>
+      <rect x="370" y="80" width="90" height="56" rx="6" class="box line-dash"/><text x="415" y="114" text-anchor="middle" class="t-xs t-muted">free</text>
+    </g>
+    <g data-steps="4">
+      <rect x="100" y="80" width="90" height="56" rx="6" class="box line-dash"/><text x="145" y="114" text-anchor="middle" class="t-xs t-muted">free</text>
+      <rect x="190" y="80" width="90" height="56" rx="6" class="box line-dash"/><text x="235" y="114" text-anchor="middle" class="t-xs t-muted">free</text>
+      <rect x="280" y="80" width="90" height="56" rx="6" class="box line-dash"/><text x="325" y="114" text-anchor="middle" class="t-xs t-muted">free</text>
+      <rect x="370" y="80" width="90" height="56" rx="6" class="box line-dash"/><text x="415" y="114" text-anchor="middle" class="t-xs t-muted">free</text>
+    </g>
+    <g data-steps="5">
+      <rect x="100" y="80" width="90" height="56" rx="6" class="fs-orange s-orange sw-2"/><text x="145" y="114" text-anchor="middle" class="t-sm t-bold">B</text>
+      <rect x="190" y="80" width="90" height="56" rx="6" class="fs-orange s-orange sw-2"/><text x="235" y="114" text-anchor="middle" class="t-sm t-bold">B</text>
+      <rect x="280" y="80" width="90" height="56" rx="6" class="fs-orange s-orange sw-2"/><text x="325" y="114" text-anchor="middle" class="t-sm t-bold">B</text>
+      <rect x="370" y="80" width="90" height="56" rx="6" class="box line-dash"/><text x="415" y="114" text-anchor="middle" class="t-xs t-muted">free</text>
+    </g>
+    <g data-steps="1">
+      <text x="500" y="100" text-anchor="start" class="t-sm t-bold">t = 22 ms</text>
+      <text x="500" y="120" text-anchor="start" class="t-xs t-muted">prefill 12 tokens: 10 + 12</text>
+    </g>
+    <g data-steps="2">
+      <text x="500" y="100" text-anchor="start" class="t-sm t-bold">t = 32 ms</text>
+      <text x="500" y="120" text-anchor="start" class="t-xs t-muted">contexts are 8 tokens: exactly full</text>
+    </g>
+    <g data-steps="3">
+      <text x="500" y="100" text-anchor="start" class="t-sm t-bold">t = 42 ms</text>
+      <text x="500" y="120" text-anchor="start" class="t-xs t-muted">B preempted, B waits</text>
+    </g>
+    <g data-steps="4">
+      <text x="500" y="100" text-anchor="start" class="t-sm t-bold">t = 72 ms</text>
+      <text x="500" y="120" text-anchor="start" class="t-xs t-muted">A has finished, pages freed</text>
+    </g>
+    <g data-steps="5">
+      <text x="500" y="100" text-anchor="start" class="t-sm t-bold">t = 90 to 120 ms</text>
+      <text x="500" y="120" text-anchor="start" class="t-xs t-muted">B re-prefilled (8 tokens), finishes</text>
+    </g>
+    <rect x="10" y="180" width="740" height="74" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <g data-steps="1"><text x="380" y="208" text-anchor="middle" class="t-sm t-bold">A and B are both admitted</text><text x="380" y="230" text-anchor="middle" class="t-xs t-muted">each needs 7 tokens of room (6 + the new one) = 2 pages; the cache is exactly full</text></g>
+    <g data-steps="2"><text x="380" y="208" text-anchor="middle" class="t-sm t-bold">Decode: no new page needed yet</text><text x="380" y="230" text-anchor="middle" class="t-xs t-muted">a context of 7 or 8 tokens still fits in two 4-token pages</text></g>
+    <g data-steps="3"><text x="380" y="208" text-anchor="middle" class="t-sm t-bold">Step 3: A needs a ninth token, no page is free</text><text x="380" y="230" text-anchor="middle" class="t-xs t-muted">the youngest running request (B) is evicted, its pages freed, A takes one; B goes to the front of the queue</text></g>
+    <g data-steps="4"><text x="380" y="208" text-anchor="middle" class="t-sm t-bold">B cannot be re-admitted yet</text><text x="380" y="230" text-anchor="middle" class="t-xs t-muted">it needs 9 tokens = 3 pages and A holds 3 of the 4; B waits from t = 32 ms until A finishes</text></g>
+    <g data-steps="5"><text x="380" y="208" text-anchor="middle" class="t-sm t-bold">B is recomputed</text><text x="380" y="230" text-anchor="middle" class="t-xs t-muted">prefill of prompt + 2 generated tokens costs 10 + 8 = 18 ms and B resumes at its third token</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Admit both.</strong> Two requests of 6-token prompts fill the four pages.</li>
+    <li><strong>Decode.</strong> Both contexts grow to 8 tokens, which still fits.</li>
+    <li><strong>Preempt.</strong> A needs a third page and the youngest request, B, pays for it.</li>
+    <li><strong>Wait.</strong> A runs alone, finishes at 72 ms and frees its pages; B had to wait for three pages.</li>
+    <li><strong>Recompute.</strong> B is prefilled again with its 8-token context and finishes at 120 ms.</li>
+  </ol>
+</div>
+
+<p>The result has an instructive asymmetry. A's first token arrives at 22 ms and its last at 72; B's first token also arrives at 22 ms, but it does not finish until 120. B's preemption did not change its TTFT (the first token was already out), it stretched its tokens apart: the TPOT of B is (120 &minus; 22) / 5 = 19.6 ms against A's 10 ms. Preemption protects the system and charges the cost to one user's streaming speed. Now shrink the cache under a fixed workload and watch the cost add up:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_preempt.py</span>
+<span class="out">continuous batching, 150 requests at 12/s, max batch 64, paged
+ pages   tokens  preempts  steps   tok/s  ttft p95  tpot p95   e2e p95
+  3070    49120         0    661     684      1765      74.9     11640
+  1500    24000        10    669     666      2623      72.6     12070
+   800    12800        27    837     553      9214      56.9     16859
+   500     8000        35   1132     449     16475      43.4     21806
+   300     4800        48   1774     315     32127      43.5     35593
+   200     3200        49   2520     238     50696      40.7     53909</span></code></pre>
+<p>With 1,500 pages there are 10 preemptions and little changes (throughput 666 against 684 tokens per second, TTFT p95 2.6 seconds against 1.8); at 800 pages the run needs 837 steps instead of 661 (the recomputed prefills), throughput falls from 684 to 553 tokens per second and TTFT p95 rises five-fold, from 1.8 to 9.2 seconds. Note the TPOT column: it <em>improves</em>, from 74.9 ms to 56.9 and then 40.7, as the cache shrinks. The cache is limiting how many requests decode together, so each step is cheaper and fewer prefills interleave, but requests wait much longer for their first token and the GPU does less. A dashboard that watched only TPOT would report a healthier system while it got worse. At 200 pages (3,200 tokens) the system spends most of its steps redoing work: 2,520 steps for the same tokens.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>preempt_one(running, waiting, alloc)</code>: remove and return the last request of <code>running</code>, release its pages, add one to its <code>preemptions</code>, and put it at the front of <code>waiting</code>; raise <code>RuntimeError</code> if nothing is running. Your <code>simulate_continuous</code> from milestone 4 must now behave correctly under pressure.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks <code>preempt_one</code> directly (the victim is the last in the list, goes to the front of the queue, keeps its generated count, its pages come back), the hand trace above (first tokens at 22 ms for both, A finishing at 72, B at 120, 10 steps, 12 tokens, exactly one preemption, of B), that a lone request which needs the entire cache is not preempted forever, that the reserve mode never preempts, and then six seeded workloads on a deliberately small 140-page cache against the independent reference: preemption counts, per-request counts, peak pages and every timing must match, and a run with a small cache can never finish earlier than the same run with a large one.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>running.pop()</code> removes and returns the last element. <code>waiting.appendleft(victim)</code> puts it at the front of the deque.</li>
+      <li>Do <em>not</em> reset <code>generated</code>: the milestone-4 loop already uses <code>live.ctx</code> (prompt plus generated) as the size of the next prefill, which is exactly the recompute cost.</li>
+      <li>If the trace fails after step 3, check that a step that preempted skips the admission phase. If B is admitted straight back, the scheduler evicts and re-admits in a loop.</li>
+      <li>If a run never terminates, a single request probably needs more pages than the whole cache. <code>check_fits</code> (given) should have rejected it at the top of the simulation.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> preempt_one(running, waiting, alloc):
+    <span class="str">""</span>"Free cache by evicting the YOUNGEST running request (the last one <span class="kw">in</span> `running`).
+
+    Remove it <span class="kw">from</span> `running`, release its pages, count the event on the request
+    (victim.preemptions += <span class="num">1</span>), <span class="kw">and</span> put it at the FRONT of `waiting` (waiting.appendleft). It keeps
+    `generated`: the tokens already sent to the user stay sent, <span class="kw">and</span> when it <span class="kw">is</span> admitted again its
+    whole context (prompt plus generated tokens) <span class="kw">is</span> prefilled again, a RECOMPUTE preemption.
+    Return the victim. Raise RuntimeError <span class="kw">if</span> `running` <span class="kw">is</span> empty.<span class="str">""</span>"
+    <span class="kw">if</span> <span class="kw">not</span> running:
+        <span class="kw">raise</span> RuntimeError(<span class="str">"nothing to preempt"</span>)
+    victim = running.pop()
+    alloc.release(victim.req.rid)
+    victim.preemptions += <span class="num">1</span>
+    waiting.appendleft(victim)
+    <span class="kw">return</span> victim</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 6: capacity under an SLO, and what a token costs</h2>
+
+<p>Throughput on its own is the wrong target. A system that serves 800 tokens a second with a first token after ten seconds is a batch job. Capacity planning starts from a <span class="term">service level objective</span> (<a href="../../reliability/chapters/02-slos-error-budgets.html">SLIs, SLOs and error budgets</a>) and asks the reverse question: <em>what is the highest arrival rate at which the objective still holds?</em> The lab uses an interactive-chat style target: TTFT p95 at most 1,000 ms and TPOT p95 at most 80 ms. <code>run_sweep</code> replays the same seeded workload at a list of arrival rates through one policy (the workloads differ only in time scale, the property you tested in milestone 2), and <code>max_rate_under_slo</code> scans the rows in order and returns the last rate before the first violation. That first-violation rule is deliberate: a system that fails at 8 and passes at 10 is not safe to run at 10, because the failure at 8 shows the knee is already behind it (<a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>: latency does not recover as load rises).</p>
+
+<p>The last step is the one chapter 22 started with: a GPU costs the same whether busy or idle, so the cost of a token is the hourly price divided by the tokens served per hour, <code>price / (tokens_per_s &times; 3600) &times; 10<sup>6</sup></code> per million. Evaluate it at the throughput the system delivers at its SLO capacity, not at its peak, because the peak is not a rate you are allowed to run at. The price below, $1.00 an hour, is an assumption for a 24 GB class card, chosen so that the ratios are easy to read; use your own.</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_capacity.py</span>
+<span class="out">SLO: TTFT p95 &lt;= 1000 ms, TPOT p95 &lt;= 80 ms; 300 requests per rate; assumed price $1.00 per GPU-hour
+policy                 max req/s  tok/s there  $ per M tokens
+static                         0            -               -
+continuous, reserve            6          506            0.55
+continuous, paged             10          737            0.38
+
+the client's max_tokens limit decides what 'reserve' can admit; paging does not care
+ max_new  reserve: max req/s  paged: max req/s
+     256                  10                10
+     512                  10                10
+    1024                   6                10
+    2048                   5                10</span></code></pre>
+<p>Static batching misses the SLO even at 1 request per second: its first tokens wait behind other people's long answers. Continuous batching with a reserve-the-maximum cache holds the SLO to 6 requests per second, and paging raises that to 10, a two-thirds increase from the same card and the same scheduler, which is a token that costs $0.38 per million instead of $0.55. The second table shows where the reserve allocator's number comes from: it is the client's <code>max_tokens</code>. If clients ask for at most 256 or 512 tokens, reserving the worst case costs nothing and the two allocators tie at 10; at 1,024 reserving drops capacity to 6, and at 2,048 to 5. The paged allocator does not care, because it pays for the tokens a request actually uses. That is why paging is worth building even though it adds a block table to every attention kernel.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>run_sweep(policy, rates, n, seed, cfg)</code> (one summary dictionary per rate, with a <code>"rate"</code> key added), <code>max_rate_under_slo(rows, ttft_p95_ms, tpot_p95_ms)</code> and <code>cost_per_million(tokens_per_s, price_per_hour)</code>. <code>POLICIES</code> (given) maps the three policy names to simulation functions.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the cost formula ($1.00 at 1,000 tokens per second on a $3.60 card), the SLO scan on crafted rows (a violation stops the scan even if a later row passes; if no row violates, the last rate; if the first violates, 0.0), that each sweep row equals the summary of the corresponding simulation, and then the scored scenario on 300 requests per rate for rates from 1 to 12: capacity must be ordered static &lt; continuous with reserved cache &lt; continuous with paged cache, and up to 6 requests a second the paged policy must use less than half the peak cache of the reserving one.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>run_sweep</code>: for each rate, <code>POLICIES[policy](make_workload(n, rate, seed), cfg)</code>, then <code>summarise</code>, then <code>row["rate"] = rate</code>.</li>
+      <li><code>max_rate_under_slo</code>: keep <code>best = 0.0</code>; for each row, <code>break</code> on a violation, otherwise <code>best = row["rate"]</code>.</li>
+      <li>If the ordering assertion fails, compare the three tables from <code>exp_continuous.py</code> with yours: the most common cause is a static batch that is allowed to grow past what the cache holds, or a paged run that reserves <code>max_new</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> run_sweep(policy, rates, n, seed, cfg):
+    <span class="str">""</span>"For each arrival rate (requests per second, ascending), simulate `policy` (a key of POLICIES)
+    on make_workload(n, rate, seed) <span class="kw">and</span> <span class="kw">return</span> a list of dicts: summarise(...) plus the key <span class="str">"rate"</span>.
+    All rates share the same seed, so the workloads differ only by their time scale.<span class="str">""</span>"
+    rows = []
+    <span class="kw">for</span> rate <span class="kw">in</span> rates:
+        sim = POLICIES[policy](make_workload(n, rate, seed), cfg)
+        row = summarise(sim)
+        row[<span class="str">"rate"</span>] = rate
+        rows.append(row)
+    <span class="kw">return</span> rows
+
+<span class="kw">def</span> max_rate_under_slo(rows, ttft_p95_ms, tpot_p95_ms):
+    <span class="str">""</span>"The highest arrival rate the system sustains within its SLO: scan rows <span class="kw">in</span> order <span class="kw">and</span> <span class="kw">return</span>
+    the <span class="str">"rate"</span> of the last row BEFORE the first one that violates it (ttft_p95 &gt; ttft_p95_ms <span class="kw">or</span>
+    tpot_p95 &gt; tpot_p95_ms). <span class="num">0.0</span> <span class="kw">if</span> the first row already violates it; the last rate <span class="kw">if</span> none does.<span class="str">""</span>"
+    best = <span class="num">0.0</span>
+    <span class="kw">for</span> row <span class="kw">in</span> rows:
+        <span class="kw">if</span> row[<span class="str">"ttft_p95"</span>] &gt; ttft_p95_ms <span class="kw">or</span> row[<span class="str">"tpot_p95"</span>] &gt; tpot_p95_ms:
+            <span class="kw">break</span>
+        best = row[<span class="str">"rate"</span>]
+    <span class="kw">return</span> best
+
+<span class="kw">def</span> cost_per_million(tokens_per_s, price_per_hour):
+    <span class="str">""</span>"Dollars per million tokens <span class="kw">for</span> a GPU that costs `price_per_hour` <span class="kw">and</span> sustains `tokens_per_s`
+    (chapter <span class="num">22</span>): price_per_hour / (tokens_per_s * <span class="num">3600</span>) * <span class="num">1e6</span>.<span class="str">""</span>"
+    <span class="kw">return</span> price_per_hour / (tokens_per_s * <span class="num">3600.0</span>) * <span class="num">1e6</span></code></pre>
+  </details>
+</div>
+
+<h2>Run it all</h2>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution</span>
+<span class="out">Lab 6 checks against solution.py
+
+  ✔ Milestone 1: sizing and paging
+      3,070 pages of 16 tokens fit beside the weights of an 8B model on a 24 GB card; block tables of reused pages are not contiguous
+  ✔ Milestone 2: the cost model, the workload and the metrics
+      step cost, Poisson workload (mean output 100 tokens) and nearest-rank percentiles
+  ✔ Milestone 3: static batching
+      hand-traced scenarios and a match with an independent reference on 12 workloads;
+      300 requests at 4/s, batch up to 64: 265 tokens/s, 7.2 tokens per step, TTFT p95 29.8 s
+  ✔ Milestone 4: continuous batching
+      300 requests at 4/s, same GPU and same batch limit (64):
+        static        265 tokens/s,   7.2 tokens/step, TTFT p95   29795 ms
+        continuous    362 tokens/s,  10.5 tokens/step, TTFT p95     250 ms
+  ✔ Milestone 5: preemption when the cache is full
+      hand-traced preemption and recompute, and a match with an independent reference under pressure;
+      40 requests at 30/s, seed 1: 3,070 pages -&gt; 0 preemptions, 365 tokens/s, TTFT p95 1747 ms;
+      140 pages -&gt; 7 preemptions, 177 tokens/s, TTFT p95 16766 ms
+  ✔ Milestone 6: capacity under an SLO, and what a token costs
+      SLO: TTFT p95 &lt;= 1000 ms and TPOT p95 &lt;= 80 ms, 300 requests per rate, GPU at an assumed $1.00 an hour:
+        static               sustains    0 req/s (misses the SLO even at 1 req/s)
+        continuous, reserve  sustains    6 req/s (  506 tokens/s), $ 0.55 per million tokens
+        continuous, paged    sustains   10 req/s (  737 tokens/s), $ 0.38 per million tokens
+
+6/6 milestones passing  (0.6 s)</span></code></pre>
+<p>Every milestone shows a tick. The same call on your own file prints the same lines. If a milestone fails, the message says what was expected, what you produced and the likely mistake; the seed of a random case is printed so that <code>python3 check.py solution 1 7</code>-style replays work on your file too.</p>
+
+<h2>Look under the hood</h2>
+
+<ul>
+  <li><strong>What a real engine adds to the loop.</strong> <em>Chunked prefill</em> splits a long prompt into pieces of a fixed token budget so that decoding requests are never stalled for 240 ms by one big prompt; in the lab's model it would bound the <code>prefill_ms</code> term per step and flatten the TPOT tail you saw rising in milestone 4. <em>Prefix caching</em> lets requests that share a prompt prefix share its pages (reference counts on pages, copy on write when they diverge), which lowers both TTFT and cache use. Both appear in chapter 20; neither changes the shape of the loop.</li>
+  <li><strong>Swap versus recompute.</strong> The lab recomputes a preempted request's context. An engine may instead copy its pages to host memory over PCIe and copy them back; whichever is cheaper depends on context length and link bandwidth, and short contexts favour recomputation. Both choose the youngest victim for the reasons in milestone 5.</li>
+  <li><strong>Why admission looks only one token ahead.</strong> The paged mode admits a request when its prompt and one token fit. That is optimistic, and preemption is the price of the optimism. A more cautious engine keeps a watermark of free pages, or admits only while the sum of the running requests' expected growth fits; each moves the knee in this lab's tables. Try it in the stretch goals.</li>
+  <li><strong>Where the cost model is crude.</strong> It adds the memory and compute terms where a real step takes roughly the larger of the two, charges the same <code>base_ms</code> to a batch of 1 as to a batch of 64 (true while decode is memory-bound, false at very large batches), ignores attention's own FLOPs and ignores the all-reduce between GPUs when a model is sharded (<a href="../chapters/03-parallelism.html">chapter 3</a>). The scheduler's behaviour comes from the structure, not from these constants, which is why changing <code>DEFAULT</code> moves the numbers and leaves the orderings alone.</li>
+  <li><strong>Open loop, not closed loop.</strong> Requests arrive on a schedule whatever the system's state (an <em>open</em> workload). Real clients often wait for an answer before sending the next message, which makes a slow system see less load. A load test that lets the tool wait for responses understates the damage in exactly the failure you care about (<a href="../../reliability/chapters/10-load-testing-capacity.html">load testing and capacity planning</a>).</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Continuous batching makes every request faster." It makes the <em>system</em> faster, mostly by removing idle slots and queueing behind long answers, and it does so by running more requests at once, which makes each step a little slower for every request in it. In the tables, TPOT p95 rose from 30 ms to 83 ms between 2 and 12 requests a second while TTFT and throughput improved. A single request on an idle GPU is not served faster by any of this. The goal is a GPU that is full of useful work and a queue that stays short, and the SLO is how you decide how much per-request slowdown you will accept to get it.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Move the knee.</strong> Halve <code>kv_ms</code> and then double <code>base_ms</code> in a copy of <code>DEFAULT</code> and rerun <code>exp_capacity.py</code>. Which change moves the capacity more, and what does that say about whether the real bottleneck is the weights or the cache reads?</li>
+    <li><strong>Longer answers.</strong> In <code>make_workload</code>, change the output lengths to a lognormal with sigma 1.3. Static batching suffers more or less? Predict it from chapter 20's reasoning about the longest request in a batch, then run it.</li>
+    <li><strong>Page size.</strong> Rerun with <code>page_tokens</code> 1, 16, 128 and 1,024, keeping the cache at the same number of tokens (so adjust <code>total_pages</code>). Where does internal waste start to hurt, and what would a page of 1 token cost a real attention kernel?</li>
+    <li><strong>Break the SLO rule.</strong> Change <code>max_rate_under_slo</code> to return the highest passing rate anywhere in the list. For which policy does it give a different answer, and would you run production there?</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>Chunked prefill.</strong> Cap the prompt tokens processed per step at, say, 512, by splitting prefills over several steps. Measure TPOT p95 and TTFT p95 before and after, at 10 requests a second.</li>
+  <li><strong>A watermark.</strong> Refuse admission unless some fraction of the pages (5%, 10%) would remain free afterwards. How many preemptions does it prevent at 200 pages, and what does it cost in throughput?</li>
+  <li><strong>Prefix sharing.</strong> Give half the requests the same 400-token system prompt. Let their block tables share the pages of that prefix (add a reference count to <code>PageAllocator</code>) and skip its prefill. How much do TTFT and peak pages fall?</li>
+  <li><strong>Swap instead of recompute.</strong> Model a preempted request's pages as copied out and in at a given bandwidth (a cost proportional to its pages) instead of a new prefill. For which context lengths does swapping win?</li>
+  <li><strong>Priority classes.</strong> Add an interactive and a batch class with different SLOs, always preempt a batch request before an interactive one, and find the largest mix the card can serve.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>The scheduler you wrote is an old idea in new clothes. The block table is the page table of <a href="../../systems/chapters/06-virtual-memory.html">virtual memory</a>, and preemption by recomputation is thrashing with a policy: when the working set exceeds memory, the machine spends its time paging. The percentiles are the tail-latency story of <a href="../../reliability/chapters/09-tail-latency.html">tail latency at scale</a>, and the knee in the tables is the utilisation knee of queueing theory, with the twist that the "server" runs many jobs per step. The SLO and capacity-planning method of milestone 6 is the same loop an SRE runs on any service (<a href="../../reliability/chapters/10-load-testing-capacity.html">load testing</a>, <a href="../../reliability/chapters/11-overload.html">overload and load shedding</a>): in production the right response when the cache is full and the queue is long is often to refuse new work early rather than to preempt and recompute. And the dollars per million tokens link back to <a href="../chapters/22-token-economics.html">the economics of a token</a> and to the <a href="../../design/chapters/20-ml-systems.html">design of ML systems</a>: the choice between self-hosting and an API starts with a capacity number like yours.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>The cache, not the arithmetic, decides how many conversations share a GPU: 128 KiB per token for an 8B model with grouped-query attention, 3,070 pages beside the weights on a 24 GB card, and 11 sequences of 4,096 tokens.</li>
+    <li>A paged allocator keeps a block table per request and hands out fixed-size pages on demand, so waste is at most one partly used page per request. Reserving <code>prompt + max_new</code> instead makes capacity depend on what clients put in <code>max_tokens</code>.</li>
+    <li>Static batching runs every batch as long as its longest answer, so slots idle (7 tokens per step from a nominal 64) and new requests queue behind other people's long outputs. Continuous batching decides at every step, which is the difference between tens of seconds and a quarter of a second of TTFT.</li>
+    <li>Preemption by recomputation keeps the system alive when the cache is full, at the price of repeated prefills and stretched TPOT for the victim, who should be the youngest request. A shrinking cache can lower TPOT while TTFT and throughput get worse, so no single metric is safe to watch alone.</li>
+    <li>Capacity is the highest arrival rate that meets the SLO, stopping at the first violation, and a token costs the hourly price divided by the tokens served per hour <em>at that rate</em>. In the lab paging raised the SLO capacity from 6 to 10 requests a second, a drop from $0.55 to $0.38 per million tokens on the assumed price.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">The lab's card has 3,070 pages of 16 tokens beside an 8B model. About how many 4,096-token conversations fit at once?</p>
+    <ol class="q-options">
+      <li>3</li>
+      <li>11</li>
+      <li>47</li>
+      <li>95</li>
+    </ol>
+    <div class="q-explain">A 4,096-token conversation takes 4,096 / 16 = 256 pages, and 3,070 / 256 = 11.99, so 11 fit. The other numbers are the answers for other contexts: 47 sequences at 1,024 tokens and 95 at 512. The tempting error is to divide the card's memory by the model's size, which ignores that the cache, not the weights, is what each extra conversation needs.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A request has a 305-token prompt, generates 100 tokens and was sent with <code>max_new = 1024</code>. At the end, about how many tokens of cache are allocated but unused under paged allocation (16-token pages) and under reserve-the-maximum?</p>
+    <ol class="q-options">
+      <li>0 and 0</li>
+      <li>1,024 under both</li>
+      <li>About 100 under paging and about 100 under reserving</li>
+      <li>About 11 under paging and about 939 under reserving</li>
+    </ol>
+    <div class="q-explain">The final context is 405 tokens, which paging holds in 26 pages = 416 tokens (11 unused, always less than one page). Reserving claims 305 + 1,024 = 1,329 tokens, which rounds up to 84 pages = 1,344 tokens, of which 939 are never written. The reserve figure depends on what the client wrote in <code>max_tokens</code>, and that is why the capacity of the reserve allocator moved with it in milestone 6.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">In one continuous-batching step, ten requests are decoding with 400 cached tokens each and a new request with a 2,000-token prompt is admitted. With the lab's cost model (22.9 ms base, 0.000187 ms per cached token, 0.1606 ms per prompt token), what happens to the ten decoding requests?</p>
+    <ol class="q-options">
+      <li>Their next token arrives after about 345 ms, roughly fifteen times a normal step, because the prefill shares the step</li>
+      <li>Nothing: the new request is prefilled on a separate part of the GPU</li>
+      <li>Their next token arrives after about 24 ms, because the decoding cost is unchanged</li>
+      <li>Their next token arrives after about 322 ms, and the base cost is not paid because the step is compute-bound</li>
+    </ol>
+    <div class="q-explain">The step costs 22.9 + 0.000187 &times; 4,000 + 0.1606 &times; 2,000 = 22.9 + 0.7 + 321.2 = 344.8 ms, and every request in the step waits for it. That prefill interference is why real engines split long prompts into chunks. The second and third options assume the prefill is free; the last drops the base cost, which the model charges once per step whatever is in it.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">When the cache is full the simulator evicts the youngest running request, not the oldest. Why?</p>
+    <ol class="q-options">
+      <li>The youngest request is always the largest, so evicting it frees the most pages</li>
+      <li>The youngest has had the most time to finish, so it is the most likely to be done</li>
+      <li>The youngest has made the least progress, so it has the least to recompute, and the oldest are closest to finishing and to freeing their own pages</li>
+      <li>The oldest request cannot be preempted because its pages are pinned</li>
+    </ol>
+    <div class="q-explain">Recompute preemption throws away work in proportion to the victim's context, and evicting the oldest would also delay the user who has already waited longest. Age says nothing reliable about size (the first option), the youngest has had the <em>least</em> time to finish, not the most, and nothing in the allocator pins pages.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">As the cache shrinks from 3,070 to 800 pages, TPOT p95 falls from 75 ms to 57 ms, while TTFT p95 rises from 1.8 s to 9.2 s and throughput falls from 684 to 553 tokens per second. What is the right conclusion?</p>
+    <ol class="q-options">
+      <li>The system got better because streaming is faster</li>
+      <li>The system got worse: a smaller cache means fewer requests decode together and fewer prefills interleave, so each step is cheaper, but requests wait much longer and the GPU does less in total</li>
+      <li>The TPOT measurement is wrong, because TPOT cannot fall when work is recomputed</li>
+      <li>Throughput and TTFT are noisy; only TPOT is reliable</li>
+    </ol>
+    <div class="q-explain">TPOT measures the gap between tokens once a request is running, and running requests are fewer. The people who matter are also the ones in the queue, which TTFT and throughput measure. Reading the three together is the point; the lab's SLO check makes you do that. TPOT can fall because the batch is smaller, and nothing in the data suggests noise at this size.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A $1.00-an-hour GPU sustains 737 tokens per second at the highest rate that meets the SLO. About how much does a million output tokens cost?</p>
+    <ol class="q-options">
+      <li>$0.04</li>
+      <li>$0.14</li>
+      <li>$0.27</li>
+      <li>$0.38</li>
+    </ol>
+    <div class="q-explain">737 tokens per second is 2.65 million tokens an hour, so a million tokens costs 1 / 2.65 = $0.38. The first three options are off by factors of about 10, 3 and 1.4: forgetting that an hour has 3,600 seconds, or dividing by the wrong throughput (the system's peak, which you may not run at, instead of its rate at the SLO) are the usual slips.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+</body>
+</html>

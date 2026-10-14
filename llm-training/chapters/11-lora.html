@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRA, QLoRA &amp; Parameter-Efficient Tuning · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/llm11-lora.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="11">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>LoRA, QLoRA &amp; Parameter-Efficient Tuning</h1>
+  <p class="lede">Full fine-tuning of a 7-billion-parameter model needs over a hundred gigabytes of model state, so most people cannot do it and most tasks do not need it. LoRA freezes the model and learns a small low-rank correction instead; QLoRA also stores the frozen part in 4 bits. This chapter explains why a correction with under 1% of the parameters can be enough, what rank and alpha control, and how to work out what fits on a 24 GB card.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapter 10 ended with a wall: full SFT of a 7B model needs about 112 GB for weights, gradients and optimiser state, more than any single consumer or mid-range data-centre GPU. Parameter-efficient fine-tuning is how most teams outside the largest labs actually adapt models, and how a service can keep hundreds of customer-specific variants of one base model. Its failure modes are quiet (an adapter too small for the data, a learning rate copied from full fine-tuning, a template mismatch), and the memory arithmetic decides what is feasible before any training starts. After this chapter you will be able to count adapter parameters, choose rank, alpha and target layers with reasons, compute whether a QLoRA run fits your GPU, and say when LoRA is the wrong tool.</p>
+</div>
+
+<h2>The idea: learn the change, and constrain its shape</h2>
+
+<p>Fine-tuning turns a pretrained weight matrix W<sub>0</sub> into W<sub>0</sub> + &Delta;W, where &Delta;W is whatever the training run added. Full fine-tuning learns every entry of &Delta;W for every matrix, and pays for it: a gradient and two Adam moments for each entry (<a href="02-gpu-memory.html">chapter 2</a>). Hu et al. (2021), in "LoRA: Low-Rank Adaptation of Large Language Models", made one assumption: <strong>the update &Delta;W has low rank</strong>, so it can be written as a product of two thin matrices.</p>
+
+<p style="text-align:center">W = W<sub>0</sub> + (&alpha;/r) &middot; B A,  where B is d<sub>out</sub> &times; r, A is r &times; d<sub>in</sub> and r is far smaller than d<sub>in</sub> and d<sub>out</sub>.</p>
+
+<p>A matrix has <span class="term">rank</span> r if it can be built from r independent directions; the idea is the one in <a href="../../ml-foundations/chapters/07-decompositions.html">A0 on SVD and low rank</a>. W<sub>0</sub> is frozen. Only A and B, the <span class="term">adapter</span>, are trained. For an input x the layer computes</p>
+
+<p style="text-align:center">h = W<sub>0</sub> x + (&alpha;/r) &middot; B (A x).</p>
+
+<p>The second term is cheap: A x squeezes the d<sub>in</sub>-dimensional input down to r numbers, B expands them back to d<sub>out</sub>, and the constant &alpha;/r scales the result. This is the same arithmetic as a bottleneck layer with a skip connection (<a href="../../deep-learning/chapters/03-training-dynamics.html">residuals in A2</a>), except that the bottleneck is linear and sits in parallel with an existing weight rather than inside a new block.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="A layer with two parallel paths. The input x goes through the frozen weight matrix W0 on the top path, and through A, then B, then a scale of alpha over r on the bottom path. The two outputs are added to give h.">
+    <defs><marker id="ahLT11a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="115" width="80" height="50" rx="8" class="fs-green s-green sw-2"/>
+    <text x="60" y="146" text-anchor="middle" class="t-sm t-bold">x</text>
+    <line x1="100" y1="130" x2="198" y2="72" class="line" marker-end="url(#ahLT11a)"/>
+    <line x1="100" y1="150" x2="198" y2="212" class="line" marker-end="url(#ahLT11a)"/>
+    <rect x="200" y="40" width="240" height="64" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="320" y="68" text-anchor="middle" class="t-sm t-bold">W&#8320; (d_out &#215; d_in)</text>
+    <text x="320" y="88" text-anchor="middle" class="t-xs">frozen: no gradient, no Adam state</text>
+    <rect x="200" y="186" width="100" height="56" rx="8" class="fs-blue s-blue sw-3"/>
+    <text x="250" y="210" text-anchor="middle" class="t-sm t-bold">A</text><text x="250" y="228" text-anchor="middle" class="t-xs">r &#215; d_in</text>
+    <line x1="300" y1="214" x2="338" y2="214" class="line" marker-end="url(#ahLT11a)"/>
+    <rect x="340" y="186" width="100" height="56" rx="8" class="fs-blue s-blue sw-3"/>
+    <text x="390" y="210" text-anchor="middle" class="t-sm t-bold">B</text><text x="390" y="228" text-anchor="middle" class="t-xs">d_out &#215; r</text>
+    <line x1="440" y1="214" x2="478" y2="214" class="line" marker-end="url(#ahLT11a)"/>
+    <rect x="480" y="194" width="80" height="40" rx="8" class="box"/>
+    <text x="520" y="219" text-anchor="middle" class="t-sm t-bold">&#215; &#945;/r</text>
+    <line x1="440" y1="72" x2="590" y2="72" class="line"/><line x1="590" y1="72" x2="610" y2="124" class="line" marker-end="url(#ahLT11a)"/>
+    <line x1="560" y1="214" x2="590" y2="214" class="line"/><line x1="590" y1="214" x2="610" y2="156" class="line" marker-end="url(#ahLT11a)"/>
+    <circle cx="620" cy="140" r="17" class="fs-yellow s-yellow sw-2"/>
+    <text x="620" y="147" text-anchor="middle" class="t-sm t-bold t-dark">+</text>
+    <line x1="637" y1="140" x2="672" y2="140" class="line" marker-end="url(#ahLT11a)"/>
+    <rect x="674" y="115" width="70" height="50" rx="8" class="fs-green s-green sw-2"/>
+    <text x="709" y="146" text-anchor="middle" class="t-sm t-bold">h</text>
+    <text x="250" y="262" text-anchor="middle" class="t-xs">trained, random start</text>
+    <text x="390" y="262" text-anchor="middle" class="t-xs">trained, starts at zero</text>
+  </svg>
+  <figcaption><strong>LoRA adds a thin parallel path around a frozen layer.</strong> Because B starts at zero, the adapter's output is zero at step 0 and the model begins exactly as the pretrained one. After training, B&middot;A can be multiplied out and added into W&#8320; so serving has no extra layers.</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: margin notes in a textbook</p>
+  <p>A textbook (the frozen weights) is expensive to reprint. Instead of editing every page, you write short margin notes that say "when you read this section, lean towards that". A small set of notes can change how the book is used on a topic while leaving the printed text untouched, and you can keep different sets of notes for different courses and swap them in seconds.</p>
+  <p><em>Where it breaks down:</em> real notes can say anything. LoRA's notes are restricted to a few directions per matrix, and a task that needs many independent changes will not fit. And the notes are not read separately: they are added into the numbers on every page, which is why they can be merged away afterwards.</p>
+</div>
+
+<h3>Counting what is saved</h3>
+
+<p>A matrix of shape d<sub>out</sub> &times; d<sub>in</sub> has d<sub>out</sub>&middot;d<sub>in</sub> numbers. The adapter has r&middot;(d<sub>in</sub> + d<sub>out</sub>): it saves parameters only while r is below d<sub>in</sub>&middot;d<sub>out</sub>/(d<sub>in</sub> + d<sub>out</sub>), which for a square matrix is d/2. Below, the published Llama 2 7B shape (hidden size 4,096, feed-forward size 11,008, 32 layers) and a range of ranks, applied either to the query and value projections only (the original paper's common choice) or to every linear layer.</p>
+
+<pre class="terminal" data-title="lora_params.py"><code># Parameter counts for LoRA on the published Llama 2 7B shape (hidden 4096, FFN 11008, 32 layers, 32 heads, vocab 32000).
+h, ffn, L, V = 4096, 11008, 32, 32000
+shapes = {"q_proj": (h, h), "k_proj": (h, h), "v_proj": (h, h), "o_proj": (h, h),
+          "gate_proj": (h, ffn), "up_proj": (h, ffn), "down_proj": (ffn, h)}
+per_layer = sum(i * o for i, o in shapes.values())
+total = L * per_layer + 2 * V * h                      # plus embedding and output matrices (norms ignored)
+print(f"one layer: {per_layer/1e6:.1f} M parameters;  whole model: {total/1e9:.3f} B")
+
+def lora(r, names):
+    return L * sum(r * (shapes[n][0] + shapes[n][1]) for n in names)
+
+q_v = ("q_proj", "v_proj")
+all_lin = tuple(shapes)
+print(f"\nfull fine-tuning trains {total/1e9:.2f} B parameters")
+print(f"{'rank':&gt;5} {'targets':&gt;9} {'trainable':&gt;11} {'% of model':&gt;11} {'bf16 file':&gt;10}")
+for names, tag in ((q_v, "q,v"), (all_lin, "all")):
+    for r in (4, 8, 16, 64, 256):
+        n = lora(r, names)
+        print(f"{r:5d} {tag:&gt;9} {n/1e6:9.1f} M {100*n/total:10.2f}% {2*n/1e6:7.0f} MB")
+
+# one matrix, in detail
+d_in, d_out, r = h, h, 16
+print(f"\nq_proj: full {d_in*d_out:,} weights; LoRA r={r}: A {r}x{d_in} + B {d_out}x{r} = {r*(d_in+d_out):,} "
+      f"({100*r*(d_in+d_out)/(d_in*d_out):.2f}%)")</code></pre>
+<pre class="terminal" data-title="output"><code>one layer: 202.4 M parameters;  whole model: 6.738 B
+
+full fine-tuning trains 6.74 B parameters
+ rank   targets   trainable  % of model  bf16 file
+    4       q,v       2.1 M       0.03%       4 MB
+    8       q,v       4.2 M       0.06%       8 MB
+   16       q,v       8.4 M       0.12%      17 MB
+   64       q,v      33.6 M       0.50%      67 MB
+  256       q,v     134.2 M       1.99%     268 MB
+    4       all      10.0 M       0.15%      20 MB
+    8       all      20.0 M       0.30%      40 MB
+   16       all      40.0 M       0.59%      80 MB
+   64       all     159.9 M       2.37%     320 MB
+  256       all     639.6 M       9.49%    1279 MB
+
+q_proj: full 16,777,216 weights; LoRA r=16: A 16x4096 + B 4096x16 = 131,072 (0.78%)</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="A large square labelled delta W equals a tall thin matrix B times a short wide matrix A. The square has d out by d in entries; B and A share a small inner dimension r.">
+    <rect x="40" y="40" width="160" height="160" class="fs-orange s-orange sw-2"/>
+    <text x="120" y="116" text-anchor="middle" class="t-sm t-bold">&#916;W</text>
+    <text x="120" y="136" text-anchor="middle" class="t-xs">d_out &#215; d_in</text>
+    <text x="120" y="220" text-anchor="middle" class="t-xs t-muted">16.8 M numbers (q_proj of Llama 2 7B)</text>
+    <text x="236" y="126" text-anchor="middle" class="t-sm t-bold">=</text>
+    <rect x="270" y="40" width="26" height="160" class="fs-blue s-blue sw-2"/>
+    <text x="283" y="120" text-anchor="middle" class="t-sm t-bold">B</text>
+    <text x="283" y="220" text-anchor="middle" class="t-xs t-muted">d_out &#215; r</text>
+    <text x="320" y="126" text-anchor="middle" class="t-sm t-bold">&#215;</text>
+    <rect x="345" y="40" width="160" height="26" class="fs-blue s-blue sw-2"/>
+    <text x="425" y="58" text-anchor="middle" class="t-sm t-bold">A</text>
+    <text x="425" y="86" text-anchor="middle" class="t-xs t-muted">r &#215; d_in</text>
+    <text x="590" y="70" class="t-sm t-bold">r = 16</text>
+    <text x="590" y="94" class="t-xs">A: 65,536 numbers</text>
+    <text x="590" y="112" class="t-xs">B: 65,536 numbers</text>
+    <text x="590" y="136" class="t-xs t-bold">131,072 in total: 0.78%</text>
+    <text x="590" y="160" class="t-xs">of the matrix it corrects</text>
+  </svg>
+  <figcaption><strong>The same update, stored as two thin factors.</strong> The product B&middot;A is a full-size d_out &times; d_in matrix, but it can only point in r independent directions.</figcaption>
+</figure>
+
+<p>At rank 16 on all linear layers, the adapter has 40.0 million parameters, 0.59% of the model, and an 80 MB file in bf16. Hu et al. report that, against fine-tuning GPT-3 175B with Adam, LoRA reduced the number of trainable parameters by 10,000 times and the GPU memory requirement by 3 times, with no additional inference latency (their abstract). Notice the table's last rows too: rank 256 on all layers is already 9.5% of the model, which is where "parameter-efficient" stops being a fair description.</p>
+
+<h2>Why a low-rank update can be enough</h2>
+
+<p>Two lines of evidence, one empirical and one structural.</p>
+
+<p><strong>Empirical: fine-tuning moves in few directions.</strong> Aghajanyan, Zettlemoyer and Gupta (2021, "Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning") asked how many degrees of freedom a fine-tuning task really needs. They trained only a small number of parameters, randomly projected back into the full weight space, and report that optimising just 200 such parameters let a RoBERTa model reach about 90% of its full-parameter performance on the MRPC paraphrase task. The <span class="term">intrinsic dimension</span> of a task, the smallest subspace in which it can be solved well, is far lower than the parameter count, and it tends to <em>decrease</em> as the pretrained model gets bigger. LoRA exploits the same fact with a different, structured subspace.</p>
+
+<p><strong>Structural: a pretrained model has already done the hard part.</strong> Pretraining built general-purpose features. A downstream task usually asks for a re-weighting of features that already exist, not for new ones, and re-weighting is a low-rank edit.</p>
+
+<h3>A controlled experiment</h3>
+
+<p>We can test the claim in a place where the answer is known. Take a 48 &times; 48 matrix and a target update &Delta;W of fixed size. In one case the update has only four independent directions (a rank-4 change); in the other it touches every direction (a full-rank change). Train a LoRA of each rank, starting from B = 0 and a small random A, with Adam, and measure how much of the update's energy (its squared Frobenius norm) is left unexplained.</p>
+
+<pre class="terminal" data-title="lora_lowrank.py"><code>import numpy as np
+rng = np.random.default_rng(0)
+d, n = 48, 4000
+X = rng.normal(size=(n, d))
+
+def target(kind):
+    if kind == "rank-4 change":                     # a fine-tuning update with 4 directions
+        U, V = rng.normal(size=(d, 4)), rng.normal(size=(d, 4))
+        D = U @ V.T
+    else:                                           # an update touching every direction
+        D = rng.normal(size=(d, d))
+    return D / np.linalg.norm(D)                    # same size (Frobenius norm 1) in both cases
+
+def fit_lora(D, r, steps=3000, lr=0.02):
+    """Learn delta W = B @ A (B starts at zero) so that X @ delta W^T matches X @ D^T."""
+    A = rng.normal(0, 1 / np.sqrt(d), (r, d)); B = np.zeros((d, r))
+    mA = vA = mB = vB = 0
+    Y = X @ D.T
+    for t in range(1, steps + 1):
+        E = (X @ (B @ A).T - Y) / n                 # residual
+        gB = 2 * E.T @ (X @ A.T); gA = 2 * B.T @ (E.T @ X)
+        for name, g in (("A", gA), ("B", gB)):      # Adam
+            if name == "A": mA = .9 * mA + .1 * g; vA = .999 * vA + .001 * g * g; A = A - lr * (mA / (1 - .9 ** t)) / (np.sqrt(vA / (1 - .999 ** t)) + 1e-8)
+            else:           mB = .9 * mB + .1 * g; vB = .999 * vB + .001 * g * g; B = B - lr * (mB / (1 - .9 ** t)) / (np.sqrt(vB / (1 - .999 ** t)) + 1e-8)
+    return B @ A
+
+for kind in ("rank-4 change", "full-rank change"):
+    D = target(kind)
+    s = np.linalg.svd(D, compute_uv=False)
+    top4 = (s[:4] ** 2).sum()                       # share of the update's energy in its top 4 directions
+    print(f"\n{kind}: top-4 singular directions hold {100 * top4:.0f}% of the update's energy")
+    print(f"{'rank r':&gt;7} {'LoRA params':&gt;12} {'unexplained energy':&gt;19}")
+    for r in (1, 2, 4, 8, 16, 48):
+        err = np.linalg.norm(fit_lora(D, r) - D) ** 2
+        print(f"{r:7d} {r * 2 * d:12d} {100 * err:18.1f}%")
+print(f"\nfull fine-tuning of this matrix would train {d * d} numbers")</code></pre>
+<pre class="terminal" data-title="output"><code>
+rank-4 change: top-4 singular directions hold 100% of the update's energy
+ rank r  LoRA params  unexplained energy
+      1           96               47.8%
+      2          192               27.6%
+      4          384                0.0%
+      8          768                0.0%
+     16         1536                0.0%
+     48         4608                0.0%
+
+full-rank change: top-4 singular directions hold 27% of the update's energy
+ rank r  LoRA params  unexplained energy
+      1           96               92.2%
+      2          192               85.1%
+      4          384               73.3%
+      8          768               53.2%
+     16         1536               25.9%
+     48         4608                0.0%
+
+full fine-tuning of this matrix would train 2304 numbers</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Unexplained energy against LoRA rank for two target updates. For the rank-4 update the error falls from 48 percent at rank 1 to 28 percent at rank 2 and exactly zero from rank 4. For the full-rank update the error falls slowly: 92, 85, 73, 53, 26 and 0 percent at ranks 1, 2, 4, 8, 16 and 48.">
+    <line x1="60" y1="230" x2="700" y2="230" class="line-thin"/><line x1="60" y1="30" x2="60" y2="230" class="line-thin"/>
+    <polyline points="90,134.4 200,174.8 310,230 420,230 530,230 640,230" fill="none" class="s-blue" stroke-width="3"/>
+    <polyline points="90,45.6 200,59.8 310,83.4 420,123.6 530,178.2 640,230" fill="none" class="s-orange" stroke-width="3"/>
+    <g class="f-blue"><circle cx="90" cy="134.4" r="5"/><circle cx="200" cy="174.8" r="5"/><circle cx="310" cy="230" r="5"/><circle cx="420" cy="230" r="5"/><circle cx="530" cy="230" r="5"/><circle cx="640" cy="230" r="5"/></g>
+    <g class="f-orange"><circle cx="90" cy="45.6" r="5"/><circle cx="200" cy="59.8" r="5"/><circle cx="310" cy="83.4" r="5"/><circle cx="420" cy="123.6" r="5"/><circle cx="530" cy="178.2" r="5"/><circle cx="640" cy="230" r="5"/></g>
+    <g class="t-xs t-muted" text-anchor="middle"><text x="90" y="248">1</text><text x="200" y="248">2</text><text x="310" y="248">4</text><text x="420" y="248">8</text><text x="530" y="248">16</text><text x="640" y="248">48</text><text x="380" y="272">LoRA rank r</text></g>
+    <g class="t-xs t-muted" text-anchor="end"><text x="54" y="234">0%</text><text x="54" y="134">50%</text><text x="54" y="38">100%</text></g>
+    <text x="20" y="22" class="t-xs t-muted">energy of the update left unexplained</text>
+    <text x="330" y="160" class="t-sm t-bold tc-blue">update with 4 directions: solved at r = 4</text>
+    <text x="440" y="86" class="t-sm t-bold tc-orange">update touching every direction</text>
+    <text x="640" y="214" text-anchor="middle" class="t-xs">r = 48 stores more</text>
+    <text x="640" y="200" text-anchor="middle" class="t-xs">numbers than the matrix</text>
+  </svg>
+  <figcaption><strong>Rank has to match the update.</strong> When the update has four directions, rank 4 recovers it exactly and larger ranks add nothing. When it has many, error falls slowly, and the rank that removes it costs more parameters than the matrix has. Whether real fine-tuning updates resemble the blue line or the orange one is an empirical question about the task.</figcaption>
+</figure>
+
+<p>Reading the output. The rank-4 update is recovered perfectly from rank 4 upwards, with 384 trainable numbers against 2,304 for the matrix. Below its true rank (r = 1, 2) LoRA captures only part of the change. The full-rank update only has 27% of its energy in its top four directions, and LoRA's unexplained fraction falls slowly: 73% at r = 4, 53% at r = 8, 26% at r = 16. The last row is the cautionary one: at r = 48 the adapter stores 4,608 numbers, twice as many as the 2,304 in the matrix, so it would be cheaper to fine-tune the matrix directly.</p>
+
+<p>The research on real models agrees with the shape of this picture. Biderman et al. (2024), in "LoRA Learns Less and Forgets Less", compared LoRA with full fine-tuning on code and mathematics and report that LoRA usually underperforms in standard low-rank settings, and suggest that full fine-tuning learns perturbations with ranks 10 to 100 times higher than typical LoRA configurations. Schulman and colleagues at Thinking Machines (September 2025, "LoRA Without Regret") report that for small-to-medium supervised datasets LoRA matches full fine-tuning, provided it is applied to all layers and is not capacity-limited, and that for datasets exceeding its capacity LoRA underperforms, with efficiency degrading as the ratio of model capacity to dataset size worsens.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"LoRA is a free lunch: the same quality for 1% of the cost." It matches full fine-tuning when the task fits in the adapter, which is common for style, format and moderate-size domain data, and often does not when the dataset is large or the new skill is far from what the model knows (new languages, long continued pretraining). The honest summary from the two studies above: LoRA learns less, forgets less, and can match full fine-tuning if you give it enough rank, put it on enough layers and size its learning rate for it. "Always cheaper to tune" is also false: its learning-rate sweet spot differs from full fine-tuning's (below), and a hyperparameter copied across will underperform without any error.</p>
+</div>
+
+<h2>How it trains</h2>
+
+<h3>Initialisation and the first step</h3>
+
+<p>A is initialised with small random values and B with zeros. Then B&middot;A = 0, so the adapted model equals the pretrained model at step 0, and the first loss is the base model's loss. Why not initialise both randomly? Then the model would start with a random perturbation, an unnecessary shock. Why not both zero? Then the gradients vanish entirely: look at the derivation.</p>
+
+<details class="deeper"><summary>Go deeper <span class="hint">the gradients of A and B</span></summary>
+<p>Let s = &alpha;/r and let g = &part;L/&part;h, the gradient of the loss with respect to this layer's output (a vector of length d<sub>out</sub>). With h = W<sub>0</sub>x + s B A x, the chain rule gives</p>
+<p style="text-align:center">&part;L/&part;B = s &middot; g (A x)<sup>T</sup> &nbsp;&nbsp;(d<sub>out</sub> &times; r),  &nbsp;&nbsp;&part;L/&part;A = s &middot; (B<sup>T</sup> g) x<sup>T</sup> &nbsp;&nbsp;(r &times; d<sub>in</sub>).</p>
+<p>At initialisation B = 0, so &part;L/&part;A = 0 exactly, while &part;L/&part;B = s&middot;g(Ax)<sup>T</sup> is non-zero because A is random. So the first updates move only B; once B is non-zero, A starts to receive gradient too. If both were zero, both gradients would be zero and nothing would ever train. Summed over a batch, each gradient is the sum of these outer products over all tokens.</p>
+<p>Adam (A0 on <a href="../../ml-foundations/chapters/10-optimisers.html">optimisers</a>) normalises each parameter's step by its recent gradient size, so B's entries each move by roughly the learning rate per step regardless of how small the raw gradient is. That is why the scale factor &alpha;/r affects the update to W = W<sub>0</sub> + sBA directly: it multiplies a step whose size the optimiser has already fixed.</p>
+</details>
+
+<p>Only A and B hold gradients and Adam moments, so the optimiser state shrinks by roughly the ratio of adapter size to model size. The frozen weights still have to sit in memory for the forward and backward passes, and the activations of the whole network are still needed to back-propagate through to the adapters. LoRA does not shrink either; the next sections show how much that matters.</p>
+
+<h3>Rank, alpha, which layers, and the learning rate</h3>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Knob</th><th>What it does</th><th>What the evidence says</th></tr></thead>
+  <tbody>
+    <tr><td>Rank r</td><td>Capacity of the adapter; parameters grow linearly in r</td><td>Match it to the amount of new information in the data. Too small and loss plateaus above what full fine-tuning reaches; beyond the task's needs it only adds cost.</td></tr>
+    <tr><td>Alpha &alpha;</td><td>Scales the update by &alpha;/r</td><td>Mostly redundant with the learning rate. Thinking Machines fixed &alpha; = 32 throughout and report that the 1/r factor makes the optimal learning rate roughly independent of rank. Kalajdzievski (2023) argues instead for &alpha;/&radic;r ("rsLoRA"), which stops higher ranks from learning too slowly. The two papers disagree on the best scale, so treat it as a setting to test.</td></tr>
+    <tr><td>Target layers</td><td>Which weight matrices get adapters</td><td>Thinking Machines report that attention-only LoRA significantly underperforms MLP-only LoRA even at matched parameter count, and that adding attention to the MLP gives no further benefit in their experiments. The original paper adapted attention only. Applying it to all linear layers is the safe default.</td></tr>
+    <tr><td>Learning rate</td><td>Step size for A and B</td><td>Much higher than for full fine-tuning. Thinking Machines found the optimal LoRA rate consistently about 10 times the full fine-tuning rate, in supervised and RL settings, without a theoretical explanation. TRL's SFT documentation suggests around 1e-4 for adapters versus a 2e-5 default for full fine-tuning.</td></tr>
+    <tr><td>Dropout</td><td>Randomly zeroes the adapter path's input during training</td><td>A mild regulariser (0 to 0.1 is common). Little systematic evidence on its value; do not expect it to fix overfitting caused by data.</td></tr>
+  </tbody>
+</table></div>
+
+<p>A direct look at the scaling question, in a toy where the answer is cleanly measurable. The same rank-2 update is learned by adapters of rank 2, 8, 32 and 64 with Adam at one fixed learning rate and &alpha; = 16, under three conventions for the scale s: &alpha;/r, &alpha;/&radic;r and a constant &alpha; that ignores rank.</p>
+
+<pre class="terminal" data-title="lora_scale.py"><code>import numpy as np
+d, n, ALPHA, LR = 64, 2000, 16.0, 0.01
+rng0 = np.random.default_rng(1)
+X = rng0.normal(size=(n, d))
+U, V = rng0.normal(size=(d, 2)), rng0.normal(size=(d, 2))
+D = U @ V.T; D /= np.linalg.norm(D)                  # target update: rank 2, Frobenius norm 1
+Y = X @ D.T
+
+def run(r, scale, steps):
+    rng = np.random.default_rng(5)
+    A = rng.normal(0, 1 / np.sqrt(d), (r, d)); B = np.zeros((d, r))
+    m = [np.zeros_like(A), np.zeros_like(B)]; v = [np.zeros_like(A), np.zeros_like(B)]
+    out = {}
+    for t in range(1, steps + 1):
+        E = (X @ (scale * B @ A).T - Y) / n
+        gB = 2 * scale * E.T @ (X @ A.T); gA = 2 * scale * B.T @ (E.T @ X)
+        for i, (P, g) in enumerate(((A, gA), (B, gB))):
+            m[i] = .9 * m[i] + .1 * g; v[i] = .999 * v[i] + .001 * g * g
+            P -= LR * (m[i] / (1 - .9 ** t)) / (np.sqrt(v[i] / (1 - .999 ** t)) + 1e-8)
+        if t in (25, 100, 400):
+            out[t] = np.linalg.norm(scale * B @ A - D) ** 2
+    return out
+
+print(f"unexplained energy of the update after 25 / 100 / 400 Adam steps (alpha = {ALPHA:g}, same learning rate)")
+for name, f in (("alpha / r      ", lambda r: ALPHA / r), ("alpha / sqrt(r) ", lambda r: ALPHA / np.sqrt(r)), ("alpha (no rank)  ", lambda r: ALPHA)):
+    print(name.strip())
+    for r in (2, 8, 32, 64):
+        o = run(r, f(r), 400)
+        print(f"   r = {r:2d}: " + "  ".join(f"{100 * o[t]:7.1f}%" for t in (25, 100, 400)))</code></pre>
+<pre class="terminal" data-title="output"><code>unexplained energy of the update after 25 / 100 / 400 Adam steps (alpha = 16, same learning rate)
+alpha / r
+   r =  2:    34.2%      0.0%      0.0%
+   r =  8:     2.0%      0.0%      0.0%
+   r = 32:     1.8%      0.0%      0.0%
+   r = 64:     1.7%      0.0%      0.0%
+alpha / sqrt(r)
+   r =  2:    58.5%      0.0%      0.0%
+   r =  8:     5.2%      0.0%      0.0%
+   r = 32:     3.9%      0.0%      0.0%
+   r = 64:     3.9%      0.0%      0.0%
+alpha (no rank)
+   r =  2:    69.1%      0.2%      0.0%
+   r =  8:    28.9%      0.0%      0.0%
+   r = 32:    84.7%      0.0%      0.4%
+   r = 64:   219.6%      0.1%      2.0%</code></pre>
+
+<p>After 25 steps, a constant scale gives wildly different behaviour across ranks (29% unexplained at r = 8, but 220% at r = 64: it overshoots, because the update's size grows with the number of columns of B), while &alpha;/r gives nearly the same result for r = 8, 32 and 64 (about 2%), and &alpha;/&radic;r is a little slower but also rank-stable here. After 100 steps everything has converged, so the differences are about how quickly and how safely training starts, which is what a learning-rate search is sensitive to. This is a small toy with an easy target, which cannot settle the &alpha;/r versus &alpha;/&radic;r debate; it only shows why some rank-dependent scaling is necessary.</p>
+
+<div class="widget" id="llm11-lora">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Adapter size and QLoRA memory</h4></div>
+  <p class="widget-help">Pick a model shape, a rank and the layers to adapt. The bar shows an estimate of GPU memory for one training step (sequence 1,024 tokens, batch 4, gradient checkpointing on). Try the 13B shape on a 24 GB card with bf16 and then NF4 bases, and the 70B shape on 48 GB.</p>
+  <div class="lora-ctl">
+    <div><label for="lora-model">Model shape</label>
+      <select id="lora-model" data-act="model">
+        <option value="b7" selected>Llama 2 7B shape</option>
+        <option value="b13">Llama 2 13B shape</option>
+        <option value="b70">Llama 2 70B shape (GQA)</option>
+      </select></div>
+    <div><label for="lora-rank">Rank r</label>
+      <select id="lora-rank" data-act="rank">
+        <option value="1">1</option><option value="4">4</option><option value="8">8</option>
+        <option value="16" selected>16</option><option value="32">32</option><option value="64">64</option>
+        <option value="128">128</option><option value="256">256</option>
+      </select></div>
+    <div><label for="lora-targets">Layers with adapters</label>
+      <select id="lora-targets" data-act="targets">
+        <option value="qv">Attention q and v only</option>
+        <option value="attn">All attention (q, k, v, o)</option>
+        <option value="all" selected>All linear layers</option>
+      </select></div>
+    <div><label for="lora-base">Frozen base stored as</label>
+      <select id="lora-base" data-act="base">
+        <option value="bf16">bf16 (LoRA)</option>
+        <option value="nf4" selected>NF4 + double quantisation (QLoRA)</option>
+      </select></div>
+    <div><label for="lora-cap">GPU memory</label>
+      <select id="lora-cap" data-act="cap">
+        <option value="16">16 GB</option><option value="24" selected>24 GB (RTX 4090 class)</option>
+        <option value="48">48 GB</option><option value="80">80 GB (A100 or H100)</option>
+      </select></div>
+  </div>
+  <svg class="lora-chart" viewBox="0 0 700 150" role="img" aria-label="Stacked bar of estimated GPU memory by category compared with the chosen GPU capacity."></svg>
+  <div class="table-wrap"><table class="lora-table"><thead><tr><th>Quantity</th><th>Value</th></tr></thead><tbody></tbody></table></div>
+  <p class="widget-out lora-summary" aria-live="polite"></p>
+</div>
+
+<h2>Merging and serving</h2>
+
+<p>Because the adapter is a linear correction, it can be folded into the base weights after training: W &larr; W<sub>0</sub> + s&middot;B&middot;A, one matrix addition per adapted layer. The merged model is an ordinary model with no extra layers and no extra latency, which was an explicit design goal of the paper. The alternative is to keep adapters separate: one base model in memory, many small adapter files (tens to hundreds of megabytes each in the table above), and the serving engine applying whichever adapter a request names. That is how a platform serves many fine-tuned variants cheaply; chapter 17 takes up generating adapters from a task description, and chapter 20 covers how engines batch requests that use different adapters.</p>
+
+<p>One caution: merging into a <em>quantised</em> base adds a high-precision update to low-precision weights, so the sum is rounded and a little of the adapter's effect is lost. The usual practice is to merge into a full-precision copy of the base and quantise afterwards if needed, then re-evaluate.</p>
+
+<h2>QLoRA: fine-tuning on top of a 4-bit model</h2>
+
+<p>LoRA removes the gradient and optimiser cost of the base model but still keeps its weights in 16 bits: 13.5 GB for the Llama 2 7B shape, 26 GB for 13B, 138 GB for 70B. Dettmers, Pagnoni, Holtzman and Zettlemoyer (2023), in "QLoRA: Efficient Finetuning of Quantized LLMs", store the frozen base in 4 bits, and report that this lets them fine-tune a 65B-parameter model on a single 48 GB GPU while preserving full 16-bit fine-tuning performance; their Guanaco model family reached 99.3% of ChatGPT's performance level on the Vicuna benchmark after 24 hours of fine-tuning on a single GPU (abstract). Three techniques make this work.</p>
+
+<dl class="terms">
+  <dt>4-bit NormalFloat (NF4)</dt><dd>A 4-bit number format whose 16 levels are chosen so that each is equally likely to be used by normally distributed weights. Pretrained weights are roughly bell-shaped, so a grid of evenly spaced levels wastes resolution in the sparse tails and under-resolves the dense middle; NF4 puts levels at quantiles of a normal distribution.</dd>
+  <dt>Double quantisation</dt><dd>Quantisation needs a scale factor per block of weights. At one 32-bit scale per 64 weights, scales alone cost 0.5 bit per weight. Double quantisation quantises the scales themselves to 8 bits, with a second-level 32-bit constant per 256 scales, cutting that overhead to about 0.127 bit.</dd>
+  <dt>Paged optimisers</dt><dd>Optimiser state that is moved between GPU and CPU memory on demand (using unified memory) so that a momentary memory spike, such as a long sequence in a batch, does not crash the run with an out-of-memory error.</dd>
+</dl>
+
+<p>The forward pass uses the 4-bit weights by <em>dequantising</em> each block back to bf16 just before the matrix multiplication, then discarding the temporary copy. The adapter path runs in 16-bit as in LoRA, and gradients flow through the dequantised weights to the activations and to A and B only. The quantised weights are never updated.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="One QLoRA layer. Forward: NF4 weights are dequantised to bf16, multiplied with the input, and the LoRA path output is added. Backward: gradients flow to the input and to A and B; the quantised weights get no update.">
+    <defs><marker id="ahLT11b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="40" width="150" height="64" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="95" y="66" text-anchor="middle" class="t-sm t-bold">NF4 weights</text><text x="95" y="86" text-anchor="middle" class="t-xs">4.1 bits each, frozen</text>
+    <line x1="170" y1="72" x2="208" y2="72" class="line" marker-end="url(#ahLT11b)"/>
+    <rect x="210" y="40" width="150" height="64" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="285" y="66" text-anchor="middle" class="t-sm t-bold">Dequantise</text><text x="285" y="86" text-anchor="middle" class="t-xs">to bf16, one layer</text>
+    <line x1="360" y1="72" x2="398" y2="72" class="line" marker-end="url(#ahLT11b)"/>
+    <rect x="400" y="40" width="150" height="64" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="475" y="66" text-anchor="middle" class="t-sm t-bold">Matmul with x</text><text x="475" y="86" text-anchor="middle" class="t-xs">temporary copy freed</text>
+    <line x1="550" y1="72" x2="588" y2="72" class="line" marker-end="url(#ahLT11b)"/>
+    <rect x="590" y="40" width="150" height="64" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="665" y="66" text-anchor="middle" class="t-sm t-bold t-dark">+ LoRA path</text><text x="665" y="86" text-anchor="middle" class="t-xs t-dark">B (A x), bf16 / fp32</text>
+    <text x="20" y="140" class="t-sm t-bold">Backward pass through the same layer</text>
+    <rect x="20" y="152" width="340" height="50" rx="8" class="box"/>
+    <text x="190" y="173" text-anchor="middle" class="t-xs">gradient reaches the layer input (to earlier layers)</text>
+    <text x="190" y="191" text-anchor="middle" class="t-xs">via the dequantised weights</text>
+    <rect x="400" y="152" width="340" height="50" rx="8" class="fs-red s-red sw-2"/>
+    <text x="570" y="173" text-anchor="middle" class="t-xs t-bold">gradients stored only for A and B</text>
+    <text x="570" y="191" text-anchor="middle" class="t-xs">plus their Adam moments (paged if needed)</text>
+    <rect x="20" y="224" width="720" height="50" rx="8" class="box"/>
+    <text x="380" y="246" text-anchor="middle" class="t-xs">No gradient, no optimiser state and no update for the 4-bit weights.</text>
+    <text x="380" y="264" text-anchor="middle" class="t-xs">The price: dequantising costs a little extra compute per layer, and the base keeps its rounding error.</text>
+  </svg>
+  <figcaption><strong>The base is stored in 4 bits, used in 16.</strong> The adapter learns to compensate for the quantisation error as well as to add the new skill, which is part of why QLoRA can match 16-bit LoRA.</figcaption>
+</figure>
+
+<h3>Building NF4 and measuring it</h3>
+
+<p>The levels are not magic constants: they come from a short recipe in the paper. Take quantiles of the standard normal distribution (seven negative, zero, eight positive, built asymmetrically so that zero is exactly representable), scale them into [&minus;1, 1], and divide each block of weights by its largest absolute value before rounding to the nearest level. The script builds the table, compares NF4 with evenly spaced 4-bit levels on synthetic bell-shaped weights (plus a few large outliers, which inflate the per-block scale for both), and does the storage arithmetic.</p>
+
+<pre class="terminal" data-title="nf4.py"><code>import numpy as np
+from statistics import NormalDist
+rng = np.random.default_rng(0)
+
+# NF4 levels (Dettmers et al., 2023): quantiles of a standard normal, 7 negative + zero + 8 positive, scaled to [-1, 1].
+nd, off = NormalDist(), 0.9677
+pos = [nd.inv_cdf(p) for p in np.linspace(off, 0.5, 9)[:-1]]
+neg = [-nd.inv_cdf(p) for p in np.linspace(off, 0.5, 8)[:-1]]
+levels = np.array(sorted(pos + [0.0] + neg)); levels /= np.abs(levels).max()
+print("NF4 levels:", np.round(levels, 4))
+int4 = np.arange(-8, 8) / 8                          # 16 evenly spaced levels (symmetric int4, absmax-scaled)
+
+def quantise(w, grid, block=64):
+    w = w.reshape(-1, block)
+    scale = np.abs(w).max(axis=1, keepdims=True)     # one absmax constant per block of 64 weights
+    q = grid[np.abs(w / scale - grid[:, None, None]).argmin(axis=0)]
+    return (q * scale).ravel()
+
+w = rng.normal(0, 0.02, 2_000_000)                   # weights are roughly normal around zero
+w[::5000] *= 8                                       # plus a few outliers
+for name, grid in (("uniform int4", int4), ("NF4", levels)):
+    err = quantise(w, grid) - w
+    print(f"{name:13} RMS error = {np.sqrt(np.mean(err**2)) / w.std():.4f} of the weights' std")
+
+# storage per weight, in bits
+plain = 4 + 32 / 64                                  # 4-bit code + one fp32 scale per 64 weights
+double = 4 + 8 / 64 + 32 / (64 * 256)                # scales themselves stored in 8 bits, with an fp32 constant per 256 scales
+print(f"bits per weight: plain {plain:.3f}, double quantisation {double:.3f}  (saves {plain - double:.3f})")
+print(f"7B weights: bf16 {7e9 * 2 / 1e9:.1f} GB, NF4 + double quantisation {7e9 * double / 8 / 1e9:.2f} GB")</code></pre>
+<pre class="terminal" data-title="output"><code>NF4 levels: [-1.     -0.6962 -0.5251 -0.3949 -0.2845 -0.1848 -0.0911  0.      0.0796
+  0.1609  0.2461  0.3379  0.4407  0.5626  0.723   1.    ]
+uniform int4  RMS error = 0.1038 of the weights' std
+NF4           RMS error = 0.0937 of the weights' std
+bits per weight: plain 4.500, double quantisation 4.127  (saves 0.373)
+7B weights: bf16 14.0 GB, NF4 + double quantisation 3.61 GB</code></pre>
+
+<p>The sixteen levels are crowded near zero and sparse towards &plusmn;1, as intended. On this synthetic data NF4's RMS error is 0.094 of the weights' standard deviation against 0.104 for the uniform grid, about 10% lower: a real but modest gain, and a reminder that the dominant error source is simply having 16 levels. Double quantisation brings storage from 4.500 to 4.127 bits per weight, so a 7B model's linear weights occupy about 3.6 GB instead of 14 GB (this script rounds all 7 billion to the 4.127 rate, including parameters that bitsandbytes keeps in 16-bit, so the next script is more careful).</p>
+
+<h3>What fits on 24 GB</h3>
+
+<p>Putting the pieces together, using chapter 2's accounting. Assumptions, all stated: linear layers in NF4 with double quantisation (4.127 bits), embedding and output matrices kept in bf16, adapters of rank 16 on all linear layers held in fp32 with fp32 gradients and Adam moments (16 bytes per adapter parameter), sequence length 1,024 and batch 4 with gradient checkpointing (2 bytes &times; s &times; b &times; h at each layer boundary, plus about 34&middot;s&middot;b&middot;h bytes for the one layer being recomputed, plus fp32 logits), and 1.5 GB of overhead. These are estimates, not measurements; real frameworks differ in detail.</p>
+
+<pre class="terminal" data-title="qlora_budget.py"><code># What fits on a 24 GB GPU?  QLoRA memory estimate for Llama 2 shapes (assumptions in the comments).
+MODELS = {  # hidden, ffn, layers, kv_dim, vocab  (published Llama 2 configurations)
+    "7B":  (4096, 11008, 32, 4096, 32000),
+    "13B": (5120, 13824, 40, 5120, 32000),
+    "70B": (8192, 28672, 80, 1024, 32000),     # grouped-query attention: 8 key/value heads of 128
+}
+R, SEQ, BATCH, OVERHEAD = 16, 1024, 4, 1.5      # LoRA rank, tokens per sequence, sequences per step, GB assumed
+NF4_BITS = 4 + 8 / 64 + 32 / (64 * 256)         # NF4 with double quantisation
+
+print(f"{'model':&gt;5} {'linear params':&gt;13} {'base NF4':&gt;9} {'embed bf16':&gt;10} {'LoRA params':&gt;11} {'LoRA state':&gt;10} "
+      f"{'activations':&gt;11} {'total':&gt;7}  fits 24 GB?")
+for name, (h, ffn, L, kv, V) in MODELS.items():
+    shapes = [(h, h), (h, kv), (h, kv), (h, h), (h, ffn), (h, ffn), (ffn, h)]
+    linear = L * sum(i * o for i, o in shapes)
+    lora = L * sum(R * (i + o) for i, o in shapes)
+    base = linear * NF4_BITS / 8 / 1e9
+    embed = 2 * V * h * 2 / 1e9                                  # embedding + output matrix kept in bf16
+    state = lora * (4 + 4 + 8) / 1e9                             # fp32 adapter weights, gradients, Adam moments
+    # activations with gradient checkpointing: bf16 boundary per layer + one layer's ~34*s*b*h bytes + fp32 logits
+    act = (L * 2 * SEQ * BATCH * h + 34 * SEQ * BATCH * h + 4 * SEQ * BATCH * V) / 1e9
+    total = base + embed + state + act + OVERHEAD
+    print(f"{name:&gt;5} {linear/1e9:11.2f} B {base:7.2f} GB {embed:7.2f} GB {lora/1e6:8.1f} M {state:7.2f} GB "
+          f"{act:8.2f} GB {total:5.1f} GB  {'yes' if total &lt;= 24 else 'no'}")
+print(f"\nfor comparison, full fine-tuning of 7B at 16 bytes/param: {16*6.74:.0f} GB of model states alone")</code></pre>
+<pre class="terminal" data-title="output"><code>model linear params  base NF4 embed bf16 LoRA params LoRA state activations   total  fits 24 GB?
+   7B        6.48 B    3.34 GB    0.52 GB     40.0 M    0.64 GB     2.17 GB   8.2 GB  yes
+  13B       12.69 B    6.55 GB    0.66 GB     62.6 M    1.00 GB     2.92 GB  12.6 GB  yes
+  70B       68.45 B   35.31 GB    1.05 GB    207.1 M    3.31 GB     7.03 GB  48.2 GB  no
+
+for comparison, full fine-tuning of 7B at 16 bytes/param: 108 GB of model states alone</code></pre>
+
+<p>The 7B model needs about 8 GB and the 13B about 13 GB, so both fit on a 24 GB card with room to raise the batch size or sequence length. The 70B shape needs about 48 GB, which is consistent with the QLoRA paper's claim of a 65B model on one 48 GB card, though it is above 48 GB at these settings and a smaller batch or shorter sequence would be needed. Compare full fine-tuning of the 7B model, which needs 108 GB for model states alone. The base-model weights dominate every row; the adapters' own state is small (0.64 GB for the 7B), which is the point. As sequence length and batch grow, the activations term takes over, which is why gradient checkpointing (chapter 2) is almost always switched on for these runs.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Use the calculator above and the scripts to answer three questions, then check your reasoning against the numbers.</p>
+  <ol>
+    <li>In <code>lora_lowrank.py</code> change the rank-4 target to rank 8 (the <code>4</code> in <code>rng.normal(size=(d, 4))</code>). At which LoRA rank does the error reach zero? Does it match the number of directions you built in?</li>
+    <li>In the widget, hold the 7B shape and rank 16, and switch the base from NF4 to bf16. How much memory did QLoRA save, and which bar shrank? Now raise the rank to 256: how much does that cost?</li>
+    <li>In <code>qlora_budget.py</code>, set <code>SEQ = 4096</code>. Which model stops fitting 24 GB first, and which term in the total grew?</li>
+  </ol>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 lora_lowrank.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 qlora_budget.py</span></code></pre>
+</div>
+
+<h3>The recipe in code</h3>
+
+<p>With the Hugging Face stack, QLoRA is a quantisation config, an adapter config and a trainer. This listing is the standard shape of the code (TRL <code>SFTTrainer</code>, PEFT, bitsandbytes); it was not run here because the libraries and a GPU are not available in this environment, so no output is shown. Running it prints the usual training logs: a loss that falls over the first few hundred steps, and a saved adapter directory of tens of megabytes rather than a multi-gigabyte model.</p>
+
+<pre class="terminal" data-title="qlora_sft.py (TRL + PEFT + bitsandbytes, not run here)"><code>import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import BitsAndBytesConfig
+from trl import SFTConfig, SFTTrainer
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",            # the NormalFloat grid
+    bnb_4bit_use_double_quant=True,       # quantise the scales too
+    bnb_4bit_compute_dtype=torch.bfloat16 # dequantise to bf16 for the matmul
+)
+lora = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules="all-linear",          # adapters on every linear layer
+    task_type="CAUSAL_LM",
+)
+trainer = SFTTrainer(
+    model="your-org/your-base-model",
+    train_dataset=load_dataset("trl-lib/Capybara", split="train"),
+    quantization_config=bnb,
+    peft_config=lora,
+    args=SFTConfig(
+        output_dir="qlora-out",
+        learning_rate=1e-4,               # about 10x the full fine-tuning rate
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
+        gradient_checkpointing=True,
+        bf16=True,
+        model_init_kwargs={"dtype": torch.bfloat16},
+    ),
+)
+trainer.train()
+trainer.save_model("qlora-out")           # saves the adapter, not the base model</code></pre>
+
+<h2>Other parameter-efficient methods</h2>
+
+<p><span class="term">Parameter-efficient fine-tuning</span> (PEFT) is the umbrella term for methods that train a small number of new or selected parameters. LoRA dominates practice, but you will see others.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Method</th><th>What it trains</th><th>Trade-off</th></tr></thead>
+  <tbody>
+    <tr><td>Bottleneck adapters (Houlsby et al., 2019)</td><td>Small down-project/up-project modules inserted inside each block</td><td>Cannot be merged away, so they add inference latency; the thing LoRA's parallel form avoids.</td></tr>
+    <tr><td>Prompt tuning and prefix tuning (Lester et al., 2021; Li and Liang, 2021)</td><td>Learned vectors prepended to the input or to each layer's keys and values</td><td>Tiny and cheap, but they use up context length and are generally less expressive than LoRA at the same size, especially for smaller models.</td></tr>
+    <tr><td>(IA)<sup>3</sup> (Liu et al., 2022)</td><td>Learned per-channel scaling vectors on keys, values and MLP activations</td><td>Even fewer parameters than LoRA; less capacity.</td></tr>
+    <tr><td>DoRA (Liu et al., 2024)</td><td>Splits each weight into magnitude and direction and applies LoRA to the direction</td><td>Aims to close the remaining gap to full fine-tuning at no inference cost; adds some training overhead. Gains vary by task, so verify on yours.</td></tr>
+  </tbody>
+</table></div>
+
+<p>For a first project the choice is easy: LoRA or QLoRA on all linear layers, rank 16 to 64, a learning rate near 1e-4 to 2e-4, and a held-out comparison with the base model and with prompting. Reach for anything else only after you can name the specific limit LoRA hit.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>An adapter is a small, versioned artefact that changes behaviour without redeploying the base: that is the shape of a configuration change, and it deserves the controls of <a href="../../reliability/chapters/13-config-iac.html">configuration management</a>: review, staged rollout, rollback. A platform serving one adapter per customer from one shared base is a pool-model multi-tenant system, with the isolation questions of <a href="../../security/chapters/15-multi-tenancy.html">multi-tenancy</a> (which adapter does this request get, and can one tenant's adapter influence another's output?). And the memory arithmetic here, bytes per parameter, activations versus weights, is the same napkin maths as <a href="../../systems/chapters/22-performance-engineering.html">performance engineering</a>.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p><strong>Findings.</strong> "LoRA Without Regret" (Thinking Machines, September 2025) is the most careful recent comparison I could verify: LoRA on all layers matches full fine-tuning on small-to-medium supervised data, falls behind when capacity is exceeded, wants about 10 times the full fine-tuning learning rate, and matches full fine-tuning for policy-gradient reinforcement learning even at rank 1 on the math-reasoning runs they report (their information-theoretic argument is that RL learns few bits per episode; generalisation beyond those tasks is not established). <strong>Tools.</strong> TRL's <code>SFTTrainer</code> takes <code>peft_config</code> and <code>quantization_config</code> directly (documentation fetched October 2026); the PEFT and bitsandbytes libraries supply the adapter and the 4-bit kernels. Version numbers, supported GPUs and defaults change often: check the current PEFT and bitsandbytes documentation before copying arguments. Rankings of variants such as DoRA against plain LoRA vary between papers and tasks.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>LoRA freezes W<sub>0</sub> and learns W = W<sub>0</sub> + (&alpha;/r)BA with r much smaller than the matrix sides. Parameters per matrix: r(d<sub>in</sub> + d<sub>out</sub>) against d<sub>in</sub>&middot;d<sub>out</sub>; for Llama 2 7B at r = 16 on all linear layers, 40 million (0.59%).</li>
+    <li>It works because fine-tuning updates occupy few directions (intrinsic dimension) and because B starts at zero. It fails quietly when the update needs more rank than you gave it; error fell slowly with rank for a full-rank update in the experiment.</li>
+    <li>Use all linear layers, size the learning rate for LoRA (about 10 times the full fine-tuning rate, per Thinking Machines), and treat &alpha; and rank as tunable rather than universal.</li>
+    <li>LoRA removes gradient and optimiser cost for the base but not its weights or the activations. QLoRA stores the base in NF4 with double quantisation (about 4.1 bits per weight) and dequantises on the fly: a 7B model trains in roughly 8 GB and a 13B in roughly 13 GB under the stated assumptions.</li>
+    <li>Adapters can be merged for zero-latency serving or kept separate to share one base across many variants. Merge in full precision, not into a quantised base.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models" (2021)</a>. The original method, with the parameter and memory reductions measured on GPT-3 175B.</li>
+  <li><a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">Dettmers, Pagnoni, Holtzman, Zettlemoyer, "QLoRA: Efficient Finetuning of Quantized LLMs" (2023)</a>. NF4, double quantisation, paged optimisers and the Guanaco models.</li>
+  <li><a href="https://arxiv.org/abs/2012.13255" target="_blank" rel="noopener">Aghajanyan, Zettlemoyer, Gupta, "Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning" (2021)</a>. Why so few parameters suffice.</li>
+  <li><a href="https://thinkingmachines.ai/blog/lora/" target="_blank" rel="noopener">Schulman et al., "LoRA Without Regret" (Thinking Machines, 2025)</a>. Careful comparison with full fine-tuning: capacity limits, layers, learning rate and RL.</li>
+  <li><a href="https://arxiv.org/abs/2405.09673" target="_blank" rel="noopener">Biderman et al., "LoRA Learns Less and Forgets Less" (2024)</a>. The cost and the benefit, measured on code and mathematics.</li>
+  <li><a href="https://arxiv.org/abs/2312.03732" target="_blank" rel="noopener">Kalajdzievski, "A Rank Stabilization Scaling Factor for Fine-Tuning with LoRA" (2023)</a>. The case for &alpha;/&radic;r scaling.</li>
+  <li><a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noopener">Liu et al., "DoRA: Weight-Decomposed Low-Rank Adaptation" (2024)</a>. Magnitude and direction, with LoRA on the direction.</li>
+  <li><a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">Hugging Face, PEFT documentation</a>. The reference library for LoRA configurations, merging and multi-adapter use.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">A weight matrix is 4,096 &times; 11,008. A LoRA adapter of rank 32 is added. How many trainable parameters does the adapter have?</p>
+    <ol class="q-options">
+      <li>About 45 million, the same as the matrix</li>
+      <li>About 32 thousand</li>
+      <li>About 0.48 million</li>
+      <li>About 1.4 million</li>
+    </ol>
+    <div class="q-explain">r(d<sub>in</sub> + d<sub>out</sub>) = 32 &times; (4,096 + 11,008) = 32 &times; 15,104 = 483,328, about 0.48 million, around 1% of the 45.1 million in the matrix. Option 1 is the full matrix; option 2 is r times 1,000; option 4 would be a rank near 93.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">Why is B initialised to zero and A to small random values, rather than both to zero?</p>
+    <ol class="q-options">
+      <li>With B = 0 the adapter starts as a no-op, and B still gets a non-zero gradient from the random A; with both zero, neither would receive any gradient</li>
+      <li>Zero B makes the adapter faster to compute</li>
+      <li>Random A makes the final update exactly rank r</li>
+      <li>Random initialisation of A prevents overfitting</li>
+    </ol>
+    <div class="q-explain">&part;L/&part;B = s&middot;g(Ax)<sup>T</sup> needs A to be non-zero; &part;L/&part;A = s&middot;(B<sup>T</sup>g)x<sup>T</sup> is zero while B is zero, but B moves first and then A follows. Both-zero training would never start. Speed, rank and regularisation are unrelated to the initialisation.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">You fine-tune with LoRA at rank 8 on a very large domain dataset and the loss plateaus well above what full fine-tuning reached on a pilot. What is the most plausible explanation and fix?</p>
+    <ol class="q-options">
+      <li>The learning rate is too high; lower it by a factor of 10</li>
+      <li>LoRA cannot be used with large datasets at all</li>
+      <li>The base model is quantised; switch to bf16</li>
+      <li>The adapter is capacity-limited: raise the rank and apply it to all linear layers, then re-tune the learning rate</li>
+    </ol>
+    <div class="q-explain">Thinking Machines report LoRA underperforms full fine-tuning when the dataset exceeds its capacity, with loss that stops improving at a level tied to the rank; attention-only adapters make it worse. The toy rank experiment shows the same signature. A lower learning rate would not lift a capacity plateau, and the quantisation of the base is not the main limit. LoRA is not forbidden for large data, but it needs enough rank.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">Which statement about what QLoRA saves relative to ordinary bf16 LoRA is correct?</p>
+    <ol class="q-options">
+      <li>It removes the need to store activations</li>
+      <li>It cuts the memory held by the frozen base weights by roughly a factor of 3.5 to 4, because they are stored in about 4.1 bits instead of 16</li>
+      <li>It removes the adapter's optimiser state</li>
+      <li>It makes every forward pass faster</li>
+    </ol>
+    <div class="q-explain">The base weights go from 2 bytes to about 0.52 bytes per parameter. Activations are unchanged (gradient checkpointing handles those), the adapters still carry Adam state, and dequantising before each matrix multiply adds a little compute, so steps are not faster.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">A colleague copies a full fine-tuning recipe (learning rate 2e-5) to a LoRA run and reports that "LoRA doesn't learn much". What do you suggest first?</p>
+    <ol class="q-options">
+      <li>Double the number of epochs</li>
+      <li>Remove the adapter dropout</li>
+      <li>Raise the learning rate towards about 10 times the full fine-tuning value (around 1e-4 to 2e-4) and compare</li>
+      <li>Switch to a prefix-tuning method</li>
+    </ol>
+    <div class="q-explain">The adapter's parameters start at zero or random and need larger steps; Thinking Machines found the optimal LoRA rate about 10 times the full fine-tuning rate. Extra epochs at a too-low rate mostly cost time, dropout is a minor effect, and switching methods before fixing the basic hyperparameter changes too many things at once.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">You want to ship a model with a QLoRA adapter merged in, for lowest-latency serving. What is the careful procedure?</p>
+    <ol class="q-options">
+      <li>Merge the adapter into a bf16 copy of the base, then quantise the merged model if needed and re-evaluate</li>
+      <li>Add the adapter's B&middot;A directly to the 4-bit weights, which is exact</li>
+      <li>Never merge; adapters cannot be merged</li>
+      <li>Merge into the NF4 weights and skip evaluation because the adapter was trained against them</li>
+    </ol>
+    <div class="q-explain">Adding a high-precision update to 4-bit weights rounds the result, so some of the adapter's effect is lost; merging in higher precision first and quantising once keeps the error to a single rounding step. Adapters can be merged (that is a design goal), but whichever route you take you re-run your evaluation, since the shipped weights differ from the ones you trained against.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/llm11-lora.js"></script>
+</body>
+</html>

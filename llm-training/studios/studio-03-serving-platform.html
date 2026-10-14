@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design an LLM Serving Platform &middot; Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-studio="S3">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Design an LLM Serving Platform</h1>
+  <p class="lede">Design one platform that serves many models and many tenants with token-streaming latency targets and a GPU bill that finance can live with. The core problems are sizing from memory traffic, routing for cache hits, scaling GPUs that take minutes to start, and keeping tenants out of each other's way.</p>
+</header>
+<div class="callout why">
+  <p class="callout-title">How a design studio works</p>
+  <p>This page is a mock design session of 60 to 90 minutes, not a chapter. At each stage there is a <strong>Your turn</strong> question. Write your answer in the notes box first (it saves in this browser), <em>then</em> open the worked answer and compare. The worked answer is one strong design with its reasoning, not the only right one. The stages follow the usual order for an AI system: clarify the problem and users, decide how success is measured, estimate tokens, cost and latency, design the data and the architecture, choose the model strategy, go deep on the risky parts, plan for failure, roll out, state the trade-offs and say it aloud. A rubric at the end separates mid-level from senior signals. All numbers in the worked answers are either computed by a script shown on the page or labelled as assumptions; GPU figures come from NVIDIA's datasheets as used in <a href="../chapters/18-kv-cache.html">chapter 18</a> and <a href="../chapters/22-token-economics.html">chapter 22</a>. For the general method see <a href="../../design/chapters/01-framework.html">the design framework</a> and <a href="../../design/chapters/20-ml-systems.html">Designing with ML &amp; LLMs</a>.</p>
+</div>
+
+<div class="studio-brief">
+  <p class="brief-title">&#128208; The brief</p>
+  <p>A platform lead says: <em>"We run an internal LLM service for 40 product teams and about 200 external customers with their own fine-tuned adapters. Today every team rents its own GPUs and most sit idle half the day. Build one serving platform. Interactive traffic needs a first token in under a second at p95 and fast streaming after that; there is a premium larger model for a few use cases, a stream of overnight batch jobs, and a monthly GPU bill that finance wants cut by a third without anyone noticing."</em></p>
+  <ul>
+    <li>Traffic is lumpy: a diurnal curve plus occasional customer jobs that triple the load in minutes.</li>
+    <li>Tenants must not see each other's data, prompts, adapters or latency spikes.</li>
+    <li>GPUs are expensive and take minutes to start; they are not elastic like CPUs.</li>
+    <li>Builds on <a href="../chapters/18-kv-cache.html">the KV cache</a>, <a href="../chapters/20-serving-engines.html">serving engines</a>, <a href="../chapters/22-token-economics.html">the economics of a token</a>, <a href="../chapters/17-adapters-on-demand.html">adapters on demand</a>, <a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>, <a href="../../reliability/chapters/11-overload.html">overload</a> and <a href="../../security/chapters/15-multi-tenancy.html">multi-tenancy</a>. Practice: <a href="../labs/lab-06-serving-sim.html">Lab 6: a serving simulator</a>; case: <a href="../cases/case-04-vllm.html">vLLM and PagedAttention</a>.</li>
+    <li>Time box: 60 to 90 minutes.</li>
+  </ul>
+</div>
+
+<h2>Your notes</h2>
+<p>Keep your assumptions, numbers and sketches here. They save in this browser only.</p>
+<textarea class="studio-notes" aria-label="Your design notes for this studio" placeholder="Workloads and SLOs&#10;Per-GPU capacity and fleet&#10;Pools, routing and caches&#10;Autoscaling and fairness&#10;Failures and rollout"></textarea>
+<section class="stage">
+<h2><span class="h-num">1</span>Clarify the problem</h2>
+<p class="stage-q">Ask eight questions about workloads and tenants, with the answers you assume. Mark which answers set the GPU count.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<div class="table-wrap"><table><thead><tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr></thead><tbody><tr><td>Which models?</td><td>An 8B chat model with about 200 rank-16 LoRA adapters (one per external customer), and one 70B-class model for premium uses; open weights, so we run them</td><td>Different memory profiles: 8B fits one GPU, 70B needs two in fp8; adapters share a base</td></tr><tr><td>Request shape?</td><td>Interactive: 1,500 input tokens (of which about 60 percent is a shared system prompt and few-shot block), 300 output. Premium: 3,000 in, 500 out. Batch: 4,000 in, 1,000 out</td><td>Input and output lengths set prefill and decode cost; the shared prefix sets what caching can save</td></tr><tr><td>Peak and average?</td><td>Interactive 8B peak 150 requests/s, premium 12/s, batch 30/s; average is 55 percent of peak; a customer job can triple 8B load for 15 minutes</td><td>Peak sizes the fleet; shape sizes the bill; the spike decides autoscaling design</td></tr><tr><td>Latency targets?</td><td>p95 time to first token under 1 s, p95 inter-token latency under 50 ms for interactive; batch needs completion within 12 hours</td><td>Interactive and batch can share hardware only if batch yields</td></tr><tr><td>Availability?</td><td>99.9 percent monthly for interactive; premium and batch can be 99.5 percent</td><td>Sets redundancy: the cost of an N+1 spare per pool</td></tr><tr><td>Tenancy?</td><td>40 internal teams with shared trust; 200 external customers with contractual data isolation, no training on their data, 30-day log retention</td><td>Decides cache sharing, log handling and whether adapters need hard isolation</td></tr><tr><td>Where do GPUs come from?</td><td>Rented H100-class instances at about $3 per GPU-hour on-demand (assumption); boot plus model load about 4 minutes</td><td>Cold start decides how far ahead you must scale</td></tr><tr><td>What is out of scope?</td><td>Training, retrieval, the application layers above, multi-region failover (mentioned in stage 10)</td><td>Keeps the platform a model-serving service</td></tr></tbody></table></div><p>The interactive 8B pool is the bulk of the load and the bill. The 70B pool is small but has the largest cost per request. The spike behaviour is the question most likely to trip the design.</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">2</span>SLOs and metrics</h2>
+<p class="stage-q">Define the service-level indicators for a token-streaming service. Why is 'requests per second' the wrong main metric?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>A streaming response has no single latency, so split it (<a href="../chapters/18-kv-cache.html">chapter 18</a>; <a href="../../reliability/chapters/02-slos-error-budgets.html">SLIs, SLOs and error budgets</a>).</p><div class="table-wrap"><table><thead><tr><th>Indicator</th><th>Definition</th><th>Target</th><th>What drives it</th></tr></thead><tbody><tr><td>TTFT (time to first token)</td><td>Request arrival to first streamed token, including queueing</td><td>p95 &lt; 1 s</td><td>Queue wait plus prefill of uncached input tokens</td></tr><tr><td>ITL (inter-token latency)</td><td>Gap between streamed tokens, as seen by the client</td><td>p95 &lt; 50 ms</td><td>Decode step time, which grows with batch size and total cache bytes</td></tr><tr><td>Goodput</td><td>Requests per second that meet <em>both</em> targets</td><td>At least 99 percent of admitted requests</td><td>Raw throughput is useless if half the requests miss the target</td></tr><tr><td>Availability</td><td>Share of requests that finish with a valid response (including deliberate 429s counted separately)</td><td>99.9 percent monthly</td><td>Replica failures, OOMs, deploys</td></tr><tr><td>Utilisation</td><td>Fraction of paid GPU time doing useful work</td><td>Track, no target</td><td>Autoscaling, batching and routing together</td></tr><tr><td>Cost per million tokens</td><td>GPU dollars divided by tokens served, by pool and tenant</td><td>Track by pool</td><td>Utilisation and batch efficiency (<a href="../chapters/22-token-economics.html">chapter 22</a>)</td></tr></tbody></table></div><ul>
+<li><strong>Measure what the client sees.</strong> Server-side timers that start after the queue hide the very delay you must control. Measure TTFT at the gateway; break it into queue, prefill and network (<a href="../../reliability/chapters/06-tracing.html">tracing</a>).</li>
+<li><strong>Use percentiles, per tenant and per model.</strong> An average over 240 tenants hides the one with a long-prompt problem (<a href="../../reliability/chapters/04-metrics.html">metrics and percentiles</a>).</li>
+<li><strong>Requests per second says nothing about work.</strong> A request with 8,000 input tokens costs about five times the prefill of a 1,500-token one. Track tokens in and tokens out per second, and the number of sequences in flight.</li>
+<li><strong>Error budget policy.</strong> 99.9 percent allows 43 minutes of failures a month. Spend it on deploys and experiments deliberately; if it is gone, stop risky rollouts.</li>
+</ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">3</span>Estimate capacity, GPUs and the bill</h2>
+<p class="stage-q">How many requests per second does one GPU serve at your latency target? How many GPUs for each pool? What does it cost, and what does the flat-fleet number hide?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>The script applies the decode model of <a href="../chapters/18-kv-cache.html">chapter 18</a> (every step reads the weights once and each sequence's cache once) and the prefill FLOP count (about 2 &times; parameters &times; input tokens). H100 SXM figures (80 GB, 3.35 TB/s, 989 TFLOPS dense bf16) come from NVIDIA's datasheet; the 60 percent bandwidth efficiency, 50 percent arithmetic efficiency, 90 percent usable memory, request shapes and 60 percent prefix-cache hit are <strong>assumptions</strong>. Shapes are Llama-3-class (8B: 128 KiB of cache per token; 70B: 320 KiB).</p><pre class="terminal" data-title="s3_cap.py"><code>"""Serving platform: per-GPU capacity from the chapter 18/22 decode model. Hardware: H100 SXM 80 GB, 3.35 TB/s, 989 TFLOPS dense bf16 (NVIDIA datasheet). Efficiencies, traffic and prices are ASSUMPTIONS."""
+BW, PEAK, HBM = 3.35e12, 989e12, 80e9
+BW_EFF, MFU, HBM_USE, GPU_HR = 0.6, 0.5, 0.90, 3.0
+def cap(name, P, wbytes, kv_tok, gpus, inp, out, hit, itl_slo=0.05):
+    """P params, wbytes per param, kv_tok bytes per token (kv bytes already per-GPU-shared), gpus per replica."""
+    weights = P*wbytes
+    free = gpus*HBM*HBM_USE - weights
+    ctx = inp + out/2
+    seq_bytes = ctx*kv_tok
+    b_mem = int(free/seq_bytes)
+    b_itl = int((itl_slo*gpus*BW*BW_EFF - weights)/seq_bytes)
+    B = min(b_mem, b_itl)
+    step = (weights + B*seq_bytes)/(gpus*BW*BW_EFF)
+    prefill = 2*P*inp*(1-hit)/(gpus*PEAK*MFU)          # seconds of replica time per request
+    decode = out*step/B                                  # this request's share of decode steps
+    per_req = prefill+decode
+    print(f"{name:26} weights {weights/1e9:5.0f} GB  batch limit: memory {b_mem:4}, ITL {b_itl:4} -&gt; B={B:4}  step {step*1000:5.1f} ms")
+    print(f"{'':26} per request: prefill {prefill*1000:6.1f} ms + decode share {decode*1000:6.1f} ms = {per_req*1000:6.1f} ms -&gt; {1/per_req:5.1f} req/s per replica ({gpus} GPU)")
+    return 1/per_req, gpus
+print("prefix-cache hit rate 0.0 vs 0.6 (shared system prompt + few-shot = 60% of a 1,500-token input)")
+for hit in (0.0, 0.6):
+    print(f"--- hit rate {hit}")
+    r8 = cap("8B bf16 (1 GPU)", 8.03e9, 2, 128*1024, 1, 1500, 300, hit)
+    r70 = cap("70B fp8 (2 GPUs, TP=2)", 70.6e9, 1, 320*1024, 2, 3000, 500, hit)</code></pre><pre class="terminal" data-title="output"><code>prefix-cache hit rate 0.0 vs 0.6 (shared system prompt + few-shot = 60% of a 1,500-token input)
+--- hit rate 0.0
+8B bf16 (1 GPU)            weights    16 GB  batch limit: memory  258, ITL  390 -&gt; B= 258  step  35.7 ms
+                           per request: prefill   48.7 ms + decode share   41.6 ms =   90.3 ms -&gt;  11.1 req/s per replica (1 GPU)
+70B fp8 (2 GPUs, TP=2)     weights    71 GB  batch limit: memory   68, ITL  122 -&gt; B=  68  step  35.6 ms
+                           per request: prefill  428.3 ms + decode share  261.6 ms =  689.9 ms -&gt;   1.4 req/s per replica (2 GPU)
+--- hit rate 0.6
+8B bf16 (1 GPU)            weights    16 GB  batch limit: memory  258, ITL  390 -&gt; B= 258  step  35.7 ms
+                           per request: prefill   19.5 ms + decode share   41.6 ms =   61.1 ms -&gt;  16.4 req/s per replica (1 GPU)
+70B fp8 (2 GPUs, TP=2)     weights    71 GB  batch limit: memory   68, ITL  122 -&gt; B=  68  step  35.6 ms
+                           per request: prefill  171.3 ms + decode share  261.6 ms =  432.9 ms -&gt;   2.3 req/s per replica (2 GPU)</code></pre><ul>
+<li><strong>The batch limit is memory first, not latency.</strong> The 8B model fits 258 sequences of 1,650 tokens (a 1,500-token prompt plus half the output) before HBM runs out; the 50 ms inter-token target would allow 390. A step at batch 258 takes 35.7 ms, which meets the target with room.</li>
+<li><strong>Prefill is a third to over a half of the time.</strong> At hit rate 0, 48.7 ms of the 90.3 ms per request is prefill; prefix caching at 60 percent cuts prefill to 19.5 ms and capacity from 11.1 to 16.4 requests per second per GPU, a 48 percent gain. Caching is capacity.</li>
+<li><strong>The 70B model is about 14 times dearer per request in GPU time:</strong> 0.43 s of a two-GPU replica against 0.061 s of a one-GPU replica, which is 7 times the time on twice the GPUs (and its requests are longer: 3,000 tokens in, 500 out). It earns its place only where quality justifies it.</li>
+</ul>
+<p>Now the fleet. Headroom is 1/0.65 for interactive pools (so a 35 percent margin for spikes, failures and imbalance) and 1/0.90 for batch.</p><pre class="terminal" data-title="s3_fleet.py"><code>"""Fleet sizing and monthly bill. Capacities from s3_cap.py (hit rate 0.6). Traffic, headroom and price are ASSUMPTIONS."""
+import math
+GPU_HR = 3.0; HOURS = 730
+# LoRA adapter size for an 8B model, rank 16 on all seven projection matrices (shapes from chapter 18/11)
+d, kv, ff, L, r = 4096, 1024, 14336, 32, 16
+per_layer = r*((d+d)+(d+kv)+(d+kv)+(d+d)+(d+ff)+(d+ff)+(ff+d))
+ad = per_layer*L
+print(f"rank-16 adapter on 8B: {ad/1e6:.1f}M params = {ad*2/1e6:.0f} MB in bf16; 200 adapters = {200*ad*2/1e9:.1f} GB")
+pools = [  # name, peak req/s, req/s per replica, GPUs per replica, headroom
+  ("8B chat pool (shared base + adapters)", 150, 16.4, 1, 1/0.65),
+  ("70B premium pool",                       12, 2.3, 2, 1/0.65),
+  ("batch / offline (priced at off-peak)",   30, 16.4, 1, 1/0.90),
+]
+tot = 0
+print(f"{'pool':40} {'peak rps':&gt;8} {'replicas':&gt;9} {'GPUs':&gt;5} {'$/month 24x7':&gt;13}")
+for name, rps, cap, g, head in pools:
+    rep = math.ceil(rps*head/cap); gpus = rep*g; cost = gpus*GPU_HR*HOURS
+    tot += gpus
+    print(f"{name:40} {rps:8} {rep:9} {gpus:5} {cost:13,.0f}")
+print(f"{'total GPUs at peak':40} {'':8} {'':9} {tot:5} {tot*GPU_HR*HOURS:13,.0f}")
+avg_util = 0.55
+print(f"\nIf the fleet follows load (average 55% of peak) the bill is about ${tot*avg_util*GPU_HR*HOURS:,.0f}/month plus a floor and headroom; compare ${tot*GPU_HR*HOURS:,.0f} for a flat peak fleet.")</code></pre><pre class="terminal" data-title="output"><code>rank-16 adapter on 8B: 41.9M params = 84 MB in bf16; 200 adapters = 16.8 GB
+pool                                     peak rps  replicas  GPUs  $/month 24x7
+8B chat pool (shared base + adapters)         150        15    15        32,850
+70B premium pool                               12         9    18        39,420
+batch / offline (priced at off-peak)           30         3     3         6,570
+total GPUs at peak                                             36        78,840
+
+If the fleet follows load (average 55% of peak) the bill is about $43,362/month plus a floor and headroom; compare $78,840 for a flat peak fleet.</code></pre><ul>
+<li><strong>36 GPUs at peak, about $79,000 a month if bought flat.</strong> The adapter arithmetic matters: 200 rank-16 adapters are 84 MB each, so 16.8 GB in total, which fits in CPU memory of one host and is loaded to the GPU on demand. You do not need 200 deployments, or even 200 GPUs' worth of weights.</li>
+<li><strong>Cost per request at full utilisation:</strong> $3 an hour is $0.00083 a second; at 16.4 requests a second on one GPU that is about $0.05 per thousand requests, and at 55 percent average utilisation about $0.09. <strong>Utilisation is the lever finance cares about</strong> (<a href="../chapters/22-token-economics.html">chapter 22</a>): a team-owned GPU idle half the day costs twice as much per request as it looks.</li>
+<li><strong>A fleet that follows load is at best about $43,000</strong> before the floor and headroom; the realistic target is $50,000 to $55,000, a saving of a third from the flat fleet, and more against the status quo of dedicated per-team GPUs. These are rented prices and traffic shapes I assumed; plug in your own.</li>
+</ul>
+<div class="callout note"><p class="callout-title">State of play, October 2026</p><p>H100 on-demand rates in October 2026 ranged from about $2 to $7 per GPU-hour across specialist and hyperscale clouds, per the sources cited in <a href="../chapters/22-token-economics.html">chapter 22</a>; reserved and spot are cheaper. Newer GPU generations change the bandwidth and memory in the first lines of the script, not its structure. The numbers are a method, not a quote.</p></div>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">4</span>High-level architecture</h2>
+<p class="stage-q">Draw the platform. Where are the pools, where does the batch work wait, and what makes a request cross from one pool to another?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<figure class="diagram">
+  <svg viewBox="0 0 760 340" role="img" aria-label="Architecture of an LLM serving platform. Clients call a gateway that authenticates and applies per-tenant token quotas. A router picks the model and the replica. Three pools serve requests: an 8B pool with adapters, a 70B pool, and a batch pool fed by a queue. Pools read weights and adapters from stores. An autoscaler watches queue depth and cache use on the pools and adds or removes replicas.">
+    <defs><marker id="ahLT-S3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="132" width="90" height="56" rx="8" class="fs-green s-green sw-2"/>
+    <text x="65" y="156" text-anchor="middle" class="t-sm t-bold">Tenants</text><text x="65" y="173" text-anchor="middle" class="t-xs t-muted">apps, users</text>
+    <rect x="140" y="132" width="120" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="200" y="156" text-anchor="middle" class="t-sm t-bold">Gateway</text><text x="200" y="173" text-anchor="middle" class="t-xs t-muted">auth, token quotas</text>
+    <rect x="290" y="132" width="120" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="350" y="156" text-anchor="middle" class="t-sm t-bold">Router</text><text x="350" y="173" text-anchor="middle" class="t-xs t-muted">model, replica</text>
+    <rect x="450" y="30" width="160" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="530" y="55" text-anchor="middle" class="t-sm t-bold">8B pool</text><text x="530" y="72" text-anchor="middle" class="t-xs t-muted">base + tenant adapters</text>
+    <rect x="450" y="130" width="160" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="530" y="155" text-anchor="middle" class="t-sm t-bold">70B pool</text><text x="530" y="172" text-anchor="middle" class="t-xs t-muted">2 GPUs per replica</text>
+    <rect x="450" y="228" width="160" height="62" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="530" y="253" text-anchor="middle" class="t-sm t-bold">Batch queue + pool</text><text x="530" y="270" text-anchor="middle" class="t-xs t-muted">fills idle capacity</text>
+    <rect x="640" y="30" width="110" height="62" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="695" y="55" text-anchor="middle" class="t-sm t-bold">Adapters</text><text x="695" y="72" text-anchor="middle" class="t-xs t-muted">84 MB each</text>
+    <rect x="640" y="130" width="110" height="62" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="695" y="155" text-anchor="middle" class="t-sm t-bold">Weights</text><text x="695" y="172" text-anchor="middle" class="t-xs t-muted">cache near GPUs</text>
+    <rect x="270" y="268" width="160" height="56" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="350" y="292" text-anchor="middle" class="t-sm t-bold">Autoscaler</text><text x="350" y="309" text-anchor="middle" class="t-xs t-muted">queue, KV use, schedule</text>
+    <line x1="110" y1="160" x2="138" y2="160" class="line" marker-end="url(#ahLT-S3a)"/>
+    <line x1="260" y1="160" x2="288" y2="160" class="line" marker-end="url(#ahLT-S3a)"/>
+    <line x1="410" y1="150" x2="448" y2="70" class="line" marker-end="url(#ahLT-S3a)"/>
+    <line x1="410" y1="160" x2="448" y2="160" class="line" marker-end="url(#ahLT-S3a)"/>
+    <line x1="410" y1="172" x2="448" y2="250" class="line" marker-end="url(#ahLT-S3a)"/>
+    <line x1="610" y1="61" x2="638" y2="61" class="line-dash" marker-end="url(#ahLT-S3a)"/>
+    <line x1="610" y1="161" x2="638" y2="161" class="line-dash" marker-end="url(#ahLT-S3a)"/>
+    <path d="M450,262 L430,262 L430,296" fill="none" class="line-dash s-yellow" marker-end="url(#ahLT-S3a)"/>
+    <text x="205" y="300" text-anchor="middle" class="t-xs t-muted">metrics in, replicas out</text>
+  </svg>
+  <figcaption><strong>Pools by workload, not by tenant.</strong> The router chooses the model and then a replica; tenants share an 8B pool whose adapters are loaded on demand. Batch work waits in a queue and runs when interactive pools have room. The autoscaler's dashed arrow stands for metrics in and replica counts out.</figcaption>
+</figure><ul>
+<li><strong>Gateway.</strong> Authenticates, applies per-tenant quotas on <em>tokens</em> (not requests), validates the model name, and attaches a priority class. It is the place to refuse work cheaply (<a href="../../reliability/chapters/11-overload.html">load shedding</a>; <a href="../../design/chapters/05-rate-limiter.html">rate limiter</a>).</li>
+<li><strong>Router.</strong> Two decisions: which <em>model</em> (the caller's choice, or a policy such as "try the 8B model first and escalate", stage 6) and which <em>replica</em> (stage 6). It keeps a live view of each replica's queue depth, in-flight sequences and free cache blocks.</li>
+<li><strong>Pools.</strong> Each replica runs one engine (vLLM or SGLang, <a href="../chapters/20-serving-engines.html">chapter 20</a>) with continuous batching and paged cache. The 8B pool's replicas hold the base weights and a handful of adapters on the GPU at a time, with the rest in host memory.</li>
+<li><strong>Batch.</strong> Overnight jobs go through a queue and run on idle capacity at lower priority. They are the way to buy utilisation: interactive load leaves holes, and batch fills them (<a href="../../distributed/chapters/17-logs-exactly-once.html">durable logs and exactly-once</a> for the queue's semantics).</li>
+<li><strong>Stores.</strong> Adapters and weights live in object storage with a local NVMe cache on each node, because loading 16 GB over the network at every cold start is minutes you do not have.</li>
+</ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">5</span>The engine: batching, memory and adapters</h2>
+<p class="stage-q">Which settings on a replica control throughput and tail latency? What does continuous batching assume, and what can one bad request do to everyone else?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>Inside a replica the engine is a scheduler (<a href="../chapters/20-serving-engines.html">chapter 20</a>). At every step it picks which sequences to advance, admits new ones if cache blocks are free, and either prefills a prompt or decodes tokens. Four dials matter.</p>
+<ul>
+<li><strong>Maximum concurrent sequences.</strong> More sequences raise throughput until the cache is full or step time exceeds the ITL target. The script put the knee at 258 sequences for the 8B model; set the limit slightly below the memory bound so a few long conversations cannot exhaust blocks and trigger preemption (evicting a sequence and recomputing it later).</li>
+<li><strong>Maximum context length.</strong> The cache is reserved per sequence as it grows, so a 128k-token request holds 17 GB (chapter 18) for as long as it decodes. Cap context per tier and charge long contexts more.</li>
+<li><strong>Chunked prefill.</strong> A 30,000-token prompt prefilled in one step stalls every other sequence's next token. Splitting prefill into chunks mixed into decode steps keeps ITL steady at some cost to the long prompt's TTFT (<a href="../chapters/20-serving-engines.html">prefill versus decode inside one step</a>).</li>
+<li><strong>Adapter slots.</strong> Per vLLM's documentation, <code>--enable-lora</code> turns serving on, <code>--lora-modules</code> registers adapters and the request's <code>model</code> field selects one; <code>--max-loras</code> bounds how many distinct adapters are active in one batch and <code>--max-cpu-loras</code> how many are cached in host memory. Set <code>--max-lora-rank</code> to the largest rank you serve. Adapters in a batch add a small computation per layer; mixed batches cost a bit more than base-only ones (<a href="../chapters/17-adapters-on-demand.html">chapter 17</a>; measure it on your engine version).</li>
+</ul><pre class="terminal" data-title="serve.sh (illustrative, not run here)"><code># One replica of the 8B pool (illustrative; flags as documented for vLLM, check your version)
+vllm serve &lt;base-model&gt; \
+    --max-model-len 8192 \
+    --max-num-seqs 256 \
+    --gpu-memory-utilization 0.90 \
+    --enable-prefix-caching \
+    --enable-lora --max-loras 8 --max-lora-rank 16 --max-cpu-loras 64 \
+    --lora-modules tenant_a=/adapters/tenant_a tenant_b=/adapters/tenant_b
+
+# A request picks its adapter with the model field:
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "tenant_a", "messages": [{"role": "user", "content": "..."}], "stream": true}' </code></pre><p>I did not run this (no GPU or vLLM here); the flags are the ones in the vLLM documentation fetched in October 2026 plus standard engine options, and defaults change by version.</p>
+<ul>
+<li><strong>The blast radius of one bad request is the replica.</strong> A prompt that is too long, an adversarial request that maximises generated length, or a pathological adapter can raise ITL for hundreds of co-batched users. Enforce per-request limits at the gateway (max input, max output, max total) and a hard wall-clock cap on generation.</li>
+<li><strong>Cold adapters cost latency.</strong> The first request for an adapter not on the GPU waits for a load from host memory (84 MB, milliseconds over PCIe) or from disk (tens of milliseconds). Route a tenant's traffic to replicas that already hold the adapter (stage 6).</li>
+</ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">6</span>Routing: which model, which replica</h2>
+<p class="stage-q">Write two routing policies, one choosing the model and one choosing the replica. What does each optimise and what can go wrong?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<h3>Model routing</h3>
+<p>Not every request needs the 70B model. A <strong>cascade</strong> tries the cheap model and escalates when a check fails (a confidence signal, a format error, a failed unit test); a <strong>router</strong> predicts difficulty from the request and chooses up front (<a href="../../evals/chapters/19-cost-latency-quality.html">cost, latency and quality trade-offs</a>). The platform should expose this as a policy, not decide it for tenants: a tenant picks "fast", "balanced" or "best", the platform maps those to models and can change the mapping when a better model arrives. Validate the mapping on each tenant's own evaluation set, since a router trained on general data may be wrong for a legal-contract workload. Always keep an explicit model name option for tenants with regulated needs.</p>
+<h3>Replica routing</h3>
+<p>Within a pool, choose a replica. Least-loaded routing balances load. Cache-aware routing sends requests that share a prefix to a replica that holds it. The two conflict, and the script measures the conflict on a synthetic workload: 40 tenants with their own 1,000-token system prompts, 8 replicas each caching 6 tenants' prefixes, tenant popularity following a long tail.</p><pre class="terminal" data-title="s3_route.py"><code>"""Prefix-cache hit rate under two routing policies. SYNTHETIC workload: 40 tenants, each with its own 1,000-token system prompt; each replica's prefix cache holds 6 tenants' prefixes (LRU)."""
+import random, hashlib
+from collections import OrderedDict
+random.seed(3)
+TENANTS, REPL, SLOTS, N = 40, 8, 6, 60000
+weights = [1/(i+1)**0.9 for i in range(TENANTS)]   # a few big tenants, long tail
+def run(policy):
+    caches = [OrderedDict() for _ in range(REPL)]
+    hits = 0; load = [0]*REPL
+    for _ in range(N):
+        t = random.choices(range(TENANTS), weights)[0]
+        if policy == "random": r = random.randrange(REPL)
+        elif policy == "least-loaded": r = min(range(REPL), key=lambda i: (load[i], random.random()))
+        else:  # tenant-affinity: hash tenant to a home replica (and the next one for the biggest tenants)
+            h = int(hashlib.md5(str(t).encode()).hexdigest(), 16)
+            r = (h + (random.randrange(2) if t &lt; 4 else 0)) % REPL
+        c = caches[r]; load[r] += 1
+        if t in c: hits += 1; c.move_to_end(t)
+        else:
+            c[t] = 1
+            if len(c) &gt; SLOTS: c.popitem(last=False)
+    spread = max(load)/(sum(load)/REPL)
+    return hits/N, spread
+for p in ("random", "least-loaded", "tenant-affinity"):
+    h, s = run(p)
+    print(f"{p:16} prefix hit rate {h:5.2f}   busiest replica carries {s:4.2f}x the mean load")</code></pre><pre class="terminal" data-title="output"><code>random           prefix hit rate  0.35   busiest replica carries 1.01x the mean load
+least-loaded     prefix hit rate  0.35   busiest replica carries 1.00x the mean load
+tenant-affinity  prefix hit rate  0.91   busiest replica carries 2.14x the mean load</code></pre><ul>
+<li><strong>Random and least-loaded routing find a cached prefix 35 percent of the time</strong>, because each replica sees all 40 tenants and its cache holds only 6.</li>
+<li><strong>Tenant-affinity routing lifts that to 91 percent</strong>, which by stage 3 is worth roughly half again as much capacity. The price is imbalance: the busiest replica carries 2.1 times the mean load, so the others idle while it queues.</li>
+<li><strong>The practical policy is affinity with a spill-over rule:</strong> send a tenant to its home replica unless that replica's queue exceeds a threshold, then to the next in a stable order. Spread large tenants over two or three home replicas. This is the same idea as consistent hashing with bounded loads for caches (<a href="../../design/chapters/06-distributed-cache.html">distributed cache</a>), applied to a cache whose misses cost GPU seconds rather than milliseconds.</li>
+<li><strong>Adapters add a second affinity key.</strong> A request for tenant X's adapter prefers replicas with that adapter loaded.</li>
+</ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">7</span>Caching: what to cache and what to keep apart</h2>
+<p class="stage-q">List the caches you would add in order of payoff. Which one is risky across tenants, and why?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<div class="table-wrap"><table><thead><tr><th>Cache</th><th>What it saves</th><th>Risks and rules</th></tr></thead><tbody><tr><td>Prefix (KV) cache in the engine</td><td>Prefill of repeated system prompts, few-shot blocks and shared documents; 60 percent hit rate gave +48 percent capacity above</td><td>Hit rate depends on routing; block size matters (a prefix is cached in whole blocks); evicts under memory pressure</td></tr><tr><td>Provider-style prompt caching exposed to tenants</td><td>Lets a tenant mark a stable prefix; lower price for cached tokens (the economic mirror of the saved prefill)</td><td>Price list structure only; the platform must meter cached versus uncached tokens (<a href="../chapters/22-token-economics.html">chapter 22</a>)</td></tr><tr><td>Exact response cache</td><td>Identical request at temperature 0 returns the stored answer in microseconds</td><td>Only valid if the request is fully identical, including adapter and model version; keyed per tenant; never for personalised output</td></tr><tr><td>Semantic cache</td><td>Similar question returns a stored answer</td><td>High risk: a near-duplicate can have a different correct answer; cross-tenant sharing leaks content; use only for low-stakes, tenant-scoped FAQs, with a measured error rate</td></tr><tr><td>KV offload to host memory or SSD</td><td>Keeps long conversations' caches for the next turn</td><td>Slower than HBM; pays when many turns arrive after minutes of idle; engine support varies</td></tr><tr><td>Weights and adapter caches on node</td><td>Cold start from NVMe instead of the network</td><td>Needs capacity and a warm-up pipeline</td></tr></tbody></table></div><p><strong>The cross-tenant danger is real.</strong> If tenants share a prefix cache, a request that hits the cache returns its first token sooner than one that misses. A tenant can therefore probe whether another tenant's system prompt, or a particular document, has recently been processed on that replica, by timing responses. The practical rules are to scope cache keys by tenant for external customers (accepting lower hit rates), to share only platform-owned prefixes, and to treat cache hits as sensitive in the same way as any timing side channel (<a href="../../security/chapters/15-multi-tenancy.html">multi-tenancy and isolation</a>). Internal teams under shared trust can share caches by agreement. The rule is a policy decision to write down, with the cost in capacity measured, not a default to leave to the engine.</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">8</span>Autoscaling GPUs</h2>
+<p class="stage-q">Why does reactive autoscaling fail on a sudden customer job? Design the scaling policy and say what each signal contributes.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>GPU pools differ from web fleets in two ways: a new replica takes minutes (schedule, pull the image, load 16 GB of weights, warm up, assumed 240 s here), and a replica cannot be partly loaded. The script simulates a synthetic day: a diurnal curve (60 to 150 requests per second) plus a 15-minute tripling from 09:00 (a customer job), 16 requests per second per GPU, and four policies.</p><pre class="terminal" data-title="s3_scale.py"><code>"""Autoscaling an 8B pool. SYNTHETIC day: diurnal load plus a 3x spike at 09:00 sharp (a customer batch job). Capacity 16 req/s per GPU (hit rate 0.6, s3_cap.py).
+A request that arrives when demand exceeds ready capacity queues; we report the worst minute of overload, in multiples of ready capacity."""
+import math
+CAP, GPU_HR, COLD = 16.0, 3.0, 240          # req/s per GPU; $/GPU-h; cold start seconds: schedule, pull 16 GB image+weights, load, warm up (assumption)
+def demand(t):                                # t in seconds since midnight
+    h = t/3600
+    base = 60 + 90*max(0, math.sin((h-6)/12*math.pi))      # 60 at night, 150 at 12:00
+    spike = 2.0*base if 9*3600 &lt;= t &lt; 9*3600+900 else 0     # 15 minutes at 3x
+    return base + spike
+TL = {}
+def sim(policy, target_util=0.6, floor=6):
+    ready = [floor]*1; pending = []; gpus = floor
+    cost = 0.0; worst = 0.0; bad_s = 0
+    ready_n = floor
+    for t in range(0, 86400):
+        pending = [(due, n) for due, n in pending if due &gt; t] if False else pending
+        # arrivals of new GPUs
+        for p in [p for p in pending if p[0] &lt;= t]:
+            ready_n += p[1]
+        pending = [p for p in pending if p[0] &gt; t]
+        d = demand(t)
+        if policy == "reactive":
+            want = math.ceil(d/(CAP*target_util))
+        elif policy == "reactive+headroom":
+            want = math.ceil(d*1.5/(CAP*target_util))
+        elif policy == "scheduled+reactive":
+            sched = math.ceil(demand(9*3600+300)/(CAP*0.8)) if 8*3600+1800 &lt;= t &lt; 10*3600 else 0
+            want = max(sched, math.ceil(d/(CAP*target_util)))
+        elif policy == "static peak":
+            want = math.ceil(max(demand(x) for x in range(0, 86400, 60))/(CAP*0.8))
+        want = max(want, floor)
+        total = ready_n + sum(n for _, n in pending)
+        if want &gt; total: pending.append((t+COLD, want-total))
+        elif want &lt; ready_n and t % 60 == 0:                 # scale down slowly: one GPU a minute
+            ready_n -= 1
+        if t % 60 == 0: TL.setdefault(policy, []).append((t, d, ready_n))
+        ratio = d/(ready_n*CAP)
+        if ratio &gt; 1: bad_s += 1
+        worst = max(worst, ratio)
+        cost += (ready_n + sum(n for _, n in pending))*GPU_HR/3600
+    return cost, worst, bad_s
+print(f"{'policy':22} {'GPU-h cost/day':&gt;15} {'worst demand/capacity':&gt;22} {'seconds overloaded':&gt;19}")
+for pol in ("static peak", "reactive", "reactive+headroom", "scheduled+reactive"):
+    c, w, b = sim(pol)
+    print(f"{pol:22} {'$'+format(c,',.0f'):&gt;15} {w:22.2f} {b:19,}")
+
+import json
+json.dump({k: v for k, v in TL.items()}, open('s3_tl.json', 'w'))</code></pre><pre class="terminal" data-title="output"><code>policy                  GPU-h cost/day  worst demand/capacity  seconds overloaded
+static peak                     $2,160                   0.80                   0
+reactive                          $746                   1.80                 240
+reactive+headroom               $1,105                   1.17                 240
+scheduled+reactive                $798                   0.78                   0</code></pre><figure class="diagram">
+  <svg viewBox="0 0 760 280" role="img" aria-label="Line chart from 08:30 to 10:00 of GPUs needed and GPUs ready. Demand, in GPU equivalents, jumps from about 8 to about 23 at 09:00 for fifteen minutes. A purely reactive autoscaler stays at 13 GPUs for four minutes after the jump, then climbs to 40, so demand exceeds capacity for four minutes. A scheduled floor of 30 GPUs from 08:30 covers the jump with no overload.">
+    <line x1="80" y1="40" x2="80" y2="210" class="line"/><line x1="80" y1="210" x2="720" y2="210" class="line"/>
+    <line x1="80" y1="210" x2="80" y2="215" class="line-thin"/><text x="80" y="230" text-anchor="middle" class="t-xs t-muted">08:30</text><line x1="293" y1="210" x2="293" y2="215" class="line-thin"/><text x="293" y="230" text-anchor="middle" class="t-xs t-muted">09:00</text><line x1="507" y1="210" x2="507" y2="215" class="line-thin"/><text x="507" y="230" text-anchor="middle" class="t-xs t-muted">09:30</text><line x1="720" y1="210" x2="720" y2="215" class="line-thin"/><text x="720" y="230" text-anchor="middle" class="t-xs t-muted">10:00</text><line x1="75" y1="210" x2="80" y2="210" class="line-thin"/><text x="70" y="214" text-anchor="end" class="t-xs t-muted">0</text><line x1="75" y1="172" x2="80" y2="172" class="line-thin"/><text x="70" y="176" text-anchor="end" class="t-xs t-muted">10</text><line x1="75" y1="134" x2="80" y2="134" class="line-thin"/><text x="70" y="138" text-anchor="end" class="t-xs t-muted">20</text><line x1="75" y1="97" x2="80" y2="97" class="line-thin"/><text x="70" y="101" text-anchor="end" class="t-xs t-muted">30</text><line x1="75" y1="59" x2="80" y2="59" class="line-thin"/><text x="70" y="63" text-anchor="end" class="t-xs t-muted">40</text>
+    <text x="400" y="256" text-anchor="middle" class="t-sm">time of day</text>
+    <text x="22" y="125" text-anchor="middle" transform="rotate(-90 22 125)" class="t-sm">GPUs</text>
+    <polyline points="80,183 87,183 94,183 101,183 108,183 116,183 123,182 130,182 137,182 144,182 151,182 158,182 165,182 172,182 180,182 187,182 194,182 201,182 208,182 215,182 222,181 229,181 236,181 244,181 251,181 258,181 265,181 272,181 279,181 286,181 293,122 300,122 308,122 315,122 322,122 329,121 336,121 343,121 350,121 357,121 364,120 372,120 379,120 386,120 393,120 400,180 407,180 414,180 421,180 428,180 436,180 443,179 450,179 457,179 464,179 471,179 478,179 485,179 492,179 500,179 507,179 514,179 521,179 528,179 535,179 542,179 549,179 556,179 564,179 571,178 578,178 585,178 592,178 599,178 606,178 613,178 620,178 628,178 635,178 642,178 649,178 656,178 663,178 670,178 677,178 684,178 692,178 699,178 706,178 713,177 720,177" fill="none" class="line sw-2"/>
+    <polyline points="80,165 87,165 94,165 101,165 108,165 116,165 123,161 130,161 137,161 144,161 151,161 158,161 165,161 172,161 180,161 187,161 194,161 201,161 208,161 215,161 222,161 229,161 236,161 244,161 251,161 258,161 265,161 272,161 279,161 286,161 293,161 300,161 308,161 315,161 322,63 329,63 336,63 343,63 350,63 357,59 364,59 372,59 379,59 386,59 393,59 400,63 407,66 414,70 421,74 428,78 436,82 443,85 450,89 457,93 464,97 471,100 478,104 485,108 492,112 500,116 507,119 514,123 521,127 528,131 535,134 542,138 549,142 556,146 564,150 571,153 578,157 585,157 592,157 599,157 606,157 613,157 620,157 628,157 635,153 642,153 649,153 656,153 663,153 670,153 677,153 684,153 692,153 699,153 706,153 713,153 720,153" fill="none" class="s-red sw-2"/>
+    <polyline points="80,165 87,165 94,165 101,165 108,97 116,97 123,97 130,97 137,97 144,97 151,97 158,97 165,97 172,97 180,97 187,97 194,97 201,97 208,97 215,97 222,97 229,97 236,97 244,97 251,97 258,97 265,97 272,97 279,97 286,97 293,97 300,97 308,97 315,97 322,63 329,63 336,63 343,63 350,63 357,59 364,59 372,59 379,59 386,59 393,59 400,63 407,66 414,70 421,74 428,78 436,82 443,85 450,89 457,93 464,97 471,97 478,97 485,97 492,97 500,97 507,97 514,97 521,97 528,97 535,97 542,97 549,97 556,97 564,97 571,97 578,97 585,97 592,97 599,97 606,97 613,97 620,97 628,97 635,97 642,97 649,97 656,97 663,97 670,97 677,97 684,97 692,97 699,97 706,97 713,97 720,100" fill="none" class="s-blue sw-2"/>
+    <text x="90" y="91" class="t-xs tc-blue t-bold">scheduled floor + reactive: 30 ready</text>
+    <text x="430" y="203" class="t-xs tc-red t-bold">reactive only: 13 ready, then 4 minutes late</text>
+    <text x="300" y="107" class="t-xs t-muted">demand (GPUs needed at full load)</text>
+  </svg>
+  <figcaption><strong>Cold start is the whole problem.</strong> A GPU requested at 09:00 is useful at 09:04 (assumed 240 s to schedule, pull the image, load 16 GB of weights and warm up). Synthetic day from <code>s3_scale.py</code>; the demand line is requests per second divided by 16 requests per second per GPU.</figcaption>
+</figure><ul>
+<li><strong>Reactive scaling alone is cheap and fails:</strong> $746 a day, but for 240 seconds demand was up to 1.8 times capacity. For those four minutes, queues grow, TTFT blows through the 1 s target, and the load shedder has to refuse traffic (<a href="../../reliability/chapters/11-overload.html">overload and metastability</a>: a backed-up queue also holds on to cache and makes recovery slower).</li>
+<li><strong>Headroom costs 48 percent more and does not fix it:</strong> with a 1.5 times safety margin the day costs $1,105 and the worst moment is still 1.17 times capacity, because a margin is a ratio and the jump is 3 times.</li>
+<li><strong>A scheduled floor fixes what is predictable.</strong> If the customer tells you the job starts at 09:00, or history shows it, hold 30 GPUs from 08:30 to 10:00: $798 a day, zero overloaded seconds, about 7 percent above reactive. The flat peak fleet costs $2,160.</li>
+<li><strong>What does the autoscaler watch?</strong> Not CPU, which is meaningless for GPUs. Use queue depth and wait time (the earliest signal), free KV blocks (the capacity signal), and TTFT p95 (the outcome signal). Scale up on the first two; scale down slowly on utilisation with a cool-down, since flapping wastes the 4-minute load time and a cache that was warm.</li>
+<li><strong>For unpredictable spikes</strong> keep a small pool of <em>warm spare</em> replicas with weights already loaded (they can join in seconds), shed or defer batch and low-priority traffic immediately, and use per-tenant limits so that a spike from one customer cannot consume the whole spare capacity.</li>
+</ul>
+<p>The arithmetic under all of this is queueing: when utilisation approaches 100 percent, waiting grows without bound (<a href="../../reliability/chapters/08-queueing-theory.html">queueing theory for engineers</a>). That is why the target utilisation in the autoscaler (60 percent here) is much lower than the fleet average you would like on the bill.</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">9</span>Tenants, fairness and isolation</h2>
+<p class="stage-q">One tenant floods the service for 30 seconds. What happens to the others, and which mechanisms stop it? What must never be shared?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>The script simulates a single replica that can serve 12 requests per second. Tenant A sends 4 per second steadily. Tenant B sends 20 per second between seconds 20 and 50. Arrivals are synthetic.</p><pre class="terminal" data-title="s3_fair.py"><code>"""Noisy neighbour: one replica serving 12 req/s of work (SYNTHETIC arrivals). Tenant A sends 4 req/s steadily; tenant B floods at 20 req/s for 30 s.
+Compare one FIFO queue with per-tenant fair queueing (round robin over tenants that have work) and with FIFO plus a per-tenant limit of 6 req/s."""
+import random, statistics as st
+random.seed(21)
+RATE, T = 12.0, 90
+def arrivals():
+    ev = []
+    t = 0
+    while t &lt; T:
+        t += random.expovariate(4.0); ev.append((t, "A"))
+    t = 20
+    while t &lt; 50:
+        t += random.expovariate(20.0); ev.append((t, "B"))
+    return sorted(ev)
+def serve(policy, limit=None):
+    ev = arrivals(); q = {"A": [], "B": []}; fifo = []; clock = 0.0; i = 0; waits = {"A": [], "B": []}; shed = {"A": 0, "B": 0}
+    tokens = {"A": 6.0, "B": 6.0}; last = 0.0; turn = "A"
+    while i &lt; len(ev) or fifo or q["A"] or q["B"]:
+        if not (fifo or q["A"] or q["B"]) and i &lt; len(ev): clock = max(clock, ev[i][0])
+        while i &lt; len(ev) and ev[i][0] &lt;= clock:
+            t, who = ev[i]; i += 1
+            if limit:
+                tokens[who] = min(limit, tokens[who] + (t - last) * limit); last = t
+                if tokens[who] &lt; 1: shed[who] += 1; continue
+                tokens[who] -= 1
+            (fifo if policy != "fair" else q[who]).append((t, who))
+        if policy != "fair":
+            if not fifo: continue
+            t, who = fifo.pop(0)
+        else:
+            order = [turn, "B" if turn == "A" else "A"]
+            pick = next((w for w in order if q[w]), None)
+            if pick is None: continue
+            t, who = q[pick].pop(0); turn = "B" if pick == "A" else "A"
+        waits[who].append(clock - t); clock += 1 / RATE
+    return waits, shed
+def p95(x): x = sorted(x); return x[int(0.95 * (len(x) - 1))]
+print(f"{'policy':28} {'A p95 wait':&gt;11} {'A max wait':&gt;11} {'B p95 wait':&gt;11} {'B shed':&gt;7}")
+for name, pol, lim in (("one FIFO queue", "fifo", None), ("per-tenant fair queueing", "fair", None), ("FIFO + 6 req/s limit each", "fifo", 6.0)):
+    w, s = serve(pol, lim)
+    print(f"{name:28} {p95(w['A']):10.1f}s {max(w['A']):10.1f}s {p95(w['B']):10.1f}s {s['B']:7}")</code></pre><pre class="terminal" data-title="output"><code>policy                        A p95 wait  A max wait  B p95 wait  B shed
+one FIFO queue                     27.7s       29.6s       28.5s       0
+per-tenant fair queueing            0.4s        0.6s       40.0s       0
+FIFO + 6 req/s limit each           0.1s        0.4s        0.1s     466</code></pre><ul>
+<li><strong>In one shared queue, B's flood hurts A:</strong> A's p95 wait is 27.7 seconds, about as bad as B's own, although A did nothing wrong.</li>
+<li><strong>Fair queueing protects A</strong> (0.4 s) by alternating between tenants with work waiting. B pays: its p95 wait is 40 seconds, since it asked for more than its share. This is the behaviour you want.</li>
+<li><strong>A rate limit sheds B's excess</strong> (466 of B's requests were refused with a 429) and keeps everyone else's wait near zero. Which one to use is a product choice: queue and delay, or refuse early. Most platforms do both, with the limit in <em>tokens</em> per minute because a request's cost is its tokens, and a weighted fair queue across tenants inside the pool.</li>
+<li><strong>Priority classes.</strong> Interactive above batch above best-effort; batch work is preempted or paused whenever interactive queue wait approaches the SLO.</li>
+</ul>
+<div class="callout warn"><p class="callout-title">Common misconception</p><p>"Per-tenant rate limits on requests per second are enough." One request with a 100,000-token context and a 4,000-token output costs far more than a hundred small ones. Limit tokens in and out, concurrent sequences, and context length, not only request counts.</p></div>
+<p><strong>What must not be shared.</strong></p>
+<ul>
+<li><strong>Prompts, outputs and logs.</strong> Encrypted at rest, retained for the contracted time, access-controlled, and never used for training without an agreement (<a href="../../security/chapters/17-data-protection.html">data protection</a>; <a href="../../evals/chapters/22-privacy-data.html">privacy and data handling</a>). Logging full prompts by default is the commonest breach.</li>
+<li><strong>Adapters.</strong> An adapter is derived from a customer's data and may encode it. Store per-tenant, authorise per request, and make sure routing cannot apply tenant X's adapter to tenant Y's request (a confused-deputy bug, <a href="../../security/chapters/08-authorization.html">authorisation</a>).</li>
+<li><strong>Cache entries</strong> as stage 7 describes.</li>
+<li><strong>Hardware for the highest-sensitivity tenants.</strong> Siloed pools for customers who require them, priced accordingly: the silo-pool-bridge trade-off.</li>
+</ul>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">10</span>Failure modes</h2>
+<p class="stage-q">List what breaks in a GPU serving platform, the symptom, and the mitigation.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<div class="table-wrap"><table><thead><tr><th>Failure</th><th>Symptom</th><th>Mitigation</th></tr></thead><tbody><tr><td>GPU or node failure</td><td>Replica disappears; in-flight streams cut</td><td>N+1 spare per pool; health checks on real token generation, not just a port; clients retry with idempotency keys; mid-stream failures resume or restart cleanly</td></tr><tr><td>Out of memory</td><td>Engine crashes or preempts heavily after a burst of long requests</td><td>Cap context; leave memory headroom; alert on preemption rate; admission control on cache blocks</td></tr><tr><td>Cold-start storm</td><td>After a deploy or zone failure, all replicas load weights at once from object storage</td><td>Stagger, local NVMe cache, peer-to-peer weight copy, keep a warm pool</td></tr><tr><td>Retry storm</td><td>A brief slowdown triggers client retries that double the load</td><td>Retry budgets, jitter, 429 with Retry-After, shed at the gateway (<a href="../../networking/chapters/16-failure.html">failure in networked systems</a>)</td></tr><tr><td>Long-prompt or long-output abuse</td><td>ITL spikes for co-batched users</td><td>Per-request and per-tenant limits, hard wall-clock limit, chunked prefill</td></tr><tr><td>Bad model or adapter rollout</td><td>Quality drops silently; latency unchanged</td><td>Shadow and canary with evaluation, not just health checks; keep previous versions (<a href="../../reliability/chapters/12-deployments.html">deployment strategies</a>)</td></tr><tr><td>Engine or driver regression</td><td>Throughput falls 30 percent after an upgrade</td><td>Pin versions; run a standard load test before promotion (<a href="../../reliability/chapters/10-load-testing-capacity.html">load testing</a>)</td></tr><tr><td>Zone or region outage</td><td>Whole pool lost</td><td>Pools in two zones with capacity to absorb a zone; region failover only if contracts require, since duplicating 36 GPUs doubles the bill</td></tr><tr><td>Noisy neighbour</td><td>One tenant's flood raises everyone's TTFT</td><td>Stage 9 mechanisms</td></tr></tbody></table></div><p>The hardest failure to see is <strong>quality drift with healthy infrastructure</strong>: a quantisation setting, an engine upgrade, or a changed default silently alters outputs. Keep a small fixed evaluation set per model that runs continuously against production replicas and compare outputs to a reference (<a href="../chapters/19-quantisation.html">measuring the damage from quantisation</a>; <a href="../../evals/chapters/17-observability.html">tracing and observability for LLM systems</a>).</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">11</span>Rollout, observability and the trade-offs</h2>
+<p class="stage-q">How do you migrate 40 teams without an outage? What do you give up? What changes if a new GPU generation or a hosted API appears?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p><strong>Migration.</strong> Start with one volunteer team behind a proxy that speaks the OpenAI-compatible API each engine exposes, so their code changes only a base URL. Shadow traffic first, compare TTFT and quality, then cut over. Each team keeps its old deployment for a rollback window. Move the most expensive and the quietest teams first: the first gives the visible saving, the second the lowest risk.</p>
+<p><strong>Dashboards.</strong> Per pool: queue depth, TTFT and ITL percentiles, free cache blocks, preemption rate, prefix-cache hit rate, GPU utilisation and memory. Per tenant: tokens in and out, quota use, 429 rate, cost. One page for finance: dollars per million tokens by pool, and idle GPU-hours.</p><div class="table-wrap"><table><thead><tr><th>We chose</th><th>We gave up</th><th>Because</th></tr></thead><tbody><tr><td>Shared pools with token quotas</td><td>The simplicity of per-team GPUs</td><td>Idle half the day is a third of the bill</td></tr><tr><td>One base model plus adapters</td><td>Each tenant's freedom to choose any base</td><td>200 deployments of 16 GB each would need 200 GPUs; adapters fit in 16.8 GB</td></tr><tr><td>Prefix affinity routing</td><td>Perfect load balance</td><td>Roughly 50 percent more capacity per GPU on this workload</td></tr><tr><td>Tenant-scoped caches for external customers</td><td>A higher hit rate from sharing</td><td>Timing side channels across contracts</td></tr><tr><td>Scheduled floors plus reactive scaling</td><td>Some idle minutes before known spikes</td><td>Cold start is four minutes and spikes arrive in one</td></tr><tr><td>Open-weight models on our GPUs</td><td>Zero operations work</td><td>Data residency, adapters and cost at this volume; revisit as hosted prices fall</td></tr></tbody></table></div><p><strong>If a newer GPU doubles bandwidth:</strong> decode speeds up by close to twice (chapter 18), the batch limit stays memory-bound unless capacity also grows, and you rerun the script rather than redesign. <strong>If a hosted API becomes cheaper than your cost per token:</strong> the answer is a mix; keep adapters and regulated tenants on your pool, send spiky or low-sensitivity traffic out, and let the router treat the API as one more pool with its own limits (<a href="../../design/chapters/20-ml-systems.html">Designing with ML and LLMs</a>). <strong>If a tenant needs a 1M-token context:</strong> price it separately and give it its own pool; one such request can hold more cache than 50 ordinary ones.</p>
+</details>
+</section>
+<section class="stage">
+<h2><span class="h-num">12</span>Say it out loud: a five-minute summary</h2>
+<p class="stage-q">Say your design aloud in five minutes, then compare with the model summary.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<div class="callout mentor">
+  <p class="callout-title">How a senior engineer would summarise this</p>
+  <p>"The cost of serving is memory traffic and utilisation, so I'd size from the decode model. One H100 serves a 1,500-token-in, 300-token-out request to an 8B model in about 90 milliseconds of GPU time, or 61 with a sixty percent prefix cache hit, which is 16 requests a second per GPU. Peak load of 150 a second needs 15 GPUs with 35 percent headroom; the 70B model costs about 14 times the GPU time per request and needs 18 GPUs for 12 a second. About 36 GPUs at peak is $79,000 a month flat and, if it follows load, in the low fifties. Adapters are 84 MB each, so 200 customers share one base model.</p>
+  <p>Three things make that number real. First, routing: sending a tenant's requests to the replica that holds its prefix lifts the cache hit rate from 35 to 91 percent but concentrates load, so I'd use affinity with spill-over. Second, autoscaling: a GPU takes four minutes to become useful, so a reactive scaler spent four minutes at 1.8 times capacity on a synthetic tripling; a scheduled floor ahead of known spikes plus a reactive scaler on queue depth cost seven percent more and had no overload. Third, tenants: a flood in a shared queue put the quiet tenant's p95 wait at 28 seconds; fair queueing and token limits brought it to under half a second.</p>
+  <p>I'd define SLOs on time to first token and inter-token latency measured at the gateway, scope caches by tenant for external customers because cache hits leak through timing, keep batch work as a yielding low-priority tenant that fills idle time, and watch quality continuously because infrastructure can be healthy while outputs drift."</p>
+  <p>Notice the shape: <strong>workload and SLOs → per-GPU capacity from the decode model → pools and adapters → cache-aware routing → autoscaling that respects cold start → fairness and isolation → quality watch.</strong></p>
+</div>
+</details>
+</section>
+
+<h2>Rubric</h2>
+<p>Tick what your own design (before reading the answers) covered. The first items are what a solid mid-level answer has; the later ones separate a senior answer.</p>
+<ul class="rubric">
+  <li>Split the workload into <strong>pools by model and priority</strong> (interactive 8B, premium 70B, batch) instead of one pool per tenant.</li>
+  <li>Defined <strong>TTFT, inter-token latency and goodput</strong> measured at the gateway, per tenant and per model, with percentiles.</li>
+  <li>Sized per-GPU capacity from the <strong>decode and prefill model</strong>, stating the HBM bandwidth and FLOPs used and the assumed efficiencies.</li>
+  <li>Recognised that the <strong>batch limit is set by KV-cache memory</strong> and computed it for the stated context length.</li>
+  <li>Showed the effect of <strong>prefix caching</strong> on capacity and tied it to routing.</li>
+  <li>Explained <strong>adapter serving</strong> (shared base, small adapters, slot limits) and why 200 tenants do not need 200 GPUs.</li>
+  <li>Computed the <strong>fleet and monthly bill</strong>, including headroom, and distinguished a flat peak fleet from one that follows load.</li>
+  <li>Chose a <strong>routing policy</strong> that trades cache hits against load balance (affinity with spill-over).</li>
+  <li>Designed <strong>autoscaling around cold start</strong>: queue-based signals, scheduled floors for known spikes, warm spares.</li>
+  <li>Used <strong>token-based quotas, fair queueing and priority classes</strong> to stop a noisy neighbour; limited context and output length.</li>
+  <li>Identified the <strong>cross-tenant cache timing risk</strong> and scoped caches, logs and adapters per tenant.</li>
+  <li>Listed <strong>failure modes</strong> (node loss, OOM, cold-start storm, retry storm, bad rollout, engine regression) with mitigations.</li>
+  <li>Planned <strong>continuous quality evaluation</strong> on production replicas, not only health checks.</li>
+  <li>Named <strong>trade-offs and triggers for change</strong> (new GPU, hosted API price, very long contexts, regulated tenants).</li>
+</ul>
+<p class="studio-status" id="studio-status"></p>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+<ul><li>Serving cost is memory traffic and utilisation: size from the decode model, then raise utilisation with shared pools, caching and batch work that yields.</li><li>KV-cache memory sets the batch size; prefix caching and cache-aware routing convert repeated prompts into capacity.</li><li>GPUs take minutes to start, so autoscaling must be predictive or buffered; a scheduled floor plus a queue-based reactive scaler handles most spikes.</li><li>Fairness needs token-based limits and per-tenant queueing; isolation needs scoped caches, logs and adapters.</li><li>Healthy infrastructure can serve worse outputs; evaluate quality continuously.</li></ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/studio.js"></script>
+</body>
+</html>

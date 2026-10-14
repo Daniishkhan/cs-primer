@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Economics of a Token · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="22">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>The Economics of a Token</h1>
+  <p class="lede">What does a million tokens cost to serve? The honest answer is "it depends on batch size, context length, precision and how busy the GPU is", and each of those can move the price tenfold. This chapter builds a small model of one GPU from its datasheet numbers, uses it to explain why output tokens cost more than input tokens, and ends with a worked capacity and cost estimate you can adapt.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Every decision in this part of the course (quantise or not, which engine, how many sequences to batch, whether to speculate) is ultimately a decision about money and latency. A team that cannot turn those choices into a cost per token ends up comparing a hosted API with its own GPUs on vibes. After this chapter you will be able to estimate throughput, latency and cost for a model on a given GPU from first principles, say which assumption dominates the answer, and tell whether self-hosting could beat a per-token API for a given volume.</p>
+</div>
+
+<h2>Cost per token is a division</h2>
+
+<p>A GPU costs the same per hour whether it is working or idle. So the cost of a token is simple arithmetic:</p>
+<p style="text-align:center">cost per million tokens = (GPU price per hour &divide; tokens served per hour) &times; 1,000,000</p>
+<p>Everything interesting is in the denominator. How many tokens per hour a GPU serves depends on how much work it does per second while busy (<span class="term">throughput</span>) and on the share of the time it is busy (<span class="term">utilisation</span>). Throughput is what the first half of this chapter models; utilisation is the second half.</p>
+
+<p>The models in this chapter are deliberately simple. They use these inputs, which you should treat as the chapter's assumptions, not as measurements of any system.</p>
+<ul>
+  <li><strong>Hardware</strong> (NVIDIA datasheet, H100 SXM): 3.35 TB/s of HBM bandwidth, 80 GB of memory, and 1,979 TFLOPS of bf16 tensor throughput which the datasheet footnotes as including sparsity, so the dense figure used here is 989 TFLOPS.</li>
+  <li><strong>Efficiency</strong> (assumption): kernels achieve 70% of peak bandwidth and 50% of peak arithmetic. Real figures vary by kernel, model and version.</li>
+  <li><strong>Price</strong> (assumption): $3.00 per GPU-hour. See the dated note below for the range seen in October 2026.</li>
+  <li><strong>Model</strong>: the Llama 3 8B shape (Dubey et al., 2024): 8.03 billion parameters, 32 layers, 8 KV heads of width 128, so 128 KiB of KV cache per token in bf16 (<a href="18-kv-cache.html">chapter 18</a>).</li>
+</ul>
+
+<h2>The decode step as a bill of bytes</h2>
+
+<p>From chapter 18: one decode step produces one token for each running sequence. It must read all the weights from HBM (16.1 GB in bf16) and each sequence's whole KV cache. It performs about 2 FLOPs per parameter per token, so 2 &times; 8.03 billion &times; <em>B</em> for a batch of <em>B</em>. The step takes as long as the slower of the two jobs:</p>
+<p style="text-align:center">step time = max( (weight bytes + <em>B</em> &times; context &times; KV bytes per token) &divide; usable bandwidth , 2 &times; params &times; <em>B</em> &divide; usable FLOP/s )</p>
+<p>The first term is the memory time; the second is the compute time. The ratio of peak FLOP/s to bandwidth for this GPU, 989 &times; 10<sup>12</sup> &divide; 3.35 &times; 10<sup>12</sup> &asymp; 295 FLOPs per byte, is the arithmetic intensity a step needs before arithmetic, not memory, is the limit. For the weights alone, batch <em>B</em> has intensity about <em>B</em> FLOPs per byte (2<em>B</em> FLOPs for each 2-byte weight), so a batch near 300 would be needed. The script puts numbers on that for a 2,048-token context.</p>
+
+<pre class="terminal" data-title="econ.py"><code>&quot;&quot;&quot;What does a million tokens cost? A decode-step model for Llama 3 8B on one H100 SXM.
+Sources: H100 SXM 3.35 TB/s HBM, 80 GB, 989 TFLOPS dense bf16 (NVIDIA datasheet halves, since its 1,979 includes sparsity).
+ASSUMPTIONS (not measurements): memory efficiency 70%, compute efficiency (MFU) 50%, GPU price $3.00 per hour, 2 GB overhead.&quot;&quot;&quot;
+BW, PEAK, HBM = 3.35e12, 989e12, 80e9
+BW_EFF, MFU, PRICE, OVERHEAD = 0.70, 0.50, 3.00, 2e9
+PARAMS, KV_TOK = 8.03e9, 131072                     # parameters; KV bytes per token (bf16, 8 KV heads, 32 layers)
+
+def decode_step(B, ctx, wbytes=2.0, kvbytes=2.0):
+    &quot;&quot;&quot;Seconds for one decode step with B sequences each holding ctx tokens of cache.&quot;&quot;&quot;
+    mem = PARAMS * wbytes + B * ctx * KV_TOK * (kvbytes / 2)          # weights once + every sequence&#x27;s cache
+    flops = 2 * PARAMS * B                                            # 2 FLOPs per parameter per token (attention FLOPs ignored)
+    return max(mem / (BW * BW_EFF), flops / (PEAK * MFU))
+
+def max_batch(ctx, wbytes=2.0, kvbytes=2.0):
+    return int((HBM - OVERHEAD - PARAMS * wbytes) // (ctx * KV_TOK * (kvbytes / 2)))
+
+def cost_per_m(tok_per_s, util=1.0):
+    return PRICE / (tok_per_s * util * 3600) * 1e6
+
+if __name__ == &quot;__main__&quot;:
+    ctx = 2048
+    print(f&quot;Llama 3 8B bf16, context {ctx}: KV {ctx*KV_TOK/1e6:.0f} MB per sequence, at most {max_batch(ctx)} sequences fit in 80 GB&quot;)
+    print(f&quot;{&#x27;batch&#x27;:&gt;6}{&#x27;step ms&#x27;:&gt;9}{&#x27;tok/s&#x27;:&gt;9}{&#x27;ITL ms&#x27;:&gt;8}{&#x27;$/M out tokens&#x27;:&gt;16}{&#x27;bound by&#x27;:&gt;11}&quot;)
+    for B in (1, 4, 16, 32, 64, 128, 200):
+        t = decode_step(B, ctx); mem_t = (PARAMS*2 + B*ctx*KV_TOK)/(BW*BW_EFF)
+        print(f&quot;{B:&gt;6}{t*1e3:&gt;9.1f}{B/t:&gt;9.0f}{t*1e3:&gt;8.1f}{cost_per_m(B/t):&gt;16.3f}{&#x27;memory&#x27; if mem_t &gt;= 2*PARAMS*B/(PEAK*MFU) else &#x27;compute&#x27;:&gt;11}&quot;)
+    pre = PEAK * MFU / (2 * PARAMS)
+    print(f&quot;\nPrefill is compute-bound: {pre:,.0f} input tokens/s -&gt; ${cost_per_m(pre):.3f} per million input tokens&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>Llama 3 8B bf16, context 2048: KV 268 MB per sequence, at most 230 sequences fit in 80 GB
+ batch  step ms    tok/s  ITL ms  $/M out tokens   bound by
+     1      7.0      144     7.0           5.803     memory
+     4      7.3      547     7.3           1.522     memory
+    16      8.7     1843     8.7           0.452     memory
+    32     10.5     3044    10.5           0.274     memory
+    64     14.2     4515    14.2           0.185     memory
+   128     21.5     5953    21.5           0.140     memory
+   200     29.7     6724    29.7           0.124     memory
+
+Prefill is compute-bound: 30,791 input tokens/s -&gt; $0.027 per million input tokens</code></pre>
+
+<p>Read the table from top to bottom. At batch 1 the GPU delivers 144 tokens per second and each million tokens costs $5.80. Raising the batch to 32 makes tokens twenty times cheaper ($0.27), because the 16 GB of weights are read once for 32 sequences instead of once for one. But the gains slow: going from 64 to 200 sequences cuts the cost only from $0.185 to $0.124, and the inter-token latency doubles (14 ms to 30 ms). Every row is memory-bound: the compute limit at batch 300 is never reached, because the KV caches take over before that.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Stacked horizontal bars of the bytes read in one decode step for Llama 3 8B with 2,048-token contexts. Weights are a constant 16.1 gigabytes. The KV cache adds 0.3 gigabytes at batch 1, 4.3 at batch 16, 17.2 at batch 64 and 53.7 at batch 200, so at large batches the cache is read three times as much as the weights.">
+    <text x="20" y="20" class="t-sm t-bold">Bytes read from HBM in one decode step</text>
+    <text x="100" y="62" text-anchor="end" class="t-sm">batch 1</text>
+    <rect x="110" y="40" width="128.5" height="30" class="f-purple"/>
+    <rect x="238.5" y="40" width="2.1" height="30" class="f-cyan"/>
+    <text x="248.6" y="60" class="t-xs t-muted">16.3 GB</text>
+    <text x="100" y="108" text-anchor="end" class="t-sm">batch 16</text>
+    <rect x="110" y="86" width="128.5" height="30" class="f-purple"/>
+    <rect x="238.5" y="86" width="34.4" height="30" class="f-cyan"/>
+    <text x="280.8" y="106" class="t-xs t-muted">20.4 GB</text>
+    <text x="100" y="154" text-anchor="end" class="t-sm">batch 64</text>
+    <rect x="110" y="132" width="128.5" height="30" class="f-purple"/>
+    <rect x="238.5" y="132" width="137.4" height="30" class="f-cyan"/>
+    <text x="383.9" y="152" class="t-xs t-muted">33.2 GB</text>
+    <text x="100" y="200" text-anchor="end" class="t-sm">batch 200</text>
+    <rect x="110" y="178" width="128.5" height="30" class="f-purple"/>
+    <rect x="238.5" y="178" width="429.5" height="30" class="f-cyan"/>
+    <text x="676.0" y="198" class="t-xs t-muted">69.7 GB</text>
+    <rect x="110" y="226" width="12" height="12" class="f-purple"/><text x="128" y="237" class="t-xs">weights, read once per step whatever the batch (16.1 GB)</text>
+    <rect x="470" y="226" width="12" height="12" class="f-cyan"/><text x="488" y="237" class="t-xs">KV cache: 0.27 GB per sequence</text>
+  </svg>
+  <figcaption><strong>Why batching stops paying.</strong> The weights are shared by every sequence in the batch, but each sequence brings its own cache. By batch 64 the cache is as large as the weights; by batch 200 it is more than three times larger. Purple is stored model state, cyan is cache. Context 2,048 tokens; bf16.</figcaption>
+</figure>
+
+<p>That is the central insight of serving economics. <strong>Batching amortises the weights, but not the cache.</strong> At batch 64 the cache bytes equal the weight bytes; at 200 they are three times larger, and the step time is almost entirely a function of how many cache bytes are read. This is why the cache is the focus of so much engineering: paging so that more sequences fit (<a href="20-serving-engines.html">chapter 20</a>), fewer KV heads (<a href="../../deep-learning/chapters/19-efficient-attention.html">grouped-query attention</a>), and cache quantisation (<a href="19-quantisation.html">chapter 19</a>).</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the airline seat</p>
+  <p>A flight costs roughly the same to operate whether it is empty or full, so the cost per passenger is the flight's cost divided by the seats filled. Batching is filling seats; the aircraft's fixed cost (the weights read every step) is shared among passengers. But each passenger also brings luggage (the KV cache) that takes room and weight, so past a point more passengers do not make each ticket much cheaper and the aircraft has a limit on how much it can carry.</p>
+  <p><em>Where it breaks down:</em> an airline can fill seats with a booking system months in advance. A serving system gets requests at random and must trade the wait for a full batch against the latency each user sees.</p>
+</div>
+
+<h2>Input tokens are cheaper than output tokens</h2>
+
+<p>The last line of the output explains a pattern you will see on every price list. Prefill (processing the prompt) is compute-bound: all of a prompt's tokens are processed together, so the weights are read once for thousands of tokens. At the assumed 50% arithmetic efficiency, one H100 processes about 30,800 prompt tokens per second for the 8B model, which at $3 an hour is $0.027 per million input tokens. Decoding the same number of tokens costs between $0.12 and $5.80 per million depending on the batch, a difference of roughly 5 to 200 times.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026: how prices are structured</p>
+  <p>Hosted-model price lists reflect this physics. Anthropic's pricing page, fetched in October 2026, lists output tokens at five times the base input price for the models I checked, charges 1.25 times the input price to write a prompt to a five-minute cache and a small fraction (one tenth on most listed models, lower on some) of the input price to read from it, and offers a 50% discount on both input and output for asynchronous batch processing. Other providers' ratios differ and all of these change; the structure (output dearer than input, cache reads much cheaper than fresh input, batch work discounted) follows from the costs above: output is memory-bound, a cache hit skips prefill (<a href="20-serving-engines.html">chapter 20</a>), and asynchronous work can be packed into the gaps in utilisation. Rented GPU prices also move: sources in October 2026 give H100 on-demand rates from about $2 to $7 per GPU-hour at specialist and hyperscale clouds, with spot and reserved rates about half. The $3 used here sits inside that range and is not a quote.</p>
+</div>
+
+<h2>Latency and throughput pull against each other</h2>
+
+<p>The table already shows the trade: more sequences per step means cheaper tokens and slower steps. A product has a latency requirement, so the real question is the cheapest configuration that meets it. The plot sweeps the batch size for two context lengths and draws the cost against the inter-token latency each user would see.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="A plot of cost per million output tokens, on a logarithmic axis, against inter-token latency in milliseconds, for Llama 3 8B on one H100. Two curves, for 2,048-token and 16,384-token contexts. Both fall steeply as latency rises because larger batches share the weight reads, then flatten. The 16,384-token curve sits about eight times higher and stops at smaller batches. A dashed vertical line marks a 25 millisecond latency target.">
+    <line x1="70" y1="230" x2="720" y2="230" class="line"/><line x1="70" y1="230" x2="70" y2="20" class="line"/>
+    <line x1="70.0" y1="230" x2="70.0" y2="235" class="line"/><text x="70.0" y="249" text-anchor="middle" class="t-xs t-muted">0</text>
+    <line x1="178.3" y1="230" x2="178.3" y2="235" class="line"/><text x="178.3" y="249" text-anchor="middle" class="t-xs t-muted">10</text>
+    <line x1="286.7" y1="230" x2="286.7" y2="235" class="line"/><text x="286.7" y="249" text-anchor="middle" class="t-xs t-muted">20</text>
+    <line x1="395.0" y1="230" x2="395.0" y2="235" class="line"/><text x="395.0" y="249" text-anchor="middle" class="t-xs t-muted">30</text>
+    <line x1="503.3" y1="230" x2="503.3" y2="235" class="line"/><text x="503.3" y="249" text-anchor="middle" class="t-xs t-muted">40</text>
+    <line x1="611.7" y1="230" x2="611.7" y2="235" class="line"/><text x="611.7" y="249" text-anchor="middle" class="t-xs t-muted">50</text>
+    <line x1="720.0" y1="230" x2="720.0" y2="235" class="line"/><text x="720.0" y="249" text-anchor="middle" class="t-xs t-muted">60</text>
+    <line x1="65" y1="230.0" x2="720" y2="230.0" class="line-thin" opacity="0.4"/><text x="61" y="234.0" text-anchor="end" class="t-xs t-muted">$0.05</text>
+    <line x1="65" y1="202.5" x2="720" y2="202.5" class="line-thin" opacity="0.4"/><text x="61" y="206.5" text-anchor="end" class="t-xs t-muted">$0.1</text>
+    <line x1="65" y1="138.7" x2="720" y2="138.7" class="line-thin" opacity="0.4"/><text x="61" y="142.7" text-anchor="end" class="t-xs t-muted">$0.5</text>
+    <line x1="65" y1="111.3" x2="720" y2="111.3" class="line-thin" opacity="0.4"/><text x="61" y="115.3" text-anchor="end" class="t-xs t-muted">$1</text>
+    <line x1="65" y1="47.5" x2="720" y2="47.5" class="line-thin" opacity="0.4"/><text x="61" y="51.5" text-anchor="end" class="t-xs t-muted">$5</text>
+    <text x="395" y="268" text-anchor="middle" class="t-xs t-muted">inter-token latency (ms) at the chosen batch size</text>
+    <text x="14" y="125" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 14 125)">$ per million output tokens (log)</text>
+    <line x1="340.8" y1="230" x2="340.8" y2="20" class="line-dash"/><text x="345.8" y="30" class="t-xs tc-yellow">25 ms target</text>
+    <path d="M145.4,41.6 L151.6,109.5 L157.8,130.6 L164.0,142.7 L170.2,151.0 L176.4,157.1 L182.6,161.8 L188.8,165.6 L195.0,168.7 L201.2,171.4 L207.4,173.6 L213.6,175.6 L219.8,177.3 L226.0,178.8 L232.2,180.2 L238.4,181.4 L244.6,182.5 L250.8,183.5 L257.0,184.4 L263.2,185.2 L269.4,186.0 L275.6,186.7 L281.8,187.3 L288.0,187.9 L294.2,188.5 L300.4,189.0 L306.6,189.5 L312.8,189.9 L319.0,190.4 L325.2,190.8 L331.4,191.2 L337.7,191.5 L343.9,191.9 L350.1,192.2 L356.3,192.5 L362.5,192.8 L368.7,193.1 L374.9,193.3 L381.1,193.6 L387.3,193.8 L393.5,194.1 L399.7,194.3 L405.9,194.5 L412.1,194.7 L418.3,194.9 L424.5,195.1 L429.4,195.2" fill="none" class="s-blue sw-2"/>
+    <text x="466.0" y="188.0" class="t-xs t-bold">context 2,048</text>
+    <path d="M154.1,37.3 L164.0,60.3 L174.0,72.4 L183.9,80.2 L193.8,85.7 L203.7,89.9 L213.6,93.2 L223.6,95.8 L233.5,98.0 L243.4,99.8 L253.3,101.4 L263.2,102.8 L273.2,104.0 L283.1,105.0 L293.0,105.9 L302.9,106.8 L312.8,107.5 L322.8,108.2 L332.7,108.8 L342.6,109.4 L352.5,109.9 L362.5,110.4 L372.4,110.8 L382.3,111.2 L392.2,111.6 L402.1,112.0 L412.1,112.3 L422.0,112.6 L422.0,112.6" fill="none" class="s-orange sw-2"/>
+    <text x="466.0" y="124.1" class="t-xs t-bold">context 16,384</text>
+  </svg>
+  <figcaption><strong>Batch size buys cheap tokens and costs latency.</strong> Each point on a curve is one batch size (from 1 on the left to the most that fits in memory on the right). Costs use the assumptions in the script (H100 at $3 an hour, 70% bandwidth efficiency). Long contexts are costlier at every latency because each sequence's cache must be read at every step.</figcaption>
+</figure>
+
+<p>Draw a vertical line at your latency target and read off the cost. The second script does that for a 25 ms target (an assumed requirement, about 40 tokens per second per user), and varies the precision and the context length. For each configuration it finds the largest batch that still meets the target and fits in memory.</p>
+
+<pre class="terminal" data-title="latency_target.py"><code>&quot;&quot;&quot;Cost per million output tokens at a latency target, for different precisions and contexts (same assumptions as econ.py).&quot;&quot;&quot;
+from econ import decode_step, max_batch, cost_per_m, PRICE
+ITL_TARGET = 0.025                                       # ASSUMED product requirement: at most 25 ms between tokens
+
+def best(ctx, wbytes, kvbytes):
+    top, ans = max_batch(ctx, wbytes, kvbytes), None
+    for B in range(1, top + 1):                          # largest batch that still meets the latency target
+        if decode_step(B, ctx, wbytes, kvbytes) &lt;= ITL_TARGET: ans = B
+    if ans is None: return None
+    t = decode_step(ans, ctx, wbytes, kvbytes)
+    return ans, t, ans / t
+
+configs = [(&quot;bf16 weights, bf16 KV&quot;, 2.0, 2.0), (&quot;int8/fp8 weights, bf16 KV&quot;, 1.0, 2.0),
+           (&quot;int4 weights (4.125 bit), bf16 KV&quot;, 4.125/8, 2.0), (&quot;int4 weights, fp8 KV&quot;, 4.125/8, 1.0)]
+print(f&quot;inter-token latency target {ITL_TARGET*1e3:.0f} ms, GPU ${PRICE:.2f}/h, fully busy\n&quot;)
+print(f&quot;{&#x27;configuration&#x27;:&lt;36}{&#x27;context&#x27;:&gt;8}{&#x27;batch&#x27;:&gt;7}{&#x27;ITL ms&#x27;:&gt;8}{&#x27;tok/s&#x27;:&gt;8}{&#x27;$/M tokens&#x27;:&gt;12}&quot;)
+for ctx in (2048, 16384):
+    for name, w, kv in configs:
+        r = best(ctx, w, kv)
+        if r is None: print(f&quot;{name:&lt;36}{ctx:&gt;8}{&#x27;misses the latency target even at batch 1&#x27;:&gt;35}&quot;); continue
+        B, t, tps = r
+        print(f&quot;{name:&lt;36}{ctx:&gt;8}{B:&gt;7}{t*1e3:&gt;8.1f}{tps:&gt;8.0f}{cost_per_m(tps):&gt;12.3f}&quot;)
+print(&quot;\nutilisation: the same configuration (bf16, context 2048) when the GPU is only partly busy&quot;)
+B, t, tps = best(2048, 2.0, 2.0)
+for u in (1.0, 0.6, 0.3, 0.1):
+    print(f&quot;  {u:&gt;4.0%} busy: ${cost_per_m(tps, u):.3f} per million output tokens&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>inter-token latency target 25 ms, GPU $3.00/h, fully busy
+
+configuration                        context  batch  ITL ms   tok/s  $/M tokens
+bf16 weights, bf16 KV                   2048    158    24.9    6336       0.132
+int8/fp8 weights, bf16 KV               2048    188    24.9    7537       0.111
+int4 weights (4.125 bit), bf16 KV       2048    202    24.9    8116       0.103
+int4 weights, fp8 KV                    2048    405    24.9   16235       0.051
+bf16 weights, bf16 KV                  16384     19    24.2     784       1.064
+int8/fp8 weights, bf16 KV              16384     23    24.5     939       0.887
+int4 weights (4.125 bit), bf16 KV      16384     25    24.7    1014       0.822
+int4 weights, fp8 KV                   16384     50    24.7    2028       0.411
+
+utilisation: the same configuration (bf16, context 2048) when the GPU is only partly busy
+  100% busy: $0.132 per million output tokens
+   60% busy: $0.219 per million output tokens
+   30% busy: $0.438 per million output tokens
+   10% busy: $1.315 per million output tokens</code></pre>
+
+<p>Three results stand out.</p>
+<ol class="steps">
+  <li><strong>Context length is the biggest lever here.</strong> Moving from 2,048 to 16,384 tokens of context raises the cost per token by about eight times (from $0.132 to $1.064 for bf16), because the batch that meets the latency target shrinks from 158 to 19. Long contexts are expensive to serve, not just to train on.</li>
+  <li><strong>Weight quantisation helps modestly; cache quantisation helps a lot.</strong> At 2,048 tokens, going from bf16 to 4-bit weights saves about 22% ($0.132 to $0.103), because the weights are no longer the main cost; halving the cache bytes with fp8 KV nearly halves the cost again to $0.051. This is the model behind the advice that once weights are small, the cache is where to look.</li>
+  <li><strong>Utilisation can erase all of it.</strong> The bottom lines show the same configuration at 60%, 30% and 10% busy: the cost multiplies by 1.7, 3.3 and 10. An idle GPU is billed like a busy one.</li>
+</ol>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A token has a price." A token has a price only at a stated batch size, context length, precision, latency target and utilisation. The same GPU can serve a million tokens for five cents or for six dollars; the difference is how well the workload fits the hardware. A quoted benchmark figure (tokens per second) is meaningless without those conditions, and a figure measured at saturation overstates what a half-idle fleet delivers.</p>
+</div>
+
+<h2>Utilisation: the cost nobody sees in the benchmark</h2>
+
+<p>Benchmarks run at saturation; production does not. Traffic has daily and weekly cycles, bursts and launches. To meet a latency target at peak you must provision for peak, and the GPUs are idle otherwise. A server run at high utilisation also suffers: as with any queue, latency climbs steeply as load approaches capacity (<a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>), so planning for 100% busy at peak is a recipe for timeouts. The standard practice is to plan for 50 to 70% at peak, add a minimum of two replicas for availability, and scale with demand (<a href="../../reliability/chapters/10-load-testing-capacity.html">load testing and capacity planning</a>, <a href="../../reliability/chapters/20-cost-efficiency.html">cost and efficiency</a>).</p>
+
+<p>The last script works through a support assistant. The inputs are assumptions: each conversation sends 3,000 prompt tokens, of which a 2,000-token prefix is shared and served from the prefix cache, and produces 400 output tokens; the busiest hour carries three times the average load; the target is 60% busy at peak; and a minimum of two replicas are always on.</p>
+
+<pre class="terminal" data-title="capacity_plan.py"><code>&quot;&quot;&quot;A worked estimate: a support assistant on a self-hosted 8B model. Every input below is an ASSUMPTION except the H100 figures.&quot;&quot;&quot;
+import math
+from econ import PEAK, MFU, PARAMS, PRICE
+IN_TOK, OUT_TOK, CACHED = 3_000, 400, 2_000          # tokens per conversation; the first 2,000 are a shared prefix
+PEAK_TO_AVG, TARGET_UTIL, MIN_REPLICAS = 3.0, 0.6, 2   # busiest hour is 3x average; plan for 60% busy at peak; 2 replicas for availability
+DECODE_TPS = 6336                                    # per GPU at a 25 ms target (econ2.py: bf16, context 2048)
+PREFILL_TPS = PEAK * MFU / (2 * PARAMS)              # per GPU, compute-bound (econ.py)
+SECONDS_MONTH = 730 * 3600
+
+def plan(conv, use_cache=True):
+    pre = conv * (IN_TOK - (CACHED if use_cache else 0)); dec = conv * OUT_TOK
+    busy = (pre / PREFILL_TPS + dec / DECODE_TPS) / SECONDS_MONTH          # average number of GPUs&#x27; worth of work
+    need = busy * PEAK_TO_AVG / TARGET_UTIL
+    n = max(MIN_REPLICAS, math.ceil(need))
+    cost = n * PRICE * 730
+    return busy, need, n, cost
+
+print(f&quot;{&#x27;conversations/month&#x27;:&gt;20}{&#x27;avg GPUs busy&#x27;:&gt;15}{&#x27;needed at peak&#x27;:&gt;16}{&#x27;provisioned&#x27;:&gt;13}{&#x27;monthly bill&#x27;:&gt;14}{&#x27;$/conversation&#x27;:&gt;16}{&#x27;$/M tokens&#x27;:&gt;12}&quot;)
+for conv in (200_000, 2_000_000, 40_000_000):
+    busy, need, n, cost = plan(conv)
+    print(f&quot;{conv:&gt;20,}{busy:&gt;15.2f}{need:&gt;16.2f}{n:&gt;13}{&#x27;$&#x27;+format(cost,&#x27;,.0f&#x27;):&gt;14}{cost/conv:&gt;16.4f}{cost/((IN_TOK+OUT_TOK)*conv/1e6):&gt;12.3f}&quot;)
+b1 = plan(40_000_000)[1]; b2 = plan(40_000_000, use_cache=False)[1]
+print(f&quot;\nat 40M conversations a month the prefix cache cuts the GPUs needed at peak from {b2:.1f} to {b1:.1f}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code> conversations/month  avg GPUs busy  needed at peak  provisioned  monthly bill  $/conversation  $/M tokens
+             200,000           0.01            0.04            2        $4,380          0.0219       6.441
+           2,000,000           0.07            0.36            2        $4,380          0.0022       0.644
+          40,000,000           1.46            7.28            8       $17,520          0.0004       0.129
+
+at 40M conversations a month the prefix cache cuts the GPUs needed at peak from 12.2 to 7.3</code></pre>
+
+<p>At 200,000 conversations a month the bill is dominated by the two-replica minimum: $4,380 for under 1% of one GPU's work, or $0.022 per conversation. At 2 million it is the same $4,380, now $0.0022 a conversation. Only at 40 million does the bill track the token count, at $17,520 and $0.0004 a conversation, and there the prefix cache matters: it reduces the GPUs needed at peak from 12.2 to 7.3. Fixed costs, not tokens, decide the economics of a small deployment. This is the reasoning to bring to the self-hosting question.</p>
+
+<h2>Self-hosting or per-token API?</h2>
+
+<p>An API charges only for tokens and absorbs the idle time; a rented GPU charges for time and leaves the idle time to you. The break-even depends on how busy you can keep the GPU. The script compares one GPU's cost per million tokens at full load ($0.132) with a range of <em>assumed</em> API prices (not actual prices of any provider).</p>
+
+<pre class="terminal" data-title="break_even.py"><code>&quot;&quot;&quot;Self-hosting versus paying per token: at what utilisation does a rented GPU beat an API at a given (assumed) price?&quot;&quot;&quot;
+from econ import cost_per_m, PRICE
+HOURS = 730                                                     # hours in a month
+tps = 6336                                                      # bf16 8B, context 2048, 25 ms target (from econ2.py)
+full = cost_per_m(tps)
+monthly_cap = tps * 3600 * HOURS
+print(f&quot;One GPU: ${PRICE*HOURS:,.0f} a month. At full load it serves {monthly_cap/1e9:.1f} billion tokens a month (${full:.3f} per million).&quot;)
+print(f&quot;{&#x27;assumed API price $/M tokens&#x27;:&gt;30}{&#x27;break-even utilisation&#x27;:&gt;26}{&#x27;tokens/month to break even&#x27;:&gt;28}&quot;)
+for api in (0.05, 0.10, 0.20, 0.50, 1.00, 3.00):
+    u = full / api
+    tokens = PRICE * HOURS / api * 1e6
+    print(f&quot;{api:&gt;30.2f}{(f&#x27;{u:.0%}&#x27; if u &lt; 1 else &#x27;never (&gt;100%)&#x27;):&gt;26}{tokens/1e9:&gt;25.1f} B&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>One GPU: $2,190 a month. At full load it serves 16.7 billion tokens a month ($0.132 per million).
+  assumed API price $/M tokens    break-even utilisation  tokens/month to break even
+                          0.05             never (&gt;100%)                     43.8 B
+                          0.10             never (&gt;100%)                     21.9 B
+                          0.20                       66%                     10.9 B
+                          0.50                       26%                      4.4 B
+                          1.00                       13%                      2.2 B
+                          3.00                        4%                      0.7 B</code></pre>
+
+<p>If an API charged $0.50 per million tokens, the rented GPU wins once it is more than 26% busy, which is 4.4 billion tokens a month. If the API charged $0.10, no utilisation of this GPU configuration could beat it, which is a reminder that large providers batch across thousands of customers and may run more efficient hardware and kernels than you can. And this ignores things that often decide the matter: the engineering time to run the service, the cost of quality (an 8B model is not a frontier model), data-handling requirements that rule out an external API, and latency guarantees. A rule of thumb that survives the details: <strong>self-host when volume is high and steady, the model is small enough for you to serve well, or data cannot leave your environment; use an API for spiky or small workloads and for the capabilities only large models have.</strong> The routing and quality trade-offs are the subject of <a href="../../evals/chapters/19-cost-latency-quality.html">A6 chapter 19</a>, and the studio <a href="../studios/studio-03-serving-platform.html">Design an LLM Serving Platform</a> applies all of this to a multi-tenant design.</p>
+
+<h2>The levers, in one table</h2>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Lever</th><th>What it changes in the model</th><th>Typical effect</th><th>Catch</th></tr></thead>
+  <tbody>
+    <tr><td>Larger batch (continuous batching)</td><td>Shares weight reads across more sequences</td><td>Large cost drop up to a point</td><td>Raises inter-token latency; needs cache memory</td></tr>
+    <tr><td>Paged KV and prefix caching</td><td>More sequences fit; fewer prompt tokens computed</td><td>Raises feasible batch; cuts input cost</td><td>Cache hit rate depends on traffic</td></tr>
+    <tr><td>Weight quantisation</td><td>Fewer weight bytes per step; cheaper arithmetic at 8-bit</td><td>Modest at long context, larger at small batch</td><td>Quality must be measured (<a href="19-quantisation.html">chapter 19</a>)</td></tr>
+    <tr><td>KV-cache quantisation</td><td>Fewer cache bytes per sequence</td><td>Up to about 2x at long context</td><td>Long-context quality</td></tr>
+    <tr><td>Shorter context</td><td>Smaller cache per sequence</td><td>Cost scaled by context in the long-context regime</td><td>Product requirement; summarise or retrieve instead (<a href="../../retrieval/chapters/00-start-here.html">A5</a>)</td></tr>
+    <tr><td>Speculative decoding</td><td>More tokens per weight read at low batch</td><td>Latency, mostly at low concurrency</td><td>Fades when compute-bound (<a href="21-speculative-decoding.html">chapter 21</a>)</td></tr>
+    <tr><td>Smaller or distilled model</td><td>Fewer parameters</td><td>Proportional to size</td><td>Capability (<a href="15-distillation.html">chapter 15</a>)</td></tr>
+    <tr><td>Higher utilisation (autoscaling, queues, batch jobs)</td><td>The denominator</td><td>Up to 10x for a mostly idle fleet</td><td>Latency at peak; scale-up time</td></tr>
+  </tbody>
+</table></div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Edit the constants at the top of <code>econ.py</code> and rerun all four scripts (the others import it).</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 econ.py &amp;&amp; python3 econ2.py</span></code></pre>
+  <p>Set <code>PRICE</code> to $2 and then to $6: which numbers move and which do not? Set <code>BW_EFF</code> to 0.5: how much does the cost at 25 ms change, and at which batch sizes? Change <code>PARAMS</code> and <code>KV_TOK</code> to the 70B shape (70.55 billion parameters; 320 KiB per token, <a href="18-kv-cache.html">chapter 18</a>) and watch what happens to the maximum batch on one 80 GB GPU: it will fail to fit in bf16, so also set the weight bytes to 0.5 in <code>decode_step</code> and see what the cache budget allows. Finally, change <code>CONV</code>-style inputs in <code>econ4.py</code> to your own product's numbers.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>This is capacity planning, with unusual units. The estimate-then-sanity-check habit is from <a href="../../design/chapters/02-estimation.html">back-of-the-envelope estimation</a>; the way latency explodes near full load is the knee of <a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>; peak-to-average provisioning and headroom come from <a href="../../reliability/chapters/10-load-testing-capacity.html">load testing and capacity planning</a>; and treating cost as an engineering property is the point of <a href="../../reliability/chapters/20-cost-efficiency.html">cost and efficiency</a>. The model-serving view in <a href="../../design/chapters/20-ml-systems.html">Designing with ML &amp; LLMs</a> uses the same physics at a higher level.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Cost per token is the GPU's hourly price divided by the tokens it actually serves per hour; throughput and utilisation are the two things to model.</li>
+    <li>Decode is limited by bytes: weights read once per step plus every sequence's cache. Batching amortises the weights but not the cache, so gains flatten as caches take over.</li>
+    <li>Prefill is compute-bound and cheap per token; decode is memory-bound and dear. Price lists follow this: output costs several times input, cache hits are cheap.</li>
+    <li>Context length and cache precision can matter more than weight precision. In the chapter's model, 8 times more context cost about 8 times more per token.</li>
+    <li>Small deployments are dominated by fixed costs (minimum replicas, idle time); utilisation can change the unit cost tenfold.</li>
+    <li>Quote a cost only with its conditions: batch, context, precision, latency target and utilisation.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA, H100 Tensor Core GPU product page</a>. Bandwidth, memory and throughput figures (headline Tensor Core numbers include sparsity).</li>
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Llama Team, "The Llama 3 Herd of Models" (2024)</a>. Model shapes used in the calculations.</li>
+  <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (2023)</a>. Why memory capacity, not compute, bounds the batch.</li>
+  <li><a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener">Zhong et al., "DistServe" (2024)</a>. Defines goodput under latency targets for prefill and decode separately.</li>
+  <li><a href="https://platform.claude.com/docs/en/about-claude/pricing" target="_blank" rel="noopener">Anthropic, model pricing page</a>. An example of the input, output, cache and batch price structure (a live page; figures change).</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="0">
+    <p class="q-text">A GPU serves 8B-model decoding at 6,000 tokens per second and costs $3 an hour. Roughly what does a million output tokens cost at full load?</p>
+    <ol class="q-options"><li>About $0.14</li><li>About $1.40</li><li>About $14</li><li>About $0.014</li></ol>
+    <div class="q-explain">6,000 tokens a second is 21.6 million an hour, so $3 divided by 21.6 is about $0.14 per million. The tempting mistakes are slipping a factor of ten in the unit conversion.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In the chapter's model, raising the batch from 64 to 200 sequences cuts the cost per token only from $0.185 to $0.124 while latency doubles. Why do the gains flatten?</p>
+    <ol class="q-options"><li>The GPU becomes compute-bound at batch 64</li><li>The weights grow with the batch</li><li>Each sequence adds its own KV cache to read, so cache bytes come to dominate the step</li><li>The price of the GPU rises with load</li></ol>
+    <div class="q-explain">Weights are read once per step regardless of batch, but cache reads scale with the batch. At batch 64 they equal the weights; at 200 they are over three times larger. The model stays memory-bound throughout, so option 0 is wrong.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Why is an input (prompt) token usually cheaper to serve than an output token?</p>
+    <ol class="q-options"><li>Input tokens are shorter</li><li>Providers subsidise input</li><li>Input tokens skip the attention layers</li><li>Prompt tokens are processed together in compute-bound prefill that reads the weights once for many tokens, while each output token needs its own memory-bound step</li></ol>
+    <div class="q-explain">The asymmetry comes from the arithmetic intensity of the two phases. Option 1 may sometimes be true commercially, but the physics alone predicts an input-output gap; option 2 is false, since prompt tokens go through every layer.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">You serve at a 25 ms latency target with a 16,000-token context and want the biggest cost reduction. According to the chapter's model, which change helps most?</p>
+    <ol class="q-options"><li>Quantising weights from 8 bits to 4 bits</li><li>Storing the KV cache in 8 bits instead of 16</li><li>Buying a GPU with more arithmetic throughput but the same bandwidth and memory</li><li>Increasing the number of replicas</li></ol>
+    <div class="q-explain">At long context the cache dominates the bytes read and limits the batch, so halving it nearly halves the cost per token (0.82 to 0.41 dollars in the table). Weight quantisation gave a smaller gain, extra arithmetic does not help a memory-bound step, and extra replicas raise cost without improving per-GPU efficiency.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A small team serves 200,000 conversations a month with two always-on GPUs and finds the cost per conversation high. What is the main reason?</p>
+    <ol class="q-options"><li>The model is too large</li><li>Output tokens are too expensive</li><li>The GPUs are almost idle, so the bill is fixed cost spread over few tokens</li><li>Prefix caching is turned off</li></ol>
+    <div class="q-explain">The chapter's plan shows under 1% of a GPU's work at that volume, so the cost is almost all idle capacity from the availability minimum. Prefix caching or a smaller model would trim a few percent of a tiny number. The fix is a cheaper way to meet the minimum (shared infrastructure, a per-token API) rather than faster kernels.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A vendor quotes "12,000 tokens per second on an H100" for an 8B model. What do you ask first?</p>
+    <ol class="q-options"><li>At what batch size, context length, precision and latency target, and was the GPU saturated?</li><li>Which colour of GPU it is</li><li>Whether the figure includes the model's training cost</li><li>How many parameters the draft model has</li></ol>
+    <div class="q-explain">Throughput varies by an order of magnitude with those conditions: the chapter's model gives 144 tokens a second at batch 1 and 6,700 at batch 200 for the same GPU. A single number without them cannot be compared with anything.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>
