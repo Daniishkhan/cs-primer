@@ -298,8 +298,14 @@ class RealModel(Model):
         msg = ch["message"]
         blocks: List[Block] = [text(msg["content"])] if msg.get("content") else []
         for tc in msg.get("tool_calls") or []:
-            blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"],
-                           "input": json.loads(tc["function"]["arguments"] or "{}")})
+            raw = tc["function"]["arguments"] or "{}"
+            try:
+                args = json.loads(raw)
+            except json.JSONDecodeError:
+                # Real models sometimes emit cut-off or invalid JSON. Pass it on
+                # so the agent loop can answer with a tool error, not crash.
+                args = {"_malformed_arguments": raw}
+            blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"], "input": args})
         stop = {"tool_calls": "tool_use", "length": "max_tokens"}.get(ch.get("finish_reason"), "end_turn")
         u = d.get("usage") or {}
         return Response(content=blocks, stop_reason=stop, model=d.get("model", self.model),

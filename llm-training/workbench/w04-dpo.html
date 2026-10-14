@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workbench 4: DPO on a Small Preference Set · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-workbench="W4">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Workbench 4: DPO on a Small Preference Set</h1>
+  <p class="lede">A <span class="term">preference pair</span> is a prompt with two answers, one that a person preferred and one they rejected. <span class="term">Direct preference optimisation</span> (DPO) trains a model on such pairs with no separate reward model. Chapter 12 shows that the model carries its own hidden score for every answer, the <span class="term">implicit reward</span>. Here you predict what the loss must be before any training, then train a small model with TRL (Hugging Face's library for post-training) and read the hidden scores back out.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why measure it</p>
+  <p>The DPO loss is a few symbols, and it is easy to nod at it and learn nothing. Three numbers make it concrete. The <span class="term">margin</span> is the chosen answer's implicit reward minus the rejected answer's. The <span class="term">preference accuracy</span> is the share of pairs where that margin is above zero. The <span class="term">loss</span> is the number training pushes down. Before training the model equals its starting copy, so all three are known without running anything. After training they tell you whether the model learned the preference or only memorised the pairs. <strong>Write the prediction down, then measure.</strong></p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">What you need</p>
+  <ul>
+    <li><strong>Part 1, your laptop:</strong> the workbench venv (see <a href="w01-kv-cache.html">workbench 1</a>), plus <code>trl</code> and <code>peft</code>. About 0.5 GB of disk: SmolLM2-135M-Instruct (257 MB) and the training split of <code>trl-lib/ultrafeedback_binarized</code> (253 MB). The run took between three and eight minutes on a MacBook, depending on what else the machine was doing.</li>
+    <li><strong>Part 2, a GPU box (optional):</strong> one 24 GB card, about 2 GB of disk for Qwen2.5-0.5B-Instruct, and about two hours with the experiments. Setting one up is in <a href="../../lab-machine.html#gpu">Your lab machine, Option C</a>.</li>
+  </ul>
+</div>
+
+<h2>Predict before you run</h2>
+<p>Recall the loss from <a href="../chapters/12-preference-optimisation.html#eq-dpo-loss">chapter 12</a>, where <i>w</i> marks the chosen ("won") answer and <i>l</i> the rejected ("lost") one:</p>
+<div class="eq-display" data-tex="L_{\text{DPO}}(\theta) = -\E_{(x,\,y_w,\,y_l)\sim D}\Big[\log\sigma\big(\hat r_\theta(x, y_w) - \hat r_\theta(x, y_l)\big)\Big],\qquad \hat r_\theta(x, y) = \beta \log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}">L<sub>DPO</sub>(&theta;) = &minus; E [ log &sigma;( r&#770;<sub>&theta;</sub>(x, y<sub>w</sub>) &minus; r&#770;<sub>&theta;</sub>(x, y<sub>l</sub>) ) ], r&#770;<sub>&theta;</sub>(x, y) = &beta; log( &pi;<sub>&theta;</sub>(y|x) / &pi;<sub>ref</sub>(y|x) )</div>
+<p>The reference model &pi;<sub>ref</sub> is a frozen copy of the model you start from. TRL makes that copy for you when you pass no reference. On the first step the model being trained &pi;<sub>&theta;</sub> is that same copy. So for every answer the ratio &pi;<sub>&theta;</sub> / &pi;<sub>ref</sub> is exactly 1, its logarithm is 0, and both implicit rewards are 0.</p>
+<div class="callout predict">
+  <p class="callout-title">Your prediction</p>
+  <p>Work these out on paper before reading on. With &beta; = 0.1, what are the margin, the loss and the preference accuracy at step 1? Then guess what happens over the next 30 steps on 240 pairs. Does the accuracy on pairs the model has not yet seen climb towards 100 percent?</p>
+</div>
+<details class="deeper">
+  <summary>Check your arithmetic</summary>
+  <p>Margin = 0 &minus; 0 = <strong>0</strong>. The sigmoid of 0 is 0.5, so the loss is &minus;log 0.5 = log 2 = <strong>0.6931</strong>, whatever &beta; is. Accuracy counts pairs where the margin is strictly above zero. With exact ties, no pair counts, so a by-hand check gives <strong>0.00</strong>. TRL's own logged value will be near 0.5 instead. Its two forward passes differ by rounding errors of about 10<sup>&minus;7</sup>, and the sign of that noise is a coin flip.</p>
+  <p>After 30 steps the loss on fresh pairs should sit only a little below 0.693. Each pair is seen once, a 135-million-parameter model has little room to learn a general taste from 240 pairs, and the labels are noisy. Expect preference accuracy on unseen pairs of roughly 0.5 to 0.6, not 1.0. On pairs it has trained on the margin will be much larger, because the model can memorise them.</p>
+</details>
+
+<h2>Part 1: on your laptop</h2>
+<h3>Set up once</h3>
+<p>Use the venv from workbench 1. If you made it before this page existed, add the two libraries:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">source ~/.venvs/zts/bin/activate</span>
+<span class="prompt">$ </span><span class="cmd">pip install trl peft datasets</span></code></pre>
+<p>The script is <a href="code/w04/dpo_small.py"><code>code/w04/dpo_small.py</code></a>, and the same code split into cells is <a href="code/w04/dpo_small.ipynb"><code>dpo_small.ipynb</code></a>. The first run downloads the model and the dataset.</p>
+
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>read the model's shape from config.json; predict the memory and the step-1 loss (log 2)</li>
+  <li>keep pairs whose prompt and both answers fit in 256 tokens; split the prompt off</li>
+  <li>implicit reward of an answer &larr; &beta; &times; (log-prob under the model &minus; log-prob under the frozen copy)</li>
+  <li>train 30 steps of 8 pairs with TRL's DPOTrainer; log margin and accuracy</li>
+  <li>on 100 unseen pairs, compute the margin and accuracy by hand and compare with TRL's own</li>
+</ol></div>
+<p>One detail first. TRL 1.15 computes log-probabilities in a fused GPU kernel written in Triton, a GPU programming language that exists on Linux only. On a Mac the import fails and training crashes. The script includes a short stand-in, <code>PlainLogProb</code>, that does the same sums in ordinary PyTorch. It is slower and uses more memory, and the numbers are the same. On a GPU box the real kernel is found and the stand-in is skipped.</p>
+<pre class="terminal" data-title="dpo_small.py" data-run="off"><code>"""DPO on a small preference set: predict the first loss from chapter 12's
+formula, train with TRL's DPOTrainer, then read the implicit reward margin
+and the preference accuracy back out of the model, by hand and from TRL.
+
+Laptop (SmolLM2-135M-Instruct, a few hundred pairs, about 5 minutes):
+    python dpo_small.py
+GPU box (0.5B model, more pairs, bf16 autocast):
+    python dpo_small.py --model Qwen/Qwen2.5-0.5B-Instruct --pairs 2000 \
+        --steps 120 --batch 4 --accum 4 --max-length 1024
+Same, with LoRA adapters instead of full tuning (a 1.5B model fits):
+    python dpo_small.py --model Qwen/Qwen2.5-1.5B-Instruct --lora 16 ...
+Memory prediction only (reads config.json, downloads no weights):
+    python dpo_small.py --model Qwen/Qwen2.5-1.5B-Instruct --predict-only
+
+Needs: torch, transformers, trl, datasets (workbench/requirements.txt)."""
+import argparse
+import math
+import random
+
+import torch
+from datasets import Dataset, load_dataset
+from peft import LoraConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.trainer_callback import PrinterCallback
+from trl import DPOConfig, DPOTrainer
+from trl.trainer import utils as trl_utils
+
+# ── 1. Settings ──────────────────────────────────────────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M-Instruct")
+ap.add_argument("--pairs", type=int, default=240)     # training pairs
+ap.add_argument("--eval-pairs", type=int, default=100)  # held-out pairs
+ap.add_argument("--steps", type=int, default=30)      # optimiser steps
+ap.add_argument("--batch", type=int, default=2)       # pairs per micro-batch
+ap.add_argument("--accum", type=int, default=4)       # micro-batches per step
+ap.add_argument("--lr", type=float, default=2e-5)
+ap.add_argument("--beta", type=float, default=0.1)    # the leash
+ap.add_argument("--max-length", type=int, default=256)
+ap.add_argument("--lora", type=int, default=0)        # LoRA rank (0: full)
+ap.add_argument("--predict-only", action="store_true")
+args, _ = ap.parse_known_args()        # notebooks pass their own flags
+
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+random.seed(0)
+torch.manual_seed(0)
+
+
+class PlainLogProb:
+    """Stand-in for TRL's Triton kernel, which exists on Linux + CUDA only.
+
+    TRL 1.15 computes per-token log-probabilities in a fused kernel. Where
+    Triton is missing (a Mac), the import fails and training crashes. This
+    does the same sums with ordinary PyTorch: slower and hungrier, same
+    numbers. Skipped on a GPU box, where the real kernel is present."""
+
+    @staticmethod
+    def apply(hidden, weight, bias, targets, temperature, chunk, softcap,
+              scale, outputs):
+        z = hidden @ weight.t()
+        z = (z if bias is None else z + bias).float() * scale / temperature
+        lse = torch.logsumexp(z, -1)
+        logp = z.gather(1, targets[:, None])[:, 0] - lse
+        p = z.softmax(-1)
+        entropy = lse - (p * z).sum(-1) if "entropy" in outputs else None
+        sq = torch.log((p ** 2).sum(-1)) if "log_sum_sq_probs" in outputs \
+            else None
+        mean_logits = z.detach().mean(-1) if "mean_logits" in outputs \
+            else None
+        top1 = (z.argmax(-1) == targets) if "is_top1" in outputs else None
+        return logp, entropy, sq, mean_logits, top1
+
+
+HAVE_KERNEL = trl_utils._ChunkedLogProbFunction is not None
+if not HAVE_KERNEL:                                # no Triton here
+    trl_utils._ChunkedLogProbFunction = PlainLogProb
+
+
+def gib(n):
+    return f"{n / 2**30:,.2f} GiB"
+
+
+# ── 2. Predict: memory from the config, and the first loss ───────────────
+cfg = AutoConfig.from_pretrained(args.model)
+with torch.device("meta"):                  # shapes only: no memory used
+    shell = AutoModelForCausalLM.from_config(cfg)
+N = sum(p.numel() for p in shell.parameters())
+L, h, a, V = (cfg.num_hidden_layers, cfg.hidden_size,
+              cfg.num_attention_heads, cfg.vocab_size)
+s, rows = args.max_length, 2 * args.batch   # chosen and rejected together
+if args.lora:    # adapters on every linear layer; the base stays frozen
+    kv = cfg.num_key_value_heads * (h // a)
+    mats = [(h, h), (h, kv), (h, kv), (h, h), (h, cfg.intermediate_size),
+            (h, cfg.intermediate_size), (cfg.intermediate_size, h)]
+    trainable = L * sum(args.lora * (i + o) for i, o in mats)
+    states = 4 * N + 16 * trainable         # frozen fp32 base + adapters
+    ref = 0                                 # reference = adapters switched off
+else:            # fp32 weights (4), gradients (4), Adam moments (8) ...
+    trainable, states = N, 16 * N
+    ref = 4 * N                             # ... plus a frozen fp32 copy
+acts = L * s * rows * h * 2                 # checkpointing: layer inputs
+logits = s * rows * V * 4                   # one fp32 copy of the scores
+if HAVE_KERNEL or args.predict_only:       # predict-only means "for a GPU"
+    logits = 0                              # TRL's kernel works in chunks
+print(f"model {args.model} on {DEVICE}: {N:,} parameters, "
+      f"{trainable:,} trained")
+print(f"predicted memory: states {gib(states)} + reference {gib(ref)} "
+      f"+ activations {gib(acts)} + logits {gib(logits)} "
+      f"= {gib(states + ref + acts + logits)}")
+print(f"predicted step-0 loss: -log sigma(0) = log 2 = {math.log(2):.4f}")
+if args.predict_only:
+    raise SystemExit
+
+# ── 3. Data: pairs that fit untruncated, prompt split off the answers ────
+tok = AutoTokenizer.from_pretrained(args.model)
+
+
+def fits(messages):
+    """True if the whole conversation fits in max_length tokens."""
+    ids = tok.apply_chat_template(messages, return_dict=False)
+    return len(ids) &lt;= args.max_length
+
+
+def short_pairs(split, n):
+    """The first n pairs whose prompt and both answers fit untruncated."""
+    out = []
+    for r in load_dataset("trl-lib/ultrafeedback_binarized", split=split):
+        if len(r["chosen"]) != 2 or len(r["rejected"]) != 2:
+            continue                           # keep single-turn prompts
+        if fits(r["chosen"]) and fits(r["rejected"]):
+            out.append({"prompt": r["chosen"][:-1],
+                        "chosen": r["chosen"][-1:],
+                        "rejected": r["rejected"][-1:]})
+        if len(out) == n:
+            break
+    return out
+
+
+train = short_pairs("train", args.pairs)
+held = short_pairs("test", args.eval_pairs)
+print(f"{len(train)} training pairs, {len(held)} held-out pairs")
+
+
+# ── 4. The implicit reward by hand: beta * (log pi_theta - log pi_ref) ───
+def seq_logp(model, prompt, answer):
+    """Sum of the answer's token log-probabilities given the prompt."""
+    p_ids = tok.apply_chat_template(prompt, add_generation_prompt=True,
+                                    return_dict=False)
+    ids = tok.apply_chat_template(prompt + answer,
+                                  return_dict=False)[:args.max_length]
+    x = torch.tensor([ids], device=model.device)
+    with torch.no_grad():
+        lp = model(x).logits[0, :-1].float().log_softmax(-1)
+    tok_lp = lp.gather(1, x[0, 1:, None])[:, 0]
+    return tok_lp[len(p_ids) - 1:].sum().item()
+
+
+def preference_stats(policy, reference, pairs):
+    """Mean margin, accuracy, DPO loss, and how far each answer's
+    log-probability moved (chosen, rejected), over pairs, by hand."""
+    margins, moved = [], {"chosen": [], "rejected": []}
+    for r in pairs:
+        gap = {}
+        for key in ("chosen", "rejected"):
+            lp = seq_logp(policy, r["prompt"], r[key])
+            if args.lora:                       # reference: adapters off
+                with policy.disable_adapter():
+                    lp0 = seq_logp(policy, r["prompt"], r[key])
+            else:
+                lp0 = seq_logp(reference, r["prompt"], r[key])
+            moved[key].append(lp - lp0)
+            gap[key] = args.beta * (lp - lp0)       # the implicit reward
+        margins.append(gap["chosen"] - gap["rejected"])
+    n = len(margins)
+    loss = sum(-math.log(1 / (1 + math.exp(-m))) for m in margins) / n
+    return (sum(margins) / n, sum(m &gt; 0 for m in margins) / n, loss,
+            sum(moved["chosen"]) / n, sum(moved["rejected"]) / n)
+
+
+# ── 5. Train with TRL ────────────────────────────────────────────────────
+cfg_dpo = DPOConfig(
+    output_dir="dpo-out", beta=args.beta, learning_rate=args.lr,
+    loss_type=["sigmoid"],                 # the loss derived in chapter 12
+    max_steps=args.steps, per_device_train_batch_size=args.batch,
+    gradient_accumulation_steps=args.accum, max_length=args.max_length,
+    logging_steps=1, eval_strategy="no", report_to="none", save_strategy="no",
+    bf16=(DEVICE == "cuda"), gradient_checkpointing=(DEVICE == "cuda"),
+    seed=0, data_seed=0, disable_tqdm=True)
+trainer = DPOTrainer(model=args.model, args=cfg_dpo,
+                     train_dataset=Dataset.from_list(train),
+                     eval_dataset=Dataset.from_list(held),
+                     processing_class=tok,
+                     peft_config=(LoraConfig(
+                         r=args.lora, lora_alpha=2 * args.lora,
+                         target_modules="all-linear") if args.lora else None))
+trainer.remove_callback(PrinterCallback)       # we print our own table
+policy = trainer.model
+reference = None if args.lora else AutoModelForCausalLM.from_pretrained(
+    args.model, dtype=torch.float32).to(policy.device).eval()
+
+m0, acc0, loss0, _, _ = preference_stats(policy, reference, held)
+print(f"\nbefore training, held-out, by hand: margin {m0:+.4f}  "
+      f"accuracy {acc0:.2f}  loss {loss0:.4f}")
+ev = trainer.evaluate()
+print(f"before training, held-out, TRL evaluate(): "
+      f"margin {ev['eval_rewards/margins']:+.4f}  "
+      f"accuracy {ev['eval_rewards/accuracies']:.2f}  "
+      f"loss {ev['eval_loss']:.4f}")
+trainer.train()
+log = [r for r in trainer.state.log_history if "rewards/margins" in r]
+
+print(f"\n{'steps':&gt;6} {'loss':&gt;7} {'margin':&gt;8} {'acc':&gt;5} "
+      f"{'r_chosen':&gt;9} {'r_reject':&gt;9}")
+windows = [("1", log[:1])] + [(f"{k + 1}-{k + 5}", log[k:k + 5])
+                              for k in range(0, len(log), 5)]
+for name, w in windows:          # step 1 alone, then means of 5 steps
+    def avg(key):
+        return sum(r[key] for r in w) / len(w)
+    print(f"{name:&gt;6} {avg('loss'):7.4f} {avg('rewards/margins'):+8.4f} "
+          f"{avg('rewards/accuracies'):5.2f} "
+          f"{avg('rewards/chosen'):+9.4f} {avg('rewards/rejected'):+9.4f}")
+
+# ── 6. Read the result back out of the trained model ─────────────────────
+policy.eval()
+m1, acc1, loss1, dw, dl = preference_stats(policy, reference, held)
+print(f"\nafter training, held-out, by hand: margin {m1:+.4f}  "
+      f"accuracy {acc1:.2f}  loss {loss1:.4f}")
+ev = trainer.evaluate()
+print(f"after training, held-out, TRL evaluate(): "
+      f"margin {ev['eval_rewards/margins']:+.4f}  "
+      f"accuracy {ev['eval_rewards/accuracies']:.2f}  "
+      f"loss {ev['eval_loss']:.4f}")
+m2, acc2, loss2, _, _ = preference_stats(policy, reference, train[:100])
+print(f"after training, 100 pairs it trained on: margin {m2:+.4f}  "
+      f"accuracy {acc2:.2f}  loss {loss2:.4f}")
+print(f"held-out log-probs moved by {dw:+.1f} (chosen) and "
+      f"{dl:+.1f} (rejected) nats against the reference")</code></pre>
+<p>On a MacBook (Apple MPS, 32-bit floats) this printed:</p>
+<pre class="terminal" data-title="output (laptop, Apple MPS, SmolLM2-135M-Instruct, defaults)"><code>model HuggingFaceTB/SmolLM2-135M-Instruct on mps: 134,515,008 parameters, 134,515,008 trained
+predicted memory: states 2.00 GiB + reference 0.50 GiB + activations 0.03 GiB + logits 0.19 GiB = 2.73 GiB
+predicted step-0 loss: -log sigma(0) = log 2 = 0.6931
+240 training pairs, 100 held-out pairs
+
+before training, held-out, by hand: margin +0.0000  accuracy 0.00  loss 0.6931
+before training, held-out, TRL evaluate(): margin +0.0000  accuracy 0.00  loss 0.6931
+
+ steps    loss   margin   acc  r_chosen  r_reject
+     1  0.6931  -0.0000  0.50   +0.0000   +0.0000
+   1-5  0.7036  -0.0159  0.40   -0.0222   -0.0063
+  6-10  0.6684  +0.0785  0.68   -0.0526   -0.1311
+ 11-15  0.6823  +0.0480  0.45   -0.1299   -0.1778
+ 16-20  0.6652  +0.1050  0.65   -0.1003   -0.2053
+ 21-25  0.7282  -0.0033  0.60   -0.2201   -0.2168
+ 26-30  0.6541  +0.1040  0.62   -0.1571   -0.2611
+
+after training, held-out, by hand: margin +0.0726  accuracy 0.53  loss 0.6825
+after training, held-out, TRL evaluate(): margin +0.0603  accuracy 0.51  loss 0.6825
+after training, 100 pairs it trained on: margin +1.1726  accuracy 0.90  loss 0.4034
+held-out log-probs moved by -1.3 (chosen) and -2.0 (rejected) nats against the reference</code></pre>
+
+<h3>What you should see</h3>
+<ul>
+  <li><strong>Step 1: loss 0.6931, margin &minus;0.0000, rewards both 0.</strong> This is the prediction, to four places. Your own function and TRL's <code>evaluate()</code> both give a margin of +0.0000 and a loss of 0.6931 on the unseen pairs before training.</li>
+  <li><strong>Accuracy 0.50 at step 1 and 0.00 before training.</strong> The first is TRL counting rounding noise as wins and losses. The second is the strict test on exact ties. Both are the same fact: with equal models there is no preference yet.</li>
+  <li><strong>The window rows wander.</strong> Each row averages five steps, and each step uses eight pairs the model has never trained on, so these rows behave like a test set. Accuracy bounces between 0.40 and 0.68 and the loss stays within about 0.04 of 0.693. The model is not learning a general taste from 240 pairs.</li>
+  <li><strong>Both implicit rewards drift negative, the rejected one faster.</strong> The last line shows the same thing on the 100 unseen pairs: the model made the chosen answers 1.3 nats less likely and the rejected answers 2.0 nats less likely. A nat is the unit of a natural-log probability. This is the effect chapter 12 calls <em>likelihood displacement</em>: the loss only asks for a gap, and the cheapest way to open a gap is to push both answers down.</li>
+  <li><strong>Unseen pairs: margin +0.07, accuracy 0.53, loss 0.6825.</strong> That is close to chance. <strong>Pairs it trained on: margin +1.17, accuracy 0.90, loss 0.4034.</strong> The model has partly memorised them. The gap between those two lines is the lesson: a falling training loss does not show that the model has learned the preference.</li>
+  <li><strong>By hand and TRL agree on the loss (0.6825 each) but differ a little on margin and accuracy</strong> (+0.0726 against +0.0603, 0.53 against 0.51). TRL averages per batch and the last batch has only four pairs, while the by-hand number averages per pair. The sums themselves match.</li>
+</ul>
+<div class="callout note">
+  <p class="callout-title">A trap worth knowing</p>
+  <p>My first by-hand check disagreed badly with TRL (accuracy 0.36 against 0.51). The cause was truncation. Some prompts are longer than 256 tokens, so no answer tokens are left, TRL drops those pairs silently, and my function counted them as ties. The fix was to keep only pairs that fit untruncated, as the script now does. When two measurements of the same thing disagree, check that they are measuring the same pairs.</p>
+</div>
+
+<h2>Part 2: a bigger model on a GPU</h2>
+<p>Run the same script on Qwen2.5-0.5B-Instruct, with longer sequences and more pairs. Before that, predict the memory. Chapter 2's accounting for full training in 32-bit weights with 16-bit arithmetic is 16 bytes per parameter: 4 for the weights, 4 for the gradients and 8 for Adam's two running averages. DPO adds a frozen reference copy at 4 bytes per parameter. Activations (the layer outputs kept for the backward pass) are small when gradient checkpointing is on, because only each layer's input is kept. Prediction mode reads <code>config.json</code> and downloads no weights:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python dpo_small.py --model Qwen/Qwen2.5-0.5B-Instruct --max-length 1024 --batch 2 --predict-only</span>
+<span class="prompt">$ </span><span class="cmd">python dpo_small.py --model Qwen/Qwen2.5-1.5B-Instruct --max-length 1024 --batch 2 --predict-only</span>
+<span class="prompt">$ </span><span class="cmd">python dpo_small.py --model Qwen/Qwen2.5-1.5B-Instruct --max-length 1024 --batch 2 --predict-only --lora 16</span></code></pre>
+<pre class="terminal" data-title="output (laptop, config.json only, no weights loaded)"><code>model Qwen/Qwen2.5-0.5B-Instruct on mps: 494,032,768 parameters, 494,032,768 trained
+predicted memory: states 7.36 GiB + reference 1.84 GiB + activations 0.16 GiB + logits 0.00 GiB = 9.37 GiB
+predicted step-0 loss: -log sigma(0) = log 2 = 0.6931
+model Qwen/Qwen2.5-1.5B-Instruct on mps: 1,543,714,304 parameters, 1,543,714,304 trained
+predicted memory: states 23.00 GiB + reference 5.75 GiB + activations 0.33 GiB + logits 0.00 GiB = 29.08 GiB
+predicted step-0 loss: -log sigma(0) = log 2 = 0.6931
+model Qwen/Qwen2.5-1.5B-Instruct on mps: 1,543,714,304 parameters, 18,464,768 trained
+predicted memory: states 6.03 GiB + reference 0.00 GiB + activations 0.33 GiB + logits 0.00 GiB = 6.35 GiB
+predicted step-0 loss: -log sigma(0) = log 2 = 0.6931</code></pre>
+<p>The arithmetic for the first line, so you can check it. Qwen2.5-0.5B has 494,032,768 parameters (read from its <code>config.json</code> with the weights left unloaded). States: 494,032,768 &times; 16 = 7,904,524,288 bytes = 7.36 GiB. Reference copy: &times; 4 = 1.84 GiB. Activations with checkpointing: 24 layers &times; 1,024 tokens &times; 4 sequences (2 pairs, each with a chosen and a rejected answer) &times; 896 hidden &times; 2 bytes = 0.16 GiB. Total 9.37 GiB. TRL's fused kernel never builds the full table of scores over the 151,936-word vocabulary, so there is no term for it here.</p>
+<p>The 1.5B model is the interesting case. Full training needs 23.00 GiB of states plus a 5.75 GiB reference, which is 29 GiB before any activation, so it cannot fit a 24 GiB card. With LoRA (chapter 11) only the adapters train, and with no reference copy (the trainer switches the adapters off to get the reference answers) the same model needs about 6.4 GiB.</p>
+<div class="callout note">
+  <p class="callout-title">Not run here</p>
+  <p>This page was written on a Mac with no NVIDIA GPU. The numbers above are predictions from the model's published configuration and the chapter's accounting. Nothing in Part 2 was measured. The laptop run proves the script works end to end, and a two-step run with <code>--lora 8</code> showed that the LoRA path runs too. The measurements below are yours to fill in, and they are saved in this browser.</p>
+</div>
+<pre class="terminal" data-title="terminal (GPU box)"><code><span class="prompt">$ </span><span class="cmd">cd /workspace/zts/llm-training/workbench/code/w04</span>
+<span class="prompt">$ </span><span class="cmd">python dpo_small.py --model Qwen/Qwen2.5-0.5B-Instruct --pairs 2000 --eval-pairs 200 --steps 120 --batch 2 --accum 4 --max-length 1024 --lr 5e-6</span></code></pre>
+<p>While it trains, run <code>nvidia-smi</code> in a second terminal and note the highest memory it shows. The prediction is a floor, not an estimate of the peak. It leaves out one layer's temporary buffers during the backward pass, the CUDA context (roughly 0.5 GiB) and memory the allocator keeps but does not use, so expect the measured peak to be a few GiB higher.</p>
+<div class="table-wrap"><table class="measure-table">
+  <thead><tr><th>Quantity</th><th>Predicted</th><th>Measured</th><th>Ratio</th></tr></thead>
+  <tbody>
+    <tr data-predict="0.6931"><td>Loss at step 1 (log 2)</td><td>0.6931</td><td><input name="loss1"></td><td class="ratio"></td></tr>
+    <tr data-predict="9.37"><td>Peak GPU memory, Qwen2.5-0.5B full training, GiB (a floor)</td><td>&ge; 9.37</td><td><input name="mem_05b"></td><td class="ratio"></td></tr>
+    <tr data-predict="6.35"><td>Peak GPU memory, Qwen2.5-1.5B with <code>--lora 16</code>, GiB (a floor)</td><td>&ge; 6.35</td><td><input name="mem_15b_lora"></td><td class="ratio"></td></tr>
+    <tr data-predict="29.08"><td>Qwen2.5-1.5B full training, GiB needed (expect an out-of-memory error on 24 GiB)</td><td>29.08</td><td><input name="mem_15b_full"></td><td class="ratio"></td></tr>
+  </tbody>
+</table></div>
+<p>The first ratio should be 1.00 to three places. The memory ratios should come out at 1 or above. If a ratio is far above 1, find out what you kept in memory that the formula does not count. For the last row, a failed run cannot give a measured peak. Enter the largest memory you saw before it failed, or leave it empty. Also compare <code>rewards/accuracies</code> on the held-out pairs before and after. With 2,000 pairs and a larger model I expect a clearer gain than on the laptop, but that is an expectation from the mechanism, not a result.</p>
+
+<h2>Break it</h2>
+<ul>
+  <li><strong>Turn up the leash.</strong> Run the laptop script with <code>--beta 0.5</code>. Predict first: the implicit reward is &beta; times the log-ratio, so the same change in the model gives a margin five times larger, and the loss should fall faster on pairs the model trains on. Check whether held-out accuracy improves too. (It should not, for the same reason as before.)</li>
+  <li><strong>Train twice as long on the same pairs.</strong> Use <code>--steps 60</code> with <code>--pairs 240</code>, which makes two passes. Predict the margin on trained-on pairs and on unseen pairs. The first should grow and the second should stay near zero. That shows overfitting, which chapter 12 says one epoch and a small learning rate are there to prevent.</li>
+  <li><strong>Swap the labels.</strong> In <code>short_pairs</code>, swap <code>chosen</code> and <code>rejected</code>. Predict the step-1 loss before you run it. It is still 0.6931, because the models are equal and the labels do not matter yet. Then watch what the model learns: it should do as well at preferring the worse answers as it did before at preferring the better ones. DPO learns whatever the labels say.</li>
+  <li><strong>Remove the reference, on paper.</strong> Chapter 12's derivation needs the log-ratio so that the prompt-only term cancels. What would the implicit reward at step 1 be if you used &beta; log &pi;<sub>&theta;</sub>(y|x) alone? Not zero but a large negative number, the sequence's log-probability, so the margin would reflect answer length, not preference.</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Before training, the policy equals the reference, both implicit rewards are 0, and the DPO loss is log 2 = 0.6931. TRL's first logged loss matched to four places.</li>
+    <li>The implicit reward margin and the preference accuracy are cheap to compute, and you can compute them yourself from the formula. Here they agreed with TRL's on loss.</li>
+    <li>A falling training loss is not learning the preference: on unseen pairs, the margin was about 0.07 and the accuracy about 0.5, while on trained-on pairs they were 1.17 and 0.90.</li>
+    <li>Both answers' probabilities drifted down, the rejected one more. The loss asks for a gap, not for better answers.</li>
+    <li>Memory is bookkeeping you can do from <code>config.json</code>: 16 bytes per parameter, 4 more for the reference copy, and a LoRA run drops the copy.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+</body>
+</html>

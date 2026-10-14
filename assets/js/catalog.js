@@ -650,7 +650,6 @@
      kind "workbench", <course>/workbench/). Each predicts a number from the
      chapters it measures, then measures it. machine: laptop | linux | gpu
      (the least the page needs); cost is for the GPU part at rented prices. */
-  /* Planned, not yet written (add the entry back with its page): llm W4 DPO on a Small Preference Set; llm W5 GRPO on a Verifiable Task; llm W7 Serve with vLLM and Load-Test It; llm W8 Speculative Decoding, Timed; dl W3 Real Tokenisers; ml W1 The Same Models in scikit-learn; ret W1 Real Embedders and a Reranker; agt W1 Your Agent Loop on a Local Model; evl W1 A Real Judge, Calibrated; oe W1 Program Evolution with a Real Model; oe W2 Evolution at Scale on a GPU; aid W1 Deploy a Model as a Serverless Endpoint. */
   var WORKBENCHES = {
     llm: [
       { id: "W1", file: "w01-kv-cache.html", title: "The KV Cache, Measured", machine: "laptop", chapters: ["18"], time: "20 min, +1 h on a GPU", cost: "GPU part: about an hour of a 24 GB card",
@@ -659,18 +658,54 @@
         blurb: "Weights, gradients, optimiser state and activations: predict each, then watch max_memory_allocated step by step." },
       { id: "W3", file: "w03-lora-qlora.html", title: "LoRA, then QLoRA, on a Real Model", machine: "gpu", chapters: ["11"], time: "2 h", cost: "about two hours of a 24 GB card",
         blurb: "Fine-tune a 0.5B to 3B model with LoRA, then in 4 bits; predict trainable parameters and memory, measure both." },
+      { id: "W4", file: "w04-dpo.html", title: "DPO on a Small Preference Set", machine: "gpu", chapters: ["12"], time: "2 h", cost: "about two hours of a 24 GB card",
+        blurb: "Train with TRL's DPO on a few thousand pairs and watch the implicit reward margin chapter 12 derives." },
+      { id: "W5", file: "w05-grpo.html", title: "GRPO on a Verifiable Task", machine: "gpu", chapters: ["14"], time: "3 h", cost: "about three hours of a 24 GB card",
+        blurb: "Group-relative advantages on arithmetic with a checkable answer: reward curves, response length and a reward hack." },
       { id: "W6", file: "w06-quantisation.html", title: "Quantise and Measure Perplexity", machine: "gpu", chapters: ["19"], time: "1.5 h", cost: "about 90 minutes of a 24 GB card",
-        blurb: "16, 8 and 4 bits: predict the memory, measure it, and measure what perplexity pays for it." }
+        blurb: "16, 8 and 4 bits: predict the memory, measure it, and measure what perplexity pays for it." },
+      { id: "W7", file: "w07-serving.html", title: "Serve with vLLM and Load-Test It", machine: "gpu", chapters: ["20", "18"], time: "2 h", cost: "about two hours of a 24 GB card",
+        blurb: "A real serving engine under load: throughput, time to first token and the latency knee, against chapter 20's model." },
+      { id: "W8", file: "w08-speculative.html", title: "Speculative Decoding, Timed", machine: "gpu", chapters: ["21"], time: "1 h", cost: "about an hour of a 24 GB card",
+        blurb: "A small draft model and a large target: predict the speed-up from the acceptance rate, then time it." }
     ],
     dl: [
       { id: "W1", file: "w01-pytorch.html", title: "PyTorch by Hand", machine: "laptop", chapters: ["05"], time: "1 h",
         blurb: "Tensors, autograd and a training loop, checked against the micrograd-style engine you built." },
       { id: "W2", file: "w02-char-gpt.html", title: "Train a Character GPT", machine: "laptop", chapters: ["12", "16"], time: "1 h, +1 h on a GPU", cost: "GPU part: about an hour",
         blurb: "Chapter 12's GPT in PyTorch on Tiny Shakespeare; predict FLOPs and time, then scale it on a GPU." },
+      { id: "W3", file: "w03-tiktoken.html", title: "Real Tokenisers", machine: "laptop", chapters: ["13"], time: "45 min",
+        blurb: "tiktoken and a Hugging Face tokenizer on the same texts: tokens per word, languages, numbers and code." },
       { id: "W4", file: "w04-attention-kernels.html", title: "Attention Kernels, Benchmarked", machine: "gpu", chapters: ["19", "09"], time: "1 h", cost: "about an hour of a GPU",
         blurb: "Naive attention against PyTorch's fused kernel: predict memory traffic, measure time and peak memory as length grows." },
       { id: "W5", file: "w05-word-vectors.html", title: "Word Vectors from Real Text", machine: "laptop", chapters: ["06"], time: "1 h",
         blurb: "Skip-gram with negative sampling in PyTorch on text8; analogies, neighbours and what the loss curve says." }
+    ],
+    ml: [
+      { id: "W1", file: "w01-scikit-learn.html", title: "The Same Models in scikit-learn", machine: "laptop", chapters: ["05", "06", "09"], time: "1.5 h",
+        blurb: "Your lab code against scikit-learn on the same data: coefficients, cross-validation and boosting, compared number by number." }
+    ],
+    ret: [
+      { id: "W1", file: "w01-real-embedders.html", title: "Real Embedders and a Reranker", machine: "laptop", chapters: ["07", "08"], time: "1 h",
+        blurb: "sentence-transformers and a cross-encoder on the course corpus: recall and nDCG against the stand-in embedder." }
+    ],
+    agt: [
+      { id: "W1", file: "w01-local-model-agent.html", title: "Your Agent Loop on a Local Model", machine: "laptop", chapters: ["01", "02"], time: "1 h",
+        blurb: "Lab 1's loop against a model running in Ollama: what changes when the scripted model becomes a real one." }
+    ],
+    evl: [
+      { id: "W1", file: "w01-real-judge.html", title: "A Real Judge, Calibrated", machine: "laptop", chapters: ["03", "04"], time: "1.5 h",
+        blurb: "A local model as LLM judge: measure position bias and agreement with labels, with confidence intervals." }
+    ],
+    oe: [
+      { id: "W1", file: "w01-funsearch-local.html", title: "Program Evolution with a Real Model", machine: "laptop", chapters: ["09", "16"], time: "2 h",
+        blurb: "Lab 3's bin-packing evolver with a local model writing the mutations, scored on held-out instances." },
+      { id: "W2", file: "w02-funsearch-gpu.html", title: "Evolution at Scale on a GPU", machine: "gpu", chapters: ["09", "15"], time: "3 h", cost: "about three hours of a 24 GB card",
+        blurb: "The same evolver served by vLLM: hundreds of samples a minute, islands, and the evaluator hacks that appear at scale." }
+    ],
+    aid: [
+      { id: "W1", file: "w01-serverless-endpoint.html", title: "Deploy a Model as a Serverless Endpoint", machine: "gpu", chapters: ["12"], time: "2 h", cost: "pay per request, plus build time",
+        blurb: "Package a quantised model as a RunPod Serverless worker: cold starts, scaling to zero and cost per thousand requests." }
     ]
   };
   window.CS_COURSES.forEach(function (co) { co.workbenches = WORKBENCHES[co.id] || []; });

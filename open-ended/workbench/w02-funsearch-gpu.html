@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workbench 2: Evolution at Scale on a GPU · Search, Evolution &amp; Self-Improving Agents</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="oe" data-workbench="W2">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Workbench 2: Evolution at Scale on a GPU</h1>
+  <p class="lede">The evolver of <a href="w01-funsearch-local.html">Workbench 1</a> asks the model one question at a time. Real systems ask hundreds at once, because the model is the slow part and a GPU is built to serve many requests together. This page makes the evolver concurrent: many requests in flight, several islands, and a pool of worker processes that score the candidates. You predict how many new programs per minute a rented GPU should produce, from the model&rsquo;s own files and arithmetic. You also plant a flaw in the scorer, watch a hack win, and see which defences from <a href="../chapters/15-evaluator-hacking.html">chapter 15</a> catch it. The first half runs on a laptop. The GPU half is a prediction and a table for you to fill in.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why measure it</p>
+  <p>Chapter 9 describes the loop as &ldquo;one loop, many parallel workers&rdquo;. At that scale two things change. First, the question is no longer whether the model is clever but how many samples per minute you can afford, and that is arithmetic you can do before renting anything. Second, a search that runs thousands of candidates a minute finds every hole in the scorer faster than any person could read the results. A <em>sample</em> here is one model reply. <em>Throughput</em> is samples finished per minute. A <em>tripwire</em> is an automatic alarm for results that are too good to be true.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">What you need</p>
+  <ul>
+    <li><strong>Part 1, your laptop:</strong> Python 3.9 or newer, the files in <code>open-ended/workbench/code/w02/</code>, and a model behind an OpenAI-compatible endpoint, as in Workbench 1. A 0.5B model is enough. About 30 minutes.</li>
+    <li><strong>Part 2, no machine at all:</strong> the hack demonstration needs no model. About 10 minutes.</li>
+    <li><strong>Part 3, a GPU box (optional):</strong> one 24 GB card such as an RTX 4090, about 16 GB of disk for Qwen2.5-Coder-7B-Instruct, and about three hours of the card. Setting one up is in <a href="../../lab-machine.html#gpu">Your lab machine, Option C</a>.</li>
+  </ul>
+</div>
+
+<h2>Predict before you run</h2>
+<p>A sample costs the GPU two kinds of work. The prompt is <em>prefilled</em>: the model reads all of it in one go, which is limited by arithmetic. The reply is <em>decoded</em> one token at a time, and each step must read every weight from memory, which is limited by memory bandwidth until the batch is large. Many requests in flight share one weight read, which is why concurrency is nearly free at first. Write <em>P</em> for the number of parameters, <em>F</em> for the arithmetic rate you can actually use, <em>W</em> for the weight bytes, <em>BW</em> for the usable bandwidth, <em>k</em> for the cache bytes per token, <em>c</em> for the average context and <em>B</em> for the requests in flight:</p>
+<div class="eq-display" data-tex="t_{\text{sample}} = \underbrace{\frac{2P\,n_{\text{in}}}{F}}_{\text{prefill}} + n_{\text{out}}\cdot\frac{\text{step}(B)}{B},\qquad \text{step}(B)=\max\!\Big(\frac{W + B\,c\,k}{BW},\ \frac{2PB}{F}\Big)">t<sub>sample</sub> = 2P &middot; n<sub>in</sub> / F &nbsp;+&nbsp; n<sub>out</sub> &middot; step(B) / B, &nbsp; step(B) = max( (W + B&middot;c&middot;k) / BW , 2PB / F )</div>
+<p>Samples per minute is 60 divided by <em>t</em><sub>sample</sub>. The cache term <em>k</em> is the formula from the LLM course&rsquo;s KV-cache chapter, and the weight size comes from the model&rsquo;s <code>model.safetensors.index.json</code>: 15,231,233,024 bytes for Qwen2.5-Coder-7B-Instruct, so <em>P</em> is about 7.62 billion. Its <code>config.json</code> gives 28 layers and 4 key-value heads of width 128, so <em>k</em> is 2 &times; 28 &times; 4 &times; 128 &times; 2 = 57,344 bytes. Part 1 measures the prompt and reply lengths: about 224 tokens in and 152 out. A 4090&rsquo;s published peaks are 1,008 GB/s and 165 TFLOP/s in 16-bit arithmetic. I assume an engine reaches 70 per cent of the bandwidth and 40 per cent of the arithmetic. Those two percentages are guesses. The measure-table at the end is how you find your own.</p>
+<div class="callout predict">
+  <p class="callout-title">Your prediction</p>
+  <p>With 64 requests in flight: how long is one decode step, and is it limited by memory or by arithmetic? Then how long does one sample take in GPU time, and how many samples per minute is that? Which part dominates, prefill or decode? Work it out with the numbers above, then open the answer.</p>
+</div>
+<details class="deeper">
+  <summary>Check your arithmetic</summary>
+  <p>Memory time for a step: (15.23 GB of weights + 64 &times; 299 tokens &times; 57,344 bytes = 1.10 GB of cache) / 706 GB/s = 23.1 ms. Arithmetic time: 2 &times; 7.62 &times; 10<sup>9</sup> &times; 64 / 66 &times; 10<sup>12</sup> = 14.8 ms. Memory is larger, so the step is memory-bound: <strong>23.1 ms</strong>. Prefill of 224 tokens: 2 &times; 7.62 &times; 10<sup>9</sup> &times; 224 / 66 &times; 10<sup>12</sup> = 51.7 ms. Decode share: 152 &times; 23.1 / 64 = 55.0 ms. The sample costs 106.7 ms of GPU time, so <strong>about 562 samples a minute</strong>, with prefill and decode about equal. The script below prints the whole table, and it reads the files itself.</p>
+</details>
+<p>The script is <a href="code/w02/predict_rate.py"><code>code/w02/predict_rate.py</code></a>, with the notebook <a href="code/w02/predict_rate.ipynb"><code>predict_rate.ipynb</code></a>. It needs only the standard library and an internet connection.</p>
+<pre class="terminal" data-title="predict_rate.py" data-run="off"><code>"""Predict samples per minute for the evolver on one GPU, from first
+principles: decoding is limited by memory bandwidth until the batch is big,
+then by arithmetic; prefilling the prompt is limited by arithmetic.
+
+    python predict_rate.py --model Qwen/Qwen2.5-Coder-7B-Instruct
+
+Reads config.json and the weight size from Hugging Face (no GPU, no
+download of weights). The card defaults are an RTX 4090's published peaks.
+
+Needs: Python 3.9+. No other packages."""
+import argparse
+import json
+import urllib.request
+
+# ── 1. Settings ──────────────────────────────────────────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="Qwen/Qwen2.5-Coder-7B-Instruct")
+ap.add_argument("--bandwidth", type=float, default=1008)   # GB/s, peak
+ap.add_argument("--tflops", type=float, default=165)       # dense bf16, peak
+ap.add_argument("--vram", type=float, default=24)          # GiB
+ap.add_argument("--bw-eff", type=float, default=0.7)       # assumed
+ap.add_argument("--mfu", type=float, default=0.4)          # assumed
+ap.add_argument("--tokens-in", type=int, default=224)      # measured, W2
+ap.add_argument("--tokens-out", type=int, default=152)     # measured, W2
+ap.add_argument("--shared", type=int, default=160)         # cacheable prefix
+args, _ = ap.parse_known_args()
+
+
+def fetch(name):
+    url = f"https://huggingface.co/{args.model}/resolve/main/{name}"
+    with urllib.request.urlopen(url, timeout=60) as r:
+        return json.loads(r.read())
+
+
+# ── 2. Inputs from the model's own files ─────────────────────────────────
+cfg = fetch("config.json")
+weights = fetch("model.safetensors.index.json")["metadata"]["total_size"]
+L, n_kv = cfg["num_hidden_layers"], cfg["num_key_value_heads"]
+d_head = cfg["hidden_size"] // cfg["num_attention_heads"]
+params = weights / 2                       # bf16: two bytes per number
+kv_token = 2 * L * n_kv * d_head * 2       # chapter 18 of the LLM course
+ctx = args.tokens_in + args.tokens_out / 2     # average context while decoding
+bw = args.bandwidth * 1e9 * args.bw_eff    # bytes per second we can use
+flops = args.tflops * 1e12 * args.mfu      # FLOP per second we can use
+print(f"{args.model}: {weights:,} bytes of weights, {params / 1e9:.2f} B "
+      f"parameters, KV cache {kv_token:,} bytes per token")
+print(f"usable: {bw / 1e9:.0f} GB/s and {flops / 1e12:.0f} TFLOP/s "
+      f"({args.bw_eff:.0%} and {args.mfu:.0%} of the peaks)")
+
+# ── 3. Memory: how many requests can be in flight at once? ───────────────
+free = args.vram * 2**30 * 0.9 - weights   # keep a 10% margin
+fit = int(free // (ctx * kv_token))
+print(f"room for the KV cache: {free / 2**30:.1f} GiB = about {fit} "
+      f"requests of {ctx:.0f} tokens")
+
+# ── 4. Time per sample = its prefill + its share of the decode steps ─────
+print(f"\n{'in flight':&gt;9s} {'step ms':&gt;8s} {'bound by':&gt;9s} "
+      f"{'prefill ms':&gt;11s} {'decode ms':&gt;10s} {'samples/min':&gt;12s} "
+      f"{'with prefix cache':&gt;18s}")
+for b in (1, 4, 16, 64, 256):
+    mem_s = (weights + b * ctx * kv_token) / bw     # read weights + caches
+    cmp_s = 2 * params * b / flops                  # one token for each
+    step, bound = max((mem_s, "memory"), (cmp_s, "compute"))
+    decode = args.tokens_out * step / b             # this sample's share
+    rates = []
+    for new in (args.tokens_in, args.tokens_in - args.shared):
+        prefill = 2 * params * new / flops
+        rates.append((prefill, 60 / (prefill + decode)))
+    print(f"{b:9d} {1000 * step:8.1f} {bound:&gt;9s} "
+          f"{1000 * rates[0][0]:11.1f} {1000 * decode:10.1f} "
+          f"{rates[0][1]:12.0f} {rates[1][1]:18.0f}")</code></pre>
+<pre class="terminal" data-title="output (laptop, no GPU used: reads config.json from Hugging Face)"><code>Qwen/Qwen2.5-Coder-7B-Instruct: 15,231,233,024 bytes of weights, 7.62 B parameters, KV cache 57,344 bytes per token
+usable: 706 GB/s and 66 TFLOP/s (70% and 40% of the peaks)
+room for the KV cache: 7.4 GiB = about 462 requests of 300 tokens
+
+in flight  step ms  bound by  prefill ms  decode ms  samples/min  with prefix cache
+        1     21.6    memory        51.7     3284.8           18                 18
+        4     21.7    memory        51.7      824.0           69                 72
+       16     22.0    memory        51.7      208.8          230                268
+       64     23.1    memory        51.7       55.0          562                860
+      256     59.1   compute        51.7       35.1          691               1204</code></pre>
+<p>Read it left to right. Up to 64 in flight, the step barely grows (21.6 to 23.1 ms) because the weights dominate the bytes read, so 64 requests cost about what one costs and throughput rises almost in proportion. By 256 the arithmetic is the limit: 59.1 ms a step, and adding more requests no longer helps much. The last column assumes the shared start of every prompt (about 160 of 224 tokens: the instructions) is cached and not prefilled again, which serving engines can do. That lifts 64 in flight from 562 to 860.</p>
+
+<h2>Part 1: the concurrent evolver, on your laptop</h2>
+<p>The new files are <a href="code/w02/scale_evolve.py"><code>scale_evolve.py</code></a> and <a href="code/w02/sampler.py"><code>sampler.py</code></a> (Workbench 1&rsquo;s prompt-and-extract code, made into functions), with the same <a href="code/w02/binpack.py"><code>binpack.py</code></a>. The notebook is <a href="code/w02/scale_evolve.ipynb"><code>scale_evolve.ipynb</code></a>.</p>
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>start W worker threads; each handles one call at a time, so W requests are in flight</li>
+  <li>a call takes the lock only to draw parents from its island (an in-memory step), then lets go</li>
+  <li>the slow request to the model runs with no lock held, so the other threads keep going</li>
+  <li>the candidate is scored in a separate process from a small pool, so scoring uses more than one core</li>
+  <li>the lock is taken again to store the result; every 24 calls the weakest islands restart from the best</li>
+  <li>repeat for W = 1, 2, 4, 8 and print samples per minute</li>
+</ol></div>
+<pre class="terminal" data-title="scale_evolve.py" data-run="off"><code>"""Evolution at scale: many model calls in flight, islands, and a pool of
+worker processes that score the candidates. Measures samples per minute.
+
+Laptop (a small model behind any OpenAI-compatible server; sweeps workers):
+    python scale_evolve.py --base-url http://127.0.0.1:8000/v1 \\
+        --model Qwen/Qwen2.5-0.5B-Instruct --workers 1,2,4,8
+GPU box (vLLM serving a 7B model, 64 requests in flight):
+    python scale_evolve.py --base-url http://localhost:8000/v1 \\
+        --model Qwen/Qwen2.5-Coder-7B-Instruct --workers 64 \\
+        --islands 16 --calls 2000 --eval-procs 8
+
+Needs: Python 3.9+, binpack.py and sampler.py next to this file."""
+import argparse
+import random
+import threading
+import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+from binpack import (SEED_SRC, TRAIN_SEEDS, TEST_SEEDS, Database, canonical,
+                     evaluate, evaluate_seeds, make_instances)
+from sampler import build_prompt, chat, extract
+
+
+# ── 1. Settings ──────────────────────────────────────────────────────────
+def get_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base-url", default="http://localhost:11434/v1")
+    ap.add_argument("--model", default="qwen2.5-coder:7b")
+    ap.add_argument("--workers", default="1,2,4,8")  # in flight
+    ap.add_argument("--calls", type=int, default=48)  # per setting
+    ap.add_argument("--islands", type=int, default=8)
+    ap.add_argument("--eval-procs", type=int, default=2)
+    ap.add_argument("--shots", type=int, default=2)
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--max-tokens", type=int, default=300)
+    ap.add_argument("--reseed-every", type=int, default=24)
+    ap.add_argument("--seed", type=int, default=0)
+    args, _ = ap.parse_known_args()    # notebooks pass their own flags
+    return args
+
+
+# ── 2. One run: `workers` requests in flight until `calls` are done ──────
+def run_once(args, workers, pool):
+    rng = random.Random(args.seed)
+    train = make_instances(TRAIN_SEEDS)
+    seed_src = canonical(SEED_SRC)
+    db = Database(args.islands, seed_src, evaluate(seed_src, train))
+    lock = threading.Lock()              # guards db, rng, seen and stats
+    seen, stats = {seed_src}, Counter()
+
+    def one_call(call):
+        with lock:                       # choose parents: fast, in memory
+            isl = db.islands[call % args.islands]
+            parents = isl.sample(rng, args.shots)
+        scores = [evaluate(p, train).score for p in parents]
+        t0 = time.time()                 # the slow part: no lock held
+        reply, usage = chat(args.base_url, args.model,
+                            build_prompt(parents, scores),
+                            args.temperature, args.max_tokens)
+        wait = time.time() - t0
+        src = extract(reply)
+        with lock:
+            fresh = src is not None and src not in seen
+            seen.add(src)
+        status = "no_code" if src is None else "duplicate"
+        if fresh:                        # scored in another process
+            t1 = time.time()
+            out = pool.submit(evaluate_seeds, src, TRAIN_SEEDS).result()
+            stats["eval_s"] += time.time() - t1
+            status = out.status
+            with lock:
+                isl.add(src, out)
+        with lock:
+            stats[status] += 1
+            stats["wait_s"] += wait
+            stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            stats["out_tokens"] += usage.get("completion_tokens", 0)
+            stats["done"] += 1
+            if stats["done"] % args.reseed_every == 0:
+                db.reseed(rng)
+
+    start = time.time()
+    with ThreadPoolExecutor(workers) as threads:
+        list(threads.map(one_call, range(args.calls)))
+    return time.time() - start, stats, db
+
+
+# ── 3. Sweep the number of requests in flight ────────────────────────────
+def main():
+    args = get_args()
+    print(f"model {args.model} at {args.base_url}")
+    print(f"{args.calls} calls per setting, {args.islands} islands, "
+          f"{args.eval_procs} scoring processes\n")
+    chat(args.base_url, args.model, "Say hi.", 0, 8)   # warm-up, not timed
+    print(f"{'in flight':&gt;9s} {'wall s':&gt;7s} {'samples/min':&gt;12s} "
+          f"{'speed-up':&gt;9s} {'s/request':&gt;10s} {'out tok/s':&gt;10s} "
+          f"{'best':&gt;7s}")
+    base = None
+    with ProcessPoolExecutor(args.eval_procs) as pool:
+        for w in [int(x) for x in args.workers.split(",")]:
+            wall, st, db = run_once(args, w, pool)
+            rate = args.calls / wall * 60
+            base = base or rate
+            print(f"{w:9d} {wall:7.1f} {rate:12.1f} {rate / base:8.1f}x "
+                  f"{st['wait_s'] / args.calls:10.1f} "
+                  f"{st['out_tokens'] / wall:10.1f} {-db.best()[1]:7.2f}")
+    # ── 4. What the last setting produced, and what the scoring cost ─────
+    outcomes = ("ok", "rejected", "error", "timeout", "bad_value",
+                "duplicate", "no_code")
+    print("\nlast setting:", ", ".join(f"{k} {st[k]}" for k in outcomes
+                                      if st[k]))
+    n, scored = args.calls, sum(st[k] for k in outcomes[:5])
+    print(f"mean tokens per call: {st['prompt_tokens'] / n:.0f} in, "
+          f"{st['out_tokens'] / n:.0f} out")
+    print(f"scoring wait per new candidate: "
+          f"{1000 * st['eval_s'] / max(1, scored):.0f} ms")
+    best, _ = db.best()
+    test = make_instances(TEST_SEEDS)
+    print(f"best program, held-out test: {evaluate(best, test).score:.2f} "
+          f"bins (best fit {evaluate(SEED_SRC, test).score:.2f})")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+<p>The model was Qwen2.5-0.5B-Instruct on the laptop&rsquo;s GPU, behind the small batching server described in Workbench 1, which gathers requests that arrive together and generates for them as one batch. A server that ran one request at a time would show no speed-up at all. The laptop was also running other jobs while I measured.</p>
+<pre class="terminal" data-title="output (laptop, Apple MPS, Qwen2.5-0.5B-Instruct, defaults)"><code>model Qwen/Qwen2.5-0.5B-Instruct at http://127.0.0.1:8000/v1
+48 calls per setting, 8 islands, 2 scoring processes
+
+in flight  wall s  samples/min  speed-up  s/request  out tok/s    best
+        1   328.1          8.8      1.0x        6.8       28.7  130.30
+        2   179.7         16.0      1.8x        7.5       53.7  130.30
+        4    51.0         56.5      6.4x        4.2      176.7  130.30
+        8    35.4         81.2      9.3x        5.9      252.7  130.30
+
+last setting: ok 7, rejected 28, duplicate 5, no_code 8
+mean tokens per call: 231 in, 187 out
+scoring wait per new candidate: 10 ms
+best program, held-out test: 130.77 bins (best fit 130.77)</code></pre>
+<h3>What you should see</h3>
+<ul>
+  <li><strong>Samples per minute rise with requests in flight:</strong> 8.8, 16.0, 56.5 and 81.2. The speed-up column reads 9.3&times; at 8 in flight, which is more than 8 and should make you suspicious. The single-request run was slowed by the other jobs (6.8 s a request against 4.2 s at four in flight), which flatters every later row. A fair reading is that a request took roughly the same time whether 1 or 8 were in flight, so throughput rose several-fold. Expect 4&times; to 8&times; on a quiet machine, and a flatter curve above that. A short re-run later, with the 1.5B code model on a quieter machine, gave 13.1 samples a minute with one request in flight and 39.6 with four: 3.0&times;.</li>
+  <li><strong>The decode argument, seen.</strong> Output tokens a second rose from 28.7 to 252.7. The server read the weights once for each batch of tokens, not once per request. That is the reasoning behind the table above, on a small model.</li>
+  <li><strong>The best score did not move</strong> (130.30 in every row): 48 calls are far too few to find anything. This part measures speed, not quality. The last lines show why: of 48 calls, 28 were rejected by the whitelist and 8 had no code.</li>
+  <li><strong>Tokens per call: 231 in, 187 out</strong> for the last row. These are the prompt and reply lengths I fed into the prediction (224 and 152 came from a short earlier run of the same kind). A later short run with the 1.5B code model, on a quieter machine, averaged 224 in and 121 out, so code models may write shorter replies. I kept 152 as a cautious guess.</li>
+  <li><strong>Scoring cost: 10 ms</strong> per new candidate, including the trip to another process. At the predicted 562 samples a minute, about 9 candidates arrive each second, so scoring needs about a tenth of one core. The scorer is not the bottleneck. A candidate that burns its whole fuel budget costs far more, but those are rare.</li>
+</ul>
+
+<h2>Part 2: a planted hack, and a tripwire</h2>
+<p>Chapter 15&rsquo;s point is that a search optimises the score, not your intent. Here is the smallest case of it. A scorer author writes &ldquo;one bad item should not end the whole run&rdquo; and wraps the packing of each item in <code>try/except: continue</code>. It looks kind. It turns a crash into a skipped item, and an item that is skipped needs no space. <code>hack_demo.py</code> scores four hand-written candidates: the two classic rules and two planted hacks. One hack always crashes. The other crashes only when the gap left would be exactly 30, which loses just a few items. It then lets three judges pick a champion: the weak scorer alone, the weak scorer with a tripwire, and the total evaluator from Lab 3, where a crash is a crash.</p>
+<p>The tripwire has two rules from chapter 15&rsquo;s list. A score below the lower bound is impossible, so it is flagged. A score more than 3 bins better than best fit in one step is too good to be believed, so it is flagged too. Three bins is my judgement call, scaled to this problem.</p>
+<p>The script is <a href="code/w02/hack_demo.py"><code>code/w02/hack_demo.py</code></a>, with the notebook <a href="code/w02/hack_demo.ipynb"><code>hack_demo.ipynb</code></a>.</p>
+<pre class="terminal" data-title="hack_demo.py" data-run="off"><code>"""Evaluator hacking, planted: a weak scorer, two hacks, a tripwire and a fix.
+
+A scorer that treats a crash as "skip this item" rewards programs that crash.
+This script scores hand-written candidates (and, with --replay, a model's
+real samples) with that weak scorer, a tripwire and the total evaluator.
+
+    python hack_demo.py
+    python hack_demo.py --replay evolve_llm.jsonl     # Workbench 1's log
+
+Needs: Python 3.9+ and binpack.py next to this file. No model needed."""
+import argparse
+import json
+
+from binpack import (CAP, FIRST_FIT_SRC, SEED_SRC, TRAIN_SEEDS, Fuel,
+                     compile_restricted, evaluate, lower_bound,
+                     make_instances)
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--replay", default="")        # a JSONL log from evolve_llm
+ap.add_argument("--jump", type=float, default=3.0)   # tripwire, in bins
+args, _ = ap.parse_known_args()
+
+train = make_instances(TRAIN_SEEDS)
+bound = sum(map(lower_bound, train)) / len(train)
+best_fit = evaluate(SEED_SRC, train).score
+
+
+# ── 1. The weak scorer: one innocent-looking try/except ──────────────────
+def pack_weak(items, priority):
+    """Like binpack.pack, but "one bad item should not end the run": an
+    item whose handling raises is skipped. Returns (bins, items placed)."""
+    bins, placed = [], 0
+    for it in items:
+        try:
+            best, best_p = None, None
+            for i, rem in enumerate(bins):
+                if rem &gt;= it:
+                    p = priority(it, rem)
+                    if best_p is None or p &gt; best_p:
+                        best, best_p = i, p
+            if best is None:
+                bins.append(CAP - it)
+            else:
+                bins[best] -= it
+            placed += 1
+        except Exception:
+            continue                  # &lt;- the flaw: a crash is not a loss
+    return len(bins), placed
+
+
+def weak_score(src):
+    """(mean bins, mean items placed out of 300), or None if refused."""
+    try:
+        fn = compile_restricted(src, Fuel(40_000 * len(train)))
+    except Exception:
+        return None
+    runs = [pack_weak(items, lambda a, b: fn(float(a), float(b)))
+            for items in train]
+    return (sum(r[0] for r in runs) / len(runs),
+            sum(r[1] for r in runs) / len(runs))
+
+
+# ── 2. The tripwire: results that are too good to be true (chapter 15) ───
+def tripwire(score):
+    """A reason to hold the candidate for a human, or None."""
+    if score &lt; bound:
+        return f"below the lower bound ({bound:.1f}): impossible"
+    if best_fit - score &gt; args.jump:
+        return f"{best_fit - score:.1f} bins better than best fit in one step"
+    return None
+
+
+# ── 3. The candidates: two honest, two planted ───────────────────────────
+GAP = "def priority(item, rem):\n    gap = rem - item\n"
+CANDIDATES = {
+    "first fit": FIRST_FIT_SRC,
+    "best fit": SEED_SRC,
+    "hack: always crash": "def priority(item, rem):\n"
+                          "    return 1 / (item - item)\n",
+    "hack: crash at gap 30": GAP + "    return -gap + 0 * (1 / (gap - 30))\n",
+}
+print(f"search set: lower bound {bound:.1f} bins, best fit {best_fit:.1f}\n")
+print(f"{'candidate':22s} {'weak score':&gt;10s} {'placed':&gt;7s}  "
+      f"{'total evaluator':16s} tripwire")
+rows = {}
+for name, src in CANDIDATES.items():
+    bins, placed = weak_score(src)
+    strong = evaluate(src, train)
+    flag = tripwire(bins)
+    rows[name] = (bins, strong, flag)
+    verdict = f"ok {strong.score:.1f}" if strong.ok else strong.status
+    print(f"{name:22s} {bins:10.1f} {placed:7.0f}  {verdict:16s} "
+          f"{flag or '-'}")
+
+# ── 4. Three judges pick a champion from the same four candidates ────────
+weak = min(rows, key=lambda n: rows[n][0])
+wired = min((n for n in rows if not rows[n][2]), key=lambda n: rows[n][0])
+total = min((n for n in rows if rows[n][1].ok), key=lambda n: rows[n][1].score)
+print(f"\nchampion if the weak scorer alone judges:  {weak}")
+print(f"champion if the tripwire holds back hacks: {wired}")
+print(f"champion if the total evaluator judges:    {total}")
+
+# ── 5. Optionally, rescore a real model's samples with the weak scorer ───
+if args.replay:
+    errors = []
+    for line in open(args.replay):
+        rec = json.loads(line)
+        if rec["src"] and rec["status"] == "error":
+            errors.append(rec["src"])
+    print(f"\n{args.replay}: {len(errors)} samples crashed under the total "
+          f"evaluator")
+    scored = [(weak_score(s), s) for s in errors]
+    scored = [(w[0], w[1], s) for w, s in scored if w]
+    for bins, placed, _ in sorted(scored, key=lambda r: r[0])[:3]:
+        print(f"  weak scorer says {bins:6.1f} bins, "
+              f"{placed:5.0f} of 300 items placed")
+    better = sum(b &lt; best_fit for b, _, _ in scored)
+    print(f"  {better} of them 'beat' best fit ({best_fit:.1f}) only because "
+          f"they crashed")</code></pre>
+<p>I ran it with <code>--replay</code> on the log of one of Workbench 1&rsquo;s real runs (the seed 1 run), to rescore the model&rsquo;s own samples with the weak scorer:</p>
+<pre class="terminal" data-title="output (laptop, python hack_demo.py --replay evolve_llm.jsonl)"><code>search set: lower bound 120.1 bins, best fit 130.3
+
+candidate              weak score  placed  total evaluator  tripwire
+first fit                   130.7     300  ok 130.7         -
+best fit                    130.3     300  ok 130.3         -
+hack: always crash           21.7      22  error            below the lower bound (120.1): impossible
+hack: crash at gap 30       129.5     297  error            -
+
+champion if the weak scorer alone judges:  hack: always crash
+champion if the tripwire holds back hacks: hack: crash at gap 30
+champion if the total evaluator judges:    best fit
+
+evolve_llm.jsonl: 1 samples crashed under the total evaluator
+  weak scorer says   21.7 bins,    22 of 300 items placed
+  1 of them 'beat' best fit (130.3) only because they crashed</code></pre>
+<h3>What you should see</h3>
+<ul>
+  <li><strong>The always-crash hack scores 21.7 bins</strong> on a problem whose bound is 120.1, and places only 22 of 300 items. Under the weak scorer it wins by a mile. The tripwire fires, because the score is impossible.</li>
+  <li><strong>The subtle hack scores 129.5.</strong> That is 0.8 bins better than best fit, a believable improvement, and no tripwire fires. It dropped 3 items of 300. Remove the loud hack, and this quiet one becomes the champion. This is the lesson: a tripwire finds big hacks, but a small one passes. Notice the &ldquo;placed&rdquo; column: 297 of 300 is the giveaway, and it is a check of the thing itself, which is control 1 in chapter 15.</li>
+  <li><strong>The total evaluator rejects both</strong> with status <code>error</code>, and best fit wins. It does so with no cleverness at all, only by never turning a crash into a score. That is why Lab 3&rsquo;s <code>evaluate</code> is written the way it is.</li>
+  <li><strong>Replay: this is not only a story.</strong> One of the model&rsquo;s own 100 samples in that run crashed on every call (it took <code>max()</code> of a single number). Under the weak scorer that sample would have scored 21.7 bins and won the whole search. Nobody wrote a hack. A small model made an ordinary mistake, and a lenient scorer rewarded it. It is 1 sample in 100 here. At 562 samples a minute, the same rate would give about five such samples every minute.</li>
+</ul>
+
+<h2>Part 3: the same evolver on a GPU box</h2>
+<p>On the GPU box (<code>wb up</code>, <code>wb sync</code>, <code>wb ssh</code>, then <code>sh /workspace/zts/workbench/setup-pod.sh</code> the first time, which installs vLLM) start the server in one window:</p>
+<pre class="terminal" data-title="terminal (GPU box, window 1)"><code><span class="prompt">$ </span><span class="cmd">vllm serve Qwen/Qwen2.5-Coder-7B-Instruct --max-model-len 4096 \</span>
+<span class="prompt">&gt; </span><span class="cmd">    --max-num-seqs 256 --enable-prefix-caching</span></code></pre>
+<p>Check your version&rsquo;s documentation for the prefix-caching flag, because recent versions turn it on by default. In a second window, run the sweep at the sizes the table needs, with more scoring processes:</p>
+<pre class="terminal" data-title="terminal (GPU box, window 2)"><code><span class="prompt">$ </span><span class="cmd">cd /workspace/zts/open-ended/workbench/code/w02</span>
+<span class="prompt">$ </span><span class="cmd">python scale_evolve.py --base-url http://localhost:8000/v1 \</span>
+<span class="prompt">&gt; </span><span class="cmd">    --model Qwen/Qwen2.5-Coder-7B-Instruct --workers 4,16,64,256 \</span>
+<span class="prompt">&gt; </span><span class="cmd">    --islands 16 --calls 512 --eval-procs 8</span></code></pre>
+<div class="callout note">
+  <p class="callout-title">Not run here</p>
+  <p>This page was written on a machine without an NVIDIA GPU, so there is no GPU output to copy. The numbers in the table are predictions from <code>predict_rate.py</code>, which uses the model&rsquo;s published files and a 4090&rsquo;s published peaks plus two efficiency guesses. The laptop runs above are real, but a 0.5B model on a laptop GPU says nothing about a 7B model on a 4090 beyond the shape of the curve. Measured values are yours to fill in, and they are saved in this browser.</p>
+</div>
+<div class="table-wrap"><table class="measure-table">
+  <thead><tr><th>Quantity</th><th>Predicted</th><th>Measured</th><th>Ratio</th></tr></thead>
+  <tbody>
+    <tr data-predict="230"><td>Samples per minute, 16 in flight</td><td>230</td><td><input name="spm_16"></td><td class="ratio"></td></tr>
+    <tr data-predict="562"><td>Samples per minute, 64 in flight</td><td>562</td><td><input name="spm_64"></td><td class="ratio"></td></tr>
+    <tr data-predict="691"><td>Samples per minute, 256 in flight</td><td>691</td><td><input name="spm_256"></td><td class="ratio"></td></tr>
+    <tr data-predict="23.1"><td>Decode step at 64 in flight, ms (from vLLM&rsquo;s logs, or tokens a second &divide; 64)</td><td>23.1</td><td><input name="step_64"></td><td class="ratio"></td></tr>
+    <tr data-predict="10"><td>Scoring wait per new candidate, ms (the script&rsquo;s last lines)</td><td>10</td><td><input name="eval_ms"></td><td class="ratio"></td></tr>
+  </tbody>
+</table></div>
+<p>What to expect from the ratios. The 16 and 64 rows should land below 1, probably 0.5 to 0.9, because engines lose time to scheduling and to the CPU side that my two percentages only roughly cover. A ratio at or above 1 means the efficiency guesses were too cautious. The 256 row is the least certain, because there the card is arithmetic-bound and the guess for the arithmetic efficiency matters most. Whatever the ratios are, re-run <code>predict_rate.py</code> with <code>--bw-eff</code> and <code>--mfu</code> set to values that reproduce your 64 row. You now have a calibrated model for your card. The scoring row should be close to the laptop&rsquo;s, since the evaluator is plain Python. At three hours of the card and the predicted 562 samples a minute, a full session is about 100,000 samples.</p>
+
+<h2>Break it</h2>
+<ul>
+  <li><strong>Turn off prefix caching</strong> (<code>--no-enable-prefix-caching</code>). Predict: the 64 row falls from about 860 toward 562, because the 160 shared tokens are prefilled again for every sample.</li>
+  <li><strong>Use one island with 64 workers</strong> (<code>--islands 1</code>). Predict before you run: all workers draw from the same few programs at about the same moment, so the model sees near-identical prompts. The &ldquo;duplicate&rdquo; count should rise. Chapter 9 gives islands the job of keeping ideas apart. Check whether it does.</li>
+  <li><strong>Let the weak scorer into the loop.</strong> In <code>scale_evolve.py</code>, replace the call to <code>evaluate_seeds</code> by the weak scorer from <code>hack_demo.py</code>. Predict how many calls it takes the 7B model to produce a crashing program that wins. Part 2 suggests a rate of about 1 in 100 for a 0.5B model; a 7B model may be lower. Then add the tripwire and see what gets held.</li>
+  <li><strong>Hide a quiet hack.</strong> Plant the gap-30 hack in the database at the start. Predict: the tripwire does not fire, and its descendants spread through the islands, because each of them scores a little better than best fit. Which defence in chapter 15 would you add?</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Concurrency is nearly free for decoding while the weights dominate the bytes read. It stops being free when the arithmetic becomes the limit.</li>
+    <li>Samples per minute can be predicted from the model&rsquo;s files and two efficiency guesses, before renting a card. The measured ratio calibrates the guesses.</li>
+    <li>The evaluator has to keep up too, but a scorer of plain Python barely registers next to the model.</li>
+    <li>A scorer that turns a crash into a score invites a hack. A small model produced one by accident, in 1 sample of 100.</li>
+    <li>Tripwires catch loud hacks and miss quiet ones. Check the thing itself, and keep the evaluator total.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+</body>
+</html>
