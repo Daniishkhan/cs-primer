@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workbench 6: Quantise and Measure Perplexity · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-workbench="W6">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Workbench 6: Quantise and Measure Perplexity</h1>
+  <p class="lede">Chapter 19 says a weight can be squeezed into 8 or 4 bits with one scale and a rounding step, and that the price is error. Here you write that rounding yourself, apply it to every linear layer of a real language model, and measure two things: the memory the packed weights would take, and the perplexity of the model on a fixed piece of text. The first is arithmetic. The second is the bill.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why measure it</p>
+  <p>The chapter's toy experiments showed that granularity decides how much damage 4 bits does. A real model has a hundred or more weight matrices with different spreads, so whether the same ordering holds there is an empirical question. Doing the quantisation by hand, instead of calling a library, also shows how little machinery sits behind the word: a maximum, a division and a <code>round</code>.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">What you need</p>
+  <ul>
+    <li><strong>Part 1, your laptop:</strong> the workbench venv, about 270 MB of disk for SmolLM2-135M and a few MB for WikiText-2. About 10 minutes on the CPU.</li>
+    <li><strong>Part 2, a GPU box (optional):</strong> one 24 GB card, about 16 GB of disk for Qwen2.5-7B-Instruct, and about an hour and a half. Setting one up is in <a href="../../lab-machine.html#gpu">Your lab machine, Option C</a>.</li>
+  </ul>
+</div>
+
+<h2>Predict before you run</h2>
+<p>The rule is the one from <a href="../chapters/19-quantisation.html#eq-absmax">chapter 19</a>:</p>
+<div class="eq-display" data-tex="s = \frac{\max|w|}{q_{\max}}, \qquad q = \operatorname{round}\!\left(\frac{w}{s}\right), \qquad \hat{w} = q \times s">s = max|w| / q<sub>max</sub>, &nbsp; q = round(w / s), &nbsp; &#375; = q &times; s</div>
+<p>with q<sub>max</sub> = 127 for int8 and 7 for int4. Memory follows from how the numbers are packed: an int8 weight is 1 byte, two int4 weights share a byte, and every scale is a 16-bit number. Embeddings and the normalisation weights stay in 16 bits, and so does the output head (the script leaves <code>lm_head</code> alone; in SmolLM2 it is tied to the embedding, so it is the same tensor).</p>
+<div class="callout predict">
+  <p class="callout-title">Your prediction</p>
+  <p>SmolLM2-135M has 134.5 million parameters, of which 106.2 million sit in linear layers (attention and MLP projections). Work out the packed size in MiB of the whole model at int8 with one scale per output row (a row is at most a few thousand weights, so its scale is negligible) and at int4 with a scale per 128 weights. Then predict the order of perplexity: which of int8, int4 with groups and int4 per channel costs the most, and is any of them free?</p>
+</div>
+<details class="deeper">
+  <summary>Check your arithmetic</summary>
+  <p>The 28.3 million other parameters stay at 2 bytes: 54 MiB. 16-bit total: 134.5 million &times; 2 bytes = <strong>256.6 MiB</strong>. int8: 106.2 million bytes (101.3 MiB) plus the 54 MiB plus a few thousand scales, about <strong>155.6 MiB</strong>. int4 with groups: 106.2 million / 2 bytes = 50.7 MiB, plus 106.2 million / 128 scales &times; 2 bytes = 1.6 MiB, plus 54 MiB, about <strong>106 to 108 MiB</strong>. The script prints 107.5 because 576 does not divide by 128 (see below), so some layers use groups of 64 and carry a few more scales.</p>
+  <p>Perplexity: chapter 19's table has int8 per channel nearly free and int4 per channel worse than int4 with groups. Whether 4 bits stays tolerable on a model this small is what you are about to find out. Small models have less redundancy to absorb the error than large ones.</p>
+</details>
+
+<h2>Part 1: on your laptop</h2>
+<h3>Set up once</h3>
+<p>One virtual environment serves every workbench page. From the site's folder:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -m venv ~/.venvs/zts</span>
+<span class="prompt">$ </span><span class="cmd">~/.venvs/zts/bin/pip install -r workbench/requirements.txt</span>
+<span class="prompt">$ </span><span class="cmd">source ~/.venvs/zts/bin/activate</span></code></pre>
+<p>The script is <a href="code/w06/quantise.py"><code>code/w06/quantise.py</code></a>, and the same code split into cells is <a href="code/w06/quantise.ipynb"><code>quantise.ipynb</code></a>. The first run downloads the model and WikiText-2 from Hugging Face.</p>
+
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>take the first 4,096 tokens of the WikiText-2 test set, in eight windows of 512</li>
+  <li>perplexity of the unmodified model = exp(mean negative log-probability of each next token)</li>
+  <li>for each format: reload the model; for every linear layer split each row into groups, set s = max|w| / q<sub>max</sub>, replace w by round(w / s) &times; s</li>
+  <li>predict the packed size from the layout; measure perplexity of the damaged model</li>
+</ol></div>
+<pre class="terminal" data-title="quantise.py" data-run="off"><code>"""Quantise a model's linear layers yourself, then measure perplexity.
+
+Absmax quantisation (chapter 19): s = max|w| / q_max, q = round(w / s).
+int8 uses one scale per output row; int4 uses one scale per group of 128
+weights along a row. We store nothing packed: each weight is quantised and
+dequantised in place, so the model runs unchanged and perplexity shows
+what the rounding cost. Memory is predicted from the packed layout.
+
+Laptop (SmolLM2-135M, about 270 MB download, WikiText-2 test):
+    python quantise.py
+GPU box (a 7B model; add --tokens 16384):
+    python quantise.py --model Qwen/Qwen2.5-7B-Instruct
+
+Needs: torch, transformers, datasets (workbench/requirements.txt)."""
+import argparse
+import math
+
+import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# ── 1. Settings ──────────────────────────────────────────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M")
+ap.add_argument("--tokens", type=int, default=4096)   # text to score
+ap.add_argument("--window", type=int, default=512)    # tokens per window
+ap.add_argument("--group", type=int, default=128)     # int4 group size
+args, _ = ap.parse_known_args()        # notebooks pass their own flags
+
+if torch.cuda.is_available():
+    DEVICE = "cuda"          # a 7B model needs 16-bit compute to fit
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+COMPUTE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+torch.manual_seed(0)
+
+
+# ── 2. Absmax quantisation, written out ──────────────────────────────────
+def absmax_quantise(w, bits, group=None):
+    """Return (dequantised w, number of scales). Rows are output channels;
+    group=None gives one scale per row, else one per `group` weights."""
+    q_max = 2 ** (bits - 1) - 1                      # 127 or 7
+    rows, cols = w.shape
+    g = group or cols
+    while cols % g:                  # 576 columns: 128 does not divide
+        g //= 2                      # so fall back to 64
+    blocks = w.float().reshape(rows, cols // g, g)   # maths in fp32
+    s = blocks.abs().amax(dim=-1, keepdim=True) / q_max   # s = max|w|/qmax
+    s = s.clamp(min=1e-12)
+    q = torch.round(blocks / s).clamp(-q_max, q_max)      # q = round(w/s)
+    return (q * s).reshape(rows, cols).to(w.dtype), s.numel()  # w_hat
+
+
+def quantise_model(model, bits, group=None):
+    """Quantise every nn.Linear except the output head. Returns the
+    predicted packed size in bytes of the quantised layers."""
+    packed = 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, torch.nn.Linear) and "lm_head" not in name:
+            w_hat, n_scales = absmax_quantise(mod.weight.data, bits, group)
+            mod.weight.data = w_hat
+            packed += mod.weight.numel() * bits // 8 + n_scales * 2
+    return packed
+
+
+# ── 3. Perplexity on a fixed sample ──────────────────────────────────────
+tok = AutoTokenizer.from_pretrained(args.model)
+text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1",
+                                split="test")["text"])
+ids = tok(text, return_tensors="pt").input_ids[0][:args.tokens]
+windows = ids[: len(ids) // args.window * args.window].view(
+    -1, args.window).to(DEVICE)
+print(f"{args.model} on {DEVICE}; {windows.numel()} WikiText-2 test tokens "
+      f"in {len(windows)} windows of {args.window}")
+
+
+@torch.no_grad()
+def perplexity(model):
+    nll, n = 0.0, 0
+    for x in windows:
+        logits = model(x[None]).logits[0, :-1].float()
+        loss = torch.nn.functional.cross_entropy(logits, x[1:],
+                                                 reduction="sum")
+        nll, n = nll + loss.item(), n + len(x) - 1
+    return math.exp(nll / n)
+
+
+def fresh():
+    m = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
+    return m.to(COMPUTE).to(DEVICE).eval()   # bf16 values; fp32 off-GPU
+
+
+# ── 4. Predict, quantise, measure ────────────────────────────────────────
+model = fresh()
+lin = sum(m.weight.numel() for n, m in model.named_modules()
+          if isinstance(m, torch.nn.Linear) and "lm_head" not in n)
+total = sum(p.numel() for p in model.parameters())
+other = total - lin                  # embeddings, norms: left in 16 bits
+print(f"{total / 1e6:.1f}M parameters, {lin / 1e6:.1f}M in quantised "
+      f"linear layers, {other / 1e6:.1f}M left in 16 bits")
+print(f"\n{'format':&lt;22}{'predicted MiB':&gt;14}{'perplexity':&gt;12}")
+base = perplexity(model)
+mib = (lin * 2 + other * 2) / 2**20
+print(f"{'16-bit (bf16 values)':&lt;22}{mib:&gt;14.1f}{base:&gt;12.3f}")
+del model
+
+for label, bits, group in (("int8, per channel", 8, None),
+                           (f"int4, group {args.group}", 4, args.group),
+                           ("int4, per channel", 4, None)):
+    model = fresh()
+    packed = quantise_model(model, bits, group)
+    mib = (packed + other * 2) / 2**20
+    ppl = perplexity(model)
+    print(f"{label:&lt;22}{mib:&gt;14.1f}{ppl:&gt;12.3f}   "
+          f"({ppl / base:.3f}x the 16-bit perplexity)")
+    del model
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()</code></pre>
+<p>On a MacBook CPU (32-bit arithmetic on the 16-bit values) this printed:</p>
+<pre class="terminal" data-title="output (laptop, CPU, SmolLM2-135M, 4,096 WikiText-2 test tokens)"><code>HuggingFaceTB/SmolLM2-135M on cpu; 4096 WikiText-2 test tokens in 8 windows of 512
+134.5M parameters, 106.2M in quantised linear layers, 28.3M left in 16 bits
+
+format                 predicted MiB  perplexity
+16-bit (bf16 values)           256.6      20.846
+int8, per channel              155.6      20.993   (1.007x the 16-bit perplexity)
+int4, group 128                107.5      29.784   (1.429x the 16-bit perplexity)
+int4, per channel              105.0      46.251   (2.219x the 16-bit perplexity)</code></pre>
+
+<h3>What you should see</h3>
+<ul>
+  <li><strong>Sizes match the arithmetic.</strong> 256.6 MiB falls to 155.6 at int8 and about 107 at int4. Not 4 times smaller: the 28.3 million embedding and norm parameters stay in 16 bits and are now half the model. On a 7B model the embeddings are a much smaller share.</li>
+  <li><strong>int8 is almost free:</strong> perplexity rises from 20.85 to 20.99, under 1%. Rounding every weight to one of 255 levels, with a scale per row, barely moves what the model predicts.</li>
+  <li><strong>int4 is not free on a model this small.</strong> With a scale per group of 128 the perplexity is 1.43 times the baseline; with a scale per row it is 2.22 times. The only difference is how many weights share the largest value, which is the chapter's whole argument about granularity, now measured on a trained network.</li>
+  <li><strong>The group size is not always 128.</strong> SmolLM2's hidden size is 576, and 576 / 128 is not a whole number, so <code>absmax_quantise</code> halves the group until it divides (64). Real tools handle this the same way or pad.</li>
+  <li>The perplexity is on 4,096 tokens, so differences of a percent or two are within noise of the sample; the orderings above are far larger than that.</li>
+</ul>
+
+<h2>Part 2: a 7B model on a GPU</h2>
+<div class="callout note">
+  <p class="callout-title">Not run here</p>
+  <p>This page was written on a machine without an NVIDIA GPU, so there is no printed 7B output. The numbers below are predictions from the model's published configuration; the measurements are yours to fill in, and they are saved in this browser.</p>
+</div>
+<p>On the GPU box the same script runs on the 7B model; it computes in bf16 on CUDA so the model fits:</p>
+<pre class="terminal" data-title="terminal (GPU box)"><code><span class="prompt">$ </span><span class="cmd">cd /workspace/zts/llm-training/workbench/code/w06</span>
+<span class="prompt">$ </span><span class="cmd">python quantise.py --model Qwen/Qwen2.5-7B-Instruct --tokens 16384</span></code></pre>
+<p>Predicted sizes, from the model's <code>config.json</code> (hidden size 3,584, 28 layers, MLP width 18,944, 4 key-value heads of 128, so key and value projections are 512 wide, vocabulary 152,064) and its <code>model.safetensors.index.json</code> (15,231,233,024 bytes, so 7,615,616,512 parameters):</p>
+<p class="eq-plain">linear weights per layer = 2 &times; 3,584<sup>2</sup> + 2 &times; 3,584 &times; 512 + 3 &times; 3,584 &times; 18,944 = 233,046,016<br>
+all 28 layers = 6,525,288,448 &nbsp; (the rest, 1,090,328,064, is embeddings, head, norms, biases)<br>
+16-bit: 15,231,233,024 bytes = <strong>14.19 GiB</strong><br>
+int8: 6.525 GB + 1.090 &times; 2 GB &asymp; <strong>8.11 GiB</strong><br>
+int4, group 128: 3.263 GB + 0.102 GB scales + 2.181 GB &asymp; <strong>5.16 GiB</strong></p>
+<p>The embedding and head stay in 16 bits here (2.18 GB of the total), so a tool that quantises them too will report less. For the perplexity, a 7B model has far more redundancy than a 135M one, so predict that int8 stays within about 1% and that int4 with groups costs clearly less than the 1.43 times you measured on the laptop. Do not trust a number from this page for it: measure.</p>
+<div class="table-wrap"><table class="measure-table">
+  <thead><tr><th>Quantity</th><th>Predicted</th><th>Measured</th><th>Ratio</th></tr></thead>
+  <tbody>
+    <tr data-predict="14.19"><td>16-bit weights, GiB (<code>torch.cuda.memory_allocated()</code> after loading)</td><td>14.19</td><td><input name="gib16"></td><td class="ratio"></td></tr>
+    <tr data-predict="8.11"><td>int8 packed size, GiB (the script's predicted column, converted)</td><td>8.11</td><td><input name="gib8"></td><td class="ratio"></td></tr>
+    <tr data-predict="5.16"><td>int4 group 128 packed size, GiB</td><td>5.16</td><td><input name="gib4"></td><td class="ratio"></td></tr>
+    <tr data-predict="1"><td>int8 perplexity / 16-bit perplexity</td><td>&asymp; 1.00</td><td><input name="ppl8"></td><td class="ratio"></td></tr>
+    <tr data-predict="1.43"><td>int4 (group 128) perplexity / 16-bit perplexity (the laptop's 1.43 is an upper bound, expect less)</td><td>&lt; 1.43</td><td><input name="ppl4"></td><td class="ratio"></td></tr>
+  </tbody>
+</table></div>
+<p>Then compare against a real kernel. The script fake-quantises (it stores the rounded values back in 16 bits), so it saves no memory by itself; it only measures accuracy. To see real memory, load the model through <code>transformers</code>' bitsandbytes support with <code>BitsAndBytesConfig(load_in_8bit=True)</code> or <code>load_in_4bit=True</code>, or load a published GPTQ or AWQ checkpoint, check <code>torch.cuda.memory_allocated()</code> and score the same windows. This was not run here either; the packed sizes above are what to compare it with.</p>
+
+<h2>Break it</h2>
+<ul>
+  <li><strong>Shrink the group.</strong> Run <code>--group 32</code> on the laptop. Predict first: smaller groups confine each outlier, so perplexity should fall, and the scales cost 16 / 32 = 0.5 bit per weight instead of 0.125.</li>
+  <li><strong>Per-tensor scales.</strong> Change <code>group=None</code> so that one scale covers a whole matrix (use <code>w.abs().amax()</code>). Predict whether the model survives 8 bits, then 4. (Chapter 19's matrix experiment gave 0.81 relative error at 4 bits per tensor.)</li>
+  <li><strong>Quantise the embedding too.</strong> Add the embedding matrix to <code>quantise_model</code>. Which costs more perplexity per MiB saved: the embedding or the MLP layers?</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Absmax quantisation is three lines: a maximum, a division and a rounding. Everything else is bookkeeping about where the scales live.</li>
+    <li>Memory follows the packed layout exactly; "4-bit" is about 4.1 bits per weight with group scales, and parts left in 16 bits count too.</li>
+    <li>On a real model, int8 is almost free and int4 is not, and the granularity of the scale decides how much it costs.</li>
+    <li>Perplexity measured here is one sample of 4,096 tokens: it ranks the formats, but compare task results before shipping anything.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+</body>
+</html>

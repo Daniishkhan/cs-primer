@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workbench 3: LoRA, then QLoRA, on a Real Model · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-workbench="W3">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Workbench 3: LoRA, then QLoRA, on a Real Model</h1>
+  <p class="lede">Chapter 11 writes a fine-tuned weight as the frozen matrix plus a product of two thin matrices, and claims the thin matrices hold a fraction of a percent of the numbers. Here you predict the adapter's exact size from a model's configuration file and check it against PEFT's own count, fine-tune a small model end to end with only the adapter training, and then predict, from the same formulas, what the 4-bit QLoRA version of a larger model needs on a GPU.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why measure it</p>
+  <p>The two claims that make LoRA worth using are a count and a size: how many numbers train, and how much optimiser memory that saves. Both can be predicted on paper before any code runs, and the prediction is exact, not an estimate. Doing it once on a real model, with grouped-query attention and a gated feed-forward block, shows where a hand count goes wrong (the matrices are not all square) and builds the habit of sizing a run before renting the card.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">What you need</p>
+  <ul>
+    <li><strong>Part 1, your laptop:</strong> the workbench venv (see <a href="w01-kv-cache.html">workbench 1</a>) and about 300 MB of disk for SmolLM2-135M. The run itself takes seconds; allow 20 minutes to read and try the experiments.</li>
+    <li><strong>Part 2, a GPU box (optional):</strong> one 24 GB card, bitsandbytes (installed by the GPU setup script) and about 3 GB of disk for Qwen2.5-1.5B. About two hours with the experiments. Setting one up is in <a href="../../lab-machine.html#gpu">Your lab machine, Option C</a>.</li>
+  </ul>
+</div>
+
+<h2>Predict before you run</h2>
+<p>Recall the equation from <a href="../chapters/11-lora.html#eq-lora">chapter 11</a>:</p>
+<div class="eq-display" data-tex="W = W_0 + \frac{\alpha}{r}\,B\,A,\qquad B \in \R^{d_{\text{out}} \times r},\; A \in \R^{r \times d_{\text{in}}}">W = W<sub>0</sub> + (&alpha;/r) &middot; B A, with B of size d<sub>out</sub> &times; r and A of size r &times; d<sub>in</sub></div>
+<p>Each adapted matrix gains r &times; (d<sub>in</sub> + d<sub>out</sub>) trainable numbers, and W<sub>0</sub> gains none. The shapes come from <code>config.json</code>. SmolLM2-135M has 30 layers, hidden size 576, 9 attention heads of width 64 with 3 key-value heads (grouped-query attention), and a feed-forward width of 1,536. So the query and output projections are 576 &times; 576, but the key and value projections are only 192 &times; 576 (3 heads &times; 64), and the three feed-forward matrices are 1,536 &times; 576.</p>
+<div class="callout predict">
+  <p class="callout-title">Your prediction</p>
+  <p>With rank r = 8 on all seven linear layers of every block (q, k, v, o, gate, up, down), how many parameters does the adapter hold, and what fraction of the model's 134,515,008 is that? Then: how many bytes of Adam state does it need in 32-bit floats, against full fine-tuning?</p>
+</div>
+<details class="deeper">
+  <summary>Check your arithmetic</summary>
+  <p>Per layer: q 8 &times; (576 + 576) = 9,216; k and v 8 &times; (576 + 192) = 6,144 each; o 9,216; gate, up and down 8 &times; (576 + 1,536) = 16,896 each. The sum is <strong>81,408 per layer</strong>, and 30 layers make <strong>2,442,240</strong>, which is 1.82% of 134,515,008. Adam keeps two 32-bit numbers per trainable parameter: 2,442,240 &times; 8 = 19,537,920 bytes = 18.6 MiB, against 134,515,008 &times; 8 = 1,026.3 MiB for full fine-tuning.</p>
+</details>
+
+<h2>Part 1: on your laptop</h2>
+<p>The venv is the one from <a href="w01-kv-cache.html">workbench 1</a>. The script is <a href="code/w03/lora_qlora.py"><code>code/w03/lora_qlora.py</code></a>; the notebook is <a href="code/w03/lora_qlora.ipynb"><code>lora_qlora.ipynb</code></a>. PEFT's and TRL's interfaces change between releases; the script was run with PEFT 0.21.2, transformers 5.19 and torch 2.14.</p>
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>read the layer shapes from config.json; predict r &times; (d<sub>in</sub> + d<sub>out</sub>) per adapted matrix, summed over layers</li>
+  <li>predict the memory of a 4-bit base (4.127 bits per weight with double quantisation) plus adapter, activations and overhead</li>
+  <li>wrap the model with <code>get_peft_model</code> and compare <code>print_trainable_parameters()</code> with the prediction</li>
+  <li>train only the adapter on a tiny task (answer in the form <code>[[Paris]]</code>) and compare loss on countries it never saw</li>
+  <li>measure the optimiser's state, then merge the adapter into the weights and confirm the outputs do not change</li>
+</ol></div>
+<pre class="terminal" data-title="lora_qlora.py" data-run="off"><code>"""LoRA, then QLoRA: predict the adapter's size from chapter 11's equation,
+check it against PEFT, fine-tune a small model end to end, and predict what
+the 4-bit version would need on a GPU.
+
+Laptop (SmolLM2-135M, LoRA, under a minute after the download):
+    python lora_qlora.py
+Prediction only for a bigger model (reads config.json, downloads no weights):
+    python lora_qlora.py --model Qwen/Qwen2.5-1.5B --predict-only
+GPU box (4-bit base, needs bitsandbytes; not run by the authors):
+    python lora_qlora.py --model Qwen/Qwen2.5-1.5B --qlora
+
+Needs: torch, transformers, peft (workbench/requirements.txt);
+--qlora also needs bitsandbytes (workbench/requirements-gpu.txt)."""
+import argparse
+import time
+
+import torch
+from peft import LoraConfig, get_peft_model
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+# ── 1. Settings ──────────────────────────────────────────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M")
+ap.add_argument("--rank", type=int, default=8)          # r in the equation
+ap.add_argument("--alpha", type=int, default=16)        # numerator of alpha/r
+ap.add_argument("--targets", default="q_proj,k_proj,v_proj,o_proj,"
+                "gate_proj,up_proj,down_proj")
+ap.add_argument("--steps", type=int, default=40)
+ap.add_argument("--lr", type=float, default=2e-4)
+ap.add_argument("--predict-only", action="store_true")
+ap.add_argument("--qlora", action="store_true")         # GPU: 4-bit base
+args, _ = ap.parse_known_args()        # notebooks pass their own flags
+
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+TARGETS = args.targets.split(",")
+r = args.rank
+
+
+def mib(n):
+    return f"{n / 2**20:,.1f} MiB"
+
+
+# ── 2. Predict the trainable parameters (chapter 11, eq-lora) ────────────
+# Each adapted matrix W0 (d_out x d_in) gains B (d_out x r) and A (r x d_in),
+# so r * (d_in + d_out) numbers. The shapes come from config.json.
+cfg = AutoConfig.from_pretrained(args.model)
+L, h = cfg.num_hidden_layers, cfg.hidden_size
+heads = cfg.num_attention_heads
+kv = getattr(cfg, "num_key_value_heads", None) or heads
+d_head = getattr(cfg, "head_dim", None) or h // heads
+ffn = cfg.intermediate_size
+SHAPES = {                                   # name: (d_in, d_out)
+    "q_proj": (h, heads * d_head), "k_proj": (h, kv * d_head),
+    "v_proj": (h, kv * d_head), "o_proj": (heads * d_head, h),
+    "gate_proj": (h, ffn), "up_proj": (h, ffn), "down_proj": (ffn, h),
+}
+per_layer = {t: r * sum(SHAPES[t]) for t in TARGETS}
+predicted = L * sum(per_layer.values())
+with torch.device("meta"):                   # shapes only: no memory used
+    shell = AutoModelForCausalLM.from_config(cfg)
+N = sum(p.numel() for p in shell.parameters())
+print(f"model {args.model}: L={L}, h={h}, heads={heads}, kv heads={kv}, "
+      f"d_head={d_head}, ffn={ffn}")
+print(f"LoRA r={r}, alpha={args.alpha}, scale alpha/r = {args.alpha / r:g}")
+for t in TARGETS:
+    d_in, d_out = SHAPES[t]
+    print(f"  {t:10} W0 is {d_out:&gt;5} x {d_in:&lt;5} -&gt; r*(d_in+d_out) = "
+          f"{per_layer[t]:&gt;7,} per layer")
+print(f"predicted trainable: {L} layers x {sum(per_layer.values()):,} = "
+      f"{predicted:,} of {N:,} ({100 * predicted / N:.2f}%)")
+print(f"full fine-tuning would train all {N:,}: "
+      f"{N / predicted:,.0f}x more")
+
+# ── 3. Predict the 4-bit base (chapter 11, QLoRA) ────────────────────────
+NF4_BITS = 4 + 8 / 64 + 32 / (64 * 256)      # code + double-quantised scale
+blocks = sum(p.numel() for n, p in shell.named_parameters()
+             if "layers." in n and p.dim() == 2)        # the linear weights
+rest = N - blocks                    # embeddings and norms stay in bf16
+GB = 1e9
+bf16_base = N * 2
+nf4_base = blocks * NF4_BITS / 8 + rest * 2
+adapter_state = predicted * 16               # fp32 weight+grad+2 Adam
+tokens, bsz = 512, 4                         # one micro-batch of 4 x 512
+act = (L * 2 * tokens * bsz * h + 34 * tokens * bsz * h
+       + 4 * tokens * bsz * cfg.vocab_size)  # checkpointed (chapter 14)
+print(f"\nQLoRA prediction for {args.model} (batch {bsz} x {tokens}):")
+print(f"  linear weights in blocks {blocks:,} -&gt; {NF4_BITS:.3f} bits each")
+print(f"  base in bf16        {bf16_base / GB:6.2f} GB")
+print(f"  base in NF4         {nf4_base / GB:6.2f} GB "
+      f"(embeddings and norms {rest * 2 / GB:.2f} GB stay bf16)")
+print(f"  adapter + Adam      {adapter_state / GB:6.2f} GB")
+print(f"  activations         {act / GB:6.2f} GB (checkpointed)")
+print(f"  fixed overhead      {1.5:6.2f} GB (assumption, chapter 2)")
+extra = adapter_state + act + 1.5 * GB
+print(f"  total, LoRA on bf16 {(bf16_base + extra) / GB:6.2f} GB   "
+      f"QLoRA {(nf4_base + extra) / GB:6.2f} GB")
+if args.predict_only:
+    raise SystemExit
+
+# ── 4. Load, wrap in LoRA and let PEFT count ─────────────────────────────
+torch.manual_seed(0)
+tok = AutoTokenizer.from_pretrained(args.model)
+if args.qlora:
+    if DEVICE != "cuda":
+        raise SystemExit("--qlora needs an NVIDIA GPU and bitsandbytes")
+    from transformers import BitsAndBytesConfig
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, quantization_config=bnb, device_map={"": 0})
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()      # checkpointing needs this
+else:
+    model = AutoModelForCausalLM.from_pretrained(args.model,
+                                                 dtype=torch.float32)
+    model = model.to(DEVICE)
+conf = LoraConfig(r=r, lora_alpha=args.alpha, target_modules=TARGETS,
+                  lora_dropout=0.0, task_type="CAUSAL_LM")
+model = get_peft_model(model, conf)
+model.print_trainable_parameters()
+real = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"predicted {predicted:,}  PEFT {real:,}  "
+      f"-&gt; {'exact match' if real == predicted else 'MISMATCH'}")
+
+# ── 5. A tiny task: answer in a format the base model does not use ───────
+CAPITALS = [
+    ("France", "Paris"), ("Germany", "Berlin"), ("Italy", "Rome"),
+    ("Spain", "Madrid"), ("Portugal", "Lisbon"), ("Norway", "Oslo"),
+    ("Sweden", "Stockholm"), ("Finland", "Helsinki"), ("Poland", "Warsaw"),
+    ("Austria", "Vienna"), ("Greece", "Athens"), ("Ireland", "Dublin"),
+    ("Hungary", "Budapest"), ("Denmark", "Copenhagen"), ("Russia", "Moscow"),
+    ("Egypt", "Cairo"), ("Kenya", "Nairobi"), ("Japan", "Tokyo"),
+    ("China", "Beijing"), ("India", "New Delhi"), ("Peru", "Lima"),
+    ("Chile", "Santiago"), ("Cuba", "Havana"), ("Canada", "Ottawa"),
+    ("Turkey", "Ankara"), ("Iran", "Tehran"), ("Iraq", "Baghdad"),
+    ("Thailand", "Bangkok"), ("Vietnam", "Hanoi"), ("Ghana", "Accra"),
+    ("Morocco", "Rabat"), ("Argentina", "Buenos Aires"),
+    ("Belgium", "Brussels"), ("Netherlands", "Amsterdam"),
+    ("Switzerland", "Bern"), ("Czechia", "Prague"),
+    ("Ukraine", "Kyiv"), ("Colombia", "Bogota"),
+    ("Nepal", "Kathmandu"), ("Jordan", "Amman"), ("Libya", "Tripoli"),
+    ("Mexico", "Mexico City"), ("Romania", "Bucharest"),
+]
+train, held = CAPITALS[:32], CAPITALS[32:]
+print(f"\ntask: 'Country: X' -&gt; 'Capital: [[Y]]'; {len(train)} train, "
+      f"{len(held)} held-out countries")
+
+
+def encode(country, capital):
+    """Tokens of the whole line; the loss counts only the answer tokens."""
+    prompt = tok(f"Country: {country}\nCapital:")["input_ids"]
+    answer = tok(f" [[{capital}]]")["input_ids"] + [tok.eos_token_id]
+    ids = prompt + answer
+    labels = [-100] * len(prompt) + answer
+    return ids, labels
+
+
+def batch_of(pairs):
+    enc = [encode(c, k) for c, k in pairs]
+    n = max(len(i) for i, _ in enc)
+    pad = tok.eos_token_id
+    ids = torch.tensor([i + [pad] * (n - len(i)) for i, _ in enc])
+    lab = torch.tensor([x + [-100] * (n - len(x)) for _, x in enc])
+    att = torch.tensor([[1] * len(i) + [0] * (n - len(i)) for i, _ in enc])
+    return ids.to(DEVICE), lab.to(DEVICE), att.to(DEVICE)
+
+
+def held_loss():
+    model.eval()
+    ids, lab, att = batch_of(held)
+    with torch.no_grad():
+        return model(input_ids=ids, attention_mask=att, labels=lab).loss.item()
+
+
+def say(country):
+    model.eval()
+    ids = tok(f"Country: {country}\nCapital:", return_tensors="pt")
+    ids = {k: v.to(DEVICE) for k, v in ids.items()}
+    with torch.no_grad():
+        out = model.generate(**ids, max_new_tokens=8, do_sample=False,
+                             pad_token_id=tok.eos_token_id)
+    return tok.decode(out[0][ids["input_ids"].shape[1]:],
+                      skip_special_tokens=True).strip().split("\n")[0]
+
+
+before = held_loss()
+print(f"held-out loss before: {before:.3f}")
+print("  ", " | ".join(f"{c} -&gt; {say(c)}" for c, _ in held[:3]))
+
+# ── 6. Train only the adapter, with a hand-written loop ──────────────────
+params = [p for p in model.parameters() if p.requires_grad]
+opt = torch.optim.AdamW(params, lr=args.lr)
+t0 = time.perf_counter()
+for step in range(args.steps):
+    model.train()
+    start = (step * 8) % len(train)
+    pairs = (train + train)[start:start + 8]
+    ids, lab, att = batch_of(pairs)
+    loss = model(input_ids=ids, attention_mask=att, labels=lab).loss
+    loss.backward()
+    opt.step()
+    opt.zero_grad()
+    if step % 10 == 0 or step == args.steps - 1:
+        print(f"  step {step:3d}  train loss {loss.item():.3f}")
+secs = time.perf_counter() - t0
+after = held_loss()
+print(f"held-out loss after:  {after:.3f}  ({secs:.0f} s on {DEVICE})")
+print("  ", " | ".join(f"{c} -&gt; {say(c)}" for c, _ in held[:3]))
+
+# ── 7. What the optimiser kept, and merging the adapter back ─────────────
+adam = sum(t.numel() * t.element_size() for st in opt.state.values()
+           for t in st.values() if torch.is_tensor(t) and t.dim() &gt; 0)
+print(f"\nAdam state held: {mib(adam)}; full fine-tuning would hold "
+      f"{mib(N * 8)} (8 bytes x {N:,})")
+model.eval()
+probe, _, att = batch_of(held[:2])
+with torch.no_grad():
+    with_adapter = model(input_ids=probe, attention_mask=att).logits
+    merged = model.merge_and_unload()           # W = W0 + (alpha/r) B A
+    without = merged(input_ids=probe, attention_mask=att).logits
+print(f"merged weights vs adapter: max |logit difference| = "
+      f"{(with_adapter - without).abs().max().item():.1e}")</code></pre>
+<p>On a MacBook (Apple MPS, 32-bit) this printed:</p>
+<pre class="terminal" data-title="output (laptop, Apple MPS, SmolLM2-135M, defaults)"><code>model HuggingFaceTB/SmolLM2-135M: L=30, h=576, heads=9, kv heads=3, d_head=64, ffn=1536
+LoRA r=8, alpha=16, scale alpha/r = 2
+  q_proj     W0 is   576 x 576   -&gt; r*(d_in+d_out) =   9,216 per layer
+  k_proj     W0 is   192 x 576   -&gt; r*(d_in+d_out) =   6,144 per layer
+  v_proj     W0 is   192 x 576   -&gt; r*(d_in+d_out) =   6,144 per layer
+  o_proj     W0 is   576 x 576   -&gt; r*(d_in+d_out) =   9,216 per layer
+  gate_proj  W0 is  1536 x 576   -&gt; r*(d_in+d_out) =  16,896 per layer
+  up_proj    W0 is  1536 x 576   -&gt; r*(d_in+d_out) =  16,896 per layer
+  down_proj  W0 is   576 x 1536  -&gt; r*(d_in+d_out) =  16,896 per layer
+predicted trainable: 30 layers x 81,408 = 2,442,240 of 134,515,008 (1.82%)
+full fine-tuning would train all 134,515,008: 55x more
+
+QLoRA prediction for HuggingFaceTB/SmolLM2-135M (batch 4 x 512):
+  linear weights in blocks 106,168,320 -&gt; 4.127 bits each
+  base in bf16          0.27 GB
+  base in NF4           0.11 GB (embeddings and norms 0.06 GB stay bf16)
+  adapter + Adam        0.04 GB
+  activations           0.51 GB (checkpointed)
+  fixed overhead        1.50 GB (assumption, chapter 2)
+  total, LoRA on bf16   2.32 GB   QLoRA   2.16 GB
+trainable params: 2,442,240 || all params: 136,957,248 || trainable%: 1.7832
+predicted 2,442,240  PEFT 2,442,240  -&gt; exact match
+
+task: 'Country: X' -&gt; 'Capital: [[Y]]'; 32 train, 11 held-out countries
+held-out loss before: 4.768
+   Belgium -&gt; Brussels | Netherlands -&gt; Amsterdam | Switzerland -&gt; Bern
+  step   0  train loss 5.235
+  step  10  train loss 1.798
+  step  20  train loss 0.271
+  step  30  train loss 0.341
+  step  39  train loss 0.125
+held-out loss after:  0.466  (3 s on mps)
+   Belgium -&gt; [[Brussels]] | Netherlands -&gt; [[Amsterdam]] | Switzerland -&gt; [[Geneva]]
+
+Adam state held: 18.6 MiB; full fine-tuning would hold 1,026.3 MiB (8 bytes x 134,515,008)
+merged weights vs adapter: max |logit difference| = 3.3e-04</code></pre>
+
+<h3>What you should see</h3>
+<ul>
+  <li><strong>predicted 2,442,240, PEFT 2,442,240: exact match.</strong> The count is arithmetic, so it must agree to the digit. PEFT's own percentage (1.7832%) uses a denominator that already includes the adapter (136,957,248), which is why it differs from the 1.82% printed above it.</li>
+  <li><strong>The held-out loss fell from 4.768 to 0.466 in 40 steps</strong> and the model now writes <code>[[Brussels]]</code> for countries it was never trained on. Only 2.4 million of 134.5 million numbers moved. It is not a perfect model: <code>Switzerland -> [[Geneva]]</code> has the new format and a wrong fact. A tiny run teaches the format and slightly disturbs what the model knew, which is one reason real runs watch an evaluation set.</li>
+  <li><strong>Adam held 18.6 MiB</strong>, exactly the 2,442,240 &times; 8 bytes predicted above, against 1,026.3 MiB for full fine-tuning: a 55x saving, the same ratio as the parameter counts.</li>
+  <li><strong>Merging changes nothing that matters.</strong> After <code>merge_and_unload()</code> the largest logit difference is 3.3e-04 (floating-point rounding when B&middot;A is added into W<sub>0</sub>), so serving costs no extra.</li>
+  <li>The QLoRA block on a 135M model is a toy: the 1.5 GB fixed overhead assumption dominates. It is there to show the script runs; the interesting numbers are for the bigger models below.</li>
+</ul>
+
+<h2>Part 2: QLoRA on a bigger model (prediction only)</h2>
+<div class="callout note">
+  <p class="callout-title">Not run here</p>
+  <p>QLoRA's 4-bit kernels (bitsandbytes) need an NVIDIA GPU, which the authoring machine does not have, so the <code>--qlora</code> path of the script was never executed and no QLoRA memory figure on this page is measured. The numbers below are the script's <code>--predict-only</code> output, which reads only <code>config.json</code>, with the arithmetic from chapter 11 and the estimate style of chapter 14. The measurement table is yours to fill in.</p>
+</div>
+<pre class="terminal" data-title="output (laptop, --model Qwen/Qwen2.5-1.5B --predict-only; prediction only)"><code>model Qwen/Qwen2.5-1.5B: L=28, h=1536, heads=12, kv heads=2, d_head=128, ffn=8960
+LoRA r=8, alpha=16, scale alpha/r = 2
+  q_proj     W0 is  1536 x 1536  -&gt; r*(d_in+d_out) =  24,576 per layer
+  k_proj     W0 is   256 x 1536  -&gt; r*(d_in+d_out) =  14,336 per layer
+  v_proj     W0 is   256 x 1536  -&gt; r*(d_in+d_out) =  14,336 per layer
+  o_proj     W0 is  1536 x 1536  -&gt; r*(d_in+d_out) =  24,576 per layer
+  gate_proj  W0 is  8960 x 1536  -&gt; r*(d_in+d_out) =  83,968 per layer
+  up_proj    W0 is  8960 x 1536  -&gt; r*(d_in+d_out) =  83,968 per layer
+  down_proj  W0 is  1536 x 8960  -&gt; r*(d_in+d_out) =  83,968 per layer
+predicted trainable: 28 layers x 329,728 = 9,232,384 of 1,543,714,304 (0.60%)
+full fine-tuning would train all 1,543,714,304: 167x more
+
+QLoRA prediction for Qwen/Qwen2.5-1.5B (batch 4 x 512):
+  linear weights in blocks 1,310,195,712 -&gt; 4.127 bits each
+  base in bf16          3.09 GB
+  base in NF4           1.14 GB (embeddings and norms 0.47 GB stay bf16)
+  adapter + Adam        0.15 GB
+  activations           1.53 GB (checkpointed)
+  fixed overhead        1.50 GB (assumption, chapter 2)
+  total, LoRA on bf16   6.26 GB   QLoRA   4.32 GB</code></pre>
+<p>The checks that make the prediction trustworthy are on the weight side. For Qwen2.5-3B the same script reports 3,085,938,688 parameters; times 2 bytes is 6,171,877,376, which is exactly the <code>total_size</code> in the model's <code>model.safetensors.index.json</code>. The memory prediction for the 3B model:</p>
+<pre class="terminal" data-title="output (laptop, --model Qwen/Qwen2.5-3B --predict-only; prediction only)"><code>model Qwen/Qwen2.5-3B: L=36, h=2048, heads=16, kv heads=2, d_head=128, ffn=11008
+LoRA r=8, alpha=16, scale alpha/r = 2
+  q_proj     W0 is  2048 x 2048  -&gt; r*(d_in+d_out) =  32,768 per layer
+  k_proj     W0 is   256 x 2048  -&gt; r*(d_in+d_out) =  18,432 per layer
+  v_proj     W0 is   256 x 2048  -&gt; r*(d_in+d_out) =  18,432 per layer
+  o_proj     W0 is  2048 x 2048  -&gt; r*(d_in+d_out) =  32,768 per layer
+  gate_proj  W0 is 11008 x 2048  -&gt; r*(d_in+d_out) = 104,448 per layer
+  up_proj    W0 is 11008 x 2048  -&gt; r*(d_in+d_out) = 104,448 per layer
+  down_proj  W0 is  2048 x 11008 -&gt; r*(d_in+d_out) = 104,448 per layer
+predicted trainable: 36 layers x 415,744 = 14,966,784 of 3,085,938,688 (0.48%)
+full fine-tuning would train all 3,085,938,688: 206x more
+
+QLoRA prediction for Qwen/Qwen2.5-3B (batch 4 x 512):
+  linear weights in blocks 2,774,532,096 -&gt; 4.127 bits each
+  base in bf16          6.17 GB
+  base in NF4           2.05 GB (embeddings and norms 0.62 GB stay bf16)
+  adapter + Adam        0.24 GB
+  activations           1.69 GB (checkpointed)
+  fixed overhead        1.50 GB (assumption, chapter 2)
+  total, LoRA on bf16   9.60 GB   QLoRA   5.48 GB</code></pre>
+<p>Read the QLoRA lines this way. The linear weights inside the blocks drop from 16 to 4.127 bits (4 bits of code, plus 8 bits per 64-weight block for the quantised scale, plus 32 bits per 256 scales); the embedding table and norms stay in bf16, which is why the 1.5B base falls from 3.09 GB to 1.14 GB and not to a quarter. The adapter costs 16 bytes per trainable number (fp32 weight, gradient and two Adam moments). Activations use the checkpointed estimate of chapter 14 and the overhead is the chapter's assumption, not a measurement.</p>
+<p>Then run it on the GPU box and fill in what <code>torch.cuda.max_memory_allocated()</code> says after a few steps (add it to the training loop, or watch <code>nvidia-smi</code> and expect the caching allocator to show more):</p>
+<pre class="terminal" data-title="terminal (GPU box)"><code><span class="prompt">$ </span><span class="cmd">cd /workspace/zts/llm-training/workbench/code/w03</span>
+<span class="prompt">$ </span><span class="cmd">python lora_qlora.py --model Qwen/Qwen2.5-1.5B --qlora</span></code></pre>
+<div class="table-wrap"><table class="measure-table">
+  <thead><tr><th>Quantity</th><th>Predicted</th><th>Measured</th><th>Ratio</th></tr></thead>
+  <tbody>
+    <tr data-predict="9232384"><td>Trainable parameters at r = 8, all linear layers (PEFT's line)</td><td>9,232,384</td><td><input name="trainable"></td><td class="ratio"></td></tr>
+    <tr data-predict="1.14"><td>4-bit base after loading, GB (<code>model.get_memory_footprint()</code> / 1e9)</td><td>1.14</td><td><input name="base_gb"></td><td class="ratio"></td></tr>
+    <tr data-predict="4.32"><td>QLoRA peak, GB (batch 4 &times; 512, checkpointed)</td><td>4.32</td><td><input name="qlora_gb"></td><td class="ratio"></td></tr>
+  </tbody>
+</table></div>
+<p>Expect the first ratio to be exactly 1.00. Expect the second to land a little above 1: the bf16 embeddings are counted, but bitsandbytes also keeps per-block constants. The third carries the least certainty: it adds a fixed 1.5 GB guess, and transient memory in the dequantise-then-multiply step is not in the formula.</p>
+
+<h2>Break it</h2>
+<ul>
+  <li><strong>Double the rank.</strong> Run with <code>--rank 16</code>. Predict first: the count is linear in r, so 4,884,480 trainable parameters for SmolLM2 (2 &times; 2,442,240). Does the final held-out loss improve, or does a rank of 8 already suffice for a format task?</li>
+  <li><strong>Attention only.</strong> Use <code>--targets q_proj,v_proj</code>. Predict the count from the per-layer lines (30 &times; (9,216 + 6,144) = 460,800), then check against PEFT. Which held-out loss do you get with so few trainable numbers?</li>
+  <li><strong>Learning rate.</strong> Try <code>--lr 2e-5</code> and <code>--lr 2e-3</code>. The script's default is 2e-4, higher than full fine-tuning would use because few numbers move. Predict which end fails to learn the format in 40 steps and which becomes unstable.</li>
+  <li><strong>Forget to scale.</strong> On paper: with alpha = 16 and r = 8 the correction is multiplied by 2. If you double the rank but keep alpha at 16, what happens to that scale? (Answer: it halves to 1, which is why chapter 11 divides by r.)</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>The adapter's size is exact arithmetic: r &times; (d<sub>in</sub> + d<sub>out</sub>) per matrix, summed. It matched PEFT to the digit (2,442,240).</li>
+    <li>Because only those numbers train, the optimiser state shrank 55x (18.6 MiB against 1,026.3 MiB), the same ratio as the parameter counts.</li>
+    <li>Real models are not uniform: grouped-query attention makes key and value matrices thin, so a hand count that treats all matrices as square is wrong.</li>
+    <li>QLoRA changes only the storage of the frozen base (4.127 bits per linear weight); its memory is a prediction here until you measure it on a GPU.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+</body>
+</html>
