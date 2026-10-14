@@ -75,6 +75,12 @@ Formulas are typeset with the vendored [KaTeX](https://katex.org). The equations
 
 `review.html` asks the quiz questions of the pages you have finished, ten at a time, on a spaced-repetition schedule, and exports or imports all your progress. ⌘/Ctrl + K (or `/`) searches every page and section heading.
 
+### Ask about the page
+
+**Ask** (in the top bar) opens a tutor panel that has the whole page as its context. Select any passage and an **Explain** chip appears next to it: it quotes the passage into the panel with ready-made questions ("Explain this", "Give me an analogy", "Show me with numbers"), and the thread continues from there. Each page keeps its own thread.
+
+The model is called straight from the browser, so you bring the key: open the panel's ⚙ settings and paste one for OpenAI (or any OpenAI-compatible server, through its base URL) or Anthropic, or point it at a local Ollama (start Ollama with `OLLAMA_ORIGINS` set to the site's origin, or `*`, so a browser may call it). The key is kept in this browser's localStorage and is sent only to that provider; nothing passes through the site. `node authoring/check_ask.js` checks the stream parser, the request shapes and the Markdown renderer; with `OPENAI_API_KEY` set, `node authoring/check_ask.js --live` also streams one real answer.
+
 
 Diagrams are drawn in a hand-drawn (Excalidraw/tldraw-like) style by default, using the vendored [Rough.js](https://github.com/rough-stuff/rough) and the Shantell Sans font. The **✎ Hand-drawn / ▭ Clean** button switches to crisp diagrams, and printing always uses the clean style.
 
@@ -84,7 +90,8 @@ Your browser's localStorage keeps:
 - design-studio notes and rubric ticks;
 - the theme choice: Tokyo Night, Catppuccin Mocha or high-contrast Gruvbox Dark;
 - your edits to code cells (until you press Reset);
-- workbench measurements and the review schedule (back them up from the Review page).
+- workbench measurements and the review schedule (back them up from the Review page);
+- the Ask panel: your provider, model and key, and the thread for each page.
 
 ## Labs
 
@@ -123,6 +130,7 @@ assets/js/sketch.js         hand-drawn rendering of diagrams (Rough.js)
 assets/js/runner.js         code cells: copy, edit (CodeMirror), run (Pyodide in a worker); lab workspaces
 assets/js/equations.js      typeset maths (KaTeX) and equation anatomy blocks
 assets/js/review.js         spaced review of every quiz; progress export/import
+assets/js/ask.js            ask about this page: selection chip, tutor panel, streaming from OpenAI, Anthropic or Ollama
 assets/js/*-data.js         generated: review-data, search-data (authoring/build_study.py), glossary-data
 assets/js/widgets/          one script per interactive widget
 assets/vendor/              Rough.js (MIT), CodeMirror 5.65.18 (MIT), KaTeX 0.16.11 (MIT)

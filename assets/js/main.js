@@ -316,6 +316,23 @@
     }
   });
 
+  /* ---------- ask about this page (ask.js) ----------
+     ask.js registers NZ.ask once it has loaded; a click before that is
+     remembered and the panel opens as soon as it can. */
+
+  function openAsk() {
+    window.NZ = window.NZ || {};
+    if (window.NZ.ask) window.NZ.ask.open(); else window.NZ.askPending = true;
+  }
+  function askTrigger() {
+    if (!document.querySelector("article.prose")) return null;
+    var b = el("button", { class: "search-trigger ask-trigger", type: "button", "aria-label": "Ask about this page" }, [
+      icon("chat"), el("span", { class: "search-trigger-text", text: "Ask" })
+    ]);
+    b.addEventListener("click", openAsk);
+    return b;
+  }
+
   /* ---------- builder spine toggle ---------- */
 
   function applySpine(on) {
@@ -417,7 +434,8 @@
     book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2zM4 19V5"/>',
     repeat: '<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>',
     cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
-    x: '<path d="M6 6l12 12M18 6 6 18"/>'
+    x: '<path d="M6 6l12 12M18 6 6 18"/>',
+    chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 21l1.9-5.4A8 8 0 1 1 21 12z"/>'
   };
   function icon(name) {
     var span = el("span", { class: "icon", "aria-hidden": "true" });
@@ -512,7 +530,7 @@
     document.addEventListener("click", function () { setOpen(false); });
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") { setOpen(false); body.classList.remove("nav-open"); } });
 
-    var bar = el("header", { class: "appbar" }, [menu, crumbs, el("div", { class: "appbar-spacer" }), search, links,
+    var bar = el("header", { class: "appbar" }, [menu, crumbs, el("div", { class: "appbar-spacer" }), search, askTrigger(), links,
       el("div", { class: "settings" }, [gear, panel])]);
     col.insertBefore(bar, col.firstChild);
     var scrim = el("div", { class: "scrim" });
@@ -948,6 +966,16 @@
     document.body.appendChild(s);
   }
 
+  // "Ask about this page" (ask.js): a tutor panel with the page as its context.
+  function loadAsk() {
+    if (!ASSETS || !document.querySelector("article.prose")) return;
+    window.NZ = window.NZ || {};
+    window.NZ.assets = ASSETS;
+    var s = document.createElement("script");
+    s.src = ASSETS + "js/ask.js";
+    document.body.appendChild(s);
+  }
+
   function highlightCode() {
     document.querySelectorAll("pre").forEach(function (pre) {
       var code = pre.querySelector("code") || pre;
@@ -1001,6 +1029,7 @@
     refreshProgress();
     loadSketch();
     loadGlossaryHover();
+    loadAsk();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
