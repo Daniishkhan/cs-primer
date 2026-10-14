@@ -674,6 +674,16 @@
     document.body.appendChild(s);
   }
 
+  // Typeset maths (equations.js + vendored KaTeX) only on pages that have some.
+  function loadEquations() {
+    if (!ASSETS || !document.querySelector("[data-tex]")) return;
+    window.NZ = window.NZ || {};
+    window.NZ.assets = ASSETS;
+    var s = document.createElement("script");
+    s.src = ASSETS + "js/equations.js";
+    document.body.appendChild(s);
+  }
+
   function highlightCode() {
     document.querySelectorAll("pre").forEach(function (pre) {
       var code = pre.querySelector("code") || pre;
@@ -689,6 +699,7 @@
   function init() {
     highlightCode();
     loadRunner();
+    loadEquations();
     wrapTables();
     buildSidebar();
     buildTopbar();
