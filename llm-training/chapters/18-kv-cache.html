@@ -185,7 +185,79 @@ K and V row computations for 40 new tokens after a 3-token prompt: without cache
 
 <p>Count what is stored. Each token, at each layer, stores one key vector and one value vector for each of the <em>key-value heads</em>, each vector of width d<sub>head</sub>. With L layers, n<sub>kv</sub> key-value heads and b bytes per number:</p>
 
-<p style="text-align:center">KV bytes per token = 2 &times; L &times; n<sub>kv</sub> &times; d<sub>head</sub> &times; b</p>
+<figure class="eq" id="eq-kv-bytes">
+  <div class="eq-display" data-tex="\text{KV bytes per token} = \htmlClass{eq-t1}{2} \times \htmlClass{eq-t2}{L} \times \htmlClass{eq-t3}{n_{kv}} \times \htmlClass{eq-t4}{d_{\text{head}}} \times \htmlClass{eq-t5}{b}">KV bytes per token = 2 &times; L &times; n<sub>kv</sub> &times; d<sub>head</sub> &times; b</div>
+  <p class="eq-read">Every token leaves behind one key and one value vector for each key-value head in each layer. Multiply those counts by the width of a vector and the bytes per number, and you have the memory one token costs for as long as the conversation lasts.</p>
+  <dl class="eq-terms">
+    <div data-term="t1"><dt data-tex="2">2</dt>
+      <dd><span class="eq-type">constant</span>One key vector and one value vector are stored per head. (Queries are used once and thrown away.)</dd></div>
+    <div data-term="t2"><dt data-tex="L">L</dt>
+      <dd><span class="eq-type">integer</span>The number of transformer layers; every layer has its own cache. Llama 3 8B has 32.</dd></div>
+    <div data-term="t3"><dt data-tex="n_{kv}">n<sub>kv</sub></dt>
+      <dd><span class="eq-type">integer</span>The number of key-value heads per layer. Llama 3 8B has 8 (grouped-query attention); plain multi-head attention would have 32, one per query head.</dd></div>
+    <div data-term="t4"><dt data-tex="d_{\text{head}}">d<sub>head</sub></dt>
+      <dd><span class="eq-type">integer</span>The width of one head's key or value vector: 128 for Llama 3 8B.</dd></div>
+    <div data-term="t5"><dt data-tex="b">b</dt>
+      <dd><span class="eq-type">bytes per number</span>2 for bf16, 1 for fp8 or int8, 0.5 for int4.</dd></div>
+  </dl>
+  <ol class="eq-steps">
+    <li data-tex="d_{\text{head}} \times b" data-terms="t4 t5">Start with <strong>one vector</strong>: 128 numbers at 2 bytes is 256 bytes.</li>
+    <li data-tex="n_{kv} \times d_{\text{head}} \times b" data-terms="t3"><strong>One layer's keys for one token</strong>: 8 key-value heads of 256 bytes each is 2,048 bytes. Grouped-query attention's saving lives in this factor.</li>
+    <li data-tex="2 \times n_{kv} \times d_{\text{head}} \times b" data-terms="t1">Count the <strong>values too</strong>, which are the same size as the keys: 4,096 bytes per layer per token.</li>
+    <li data-tex="\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_{\text{head}} \times b" data-terms="t2">Repeat for <strong>every layer</strong>: 32 &times; 4,096 = 131,072 bytes, 128 KiB per token. A conversation of 8,192 tokens therefore holds 1.00 GiB of cache, which is why concurrency, not weights, runs out first.</li>
+  </ol>
+</figure>
+<p>Plug in numbers. Llama 3 8B's shapes, built up one factor at a time, then two changes: 32 key-value heads (plain multi-head attention) and a one-byte cache.</p>
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>per_head ← d_head × b;  per_layer ← 2 × n_kv × per_head</li>
+  <li>per_token ← layers × per_layer</li>
+  <li>conversation ← 8,192 × per_token</li>
+  <li>change n_kv to 32, then b to 1, and compare</li>
+</ol></div>
+<pre class="terminal" data-title="kv_size_by_hand.py"><code>"""KV-cache size per token and per sequence, by hand (Llama 3 8B shapes)."""
+
+# ── 1. The ingredients ───────────────────────────────────────────────────
+LAYERS = 32                               # L: transformer layers
+KV_HEADS = 8                              # n_kv: key-value heads (GQA)
+D_HEAD = 128                              # width of one head's vector
+BYTES = 2                                 # b: bf16 is 2 bytes per number
+SEQ = 8192                                # tokens in one conversation
+
+
+def kv_bytes_per_token(layers, n_kv, d_head, b):
+    """2 (keys and values) x L x n_kv x d_head x b."""
+    return 2 * layers * n_kv * d_head * b
+
+
+# ── 2. Build it up: one layer, then all layers ───────────────────────────
+per_head = D_HEAD * BYTES                 # one key (or value) vector
+per_layer = 2 * KV_HEADS * per_head       # keys and values, all kv heads
+per_token = kv_bytes_per_token(LAYERS, KV_HEADS, D_HEAD, BYTES)
+print(f"one vector            {per_head:&gt;12,} bytes")
+print(f"one layer, one token  {per_layer:&gt;12,} bytes")
+print(f"{LAYERS} layers, one token  {per_token:&gt;12,} bytes "
+      f"= {per_token // 1024} KiB")
+
+# ── 3. A whole conversation ──────────────────────────────────────────────
+seq_bytes = SEQ * per_token
+print(f"{SEQ:,} tokens          {seq_bytes / 2**30:&gt;12.2f} GiB")
+
+# ── 4. Change one factor at a time ───────────────────────────────────────
+mha = kv_bytes_per_token(LAYERS, 32, D_HEAD, BYTES)     # 32 kv heads
+fp8 = kv_bytes_per_token(LAYERS, KV_HEADS, D_HEAD, 1)   # 1 byte per number
+print()
+print(f"32 kv heads (plain MHA): {mha // 1024} KiB per token, "
+      f"{mha // per_token}x larger")
+print(f"fp8 cache (1 byte):      {fp8 // 1024} KiB per token, "
+      f"{per_token // fp8}x smaller")</code></pre>
+<pre class="terminal" data-title="output"><code>one vector                     256 bytes
+one layer, one token         4,096 bytes
+32 layers, one token       131,072 bytes = 128 KiB
+8,192 tokens                  1.00 GiB
+
+32 kv heads (plain MHA): 512 KiB per token, 4x larger
+fp8 cache (1 byte):      64 KiB per token, 2x smaller</code></pre>
 
 <p>The 2 is for keys and values. The cache of a sequence of n tokens is n times this. The shapes below are from Table 3 of the Llama 3 report (Llama Team, 2024), which describes the 8B, 70B and 405B models as using grouped-query attention with 8 key-value heads. The script reproduces them, then also works out how many 8k-token conversations fit on a 24 GB card.</p>
 
@@ -493,7 +565,7 @@ H100, one decode step, tokens/s (cap = sequences that fit in 72 GB after weights
 
 But the cache does not batch. Each sequence has its own, and in every step each sequence's whole cache is read. So a decode step for B sequences of context n moves</p>
 
-<p style="text-align:center">bytes per step &asymp; 2P (weights, once) + B &times; n &times; (KV bytes per token) (caches, one each)</p>
+<p class="eq-plain">bytes per step &asymp; 2P (weights, once) + B &times; n &times; (KV bytes per token) (caches, one each)</p>
 
 <p>and takes at least that many bytes divided by the bandwidth. The weights term is fixed; the cache term grows with both B and n. The second table in the output above evaluates this for the 8B model on an H100, with an arithmetic term included for completeness, at three context lengths. The picture below plots it.</p>
 
