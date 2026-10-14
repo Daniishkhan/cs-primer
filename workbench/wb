@@ -1,0 +1,99 @@
+#!/bin/sh
+# wb: a GPU box for the Workbench pages, on RunPod, from your laptop.
+#
+#   wb up        create a pod (RTX 4090 by default) with your network volume
+#   wb ssh       open a shell on it (full SSH over its public TCP port)
+#   wb sync      copy this site's workbench code to /workspace/zts on the pod
+#   wb status    show state, price per hour and the SSH address
+#   wb down      stop the pod (compute billing stops; the network volume stays)
+#   wb rm        delete the pod (the network volume still stays)
+#
+# Needs: curl, python3, rsync, ssh. Settings come from the environment
+# (put them in ~/.config/wb.env, which wb reads if it exists):
+#   RUNPOD_API_KEY   your API key (console > Settings > API keys). Never commit it.
+#   WB_VOLUME_ID     network volume id (console > Storage); holds venv, models, data
+#   WB_GPU           default "NVIDIA GeForce RTX 4090"
+#   WB_IMAGE         default runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+#   WB_KEY           SSH private key, default ~/.ssh/id_ed25519
+#   WB_IDLE_MIN      stop the pod after this many idle minutes, default 30
+# The pod id of the last "wb up" is kept in ~/.config/wb.pod.
+set -eu
+
+[ -f "$HOME/.config/wb.env" ] && . "$HOME/.config/wb.env"
+API=https://rest.runpod.io/v1
+GPU=${WB_GPU:-NVIDIA GeForce RTX 4090}
+IMAGE=${WB_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}
+KEY=${WB_KEY:-$HOME/.ssh/id_ed25519}
+IDLE=${WB_IDLE_MIN:-30}
+PODFILE=$HOME/.config/wb.pod
+SITE=$(cd "$(dirname "$0")/.." && pwd)
+
+die() { echo "wb: $*" >&2; exit 1; }
+need_key() { [ -n "${RUNPOD_API_KEY:-}" ] || die "set RUNPOD_API_KEY (see the top of this file)"; }
+api() {  # api METHOD PATH [JSON]
+  need_key
+  curl -fsS -X "$1" "$API$2" -H "Authorization: Bearer $RUNPOD_API_KEY" \
+    -H "Content-Type: application/json" ${3:+--data "$3"}
+}
+pod_id() { [ -f "$PODFILE" ] && cat "$PODFILE" || die "no pod yet: run wb up"; }
+field() {  # field EXPR  (reads pod JSON on stdin; EXPR is Python on d)
+  python3 -c "import json,sys; d=json.load(sys.stdin); v=$1; print('' if v is None else v)"
+}
+addr() {  # prints "IP PORT" once the pod has a public SSH port
+  api GET "/pods/$(pod_id)" | field "f\"{d.get('publicIp') or ''} {(d.get('portMappings') or {}).get('22') or ''}\""
+}
+
+case "${1:-help}" in
+  up)
+    [ -n "${WB_VOLUME_ID:-}" ] || die "set WB_VOLUME_ID: create a network volume in the console first"
+    [ -f "$KEY.pub" ] || die "no SSH key at $KEY.pub: run ssh-keygen -t ed25519"
+    body=$(python3 - "$GPU" "$IMAGE" "$WB_VOLUME_ID" "$KEY.pub" "$IDLE" <<'PY'
+import json, sys
+gpu, image, vol, pub, idle = sys.argv[1:]
+print(json.dumps({
+    "name": "zts-workbench", "computeType": "GPU", "cloudType": "SECURE",
+    "gpuTypeIds": [gpu], "gpuCount": 1, "imageName": image,
+    "containerDiskInGb": 30, "networkVolumeId": vol, "volumeMountPath": "/workspace",
+    "ports": ["22/tcp", "8888/http"],
+    "env": {"PUBLIC_KEY": open(pub).read().strip(), "WB_IDLE_MIN": idle},
+}))
+PY
+)
+    id=$(api POST /pods "$body" | field "d['id']")
+    mkdir -p "$(dirname "$PODFILE")"
+    echo "$id" > "$PODFILE"
+    echo "pod $id created; waiting for its SSH port (a minute or two)…"
+    i=0
+    while :; do
+      set -- $(addr)
+      [ -n "${2:-}" ] && break
+      i=$((i + 1)); [ $i -gt 60 ] && die "no SSH port after 5 minutes; check the console"
+      sleep 5
+    done
+    echo "ready: ssh root@$1 -p $2 -i $KEY"
+    echo "next: wb sync, then wb ssh and run: sh /workspace/zts/workbench/setup-pod.sh"
+    ;;
+  ssh)
+    set -- $(addr); [ -n "${2:-}" ] || die "pod has no SSH port yet (wb status)"
+    exec ssh -i "$KEY" -p "$2" -o StrictHostKeyChecking=accept-new "root@$1"
+    ;;
+  sync)
+    set -- $(addr); [ -n "${2:-}" ] || die "pod has no SSH port yet (wb status)"
+    cd "$SITE"
+    rsync -az --relative -e "ssh -i $KEY -p $2 -o StrictHostKeyChecking=accept-new" \
+      ./workbench ./*/workbench/code "root@$1:/workspace/zts/"
+    echo "synced to /workspace/zts"
+    ;;
+  status)
+    api GET "/pods/$(pod_id)" | field "f\"{d['id']}  {d.get('desiredStatus')}  {(d.get('machine') or {}).get('gpuDisplayName') or ''}  \${d.get('costPerHr')}/h  ssh {d.get('publicIp') or '-'}:{(d.get('portMappings') or {}).get('22') or '-'}\""
+    ;;
+  down)
+    api POST "/pods/$(pod_id)/stop" >/dev/null && echo "stopped $(pod_id): compute billing has stopped; wb up makes a fresh pod"
+    ;;
+  rm)
+    api DELETE "/pods/$(pod_id)" >/dev/null && rm -f "$PODFILE" && echo "deleted; your network volume is untouched"
+    ;;
+  *)
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac

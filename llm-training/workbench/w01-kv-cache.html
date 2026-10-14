@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workbench 1: The KV Cache, Measured · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-workbench="W1">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Workbench 1: The KV Cache, Measured</h1>
+  <p class="lede">Chapter 18 gave you one line of arithmetic for the memory a conversation costs: two vectors per layer per key-value head per token. Here you predict that number for a real model from its configuration file alone, then load the model, run a prompt through it and add up the bytes of the tensors it actually kept. On a laptop the two numbers should agree to the byte. On a GPU you then ask the question a serving team asks every day: how many conversations fit?</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why measure it</p>
+  <p>A formula you have only read is a formula you half believe. The cache formula decides how many users one GPU can serve, why grouped-query attention exists and why long contexts are expensive, so it is worth seeing it hold on a model somebody actually ships. The habit matters more than the number: <strong>write the prediction down, then measure</strong>. When the two disagree you have found something the formula leaves out, and that is the most useful thing a measurement can tell you.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">What you need</p>
+  <ul>
+    <li><strong>Part 1, your laptop:</strong> Python 3.10+, the workbench venv (below) and about 300 MB of disk for SmolLM2-135M. About 20 minutes.</li>
+    <li><strong>Part 2, a GPU box (optional):</strong> one 24 GB card such as an RTX 4090, about 16 GB of disk for Qwen2.5-7B-Instruct, and about an hour. Setting one up is in <a href="../../lab-machine.html#gpu">Your lab machine, Option C</a>.</li>
+  </ul>
+</div>
+
+<h2>Predict before you run</h2>
+<p>Recall the formula from <a href="../chapters/18-kv-cache.html#eq-kv-bytes">chapter 18</a>:</p>
+<div class="eq-display" data-tex="\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_{\text{head}} \times b">KV bytes per token = 2 &times; L &times; n<sub>kv</sub> &times; d<sub>head</sub> &times; b</div>
+<p>Every input is in the model's <code>config.json</code>. SmolLM2-135M has 30 layers (<code>num_hidden_layers</code>), 9 attention heads, of which only 3 are key-value heads (<code>num_key_value_heads</code>: grouped-query attention), and a hidden size of 576, so each head is 576 / 9 = 64 numbers wide. On Apple's GPU the script uses 16-bit floats, 2 bytes each.</p>
+<div class="callout predict">
+  <p class="callout-title">Your prediction</p>
+  <p>Work it out on paper before reading on: bytes per token, and the size of the cache after a 512-token prompt. Then do the same for Qwen2.5-7B-Instruct: 28 layers, 4 key-value heads of 28, head width 3,584 / 28 = 128, bfloat16 (2 bytes).</p>
+</div>
+<details class="deeper">
+  <summary>Check your arithmetic</summary>
+  <p>SmolLM2-135M: 2 &times; 30 &times; 3 &times; 64 &times; 2 = <strong>23,040 bytes per token</strong>, and 512 tokens make 11,796,480 bytes, or <strong>11.25 MiB</strong>. If your laptop has no usable GPU the script runs on the CPU in 32-bit floats, and both numbers double.</p>
+  <p>Qwen2.5-7B-Instruct: 2 &times; 28 &times; 4 &times; 128 &times; 2 = <strong>57,344 bytes (56 KiB) per token</strong>, so a 4,096-token conversation holds <strong>224 MiB</strong>. Without grouped-query attention (28 key-value heads instead of 4) it would be 392 KiB per token, seven times as much.</p>
+</details>
+
+<h2>Part 1: on your laptop</h2>
+<h3>Set up once</h3>
+<p>One virtual environment serves every workbench page. From the site's folder:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 -m venv ~/.venvs/zts</span>
+<span class="prompt">$ </span><span class="cmd">~/.venvs/zts/bin/pip install -r workbench/requirements.txt</span>
+<span class="prompt">$ </span><span class="cmd">source ~/.venvs/zts/bin/activate</span></code></pre>
+<p>The script is <a href="code/w01/kv_cache.py"><code>code/w01/kv_cache.py</code></a>, and the same code split into cells is <a href="code/w01/kv_cache.ipynb"><code>kv_cache.ipynb</code></a> for Jupyter. The first run downloads the model from Hugging Face.</p>
+
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>pick the device (CUDA, then Apple MPS, then CPU) and its number width b</li>
+  <li>read L, n_kv, d_head from config.json; predict 2 &times; L &times; n_kv &times; d_head &times; b</li>
+  <li>run a 512-token prompt once; add up the bytes of every key and value kept</li>
+  <li>decode 32 tokens with the cache, then recomputing everything; time both</li>
+  <li>GPU only: predict the batch that fits, then double the batch until OOM</li>
+</ol></div>
+<pre class="terminal" data-title="kv_cache.py" data-run="off"><code>"""The KV cache, measured: predict its size from chapter 18's formula, then
+read the real tensors out of a real model and compare.
+
+Laptop (SmolLM2-135M, on CPU or Apple's MPS):
+    python kv_cache.py
+GPU box (a 7B model, then batch up to the memory limit):
+    python kv_cache.py --model Qwen/Qwen2.5-7B-Instruct --sweep
+
+Needs: torch, transformers (workbench/requirements.txt)."""
+import argparse
+import time
+
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM
+
+# ── 1. Settings ──────────────────────────────────────────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M")
+ap.add_argument("--tokens", type=int, default=512)    # prompt length
+ap.add_argument("--new", type=int, default=32)        # tokens to decode
+ap.add_argument("--sweep", action="store_true")       # GPU: batch until OOM
+args, _ = ap.parse_known_args()        # notebooks pass their own flags
+
+if torch.cuda.is_available():
+    DEVICE, DTYPE = "cuda", torch.bfloat16
+elif torch.backends.mps.is_available():
+    DEVICE, DTYPE = "mps", torch.float16
+else:
+    DEVICE, DTYPE = "cpu", torch.float32
+BYTES = torch.tensor([], dtype=DTYPE).element_size()   # bytes per number
+
+
+def mib(n):
+    return f"{n / 2**20:,.2f} MiB"
+
+
+# ── 2. Predict from the config alone (chapter 18) ────────────────────────
+cfg = AutoConfig.from_pretrained(args.model)
+L = cfg.num_hidden_layers
+n_kv = getattr(cfg, "num_key_value_heads", None) or cfg.num_attention_heads
+d_head = (getattr(cfg, "head_dim", None)
+          or cfg.hidden_size // cfg.num_attention_heads)
+per_token = 2 * L * n_kv * d_head * BYTES          # K and V, every layer
+print(f"model {args.model} on {DEVICE} in {DTYPE}")
+print(f"L={L} layers, n_kv={n_kv} of {cfg.num_attention_heads} heads, "
+      f"d_head={d_head}, b={BYTES} bytes")
+print(f"predicted: {per_token:,} bytes per token; "
+      f"{mib(per_token * args.tokens)} for {args.tokens} tokens")
+
+# ── 3. Measure: run the prompt once and read the cache tensors ───────────
+model = AutoModelForCausalLM.from_pretrained(args.model, dtype=DTYPE)
+model = model.to(DEVICE).eval()
+torch.manual_seed(0)
+ids = torch.randint(0, cfg.vocab_size, (1, args.tokens), device=DEVICE)
+with torch.no_grad():
+    out = model(ids, use_cache=True)
+
+
+def cache_bytes(cache):
+    """Sum the bytes of every key and value tensor the model kept."""
+    total = 0
+    for layer in cache.layers:              # transformers' DynamicCache
+        total += layer.keys.numel() * layer.keys.element_size()
+        total += layer.values.numel() * layer.values.element_size()
+    return total
+
+
+measured = cache_bytes(out.past_key_values)
+ratio = measured / (per_token * args.tokens)
+print(f"measured:  {mib(measured)} in {len(out.past_key_values.layers)} "
+      f"layers  (measured / predicted = {ratio:.3f})")
+
+# ── 4. Why it exists: decode with the cache vs recomputing everything ────
+
+
+def sync():
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE == "mps":
+        torch.mps.synchronize()
+
+
+def decode(use_cache):
+    seq = ids
+    past = None
+    sync()
+    start = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(args.new):
+            step_in = seq[:, -1:] if past is not None else seq
+            o = model(step_in, past_key_values=past, use_cache=use_cache)
+            past = o.past_key_values if use_cache else None
+            nxt = o.logits[:, -1].argmax(-1, keepdim=True)
+            seq = torch.cat([seq, nxt], dim=1)
+    sync()
+    return (time.perf_counter() - start) / args.new * 1000
+
+
+with_cache = decode(True)
+without = decode(False)
+print(f"decode {args.new} tokens after a {args.tokens}-token prompt: "
+      f"{with_cache:.1f} ms/token with the cache, {without:.1f} without "
+      f"({without / with_cache:.1f}x)")
+
+# ── 5. GPU only: how many conversations fit? Predict, then find out ──────
+if args.sweep and DEVICE == "cuda":
+    free, total = torch.cuda.mem_get_info()
+    print(f"\nGPU: {torch.cuda.get_device_name(0)}, {mib(free)} free "
+          f"of {mib(total)} with the weights loaded")
+    predicted_batch = int(free * 0.9 // (per_token * args.tokens))
+    print(f"predicted max batch at {args.tokens} tokens: about "
+          f"{predicted_batch} (90% of free memory / cache per sequence)")
+    batch = 1
+    while True:
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            x = torch.randint(0, cfg.vocab_size, (batch, args.tokens),
+                              device=DEVICE)
+            with torch.no_grad():                # keep only the last
+                model(x, use_cache=True, logits_to_keep=1)   # logits row
+            peak = torch.cuda.max_memory_allocated()
+            print(f"  batch {batch:4d}: peak {mib(peak)}")
+            batch *= 2
+        except torch.OutOfMemoryError:
+            print(f"  batch {batch:4d}: out of memory")
+            break
+        finally:
+            torch.cuda.empty_cache()</code></pre>
+<p>On a MacBook (Apple MPS, 16-bit) this printed:</p>
+<pre class="terminal" data-title="output (laptop, Apple MPS)"><code>model HuggingFaceTB/SmolLM2-135M on mps in torch.float16
+L=30 layers, n_kv=3 of 9 heads, d_head=64, b=2 bytes
+predicted: 23,040 bytes per token; 11.25 MiB for 512 tokens
+measured:  11.25 MiB in 30 layers  (measured / predicted = 1.000)
+decode 32 tokens after a 512-token prompt: 8.9 ms/token with the cache, 33.2 without (3.7x)</code></pre>
+
+<h3>What you should see</h3>
+<ul>
+  <li><strong>Measured / predicted = 1.000.</strong> The formula is not an estimate: it counts exactly the tensors the model keeps. If yours shows 2.000, you ran on the CPU in 32-bit floats and predicted with 2 bytes.</li>
+  <li><strong>Only 3 of 9 heads are cached.</strong> SmolLM2 shares each key-value head between three query heads. With a full set of 9 the cache would be three times larger for the same model quality budget, which is the whole argument for grouped-query attention in <a href="../chapters/18-kv-cache.html">chapter 18</a>.</li>
+  <li><strong>The cache makes decoding several times faster</strong>, and the gap grows with the prompt: without it, each new token re-runs attention over the whole prompt. Your timings will differ from the ones above (they depend on the machine and on what else it is doing), but the ratio should be well above 1.</li>
+</ul>
+
+<h2>Part 2: how many conversations fit on one GPU?</h2>
+<p>On the GPU box (<code>wb up</code>, <code>wb sync</code>, <code>wb ssh</code>, then <code>sh /workspace/zts/workbench/setup-pod.sh</code> the first time), run the same script on a 7B model with a 4,096-token context, and let it double the batch until the card runs out of memory:</p>
+<pre class="terminal" data-title="terminal (GPU box)"><code><span class="prompt">$ </span><span class="cmd">cd /workspace/zts/llm-training/workbench/code/w01</span>
+<span class="prompt">$ </span><span class="cmd">python kv_cache.py --model Qwen/Qwen2.5-7B-Instruct --tokens 4096 --sweep</span></code></pre>
+<div class="callout note">
+  <p class="callout-title">Not run here</p>
+  <p>This page was written on a machine without an NVIDIA GPU, so there is no printed GPU output to copy. The predictions below are computed from the model's published configuration and weight size; the measurements are yours to fill in, and they are saved in this browser.</p>
+</div>
+<p>Before running it, predict the largest batch. The weights take 15,231,233,024 bytes (14.19 GiB, from the model's <code>model.safetensors.index.json</code>). Assume about 0.6 GiB for the CUDA context, which leaves roughly 24 &minus; 14.19 &minus; 0.6 &asymp; 9.2 GiB. The script keeps a 10% margin and divides by 224 MiB per sequence: about 9.2 &times; 0.9 / 0.219 &asymp; <strong>38 conversations</strong>. It prints its own version of this, from the free memory it actually finds.</p>
+<div class="table-wrap"><table class="measure-table">
+  <thead><tr><th>Quantity</th><th>Predicted</th><th>Measured</th><th>Ratio</th></tr></thead>
+  <tbody>
+    <tr data-predict="57344"><td>Cache per token, bytes (the <code>predicted:</code> line)</td><td>57,344</td><td><input name="per_token"></td><td class="ratio"></td></tr>
+    <tr data-predict="224"><td>Cache for one 4,096-token sequence, MiB (the <code>measured:</code> line)</td><td>224</td><td><input name="seq_mib"></td><td class="ratio"></td></tr>
+    <tr data-predict="38"><td>Largest batch that fits at 4,096 tokens (last batch without OOM, or interpolate)</td><td>&asymp; 38</td><td><input name="max_batch"></td><td class="ratio"></td></tr>
+  </tbody>
+</table></div>
+<p>Expect the first two ratios to be 1.00, and the third to come in <em>below</em> 1. The prediction counts only the cache, but running a 4,096-token prompt through the model also needs working memory for each layer's intermediate results while it computes them. The gap between your measured batch and 38 is roughly that working memory. Serving engines such as vLLM shrink it by processing long prompts in chunks (<a href="../chapters/20-serving-engines.html">chapter 20</a>).</p>
+
+<h2>Break it</h2>
+<ul>
+  <li><strong>Double the context.</strong> Re-run the sweep with <code>--tokens 8192</code>. Predict first: the cache per sequence doubles, so the batch should roughly halve.</li>
+  <li><strong>Remove grouped-query attention, on paper.</strong> Use the formula with 28 key-value heads instead of 4. How many 4,096-token conversations would fit then? (Answer: about 5.) This is the calculation that made model builders adopt GQA.</li>
+  <li><strong>Halve the bytes.</strong> Serving engines can store the cache in 8-bit floats (<a href="../chapters/19-quantisation.html">chapter 19</a>). Predict the new batch, then look up the <code>kv_cache_dtype</code> option of vLLM and measure it in the serving workbench.</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>The cache formula is exact: measured bytes equal 2 &times; L &times; n<sub>kv</sub> &times; d<sub>head</sub> &times; b &times; tokens.</li>
+    <li>Everything it needs is in <code>config.json</code>, so you can size a deployment before downloading a single weight.</li>
+    <li>On a 24 GB card, the weights of a 7B model leave room for a few dozen long conversations, and the prefill's working memory takes a real share of that room.</li>
+    <li>Predict, then measure. The disagreement is the lesson.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+</body>
+</html>

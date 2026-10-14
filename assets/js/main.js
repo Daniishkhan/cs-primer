@@ -9,6 +9,7 @@
      <body data-root="../.." data-course="net" data-lab="L1">      (<course>/labs/)
      <body data-root="../.." data-course="net" data-case="C6">     (<course>/cases/)
      <body data-root="../.." data-course="sys" data-studio="S1">   (<course>/studios/)
+     <body data-root="../.." data-course="llm" data-workbench="W1"> (<course>/workbench/)
      <body data-root=".." data-course="net" data-page="course">    (course roadmap, <course>/index.html)
      <body data-root="." data-page="hub">                          (site hub, index.html)
      <div class="app"><aside id="sidebar" class="sidebar"></aside>
@@ -25,9 +26,9 @@
   var DEPTH = window.CS_DEPTH_LABEL || {};
   var body = document.body;
   var root = body.dataset.root || ".";
-  var KIND_DIR = { chapter: "chapters", lab: "labs", "case": "cases", studio: "studios" };
+  var KIND_DIR = { chapter: "chapters", lab: "labs", "case": "cases", studio: "studios", workbench: "workbench" };
   COURSES.forEach(function (co) {
-    [["chapter", co.chapters], ["lab", co.labs], ["case", co.cases], ["studio", co.studios]].forEach(function (k) {
+    [["chapter", co.chapters], ["lab", co.labs], ["case", co.cases], ["studio", co.studios], ["workbench", co.workbenches]].forEach(function (k) {
       (k[1] || []).forEach(function (c) { c.kind = k[0]; c.dir = KIND_DIR[k[0]]; c.course = co; });
     });
   });
@@ -46,10 +47,14 @@
   var LABS = course ? course.labs || [] : [];
   var CASES = course ? course.cases || [] : [];
   var STUDIOS = course ? course.studios || [] : [];
-  var COLLECTION = { chapter: CHAPTERS, lab: LABS, "case": CASES, studio: STUDIOS };
-  var NOUN = { chapter: "chapter", lab: "lab", "case": "case study", studio: "design studio" };
-  var currentKind = body.dataset.lab ? "lab" : body.dataset["case"] ? "case" : body.dataset.studio ? "studio" : body.dataset.chapter ? "chapter" : null;
-  var currentId = body.dataset.chapter || body.dataset.lab || body.dataset["case"] || body.dataset.studio || null;
+  var BENCHES = course ? course.workbenches || [] : [];
+  var COLLECTION = { chapter: CHAPTERS, lab: LABS, "case": CASES, studio: STUDIOS, workbench: BENCHES };
+  var NOUN = { chapter: "chapter", lab: "lab", "case": "case study", studio: "design studio", workbench: "workbench" };
+  // Workbenches: real tools on a real machine. The machine decides the badge.
+  var MACHINE = { laptop: "Your laptop", linux: "A Linux VM", gpu: "A GPU box" };
+  var currentKind = body.dataset.lab ? "lab" : body.dataset["case"] ? "case" : body.dataset.studio ? "studio"
+    : body.dataset.workbench ? "workbench" : body.dataset.chapter ? "chapter" : null;
+  var currentId = body.dataset.chapter || body.dataset.lab || body.dataset["case"] || body.dataset.studio || body.dataset.workbench || null;
   var THEMES = { tokyo: "Tokyo Night", mocha: "Catppuccin Mocha", gruvbox: "Gruvbox Dark" };
   var THEME_ORDER = Object.keys(THEMES);
 
@@ -100,6 +105,7 @@
     if (ch.kind === "lab") s = "Lab " + ch.id.slice(1) + ": " + ch.title;
     else if (ch.kind === "case") s = "Case " + ch.id.slice(1) + ": " + ch.title;
     else if (ch.kind === "studio") s = "Studio " + ch.id.slice(1) + ": " + ch.title;
+    else if (ch.kind === "workbench") s = "Workbench " + ch.id.slice(1) + ": " + ch.title;
     else s = chapterNum(ch) + ". " + ch.title;
     return ch.course !== course ? ch.course.title + ", " + s : s;
   }
@@ -208,11 +214,13 @@
       ]));
     });
 
-    [["lab", "Hands-on labs", LABS], ["case", "Case studies", CASES], ["studio", "Design studios", STUDIOS]].forEach(function (g) {
+    [["lab", "Hands-on labs", LABS], ["workbench", "Workbench", BENCHES], ["case", "Case studies", CASES], ["studio", "Design studios", STUDIOS]].forEach(function (g) {
       if (!g[2].length) return;
       var list = el("ul", { class: "nav-list" });
       g[2].forEach(function (c) {
-        var tip = c.kind === "case" ? c.pattern + ": " + c.blurb : "After Part " + c.afterPart + ": " + c.blurb;
+        var tip = c.kind === "case" ? c.pattern + ": " + c.blurb
+          : c.kind === "workbench" ? MACHINE[c.machine] + ", " + c.time + ": " + c.blurb
+          : "After Part " + c.afterPart + ": " + c.blurb;
         var a = el("a", { href: href(c), "data-id": c.id, title: tip }, [
           el("span", { class: "nav-num", html: "<span>" + c.id + "</span>" }),
           el("span", { class: "nav-title", text: c.title })
@@ -300,7 +308,7 @@
       grp[1].forEach(function (co) {
         var planned = co.status === "planned";
         var n = planned ? 0 : doneFor(co).size;
-        var total = planned ? 0 : co.chapters.length + co.labs.length + co.cases.length + (co.studios || []).length;
+        var total = planned ? 0 : co.chapters.length + co.labs.length + co.cases.length + (co.studios || []).length + (co.workbenches || []).length;
         var a = el(planned ? "span" : "a", planned ? { class: "planned", title: "Coming soon: " + co.tagline } : { href: courseHome(co), title: co.tagline }, [
           el("span", { class: "nav-num", html: "<span>" + courseNum(co) + "</span>" }),
           el("span", { class: "nav-title", text: co.title }),
@@ -391,6 +399,14 @@
       el("span", { text: "Studio " + current.id.slice(1) }),
       el("span", { class: "badge studio", text: "Design it" }),
       el("span", { text: "≈ " + minutes + " min read, longer to design" })
+    ];
+    else if (current.kind === "workbench") eyebrow = [
+      el("span", { class: "part", text: "Workbench " + current.id.slice(1) + " · measures " + current.chapters.map(function (id) {
+        var c = CHAPTERS.find(function (x) { return x.id === id; });
+        return c ? "ch. " + chapterNum(c) : id;
+      }).join(", ") }),
+      el("span", { class: "badge machine-" + current.machine, text: MACHINE[current.machine] }),
+      el("span", { text: current.time + (current.cost ? " · " + current.cost : "") })
     ];
     else if (current.kind === "case") eyebrow = [
       el("span", { class: "part", text: "Case study " + current.id.slice(1) }),
@@ -515,6 +531,9 @@
       article.appendChild(el("div", { class: "callout " + cls }, [el("p", { class: "callout-title", text: title }), el("p", { text: intro }), ul]));
     }
     if (labs.length) box("lab", "Ready to build", "You now know enough for " + (labs.length > 1 ? "these labs" : "this lab") + ". Building it is the fastest way to make Part " + current.part + " stick.", labs);
+    var benches = BENCHES.filter(function (w) { return w.chapters.indexOf(current.id) !== -1; });
+    if (benches.length) box("workbench", "Measure it for real", "Predict the number from this chapter, then measure it with real tools. "
+      + (benches.some(function (w) { return w.machine === "gpu"; }) ? "Some need a rented GPU; each page says what it costs." : "Your laptop is enough."), benches);
     if (studios.length) box("studio", "Design it", "Put this part to work on an interview-style design problem. Sketch your own answer first, then compare.", studios);
     var tools = ((course.tools) || []).filter(function (t) { return t.chapters.indexOf(current.id) !== -1; });
     if (tools.length) {
@@ -561,6 +580,7 @@
 
     var blurbs = course.roadmapBlurbs || {};
     [["Hands-on labs", blurbs.labs || "Build the ideas yourself in Python. Each lab says which part to finish first.", LABS, "L"],
+     ["Workbench", blurbs.workbench || "The same ideas with the real tools, on your laptop or a rented GPU: predict a number from the chapter, measure it, compare.", BENCHES, "W"],
      ["Case studies", blurbs.cases || "Real systems and real incidents, each built around one pattern.", CASES, "C"],
      ["Design studios", blurbs.studios || "Interview-style design problems that use what the course taught. Design first, then compare.", STUDIOS, "S"]].forEach(function (g) {
       if (!g[2].length) return;
@@ -569,7 +589,8 @@
         grid.appendChild(el("a", { class: "road-card", href: href(c) }, [
           el("div", { class: "top" }, [
             el("span", { class: "num", "data-done-id": c.id, "data-label": c.id, text: c.id }),
-            el("span", { class: "badge " + c.kind, text: c.kind === "case" ? c.pattern : "after Part " + c.afterPart })
+            el("span", { class: "badge " + (c.kind === "workbench" ? "machine-" + c.machine : c.kind),
+              text: c.kind === "case" ? c.pattern : c.kind === "workbench" ? MACHINE[c.machine] : "after Part " + c.afterPart })
           ]),
           el("div", { class: "title", text: c.title }),
           el("div", { class: "blurb", text: c.blurb })
@@ -613,10 +634,10 @@
       var kids = [top, el("div", { class: "title", text: co.title }), el("div", { class: "sub", text: co.subtitle }), el("div", { class: "blurb", text: co.tagline })];
       if (!planned) {
         var d = doneFor(co);
-        var counts = [[co.chapters, "chapters"], [co.labs, "labs"], [co.cases, "case studies"], [co.studios || [], "studios"]]
+        var counts = [[co.chapters, "chapters"], [co.labs, "labs"], [co.workbenches || [], "workbenches"], [co.cases, "case studies"], [co.studios || [], "studios"]]
           .filter(function (g) { return g[0].length; })
           .map(function (g) { return g[0].length + " " + g[1]; }).join(" · ");
-        var all = co.chapters.concat(co.labs, co.cases, co.studios || []);
+        var all = co.chapters.concat(co.labs, co.cases, co.studios || [], co.workbenches || []);
         var n = all.filter(function (c) { return d.has(c.id); }).length;
         var bar = el("div", { class: "bar" }, [el("span")]);
         bar.firstChild.style.width = Math.round((n / all.length) * 100) + "%";
@@ -797,6 +818,30 @@
     });
   }
 
+  /* Workbench measurement tables: the reader types what they measured next to
+     the prediction; values persist per page, and a row with data-predict shows
+     measured / predicted so the comparison is the last thing they read.
+
+       <table class="measure-table"><tr data-predict="2.13">
+         <td>KV cache, 4k context (GiB)</td><td>2.13</td><td><input name="kv4k"></td><td class="ratio"></td></tr> */
+  function wireMeasureTables() {
+    document.querySelectorAll(".measure-table input[name]").forEach(function (input) {
+      var key = "cs-measure:" + (course ? course.id : "") + ":" + currentId + ":" + input.name;
+      var row = input.closest("tr");
+      var cell = row && row.querySelector(".ratio");
+      function show() {
+        var want = row ? parseFloat(row.getAttribute("data-predict")) : NaN;
+        var got = parseFloat(String(input.value).replace(/,/g, ""));
+        if (cell) cell.textContent = isFinite(want) && isFinite(got) && want ? "× " + (got / want).toFixed(2) + " of predicted" : "";
+      }
+      input.value = load(key, "");
+      input.setAttribute("inputmode", "decimal");
+      input.setAttribute("aria-label", "Your measurement");
+      input.addEventListener("input", function () { save(key, input.value); show(); });
+      show();
+    });
+  }
+
   function init() {
     highlightCode();
     loadRunner();
@@ -810,6 +855,7 @@
     buildRoadmap();
     buildHub();
     buildReadingBar();
+    wireMeasureTables();
     refreshProgress();
     loadSketch();
     loadGlossaryHover();

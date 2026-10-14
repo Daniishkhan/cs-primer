@@ -26,7 +26,7 @@ AMERICAN = ["behavior", "color", "optimiz", "analyz", "modeling", "modeled", "la
 def catalog():
     js = ("global.window={};require(%r);console.log(JSON.stringify(window.CS_COURSES.map(c=>({id:c.id,dir:c.dir,track:c.track||null,title:c.title,"
           "chapters:c.chapters.map(x=>({id:x.id,file:x.file,title:x.title,depth:x.depth})),labs:c.labs.map(x=>({id:x.id,file:x.file,title:x.title})),"
-          "cases:c.cases.map(x=>({id:x.id,file:x.file,title:x.title})),studios:(c.studios||[]).map(x=>({id:x.id,file:x.file,title:x.title})),"
+          "cases:c.cases.map(x=>({id:x.id,file:x.file,title:x.title})),workbench:(c.workbenches||[]).map(x=>({id:x.id,file:x.file,title:x.title})),studios:(c.studios||[]).map(x=>({id:x.id,file:x.file,title:x.title})),"
           "tools:(c.tools||[]).map(t=>t.id)}))))") % os.path.join(ROOT, "assets/js/catalog.js")
     return json.loads(subprocess.check_output(["node", "-e", js]))
 
@@ -101,7 +101,8 @@ class Page(HTMLParser):
 
 def kind_of(path):
     parts = path.split(os.sep)
-    for k, folder in (("chapter", "chapters"), ("lab", "labs"), ("case", "cases"), ("studio", "studios")):
+    for k, folder in (("chapter", "chapters"), ("lab", "labs"), ("case", "cases"), ("studio", "studios"),
+                      ("workbench", "workbench")):
         if folder in parts[-2:-1]:
             return k
     base = os.path.basename(path)
@@ -136,9 +137,9 @@ def lint(path, cat, out):
     if course is None and depth:
         errs.append(f"folder {dirname}/ is not a course in catalog.js")
     if course is not None:
-        if kind in ("chapter", "lab", "case", "studio", "course", "toolbox") and b.get("data-course") != course["id"]:
+        if kind in ("chapter", "lab", "case", "studio", "workbench", "course", "toolbox") and b.get("data-course") != course["id"]:
             errs.append(f'body data-course should be "{course["id"]}"')
-        coll = {"chapter": "chapters", "lab": "labs", "case": "cases", "studio": "studios"}.get(kind)
+        coll = {"chapter": "chapters", "lab": "labs", "case": "cases", "studio": "studios", "workbench": "workbench"}.get(kind)
         if coll:
             attr = "data-" + kind
             entry = next((e for e in course[coll] if e["file"] == os.path.basename(rel)), None)
@@ -147,7 +148,9 @@ def lint(path, cat, out):
             else:
                 if b.get(attr) != entry["id"]:
                     errs.append(f'body {attr} should be "{entry["id"]}", is {b.get(attr)!r}')
-                want = entry["title"] if kind != "lab" else f'Lab {int(entry["id"][1:])}: {entry["title"]}'
+                want = (f'Lab {int(entry["id"][1:])}: {entry["title"]}' if kind == "lab"
+                        else f'Workbench {int(entry["id"][1:])}: {entry["title"]}' if kind == "workbench"
+                        else entry["title"])
                 if html.unescape(p.h1.strip()) != want:
                     warns.append(f"h1 {p.h1.strip()!r} differs from catalog title {want!r}")
                 if not p.title.strip().startswith(html.unescape(want)) and not html.unescape(p.title.strip()).startswith(want):

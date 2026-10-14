@@ -355,3 +355,21 @@ Inline maths in prose is optional: `<span class="tex" data-tex="r_\theta(x, y)">
 - Macros available everywhere: `\E` (𝔼), `\R` (ℝ), `\KL`, `\softmax`, `\argmax`, `\argmin`. Use `\mid` for "given", `\text{…}` for words inside maths, `\operatorname{name}` for multi-letter functions.
 - Quote the source's equation faithfully (same symbols as the paper or textbook you cite), then explain it. Do not "simplify" a published equation into a different one.
 
+## 16. Workbenches
+
+A **workbench** repeats a chapter's idea with the real tools on a real machine (PyTorch, Hugging Face, TRL, vLLM, Ollama, scikit-learn). Labs stay standard-library-only and toy-sized; workbenches are where the reader meets the tools practitioners use, and **measures** something the chapter predicts. Reference: `llm-training/workbench/w01-kv-cache.html` and `llm-training/workbench/code/w01/kv_cache.py`.
+
+- **Files.** Page `<course>/workbench/wNN-name.html` with `<body … data-workbench="WN">`; code in `<course>/workbench/code/wNN/` (one or two `.py` scripts, plus helper data if any); a paired notebook generated with `python3 authoring/py2ipynb.py SCRIPT.py` (never hand-edit the `.ipynb`). The catalog entry (id, file, title, machine, chapters, time, cost, blurb) is in the `WORKBENCHES` block at the end of `assets/js/catalog.js`; the h1 is "Workbench N: Title".
+- **Machine.** `laptop` (Apple MPS or CPU; models up to a few hundred million parameters; Ollama for local language models), `linux`, or `gpu` (one 24 GB NVIDIA card, rented; see `lab-machine.html#gpu` and `workbench/wb`). Requirements are `workbench/requirements.txt` (both) and `workbench/requirements-gpu.txt` (bitsandbytes, TRL, vLLM: Linux + CUDA only).
+- **Page skeleton**, in order: `chapter-head` (h1, lede); `callout why` "Why measure it"; `callout note` "What you need" (machine, disk, time; GPU time in hours, no dollar figures outside a dated State of play box); h2 **Predict before you run**: the chapter's formula as an `eq-display` linking the chapter's anatomy block, the inputs from the model's real config, a `callout predict` asking the reader to work it out, and the answer in a `details.deeper`; h2 **Set up** / **Run it**: a `callout idea` box, the script as `<pre class="terminal" data-title="NAME.py" data-run="off">`, links to the `.py` and `.ipynb`; real output in `<pre class="terminal" data-title="output (WHERE IT RAN)">`; h3 **What you should see**: each output line explained; for GPU parts, a `measure-table` (see below); h2 **Break it**: 2 to 4 experiments, each with a prediction first; `callout key`.
+- **Honesty rule for output.** Paste only output you produced by running the script. GPU-only parts cannot be run on the authoring machine: say so in a `callout note` titled "Not run here", give **predictions computed from published configs and the chapter's formulas** (show the arithmetic), and give the reader a measurement table. Never invent a measured number, a loss curve or a timing. Qualitative expectations ("the third ratio comes in below 1, because…") must follow from the mechanism or from a cited source.
+- **Measurement tables** persist what the reader types and show measured ÷ predicted:
+  ```html
+  <div class="table-wrap"><table class="measure-table">
+    <thead><tr><th>Quantity</th><th>Predicted</th><th>Measured</th><th>Ratio</th></tr></thead>
+    <tbody><tr data-predict="224"><td>Cache per 4,096-token sequence, MiB</td><td>224</td><td><input name="seq_mib"></td><td class="ratio"></td></tr></tbody>
+  </table></div>
+  ```
+- **Scripts.** Section 5's style (≤ 80 columns, docstring with usage, `# ── N. Title ───` banners). `args, _ = ap.parse_known_args()` so the notebook runs. Pick the device in order CUDA, MPS, CPU. Laptop defaults must finish in minutes on a laptop; a flag (`--model`, `--sweep`, `--full`) scales up for the GPU. Pin models by Hugging Face id and say how big the download is. Seed everything.
+- **Models and datasets.** Prefer small, open, ungated ones (SmolLM2, Qwen2.5 0.5B to 7B, GPT-2, Tiny Shakespeare, text8, GSM8K). Read sizes and architecture numbers from the real `config.json` and `model.safetensors.index.json`, not from memory.
+
