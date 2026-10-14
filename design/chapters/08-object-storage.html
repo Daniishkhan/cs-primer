@@ -50,67 +50,131 @@
 
 <h2>Estimate</h2>
 <p>The estimate answers four questions: how big is the metadata (it is surprisingly big), how many drives and which scheme, how much background traffic repair and scrubbing produce, and how much bandwidth the front door sees. All inputs are assumptions you can edit.</p>
-<pre class="terminal" data-title="sizing.py"><code>&quot;&quot;&quot;Napkin maths for an S3-like object store: capacity, metadata, request load, repair and scrub traffic.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>objects ← bytes ÷ object size;  metadata ← objects × 300 B</li>
+  <li>shards ← ceil((PUT/s + GET/s) ÷ ops per shard)</li>
+  <li>for each scheme: raw ← logical × overhead;  drives ← raw ÷ (16 TB × 80%)</li>
+  <li>failures/day ← drives × AFR ÷ 365;  repair reads ← lost × (1 or k=6)</li>
+  <li>scrub rate ← stored bytes ÷ 30 days, fleet-wide and per drive</li>
+  <li>front door ← req/s × size × 8;  RS write fan-out ← PUT × 9/6</li>
+</ol></div>
+<pre class="terminal" data-title="sizing.py"><code>"""Napkin maths for an S3-like object store: capacity, metadata, request
+load, and the repair and scrub traffic that keeps the data safe."""
 import math
 
-# --- workload (assumptions) ---
-logical_pb   = 100               # petabytes of user data
-avg_obj_mb   = 1.0               # mean object size (a mix of many tiny and some huge)
-put_per_s    = 20_000            # peak PUTs/s
-get_per_s    = 200_000           # peak GETs/s
-meta_bytes   = 300               # assumed metadata per object (key, size, checksum, version, placement)
+# ── 1. Workload (assumptions) ─────────────────────────────────────────
+logical_pb = 100              # petabytes of user data
+avg_obj_mb = 1.0              # mean object size (many tiny, some huge)
+put_per_s  = 20_000           # peak PUTs per second
+get_per_s  = 200_000          # peak GETs per second
+meta_bytes = 300              # metadata per object (key, size, checksum...)
+shard_ops  = 20_000           # metadata ops/s one shard can serve
 
-objects = logical_pb * 1e15 / (avg_obj_mb * 1e6)
-meta_tb = objects * meta_bytes / 1e12
-print(f&quot;objects: {objects:.1e}   metadata: {meta_tb:,.0f} TB   (a sharded key-value store, not one database)&quot;)
-print(f&quot;metadata ops: {put_per_s + get_per_s:,}/s peak (every GET needs a lookup) -&gt; at ~20k ops/s per metadata shard: {math.ceil((put_per_s+get_per_s)/20_000)} shards before replicas&quot;)
+# ── 2. Metadata ───────────────────────────────────────────────────────
+objects  = logical_pb * 1e15 / (avg_obj_mb * 1e6)
+meta_tb  = objects * meta_bytes / 1e12
+meta_ops = put_per_s + get_per_s        # every GET needs a lookup too
+shards   = math.ceil(meta_ops / shard_ops)
 
-# --- raw capacity under two durability schemes ---
-drive_tb, drive_afr = 16, 0.02
-for name, overhead in ((&quot;3x replication&quot;, 3.0), (&quot;Reed-Solomon (6,3)&quot;, 9/6)):
+print(f"objects: {objects:.1e}   metadata: {meta_tb:,.0f} TB   "
+      f"(a sharded key-value store, not one database)")
+print(f"metadata ops: {meta_ops:,}/s peak (every GET needs a lookup)")
+print(f"  -&gt; at ~20k ops/s per metadata shard: {shards} shards "
+      f"before replicas")
+
+# ── 3. Raw capacity under two durability schemes ──────────────────────
+drive_tb   = 16               # capacity of one drive
+drive_afr  = 0.02             # annual failure rate per drive
+fill       = 0.80             # run drives at 80% full
+scrub_days = 30               # read every drive fully this often
+
+SCHEMES = (
+    ("3x replication", 3.0),
+    ("Reed-Solomon (6,3)", 9 / 6),
+)
+
+for name, overhead in SCHEMES:
     raw_pb = logical_pb * overhead
-    drives = math.ceil(raw_pb * 1000 / drive_tb / 0.80)          # run drives at 80% full
-    print(f&quot;\n{name}: overhead {overhead:.2f}x -&gt; raw {raw_pb:,.0f} PB -&gt; {drives:,} drives of {drive_tb} TB at 80% full&quot;)
+    drives = math.ceil(raw_pb * 1000 / drive_tb / fill)
+    print(f"\n{name}: overhead {overhead:.2f}x -&gt; raw {raw_pb:,.0f} PB")
+    print(f"  -&gt; {drives:,} drives of {drive_tb} TB at 80% full")
+
+    # ── 4. Repair traffic ─────────────────────────────────────────────
     fails_per_day = drives * drive_afr / 365
-    print(f&quot;  drive failures: {fails_per_day:.1f} per day at {drive_afr:.0%} annual failure rate&quot;)
-    read_amp = 1 if overhead == 3.0 else 6                         # replication copies 1 replica; RS reads k fragments
-    repair_tb_per_day = fails_per_day * drive_tb * 0.8 * read_amp
-    print(f&quot;  repair reads: {read_amp}x the lost data -&gt; {repair_tb_per_day:,.0f} TB/day = {repair_tb_per_day*1e12/86400/1e9:,.1f} GB/s sustained across the fleet&quot;)
-    scrub_days = 30
-    scrub_gbs = drives * drive_tb * 0.8 * 1e12 / (scrub_days * 86400) / 1e9
-    print(f&quot;  scrubbing every drive every {scrub_days} days: {scrub_gbs:,.0f} GB/s fleet-wide ({scrub_gbs*1000/drives:.1f} MB/s per drive)&quot;)
+    print(f"  drive failures: {fails_per_day:.1f} per day "
+          f"at {drive_afr:.0%} annual failure rate")
 
-# --- bandwidth at the front door ---
-print(f&quot;\nfront door at peak: GET {get_per_s*avg_obj_mb*8/1000:,.0f} Gbit/s, PUT {put_per_s*avg_obj_mb*8/1000:,.0f} Gbit/s (before the CDN and before erasure-coding fan-out)&quot;)
-print(f&quot;a PUT into RS(6,3) writes 9 fragments: internal write bandwidth {put_per_s*avg_obj_mb*1.5*8/1000:,.0f} Gbit/s&quot;)</code></pre>
+    # Replication copies one surviving replica; RS must read k=6
+    # fragments to rebuild one, so repair reads are amplified.
+    read_amp = 1 if overhead == 3.0 else 6
+    repair_tb_day = fails_per_day * drive_tb * fill * read_amp
+    repair_gbs = repair_tb_day * 1e12 / 86400 / 1e9
+    print(f"  repair reads: {read_amp}x the lost data "
+          f"-&gt; {repair_tb_day:,.0f} TB/day = {repair_gbs:,.1f} GB/s "
+          f"sustained across the fleet")
+
+    # ── 5. Scrub traffic ──────────────────────────────────────────────
+    scrub_gbs = drives * drive_tb * fill * 1e12 / (scrub_days * 86400) / 1e9
+    scrub_mbs_drive = scrub_gbs * 1000 / drives
+    print(f"  scrubbing every drive every {scrub_days} days: "
+          f"{scrub_gbs:,.0f} GB/s fleet-wide "
+          f"({scrub_mbs_drive:.1f} MB/s per drive)")
+
+# ── 6. Bandwidth at the front door ────────────────────────────────────
+get_gbit = get_per_s * avg_obj_mb * 8 / 1000
+put_gbit = put_per_s * avg_obj_mb * 8 / 1000
+rs_gbit  = put_per_s * avg_obj_mb * 1.5 * 8 / 1000   # 9 frags / 6 data
+
+print(f"\nfront door at peak: GET {get_gbit:,.0f} Gbit/s, "
+      f"PUT {put_gbit:,.0f} Gbit/s")
+print("  (before the CDN and before erasure-coding fan-out)")
+print(f"a PUT into RS(6,3) writes 9 fragments: "
+      f"internal write bandwidth {rs_gbit:,.0f} Gbit/s")</code></pre>
 <pre class="terminal" data-title="output"><code>objects: 1.0e+11   metadata: 30 TB   (a sharded key-value store, not one database)
-metadata ops: 220,000/s peak (every GET needs a lookup) -&gt; at ~20k ops/s per metadata shard: 11 shards before replicas
+metadata ops: 220,000/s peak (every GET needs a lookup)
+  -&gt; at ~20k ops/s per metadata shard: 11 shards before replicas
 
-3x replication: overhead 3.00x -&gt; raw 300 PB -&gt; 23,438 drives of 16 TB at 80% full
+3x replication: overhead 3.00x -&gt; raw 300 PB
+  -&gt; 23,438 drives of 16 TB at 80% full
   drive failures: 1.3 per day at 2% annual failure rate
   repair reads: 1x the lost data -&gt; 16 TB/day = 0.2 GB/s sustained across the fleet
   scrubbing every drive every 30 days: 116 GB/s fleet-wide (4.9 MB/s per drive)
 
-Reed-Solomon (6,3): overhead 1.50x -&gt; raw 150 PB -&gt; 11,719 drives of 16 TB at 80% full
+Reed-Solomon (6,3): overhead 1.50x -&gt; raw 150 PB
+  -&gt; 11,719 drives of 16 TB at 80% full
   drive failures: 0.6 per day at 2% annual failure rate
   repair reads: 6x the lost data -&gt; 49 TB/day = 0.6 GB/s sustained across the fleet
   scrubbing every drive every 30 days: 58 GB/s fleet-wide (4.9 MB/s per drive)
 
-front door at peak: GET 1,600 Gbit/s, PUT 160 Gbit/s (before the CDN and before erasure-coding fan-out)
+front door at peak: GET 1,600 Gbit/s, PUT 160 Gbit/s
+  (before the CDN and before erasure-coding fan-out)
 a PUT into RS(6,3) writes 9 fragments: internal write bandwidth 240 Gbit/s</code></pre>
 <p>Decisions from the output. <strong>Metadata is its own system:</strong> 10<sup>11</sup> objects at 300 bytes is 30 TB and over 200k lookups per second, so it must be sharded; the object count, not the byte count, drives it, which is why a store of tiny objects is much harder than a store of big ones. <strong>Erasure coding halves the fleet:</strong> 3x replication needs about 23,000 drives for 100 PB and Reed-Solomon (6,3) needs about 12,000; at this scale that is a hardware bill that dwarfs the engineering cost of coding. <strong>Repair is a continuous background load:</strong> with tens of thousands of drives, a drive dies every day or so, and erasure-coded rebuilds read six times the lost data (the 0.6 GB/s versus 0.2 GB/s lines), so repair bandwidth must be budgeted, not hoped for. <strong>Scrubbing is the biggest consumer:</strong> reading every byte once a month is tens to over a hundred GB/s of background I/O. And the front door at 1.6 Tbit/s says a CDN or many front ends are essential for reads.</p>
 
 <h2>API</h2>
-<pre class="terminal" data-title="object API (shape, not exact wire format)"><code>PUT    /{bucket}/{key}                 body, optional checksum header   -&gt; 200 + ETag + version-id
-GET    /{bucket}/{key}                 optional Range: bytes=0-1048575  -&gt; 200/206 + bytes + checksum
-DELETE /{bucket}/{key}                                                  -&gt; 204 (a delete marker if versioned)
-GET    /{bucket}?prefix=logs/2025/&amp;delimiter=/&amp;max-keys=1000&amp;continuation-token=...
-                                                                         -&gt; keys, common prefixes, next token
+<pre class="terminal" data-title="object API (shape, not exact wire format)"><code># Basic object operations
+PUT    /{bucket}/{key}          body, optional checksum header
+  -&gt; 200 + ETag + version-id
+GET    /{bucket}/{key}          optional Range: bytes=0-1048575
+  -&gt; 200/206 + bytes + checksum
+DELETE /{bucket}/{key}
+  -&gt; 204 (a delete marker if versioned)
+
+# Listing (prefix + delimiter fake a folder tree over a flat key space)
+GET    /{bucket}?prefix=logs/2025/&amp;delimiter=/&amp;max-keys=1000
+                &amp;continuation-token=...
+  -&gt; keys, common prefixes, next token
+
 -- multipart (objects larger than a few hundred MB)
-POST   /{bucket}/{key}?uploads                                       -&gt; upload-id
-PUT    /{bucket}/{key}?uploadId=U&amp;partNumber=7   part bytes        -&gt; part ETag
-POST   /{bucket}/{key}?uploadId=U   [(1,etag1),(2,etag2),...]       -&gt; 200  (this is the commit)
-DELETE /{bucket}/{key}?uploadId=U                                   -&gt; abort, free the parts</code></pre>
+POST   /{bucket}/{key}?uploads
+  -&gt; upload-id
+PUT    /{bucket}/{key}?uploadId=U&amp;partNumber=7      part bytes
+  -&gt; part ETag
+POST   /{bucket}/{key}?uploadId=U   [(1,etag1),(2,etag2),...]
+  -&gt; 200  (this is the commit)
+DELETE /{bucket}/{key}?uploadId=U
+  -&gt; abort, free the parts</code></pre>
 <p>Three API choices are really design choices. Keys are flat strings; "folders" are a convention (a prefix and a delimiter), which is what lets listing be a range scan of a sorted index. Objects are immutable, so there is no partial update, and everything below gets simpler. PUT is naturally idempotent for the same key and body; conditional requests (a precondition on the current ETag or "only if absent") let clients build safe concurrent updates on top.</p>
 
 <h2>Data model</h2>
@@ -250,48 +314,96 @@ DELETE /{bucket}/{key}?uploadId=U                                   -&gt; abort,
   </tbody>
 </table>
 <p>The last-but-one rows decide the layout across zones. A stripe spread evenly over three zones loses one third of its fragments when a zone goes dark, so the code must tolerate at least that many losses: (6,3) does (it loses 3, tolerates 3), and (10,4) does not (it loses 5, tolerates 4). A single-site system with many racks as its failure domains can use the wider, cheaper (10,4); a three-zone design needs (6,3) or a code with local parity groups. Now the durability, computed.</p>
-<pre class="terminal" data-title="durability_model.py"><code>&quot;&quot;&quot;SIMPLIFIED durability model: replication vs erasure coding, under assumed failure rates and repair times.
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>loss(n,k,AFR,T) ← 8766 ÷ MTTDL;  nines ← −log10(loss)</li>
+  <li>schemes ← 2x/3x replication, RS(6,3), RS(10,4), RS(17,3) as (n, k)</li>
+  <li>for each AFR and rebuild time, for each scheme: print loss, nines</li>
+  <li>lost ← ceil(n ÷ 3 zones);  survives if lost ≤ n − k</li>
+</ol></div>
+<pre class="terminal" data-title="durability_model.py"><code>"""SIMPLIFIED durability model: replication vs erasure coding, under
+assumed failure rates and repair times.
 
-Model: each stripe has n fragments on n independent drives, and data is lost if more than m = n - k fragments are
-down at once. Drives fail independently at rate lam = AFR / 8766 per hour; a lost fragment is rebuilt in T hours
-(rate mu = 1/T). Standard birth-death approximation of the mean time to data loss for one stripe:
+Model: each stripe has n fragments on n independent drives; data is lost
+if more than m = n - k fragments are down at once. Drives fail
+independently at rate lam = AFR / 8766 per hour; a lost fragment is
+rebuilt in T hours (rate mu = 1/T). Standard birth-death approximation
+of the mean time to data loss (MTTDL) for one stripe:
     MTTDL ~ mu^m / ( lam^(m+1) * n * (n-1) * ... * (n-m) )
-Annual loss probability for one stripe ~ 8766 / MTTDL (valid when it is small).
-NOT modelled: correlated failures (a rack, a batch, a firmware bug), bit rot, operator error, repair queueing under
-load, and the repair-time dependence on how many failures are in flight. Real durability is usually limited by those,
-so read the output as relative ranking and sensitivity, not as a promise.
-&quot;&quot;&quot;
+Annual loss probability for one stripe ~ 8766 / MTTDL (valid when small).
+
+NOT modelled: correlated failures (a rack, a batch, a firmware bug), bit
+rot, operator error, repair queueing under load, and how repair time
+depends on the number of failures in flight. Real durability is usually
+limited by those, so read the output as relative ranking and
+sensitivity, not as a promise.
+"""
 import math
 
-HOURS_YEAR = 8766
+# ── 1. The model ──────────────────────────────────────────────────────
+HOURS_YEAR = 8766             # hours in a year (365.25 days)
+
 
 def annual_loss(n, k, afr, repair_hours):
-    m = n - k
-    lam, mu = afr / HOURS_YEAR, 1 / repair_hours
-    falling = math.prod(n - i for i in range(m + 1))              # n (n-1) ... (n-m)
+    """Probability that one stripe loses data within a year."""
+    m = n - k                           # fragments we can afford to lose
+    lam = afr / HOURS_YEAR              # failure rate per drive-hour
+    mu = 1 / repair_hours               # repair rate per hour
+    # n (n-1) ... (n-m): ways the failures can chain, one after another
+    falling = math.prod(n - i for i in range(m + 1))
     mttdl_hours = mu ** m / (lam ** (m + 1) * falling)
     return min(1.0, HOURS_YEAR / mttdl_hours)
 
+
 def nines(p_loss):
-    return float(&quot;inf&quot;) if p_loss &lt;= 0 else -math.log10(p_loss)
+    """Durability as a count of nines: 1e-11 loss -&gt; 11.0 nines."""
+    if p_loss &lt;= 0:
+        return float("inf")
+    return -math.log10(p_loss)
 
-schemes = [(&quot;2x replication&quot;, 2, 1), (&quot;3x replication&quot;, 3, 1), (&quot;RS(6,3)&quot;, 9, 6), (&quot;RS(10,4)&quot;, 14, 10), (&quot;RS(17,3)&quot;, 20, 17)]
 
+# ── 2. Schemes to compare ─────────────────────────────────────────────
+# (name, n fragments in total, k fragments needed to read)
+SCHEMES = [
+    ("2x replication", 2, 1),
+    ("3x replication", 3, 1),
+    ("RS(6,3)", 9, 6),
+    ("RS(10,4)", 14, 10),
+    ("RS(17,3)", 20, 17),
+]
+
+# ── 3. Sweep failure rate and rebuild time ────────────────────────────
 for afr in (0.02, 0.05):
     for repair in (24, 72):
-        print(f&quot;\nAFR {afr:.0%}, rebuild time {repair} h&quot;)
-        print(f&quot;  {&#x27;scheme&#x27;:&lt;16}{&#x27;overhead&#x27;:&gt;9}{&#x27;tolerates&#x27;:&gt;10}{&#x27;annual loss / object&#x27;:&gt;22}{&#x27;durability (nines)&#x27;:&gt;20}&quot;)
-        for name, n, k in schemes:
-            p = annual_loss(n, k, afr, repair if name.startswith(&quot;RS&quot;) else repair / 2)   # one copy rebuilds faster than a wide stripe
-            print(f&quot;  {name:&lt;16}{n/k:&gt;8.2f}x{n-k:&gt;10}{p:&gt;22.2e}{nines(p):&gt;20.1f}&quot;)
-print(&quot;\n(replication rebuilds are assumed 2x faster than erasure-coded rebuilds, because RS must read k fragments per lost one)&quot;)
+        print(f"\nAFR {afr:.0%}, rebuild time {repair} h")
+        print(f"  {'scheme':&lt;16}{'overhead':&gt;9}{'tolerates':&gt;10}"
+              f"{'annual loss / object':&gt;22}{'durability (nines)':&gt;20}")
+        for name, n, k in SCHEMES:
+            # A replica is one copy, so it rebuilds faster than a wide
+            # RS stripe, which must read k fragments per lost one.
+            if name.startswith("RS"):
+                hours = repair
+            else:
+                hours = repair / 2
+            p = annual_loss(n, k, afr, hours)
+            print(f"  {name:&lt;16}{n / k:&gt;8.2f}x{n - k:&gt;10}"
+                  f"{p:&gt;22.2e}{nines(p):&gt;20.1f}")
 
-# AZ loss: can a code survive a whole zone? A stripe spread evenly over z zones loses ceil(n/z) fragments at once.
-print(&quot;\nspreading a stripe across 3 zones:&quot;)
-for name, n, k in schemes:
-    lost = math.ceil(n / 3)
-    ok = &quot;survives&quot; if lost &lt;= n - k else &quot;LOSES DATA&quot;
-    print(f&quot;  {name:&lt;10} loses up to {lost} fragments if one zone is down; tolerates {n-k}: {ok}&quot;)</code></pre>
+print("\n(replication rebuilds are assumed 2x faster than erasure-coded")
+print(" rebuilds, because RS must read k fragments per lost one)")
+
+# ── 4. Can a code survive losing a whole zone? ────────────────────────
+# Spread evenly over z zones, one zone down loses ceil(n/z) fragments.
+ZONES = 3
+print("\nspreading a stripe across 3 zones:")
+for name, n, k in SCHEMES:
+    lost = math.ceil(n / ZONES)
+    if lost &lt;= n - k:
+        verdict = "survives"
+    else:
+        verdict = "LOSES DATA"
+    print(f"  {name:&lt;10} loses up to {lost} fragments if one zone is "
+          f"down; tolerates {n - k}: {verdict}")</code></pre>
 <pre class="terminal" data-title="output"><code>
 AFR 2%, rebuild time 24 h
   scheme           overhead tolerates  annual loss / object  durability (nines)
@@ -325,7 +437,8 @@ AFR 5%, rebuild time 72 h
   RS(10,4)            1.40x         4              3.42e-10                 9.5
   RS(17,3)            1.18x         3              4.03e-07                 6.4
 
-(replication rebuilds are assumed 2x faster than erasure-coded rebuilds, because RS must read k fragments per lost one)
+(replication rebuilds are assumed 2x faster than erasure-coded
+ rebuilds, because RS must read k fragments per lost one)
 
 spreading a stripe across 3 zones:
   2x replication loses up to 1 fragments if one zone is down; tolerates 1: survives

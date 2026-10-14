@@ -19,6 +19,8 @@
   "use strict";
 
   var SITE = "Zero to Systems";
+  // assets/ folder, from this script's own URL (runner.js and vendor files live there).
+  var ASSETS = ((document.currentScript && document.currentScript.src) || "").replace(/js\/main\.js(?:[?#].*)?$/, "");
   var COURSES = window.CS_COURSES || [];
   var DEPTH = window.CS_DEPTH_LABEL || {};
   var body = document.body;
@@ -566,7 +568,127 @@
     });
   }
 
+  /* ---------- syntax highlighting ----------
+     Blocks written with hand-placed <span>s are left alone. Everything else is
+     tokenized here, using the same classes (.kw .str .num .cmt ...) as the
+     hand-highlighted blocks, so all themes colour them the same way. */
+
+  var PY_KW = "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case";
+  var PY_BI = "print len range sum min max sorted enumerate zip map filter abs round int float str bytes bool list dict set tuple frozenset isinstance hasattr getattr setattr super type iter next any all open repr divmod hash id format reversed object property staticmethod classmethod Exception ValueError KeyError TimeoutError RuntimeError AssertionError IndexError StopIteration";
+  var GEN_KW = "GET POST PUT PATCH DELETE HEAD OPTIONS function local end then if else elseif return for in do while func var let const type struct SELECT FROM WHERE INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE INDEX ON AND OR NOT NULL BEGIN COMMIT ROLLBACK JOIN GROUP BY ORDER LIMIT RETURNING PRIMARY KEY UNIQUE";
+
+  function wordSet(s) { var o = {}; s.split(" ").forEach(function (w) { o[w] = 1; }); return o; }
+  var PY = { kw: wordSet(PY_KW), bi: wordSet(PY_BI) };
+  var GEN = wordSet(GEN_KW);
+
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function wrap(cls, s) { return '<span class="' + cls + '">' + esc(s) + "</span>"; }
+
+  // One ordered alternation: the first group that matches wins, so strings and
+  // comments are consumed before anything inside them can look like a keyword.
+  var PY_RE = new RegExp([
+    /([rRbBuUfF]{0,2}"""[\s\S]*?"""|[rRbBuUfF]{0,2}'''[\s\S]*?''')/.source,   // 1 triple-quoted
+    /(#[^\n]*)/.source,                                                          // 2 comment
+    /([rRbBuUfF]{0,2}"(?:\\.|[^"\\\n])*"|[rRbBuUfF]{0,2}'(?:\\.|[^'\\\n])*')/.source, // 3 string
+    /(@[A-Za-z_][\w.]*)/.source,                                                 // 4 decorator
+    /(\b\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?j?\b|\b0[xXbBoO][\da-fA-F_]+\b)/.source, // 5 number
+    /\b(def|class)(\s+)([A-Za-z_]\w*)/.source,                                   // 6,7,8 definition
+    /([A-Za-z_]\w*)/.source                                                      // 9 word
+  ].join("|"), "g");
+
+  function highlightPython(src) {
+    var out = "", last = 0, m;
+    PY_RE.lastIndex = 0;
+    while ((m = PY_RE.exec(src))) {
+      out += esc(src.slice(last, m.index));
+      last = PY_RE.lastIndex;
+      if (m[1]) {
+        // A triple-quoted string on its own line is a docstring: style it as prose.
+        var before = src.slice(src.lastIndexOf("\n", m.index - 1) + 1, m.index);
+        out += wrap(/^\s*$/.test(before) ? "doc" : "str", m[1]);
+      } else if (m[2]) {
+        // "# ── 1. Step ──" banners mark the sections that match the idea box.
+        out += wrap(/^#\s*──/.test(m[2]) ? "cmt sec" : "cmt", m[2]);
+      } else if (m[3]) out += wrap("str", m[3]);
+      else if (m[4]) out += wrap("dec", m[4]);
+      else if (m[5]) out += wrap("num", m[5]);
+      else if (m[6]) out += wrap("kw", m[6]) + m[7] + wrap("fn", m[8]);
+      else {
+        var w = m[9];
+        if (w === "True" || w === "False" || w === "None") out += wrap("const", w);
+        else if (w === "self" || w === "cls") out += wrap("hl3", w);
+        else if (PY.kw[w]) out += wrap("kw", w);
+        else if (PY.bi[w]) out += wrap("bi", w);
+        else out += esc(w);
+      }
+    }
+    return out + esc(src.slice(last));
+  }
+
+  // API shapes, sketches, Lua/SQL/YAML and the like: strings, numbers, comments,
+  // HTTP verbs and a few common keywords. Good enough to make structure visible.
+  var GEN_RE = /("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|((?:^|\s)(?:#|--|\/\/)[^\n]*)|(\b\d[\d_,.]*\b)|([A-Za-z_][\w]*)/gm;
+  function highlightGeneric(src) {
+    var out = "", last = 0, m;
+    GEN_RE.lastIndex = 0;
+    while ((m = GEN_RE.exec(src))) {
+      out += esc(src.slice(last, m.index));
+      last = GEN_RE.lastIndex;
+      if (m[1]) out += wrap("str", m[1]);
+      else if (m[2]) {
+        var lead = m[2].match(/^\s*/)[0];
+        out += esc(lead) + wrap("cmt", m[2].slice(lead.length));
+      } else if (m[3]) out += wrap("num", m[3]);
+      else out += GEN[m[4]] ? wrap("kw", m[4]) : esc(m[4]);
+    }
+    return out + esc(src.slice(last));
+  }
+
+  // Shell sessions: "$ cmd   # note" lines, everything else is output.
+  function highlightShell(src) {
+    return src.split("\n").map(function (line) {
+      if (/^\s*#/.test(line)) return wrap("cmt", line);
+      var p = line.match(/^(\s*[$>] )(.*)$/);
+      if (!p) return wrap("out", line);
+      var c = p[2].match(/^(.*?)(\s+#\s.*)?$/);
+      return wrap("prompt", p[1]) + wrap("cmd", c[1]) + (c[2] ? wrap("cmt", c[2]) : "");
+    }).join("\n");
+  }
+
+  function languageOf(pre, src) {
+    var title = (pre.getAttribute("data-title") || "").toLowerCase();
+    if (/\.py\b/.test(title) || title === "python3") return "py";
+    if (/output|^surfaces?$/.test(title)) return null;
+    if (/^\s*\$ /m.test(src)) return "sh";
+    if (/^(import |from \w+ import |def |class |print\()/m.test(src)) return "py";
+    if (/\.(lua|sql|go|ya?ml|m3u8|tla|cfg|js|mmd)\b|api|sketch|shape|pseudocode|illustrative|promql|specification/.test(title)) return "gen";
+    return null;
+  }
+
+  // Runnable code cells (runner.js) are loaded only on pages that have scripts.
+  function loadRunner() {
+    if (!ASSETS || !document.querySelector('article pre[data-title*=".py"]')) return;
+    window.NZ = { assets: ASSETS, highlightPython: highlightPython };
+    var s = document.createElement("script");
+    s.src = ASSETS + "js/runner.js";
+    document.body.appendChild(s);
+  }
+
+  function highlightCode() {
+    document.querySelectorAll("pre").forEach(function (pre) {
+      var code = pre.querySelector("code") || pre;
+      if (code.querySelector("span")) return;                // hand-highlighted already
+      var src = code.textContent;
+      var lang = languageOf(pre, src);
+      if (lang === "py") code.innerHTML = highlightPython(src);
+      else if (lang === "sh") code.innerHTML = highlightShell(src);
+      else if (lang === "gen") code.innerHTML = highlightGeneric(src);
+    });
+  }
+
   function init() {
+    highlightCode();
+    loadRunner();
     wrapTables();
     buildSidebar();
     buildTopbar();

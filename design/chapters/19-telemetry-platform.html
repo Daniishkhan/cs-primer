@@ -53,84 +53,171 @@
 
 <h2>Estimate</h2>
 <p>The things to extract: points per second (sizes the pipeline), bytes per point (sizes storage and decides whether compression matters), the active-series count (sizes memory), tier sizes (decide the rollup design) and the query fan-out risk. As in <a href="02-estimation.html">chapter 2</a>, every assumption is a named line.</p>
-<pre class="terminal" data-title="napkin19.py"><code>&quot;&quot;&quot;Napkin maths for a metrics + logs platform. All inputs are assumptions you can change.&quot;&quot;&quot;
-DAY = 86_400
-hosts, series_per_host = 100_000, 500          # assumption: 100k hosts/pods, ~500 active series each
-interval = 10                                  # assumption: one point per series every 10 s
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>series ← hosts × per host;  rate ← series ÷ 10 s;  per day ← rate × 86,400</li>
+  <li>bytes/day ← points × 16 B raw, × 1.5 B compressed;  ingesters ← rate ÷ 500k</li>
+  <li>per tier: points ← series × days × 86,400 ÷ step;  bytes ← points × 1.5 B</li>
+  <li>head RAM ← series × 4 KB;  logs/s ← TB/day ÷ line size ÷ 86,400</li>
+  <li>reads/s ← queries × series × points;  P(slow) ← 1 − 0.99^shards</li>
+</ol></div>
+<pre class="terminal" data-title="napkin19.py"><code>"""Napkin maths for a metrics + logs platform.
+All inputs are assumptions you can change."""
+
+SECONDS_PER_DAY = 86_400
+
+# ── 1. Ingest rate ────────────────────────────────────────────────────
+hosts           = 100_000     # assumption: hosts / pods
+series_per_host = 500         # assumption: active series on each
+interval_s      = 10          # assumption: one point per series per 10 s
+
 series = hosts * series_per_host
-pps = series / interval
-print(f&quot;active series {series/1e6:,.0f}M, ingest {pps/1e6:,.1f}M points/s, {pps*DAY/1e9:,.0f}B points/day&quot;)
+pps    = series / interval_s              # points per second
+points_per_day = pps * SECONDS_PER_DAY
 
-raw, comp = 16, 1.5                            # raw = 8 B timestamp + 8 B float; compressed ~1.5 B/point (assumption, see gorilla19.py)
-print(f&quot;raw size {pps*DAY*raw/1e12:,.1f} TB/day; compressed ~{pps*DAY*comp/1e12:,.2f} TB/day ({raw/comp:.0f}x)&quot;)
+print(f"active series {series / 1e6:,.0f}M, "
+      f"ingest {pps / 1e6:,.1f}M points/s, "
+      f"{points_per_day / 1e9:,.0f}B points/day")
 
-wire = 24                                      # assumption: ~24 B/point on the wire after batching + compression
-print(f&quot;buffer (log) throughput: {pps*wire/1e6:,.0f} MB/s; at replication 3 the brokers absorb {3*pps*wire/1e6:,.0f} MB/s of writes&quot;)
-ingester_pps = 500_000                         # assumption: one ingester handles 500k points/s
-n_ing = pps / ingester_pps
-print(f&quot;ingesters: {n_ing:,.0f} for steady state; with 50% headroom and an RF of 3 replicas stored: {n_ing*1.5:,.0f} serving, {3*n_ing*1.5:,.0f} slots&quot;)
+# ── 2. Bytes: raw, compressed, on the wire ────────────────────────────
+raw_b        = 16             # 8 B timestamp + 8 B float
+compressed_b = 1.5            # assumption; see gorilla19.py
+wire_b       = 24             # assumption: per point, batched + compressed
+replication  = 3
+ingester_pps = 500_000        # assumption: one ingester's capacity
+headroom     = 1.5            # 50% spare capacity
 
-# Retention tiers
-tiers = [(&quot;raw 10s&quot;, 15, interval), (&quot;rollup 1m&quot;, 90, 60), (&quot;rollup 1h&quot;, 730, 3600)]
-total = 0
-for name, days, step in tiers:
-    pts = series * days * DAY / step
-    cap_bytes = pts * comp * (1.0 if step == interval else 4)   # rollups store min/max/sum/count = 4 values
-    total += cap_bytes
-    print(f&quot;  tier {name:&lt;10} {days:&gt;4} d: {pts/1e12:,.2f}T points, ~{cap_bytes/1e12:,.0f} TB&quot;)
-print(f&quot;  total with 1 replica ~{total/1e12:,.0f} TB; x3 replicas ~{3*total/1e12:,.0f} TB&quot;)
+raw_tb_day  = points_per_day * raw_b / 1e12
+comp_tb_day = points_per_day * compressed_b / 1e12
+wire_mb_s   = pps * wire_b / 1e6
+n_ingesters = pps / ingester_pps
 
-# Head memory: active series in RAM
-mem = 4_000                                    # assumption: ~4 KB per active series in memory (labels, index, open chunk)
-print(f&quot;\nin-memory head: {series*mem/1e9:,.0f} GB per replica, {3*series*mem/1e9:,.0f} GB at 3 replicas (~{3*series*mem/64e9:,.0f} nodes of 64 GB): series count, not points, drives RAM&quot;)
+print(f"raw size {raw_tb_day:,.1f} TB/day; "
+      f"compressed ~{comp_tb_day:,.2f} TB/day "
+      f"({raw_b / compressed_b:.0f}x)")
+print(f"buffer (log) throughput: {wire_mb_s:,.0f} MB/s; at replication "
+      f"{replication}")
+print(f"  the brokers absorb {replication * wire_mb_s:,.0f} MB/s of writes")
+print(f"ingesters: {n_ingesters:,.0f} for steady state; with 50% headroom "
+      f"and an RF of {replication}")
+print(f"  replicas stored: {n_ingesters * headroom:,.0f} serving, "
+      f"{replication * n_ingesters * headroom:,.0f} slots")
 
-# Logs
-logs_tb_day, line = 20, 200                    # assumption: 20 TB/day of raw logs, ~200 B/line
-print(f&quot;logs: {logs_tb_day*1e12/line/DAY/1e6:,.2f}M lines/s; at ~8x compression and 14 d retention: {logs_tb_day/8*14:,.0f} TB&quot;)
-# Query fan-out
-q = 2_000
-print(f&quot;\ndashboards: {q} queries/s each touching ~{200} series x 360 points = {q*200*360/1e6:,.0f}M points read/s&quot;)
+# ── 3. Retention tiers ────────────────────────────────────────────────
+# Rollups keep min/max/sum/count, so each point stores 4 values.
+ROLLUP_VALUES = 4
+tiers = [                     # (name, days kept, seconds per point)
+    ("raw 10s",   15,   interval_s),
+    ("rollup 1m", 90,   60),
+    ("rollup 1h", 730,  3600),
+]
+total_bytes = 0
+for name, days, step_s in tiers:
+    points = series * days * SECONDS_PER_DAY / step_s
+    values = 1 if step_s == interval_s else ROLLUP_VALUES
+    tier_bytes = points * compressed_b * values
+    total_bytes += tier_bytes
+    print(f"  tier {name:&lt;10} {days:&gt;4} d: "
+          f"{points / 1e12:,.2f}T points, ~{tier_bytes / 1e12:,.0f} TB")
+print(f"  total with 1 replica ~{total_bytes / 1e12:,.0f} TB; "
+      f"x3 replicas ~{replication * total_bytes / 1e12:,.0f} TB")
 
-# Query fan-out: a query touching N shards is as slow as its slowest shard.
-for n in (1, 10, 100):
-    print(f&quot;query fanned out to {n:&gt;3} shards: P(at least one shard slower than its own p99) = {1-0.99**n:5.1%}&quot;)</code></pre>
+# ── 4. Memory for the head, and the logs ──────────────────────────────
+# The head block keeps every ACTIVE series in RAM.
+head_b_per_series = 4_000     # assumption: labels, index, open chunk
+node_ram_gb       = 64
+
+head_gb = series * head_b_per_series / 1e9
+print(f"\nin-memory head: {head_gb:,.0f} GB per replica, "
+      f"{replication * head_gb:,.0f} GB at {replication} replicas")
+print(f"  (~{replication * head_gb / node_ram_gb:,.0f} nodes of "
+      f"{node_ram_gb} GB): series count, not points, drives RAM")
+
+logs_tb_day  = 20             # assumption: raw logs per day
+line_b       = 200            # assumption: bytes per log line
+log_compress = 8              # assumption: ~8x on stored logs
+log_days     = 14
+
+lines_per_s = logs_tb_day * 1e12 / line_b / SECONDS_PER_DAY
+log_store_tb = logs_tb_day / log_compress * log_days
+print(f"logs: {lines_per_s / 1e6:,.2f}M lines/s; at ~{log_compress}x "
+      f"compression and {log_days} d retention: {log_store_tb:,.0f} TB")
+
+# ── 5. Query load and fan-out ─────────────────────────────────────────
+dashboard_qps     = 2_000
+series_per_query  = 200
+points_per_series = 360       # e.g. 1 h at 10 s resolution
+
+points_read = dashboard_qps * series_per_query * points_per_series
+print(f"\ndashboards: {dashboard_qps} queries/s each touching "
+      f"~{series_per_query} series x {points_per_series} points")
+print(f"  = {points_read / 1e6:,.0f}M points read/s")
+
+# A query over N shards is as slow as its slowest shard: tails compound.
+for n_shards in (1, 10, 100):
+    p_slow = 1 - 0.99 ** n_shards
+    print(f"query fanned out to {n_shards:&gt;3} shards: "
+          f"P(at least one shard slower than its own p99) = {p_slow:5.1%}")</code></pre>
 <pre class="terminal" data-title="output"><code>active series 50M, ingest 5.0M points/s, 432B points/day
 raw size 6.9 TB/day; compressed ~0.65 TB/day (11x)
-buffer (log) throughput: 120 MB/s; at replication 3 the brokers absorb 360 MB/s of writes
-ingesters: 10 for steady state; with 50% headroom and an RF of 3 replicas stored: 15 serving, 45 slots
+buffer (log) throughput: 120 MB/s; at replication 3
+  the brokers absorb 360 MB/s of writes
+ingesters: 10 for steady state; with 50% headroom and an RF of 3
+  replicas stored: 15 serving, 45 slots
   tier raw 10s      15 d: 6.48T points, ~10 TB
   tier rollup 1m    90 d: 6.48T points, ~39 TB
   tier rollup 1h   730 d: 0.88T points, ~5 TB
   total with 1 replica ~54 TB; x3 replicas ~162 TB
 
-in-memory head: 200 GB per replica, 600 GB at 3 replicas (~9 nodes of 64 GB): series count, not points, drives RAM
+in-memory head: 200 GB per replica, 600 GB at 3 replicas
+  (~9 nodes of 64 GB): series count, not points, drives RAM
 logs: 1.16M lines/s; at ~8x compression and 14 d retention: 35 TB
 
-dashboards: 2000 queries/s each touching ~200 series x 360 points = 144M points read/s
+dashboards: 2000 queries/s each touching ~200 series x 360 points
+  = 144M points read/s
 query fanned out to   1 shards: P(at least one shard slower than its own p99) =  1.0%
 query fanned out to  10 shards: P(at least one shard slower than its own p99) =  9.6%
 query fanned out to 100 shards: P(at least one shard slower than its own p99) = 63.4%</code></pre>
 <p>Reading the output. Five million points per second is 432 billion points a day. Stored as 16-byte raw samples that would be 7 TB a day; at the roughly 1.5 bytes per point I <em>assume</em> after compression (the next section shows where such a number comes from and when it fails), it is 0.65 TB a day, which is why compression is not an optimisation here but the thing that makes the design affordable. The pipeline is a modest 120 MB/s, and about ten ingesters carry the steady load. Notice two surprises. First, <strong>memory is set by active series, not by points per second</strong>: 50 million series at roughly 4 KB each is 200 GB per replica, so a runaway label that creates ten million series costs more memory than a tenfold traffic spike. Second, the rollup tiers are a larger bill than the raw tier (about 39 TB for 90 days of 1-minute rollups against 10 TB for 15 days of raw) because they keep four values per point and live six times as long; the design question is not "can we keep raw forever" but "which rollups, kept for how long". Logs are in a different league: 1.2 million lines per second and tens of terabytes of retained text, which is why indexing every word is off the table (Deep dive 5). And the last block is the query problem: fanning one query out to 100 shards makes at least one of them slow 63% of the time, even if each is slow only 1% of the time.</p>
 
 <h2>API</h2>
-<pre class="terminal" data-title="surfaces"><code>-- Write (agents / SDKs -&gt; platform). Batched, compressed, idempotent by (series, timestamp).
-POST /v1/metrics   X-Tenant: acme   Content-Encoding: snappy
-  { "series": [ { "labels": {"__name__": "http_requests_total", "service": "api", "region": "eu"},
-                  "samples": [ [1735689600000, 18273.0], [1735689610000, 18291.0] ] } ] }
-  -&gt; 204 | 429 (over rate or series limit; Retry-After) | 400 (too old / out of window, per-sample errors)
+<pre class="terminal" data-title="surfaces"><code>-- Write (agents / SDKs -&gt; platform)
+-- Batched, compressed, idempotent by (series, timestamp).
+POST /v1/metrics
+  X-Tenant: acme
+  Content-Encoding: snappy
+  { "series": [
+      { "labels": { "__name__": "http_requests_total",
+                    "service": "api", "region": "eu" },
+        "samples": [ [1735689600000, 18273.0],
+                     [1735689610000, 18291.0] ] } ] }
+  -&gt; 204
+   | 429  (over rate or series limit; Retry-After)
+   | 400  (too old / out of window, per-sample errors)
 
-POST /v1/logs      X-Tenant: acme
-  { "streams": [ { "labels": {"service": "api", "env": "prod"},
-                   "entries": [ [1735689600123456789, "level=error msg=\"timeout calling db\""] ] } ] }
+POST /v1/logs
+  X-Tenant: acme
+  { "streams": [
+      { "labels": { "service": "api", "env": "prod" },
+        "entries": [ [1735689600123456789,
+                      "level=error msg=\"timeout calling db\""] ] } ] }
 
 -- Read
-GET /v1/query_range?query=sum by (service)(rate(http_requests_total[5m]))&amp;start=…&amp;end=…&amp;step=60
-GET /v1/logs/query?query={service="api",env="prod"} |= "timeout"&amp;start=…&amp;end=…&amp;limit=1000
-GET /v1/labels, /v1/label/{name}/values       -- for dashboards and autocomplete
+GET /v1/query_range
+  ?query=sum by (service)(rate(http_requests_total[5m]))
+  &amp;start=…&amp;end=…&amp;step=60
+GET /v1/logs/query
+  ?query={service="api",env="prod"} |= "timeout"
+  &amp;start=…&amp;end=…&amp;limit=1000
+GET /v1/labels
+GET /v1/label/{name}/values     -- for dashboards and autocomplete
 
 -- Control plane
-PUT /v1/tenants/{id}/limits  { "max_series": 1000000, "ingest_rate": 200000, "retention_days": 15 }
-PUT /v1/rules/{tenant}       { "alerts": [ … ] }</code></pre>
+PUT /v1/tenants/{id}/limits
+  { "max_series": 1000000, "ingest_rate": 200000,
+    "retention_days": 15 }
+PUT /v1/rules/{tenant}
+  { "alerts": [ … ] }</code></pre>
 <ul>
   <li><strong>Batching is the API design.</strong> One request carries thousands of samples; per-sample requests would multiply the cost of authentication, routing and acknowledgement by the batch size.</li>
   <li><strong>Idempotent by (series, timestamp).</strong> An agent that retries a batch after a timeout does not double-count: the second write of the same timestamp is a no-op. Counters are cumulative values, not increments, which is what makes retries and rate calculations safe (<a href="../../reliability/chapters/04-metrics.html">metrics</a>).</li>
@@ -254,54 +341,115 @@ PUT /v1/rules/{tenant}       { "alerts": [ … ] }</code></pre>
   <li><strong>Values: XOR with the previous value.</strong> If a float equals its predecessor, the XOR is zero and costs one bit. Otherwise XOR the two 64-bit representations: nearby values share leading sign, exponent and high mantissa bits, so the XOR has runs of leading and trailing zeros and only the middle "meaningful" bits are stored, usually reusing the previous window's position.</li>
 </ul>
 <p>The script below counts the bits such a scheme would spend on four kinds of series. It is an estimator that follows the published scheme as I understand it, not a codec.</p>
-<pre class="terminal" data-title="gorilla19.py"><code>&quot;&quot;&quot;Bit-cost estimator for Gorilla-style compression: delta-of-delta timestamps and XOR&#x27;d float values.
-It counts bits per point following the scheme as published (it does not emit a real bit stream).&quot;&quot;&quot;
-import struct, random, math
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>dod ← (t[i] − t[i−1]) − (t[i−1] − t[i−2]);  0 → 1 bit, else a wider code</li>
+  <li>xor ← bits(v[i]) ⊕ bits(v[i−1]);  0 → 1 bit, else keep the non-zero middle</li>
+  <li>build 1 h of regular and jittered timestamps, plus 4 value series</li>
+  <li>bits/point ← total bits ÷ N;  ratio ← 16 B ÷ bytes/point</li>
+</ol></div>
+<pre class="terminal" data-title="gorilla19.py"><code>"""Bit-cost estimator for Gorilla-style compression: delta-of-delta
+timestamps and XOR'd float values. It counts bits per point following the
+scheme as published (it does not emit a real bit stream)."""
+import itertools
+import math
+import random
+import struct
 
+# ── 1. Timestamps: delta-of-delta ─────────────────────────────────────
+# Regular scrapes have a constant delta, so the delta-of-delta is 0 and
+# costs a single bit. Bigger surprises get wider (prefix + payload) codes.
 def timestamp_bits(ts):
-    bits, prev_delta = 64 + 14, None          # first timestamp raw + first delta (14 bits in the paper)
+    bits = 64 + 14                  # first timestamp raw + first delta
     for i in range(2, len(ts)):
-        dod = (ts[i] - ts[i-1]) - (ts[i-1] - ts[i-2])
-        if dod == 0: bits += 1
-        elif -63 &lt;= dod &lt;= 64: bits += 2 + 7
-        elif -255 &lt;= dod &lt;= 256: bits += 3 + 9
-        elif -2047 &lt;= dod &lt;= 2048: bits += 4 + 12
-        else: bits += 4 + 32
+        delta = ts[i] - ts[i - 1]
+        prev_delta = ts[i - 1] - ts[i - 2]
+        dod = delta - prev_delta
+        if dod == 0:
+            bits += 1
+        elif -63 &lt;= dod &lt;= 64:
+            bits += 2 + 7
+        elif -255 &lt;= dod &lt;= 256:
+            bits += 3 + 9
+        elif -2047 &lt;= dod &lt;= 2048:
+            bits += 4 + 12
+        else:
+            bits += 4 + 32
     return bits
 
-def f2b(x): return struct.unpack(&quot;&gt;Q&quot;, struct.pack(&quot;&gt;d&quot;, x))[0]
+# ── 2. Values: XOR with the previous value ────────────────────────────
+# Neighbouring floats share sign, exponent and high mantissa bits, so the
+# XOR has long runs of leading and trailing zeros. Only the middle is kept.
+def float_to_bits(x):
+    return struct.unpack("&gt;Q", struct.pack("&gt;d", x))[0]
+
 def value_bits(vals):
-    bits, prev, lead, trail = 64, f2b(vals[0]), None, None
+    bits = 64                       # first value stored raw
+    prev = float_to_bits(vals[0])
+    lead = None                     # current "window" of meaningful bits
+    trail = None
     for v in vals[1:]:
-        cur = f2b(v); x = cur ^ prev; prev = cur
-        if x == 0: bits += 1; continue
-        l = min(64 - x.bit_length(), 31); t = (x &amp; -x).bit_length() - 1
-        if lead is not None and l &gt;= lead and t &gt;= trail: bits += 2 + (64 - lead - trail)       # reuse previous window
-        else: bits += 2 + 5 + 6 + (64 - l - t); lead, trail = l, t                              # new window
+        cur = float_to_bits(v)
+        xor = cur ^ prev
+        prev = cur
+        if xor == 0:
+            bits += 1               # identical to previous value
+            continue
+        new_lead = min(64 - xor.bit_length(), 31)
+        new_trail = (xor &amp; -xor).bit_length() - 1
+        fits = (lead is not None and new_lead &gt;= lead
+                and new_trail &gt;= trail)
+        if fits:
+            bits += 2 + (64 - lead - trail)          # reuse the window
+        else:
+            bits += 2 + 5 + 6 + (64 - new_lead - new_trail)
+            lead, trail = new_lead, new_trail        # open a new window
     return bits
 
+# ── 3. Test series ────────────────────────────────────────────────────
 rng = random.Random(5)
-N = 3600
+N = 3600                            # one hour at 10 s
 t0 = 1_700_000_000
+
 regular = [t0 + 10 * i for i in range(N)]
 jitter = [t0 + 10 * i + rng.choice([0, 0, 0, 1, -1, 2]) for i in range(N)]
+
+counter_steps = [rng.randint(0, 9) for _ in range(N)]
+counter = [float(x) for x in itertools.accumulate(counter_steps)]
+cpu = [round(0.40 + 0.05 * math.sin(i / 300) + rng.gauss(0, 0.004), 3)
+       for i in range(N)]
+noisy = [rng.random() for _ in range(N)]
+
 series = {
-    &quot;constant gauge (e.g. replicas=3)&quot;: [3.0] * N,
-    &quot;integer counter, +0..9 per step&quot;: list(map(float, __import__(&quot;itertools&quot;).accumulate(rng.randint(0, 9) for _ in range(N)))),
-    &quot;slowly varying gauge (cpu 0.xx)&quot;: [round(0.40 + 0.05 * math.sin(i / 300) + rng.gauss(0, 0.004), 3) for i in range(N)],
-    &quot;noisy float (full precision)&quot;: [rng.random() for _ in range(N)],
+    "constant gauge (e.g. replicas=3)": [3.0] * N,
+    "integer counter, +0..9 per step": counter,
+    "slowly varying gauge (cpu 0.xx)": cpu,
+    "noisy float (full precision)": noisy,
 }
-print(f&quot;timestamps, perfectly regular 10 s: {timestamp_bits(regular)/N:5.2f} bits/point&quot;)
-print(f&quot;timestamps, small jitter:           {timestamp_bits(jitter)/N:5.2f} bits/point&quot;)
+
+# ── 4. Report bits per point ──────────────────────────────────────────
+print(f"timestamps, perfectly regular 10 s: "
+      f"{timestamp_bits(regular) / N:5.2f} bits/point")
+print(f"timestamps, small jitter:           "
+      f"{timestamp_bits(jitter) / N:5.2f} bits/point")
+
 for name, vals in series.items():
-    vb = value_bits(vals); tb = timestamp_bits(regular)
-    print(f&quot;{name:&lt;36} values {vb/N:5.1f} bits  total {(vb+tb)/N/8:5.2f} bytes/point  (raw 16 B -&gt; {16/((vb+tb)/N/8):4.1f}x)&quot;)</code></pre>
+    value_total = value_bits(vals)
+    ts_total = timestamp_bits(regular)
+    bytes_per_point = (value_total + ts_total) / N / 8
+    print(f"{name:&lt;36} values {value_total / N:5.1f} bits  "
+          f"total {bytes_per_point:5.2f} bytes/point")
+    print(f"{'':&lt;36} (raw 16 B -&gt; {16 / bytes_per_point:4.1f}x)")</code></pre>
 <pre class="terminal" data-title="output"><code>timestamps, perfectly regular 10 s:  1.02 bits/point
 timestamps, small jitter:            7.46 bits/point
-constant gauge (e.g. replicas=3)     values   1.0 bits  total  0.25 bytes/point  (raw 16 B -&gt; 62.8x)
-integer counter, +0..9 per step      values  14.3 bits  total  1.91 bytes/point  (raw 16 B -&gt;  8.4x)
-slowly varying gauge (cpu 0.xx)      values  48.8 bits  total  6.22 bytes/point  (raw 16 B -&gt;  2.6x)
-noisy float (full precision)         values  58.0 bits  total  7.38 bytes/point  (raw 16 B -&gt;  2.2x)</code></pre>
+constant gauge (e.g. replicas=3)     values   1.0 bits  total  0.25 bytes/point
+                                     (raw 16 B -&gt; 62.8x)
+integer counter, +0..9 per step      values  14.3 bits  total  1.91 bytes/point
+                                     (raw 16 B -&gt;  8.4x)
+slowly varying gauge (cpu 0.xx)      values  48.8 bits  total  6.22 bytes/point
+                                     (raw 16 B -&gt;  2.6x)
+noisy float (full precision)         values  58.0 bits  total  7.38 bytes/point
+                                     (raw 16 B -&gt;  2.2x)</code></pre>
 <p>The lessons are in the numbers. A constant gauge costs about a quarter of a byte per point; an integer counter about two bytes. A gauge that merely <em>looks</em> regular to a human (a CPU value rounded to three decimals) still costs about six bytes, because decimal rounding is not binary rounding and the low mantissa bits churn. A full-precision noisy value is barely compressible (2.2 times here). So the single "bytes per point" figure in the estimate is a mix, not a constant: a platform whose series are mostly counters and flat gauges will land near the low end, and one full of noisy floats will not. Measure your own corpus before promising a number, and consider reducing precision at the source for values nobody needs to 15 digits.</p>
 <h3>Rollups and retention tiers</h3>
 <p>Nobody needs 10-second resolution from last year, and a year-long chart has maybe 1,000 pixels of width. The compactor therefore writes <strong>rollup tiers</strong>: every raw series is also summarised per minute and per hour. What you keep per bucket decides what questions you can still answer.</p>
@@ -315,44 +463,92 @@ noisy float (full precision)         values  58.0 bits  total  7.38 bytes/point 
     <tr><td>A percentile (p99)</td><td>Nothing correct when combined with others</td><td>Almost everything: percentiles do not aggregate</td></tr>
   </tbody>
 </table>
-<pre class="terminal" data-title="rollup19.py"><code>&quot;&quot;&quot;Downsampling: what survives a rollup. Averages and sums can be re-aggregated; percentiles of percentiles cannot.&quot;&quot;&quot;
-import random, statistics
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>10 minutes of latency samples; minute 4 is a 10x burst with a fat tail</li>
+  <li>true p99 ← quantile(all samples);  compare mean and max of per-minute p99s</li>
+  <li>histogram per minute, fixed buckets;  merge ← add counts;  read p99</li>
+  <li>mean ← Σ sums ÷ Σ counts;  compare with mean of per-minute means</li>
+</ol></div>
+<pre class="terminal" data-title="rollup19.py"><code>"""Downsampling: what survives a rollup. Averages and sums can be
+re-aggregated; percentiles of percentiles cannot."""
+import random
+import statistics
+
+# ── 1. Ten minutes of latency samples ─────────────────────────────────
 rng = random.Random(11)
-# 60 one-second latency samples per minute, 10 minutes; a busy minute has a slow tail.
+BURST_MINUTE = 4                 # 10x the traffic and a fatter slow tail
+
 minutes = []
 for m in range(10):
-    n = 600 if m == 4 else 60                     # minute 4 is a burst: 10x the traffic
-    slow = 0.2 if m == 4 else 0.01
-    minutes.append([rng.expovariate(1/20) + (400 if rng.random() &lt; slow else 0) for _ in range(n)])
-allv = [x for m in minutes for x in m]
-q = lambda xs, p: sorted(xs)[int(p * (len(xs) - 1))]
+    n = 600 if m == BURST_MINUTE else 60
+    slow_share = 0.2 if m == BURST_MINUTE else 0.01
+    samples = []
+    for _ in range(n):
+        latency = rng.expovariate(1 / 20)
+        if rng.random() &lt; slow_share:
+            latency += 400           # a slow dependency
+        samples.append(latency)
+    minutes.append(samples)
 
-print(f&quot;true p99 over 10 min:                       {q(allv, .99):7.1f} ms&quot;)
-print(f&quot;mean of per-minute p99s (a bad rollup):     {statistics.mean(q(m, .99) for m in minutes):7.1f} ms&quot;)
-print(f&quot;max of per-minute p99s:                     {max(q(m, .99) for m in minutes):7.1f} ms&quot;)
-# Keep a histogram per minute instead (fixed bucket boundaries), and merge them by adding counts.
-bounds = [5, 10, 20, 40, 80, 160, 320, 640, 1280, float(&quot;inf&quot;)]
-def hist(xs):
-    h = [0] * len(bounds)
+all_samples = [x for m in minutes for x in m]
+
+def quantile(xs, p):
+    return sorted(xs)[int(p * (len(xs) - 1))]
+
+# ── 2. Percentiles of percentiles: wrong ──────────────────────────────
+# Each minute's p99 forgets how many samples stood behind it.
+true_p99 = quantile(all_samples, .99)
+minute_p99s = [quantile(m, .99) for m in minutes]
+
+print(f"true p99 over 10 min:                       {true_p99:7.1f} ms")
+print(f"mean of per-minute p99s (a bad rollup):     "
+      f"{statistics.mean(minute_p99s):7.1f} ms")
+print(f"max of per-minute p99s:                     "
+      f"{max(minute_p99s):7.1f} ms")
+
+# ── 3. Histograms: mergeable ──────────────────────────────────────────
+# Fixed bucket boundaries mean two histograms merge by adding counts.
+BOUNDS = [5, 10, 20, 40, 80, 160, 320, 640, 1280, float("inf")]
+
+def histogram(xs):
+    counts = [0] * len(BOUNDS)
     for x in xs:
-        for i, b in enumerate(bounds):
-            if x &lt;= b: h[i] += 1; break
-    return h
-merged = [sum(col) for col in zip(*[hist(m) for m in minutes])]
-def hq(h, p):
-    target, acc = p * sum(h), 0
-    for b, c in zip(bounds, h):
-        acc += c
-        if acc &gt;= target: return b
-est = hq(merged, .99)
-print(f&quot;p99 from merged histograms (bucket bound):  {est:7} ms   &lt;- right order of magnitude, bounded error&quot;)
-sums = [sum(m) for m in minutes]; counts = [len(m) for m in minutes]
-print(f&quot;mean from rolled-up sum/count:              {sum(sums)/sum(counts):7.1f} ms   (true mean {statistics.mean(allv):.1f})&quot;)
-print(f&quot;mean of per-minute means:                   {statistics.mean(statistics.mean(m) for m in minutes):7.1f} ms   (wrong when traffic varies)&quot;)</code></pre>
+        for i, bound in enumerate(BOUNDS):
+            if x &lt;= bound:
+                counts[i] += 1
+                break
+    return counts
+
+def histogram_quantile(counts, p):
+    target = p * sum(counts)
+    seen = 0
+    for bound, count in zip(BOUNDS, counts):
+        seen += count
+        if seen &gt;= target:
+            return bound
+
+merged = [sum(col) for col in zip(*[histogram(m) for m in minutes])]
+est = histogram_quantile(merged, .99)
+print(f"p99 from merged histograms (bucket bound):  {est:7} ms")
+print(f"{'':43}&lt;- right order of magnitude, bounded error")
+
+# ── 4. Sums and counts: exact ─────────────────────────────────────────
+# A mean must be sum / count over ALL samples, not a mean of means.
+sums = [sum(m) for m in minutes]
+counts = [len(m) for m in minutes]
+rolled_mean = sum(sums) / sum(counts)
+mean_of_means = statistics.mean(statistics.mean(m) for m in minutes)
+
+print(f"mean from rolled-up sum/count:              {rolled_mean:7.1f} ms   "
+      f"(true mean {statistics.mean(all_samples):.1f})")
+print(f"mean of per-minute means:                   {mean_of_means:7.1f} ms   "
+      f"(wrong when traffic varies)")</code></pre>
 <pre class="terminal" data-title="output"><code>true p99 over 10 min:                         460.5 ms
 mean of per-minute p99s (a bad rollup):       117.4 ms
 max of per-minute p99s:                       478.3 ms
-p99 from merged histograms (bucket bound):      640 ms   &lt;- right order of magnitude, bounded error
+p99 from merged histograms (bucket bound):      640 ms
+                                           &lt;- right order of magnitude, bounded error
 mean from rolled-up sum/count:                 60.3 ms   (true mean 60.3)
 mean of per-minute means:                      28.7 ms   (wrong when traffic varies)</code></pre>
 <p>The last two rows of the table are the trap, shown by the run. The "mean of per-minute p99s" is 117 ms while the true p99 over the ten minutes is 460 ms: averaging percentiles hides the busy minute that carried most of the traffic and the slow tail. Taking the max of the per-minute p99s is closer here but is not the right quantity in general. Merging fixed-boundary histograms (add the counts) gives a bounded-error answer (a bucket bound of 640 ms here, the right order of magnitude), and storing sum and count rolls up the mean exactly, whereas the "mean of means" is wrong when traffic varies (28.7 against the true 60.3). The design consequence: <strong>emit histograms, not pre-computed percentiles</strong>, so the platform can aggregate them across hosts and across time (<a href="../../reliability/chapters/04-metrics.html">metrics</a>), and store sum and count in every rollup bucket.</p>
@@ -361,40 +557,82 @@ mean of per-minute means:                      28.7 ms   (wrong when traffic var
 <h2>Deep dive 3: cardinality and multi-tenancy</h2>
 <p>The number of series is the product of the distinct values of each label. Memory, index size, ingestion cost and query cost all scale with it, which is why it is the central limit of a metrics platform (<a href="../../reliability/chapters/04-metrics.html">metrics and cardinality</a>). Use the explorer below: a metric with five bounded labels is a number you can budget; add one unbounded label and it is set by traffic.</p>
 <div class="widget" id="tsdb-cardinality"></div>
-<pre class="terminal" data-title="card19.py"><code>&quot;&quot;&quot;Cardinality: series = product of distinct label values; a per-tenant limit stops one bad label from eating the head.&quot;&quot;&quot;
-from itertools import product
-labels_ok = {&quot;service&quot;: 50, &quot;endpoint&quot;: 40, &quot;method&quot;: 4, &quot;status&quot;: 6, &quot;region&quot;: 5}
-n = 1
-for k, v in labels_ok.items(): n *= v
-print(f&quot;http_requests_total with labels {list(labels_ok)}: up to {n:,} series per metric&quot;)
-bad = dict(labels_ok, user_id=1_000_000)
-nb = 1
-for v in bad.values(): nb *= v
-print(f&quot;add a user_id label (1M values): up to {nb:,} series  ({nb//n:,}x more) -- in practice bounded by combinations seen&quot;)
-MEM = 4_000   # assumed bytes per active series in memory
-print(f&quot;memory at {MEM} B/series: {n*MEM/1e6:,.0f} MB  vs  {min(nb, 5_000_000_000)*MEM/1e12:,.0f} TB (if only 5B combos ever appear)&quot;)
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>series ← product of distinct values per label</li>
+  <li>add user_id (1M values);  series ×1,000,000;  memory ← series × 4 KB</li>
+  <li>Tenant.write: known series → accept;  new series at limit → reject</li>
+  <li>50,000 user_id series vs 1,000 instance series, limit 10,000 each</li>
+</ol></div>
+<pre class="terminal" data-title="card19.py"><code>"""Cardinality: series = product of distinct label values; a per-tenant
+limit stops one bad label from eating the head."""
+from math import prod
 
+# ── 1. Series count is a product ──────────────────────────────────────
+LABELS_OK = {"service": 50, "endpoint": 40, "method": 4,
+             "status": 6, "region": 5}
+series_ok = prod(LABELS_OK.values())
+
+print(f"http_requests_total labels {list(LABELS_OK)}:")
+print(f"  up to {series_ok:,} series per metric")
+
+# ── 2. One unbounded label ────────────────────────────────────────────
+labels_bad = dict(LABELS_OK, user_id=1_000_000)
+series_bad = prod(labels_bad.values())
+
+print(f"add a user_id label (1M values): up to {series_bad:,} series  "
+      f"({series_bad // series_ok:,}x more)")
+print(f"  -- in practice bounded by combinations seen")
+
+BYTES_PER_SERIES = 4_000       # assumed memory per active series
+SEEN_COMBOS      = 5_000_000_000
+mem_ok_mb  = series_ok * BYTES_PER_SERIES / 1e6
+mem_bad_tb = min(series_bad, SEEN_COMBOS) * BYTES_PER_SERIES / 1e12
+
+print(f"memory at {BYTES_PER_SERIES} B/series: {mem_ok_mb:,.0f} MB  vs  "
+      f"{mem_bad_tb:,.0f} TB (if only 5B combos ever appear)")
+
+# ── 3. A per-tenant series limit ──────────────────────────────────────
 class Tenant:
-    def __init__(self, limit): self.limit, self.series, self.rejected = limit, set(), 0
+    def __init__(self, limit):
+        self.limit = limit
+        self.series = set()
+        self.rejected = 0
+
     def write(self, name, labels):
         key = (name, tuple(sorted(labels.items())))
-        if key in self.series: return True               # existing series: always accepted
-        if len(self.series) &gt;= self.limit: self.rejected += 1; return False   # new series over the limit: rejected
-        self.series.add(key); return True
+        if key in self.series:
+            return True               # existing series: always accepted
+        if len(self.series) &gt;= self.limit:
+            self.rejected += 1        # new series over the limit
+            return False
+        self.series.add(key)
+        return True
 
-t = Tenant(limit=10_000)
-ok = 0
-for i in range(50_000):                                 # a deploy starts emitting user_id as a label
-    ok += t.write(&quot;http_requests_total&quot;, {&quot;service&quot;: &quot;api&quot;, &quot;endpoint&quot;: &quot;/x&quot;, &quot;user_id&quot;: str(i)})
-t2 = Tenant(limit=10_000)
-for i in range(1000): t2.write(&quot;up&quot;, {&quot;instance&quot;: f&quot;i{i}&quot;})
-print(f&quot;\nover-limit tenant: accepted {ok:,} new series, rejected {t.rejected:,} writes (existing series still accepted)&quot;)
-print(f&quot;well-behaved tenant series: {len(t2.series):,} of {t2.limit:,}&quot;)</code></pre>
-<pre class="terminal" data-title="output"><code>http_requests_total with labels [&#x27;service&#x27;, &#x27;endpoint&#x27;, &#x27;method&#x27;, &#x27;status&#x27;, &#x27;region&#x27;]: up to 240,000 series per metric
-add a user_id label (1M values): up to 240,000,000,000 series  (1,000,000x more) -- in practice bounded by combinations seen
+# ── 4. A bad deploy vs a well-behaved tenant ──────────────────────────
+bad_tenant = Tenant(limit=10_000)
+accepted = 0
+for i in range(50_000):               # a deploy starts emitting user_id
+    labels = {"service": "api", "endpoint": "/x", "user_id": str(i)}
+    accepted += bad_tenant.write("http_requests_total", labels)
+
+good_tenant = Tenant(limit=10_000)
+for i in range(1000):
+    good_tenant.write("up", {"instance": f"i{i}"})
+
+print(f"\nover-limit tenant: accepted {accepted:,} new series, "
+      f"rejected {bad_tenant.rejected:,} writes")
+print(f"  (existing series still accepted)")
+print(f"well-behaved tenant series: {len(good_tenant.series):,} "
+      f"of {good_tenant.limit:,}")</code></pre>
+<pre class="terminal" data-title="output"><code>http_requests_total labels [&#x27;service&#x27;, &#x27;endpoint&#x27;, &#x27;method&#x27;, &#x27;status&#x27;, &#x27;region&#x27;]:
+  up to 240,000 series per metric
+add a user_id label (1M values): up to 240,000,000,000 series  (1,000,000x more)
+  -- in practice bounded by combinations seen
 memory at 4000 B/series: 960 MB  vs  20 TB (if only 5B combos ever appear)
 
-over-limit tenant: accepted 10,000 new series, rejected 40,000 writes (existing series still accepted)
+over-limit tenant: accepted 10,000 new series, rejected 40,000 writes
+  (existing series still accepted)
 well-behaved tenant series: 1,000 of 10,000</code></pre>
 <p>The run shows both halves of the lesson. A metric with five bounded labels is at most 240,000 series. Adding a <code>user_id</code> label with a million values multiplies that by a million: a theoretical upper bound of 240 billion, of which only the combinations that actually occur are created, but "only those that occur" is no comfort if traffic is large. The tenant limit then does what it must: it accepted the first 10,000 new series and rejected 40,000 further writes, while a well-behaved tenant carried on unaffected, and existing series stayed writable, so dashboards for the broken tenant keep working for everything that predates the bad deploy.</p>
 <h3>Quotas and isolation</h3>
@@ -435,43 +673,89 @@ well-behaved tenant series: 1,000 of 10,000</code></pre>
     <tr><td>Fits when</td><td>Free-form search over modest volume, analytics on content</td><td>Huge volume, queries that start from known labels (the incident case)</td></tr>
   </tbody>
 </table>
-<pre class="terminal" data-title="logidx19.py"><code>&quot;&quot;&quot;Log indexing: full-text inverted index vs a label-only index with chunk scanning (the idea behind Loki-style stores).&quot;&quot;&quot;
-import random, collections
-rng = random.Random(9)
-services = [f&quot;svc{i}&quot; for i in range(20)]
-words = [f&quot;w{i}&quot; for i in range(3000)] + [&quot;error&quot;, &quot;timeout&quot;, &quot;retry&quot;] * 40     # make the interesting words common enough to see
-lines = []                                                                     # (service, hour, text)
-for i in range(60_000):
-    lines.append((rng.choice(services), i // 2500, &quot; &quot;.join(rng.choice(words) for _ in range(12))))   # 24 &#x27;hours&#x27;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>60,000 lines over 20 services and 24 hours;  12 random words per line</li>
+  <li>full-text: word → set of line ids;  label-only: (service, hour) → line ids</li>
+  <li>full-text: filter postings of "timeout";  label-only: scan chosen chunks</li>
+  <li>compare matches and lines read;  no useful labels would scan all lines</li>
+</ol></div>
+<pre class="terminal" data-title="logidx19.py"><code>"""Log indexing: full-text inverted index vs a label-only index with
+chunk scanning (the idea behind Loki-style stores)."""
+import collections
+import random
 
-# 1) full-text: token -&gt; set of line ids
+# ── 1. Synthetic logs ─────────────────────────────────────────────────
+N_LINES    = 60_000
+N_SERVICES = 20
+LINES_PER_HOUR = 2_500            # so 60,000 lines span 24 "hours"
+
+rng = random.Random(9)
+services = [f"svc{i}" for i in range(N_SERVICES)]
+# Repeat the interesting words so they are common enough to see.
+words = [f"w{i}" for i in range(3000)] + ["error", "timeout", "retry"] * 40
+
+lines = []                        # (service, hour, text)
+for i in range(N_LINES):
+    service = rng.choice(services)
+    text = " ".join(rng.choice(words) for _ in range(12))
+    lines.append((service, i // LINES_PER_HOUR, text))
+
+# ── 2. Two indexes ────────────────────────────────────────────────────
+# Full-text: token -&gt; set of line ids. Grows with every distinct word.
 full = collections.defaultdict(set)
 for i, (_, _, text) in enumerate(lines):
-    for w in set(text.split()): full[w].add(i)
-postings = sum(len(v) for v in full.values())
+    for word in set(text.split()):
+        full[word].add(i)
+postings = sum(len(ids) for ids in full.values())
 
-# 2) label-only: the index maps (service, hour) -&gt; chunk of lines; the text is just compressed chunks, scanned at query time
+# Label-only: (service, hour) -&gt; line ids. The text itself is just
+# compressed chunks, scanned at query time.
 chunks = collections.defaultdict(list)
-for i, (s, h, t) in enumerate(lines): chunks[(s, h)].append(i)
-print(f&quot;60,000 lines, {sum(len(t) for _, _, t in lines)/1e6:.1f} MB raw text, 20 services x 24 hours&quot;)
-print(f&quot;full-text index:  {postings:,} postings (~{postings*4/1e6:.1f} MB at 4 B each); grows with every line and distinct word&quot;)
-print(f&quot;label-only index: {len(chunks):,} entries; grows with series x time, not with words&quot;)
+for i, (service, hour, _) in enumerate(lines):
+    chunks[(service, hour)].append(i)
 
-want, hours = &quot;svc3&quot;, range(20, 24)                                              # last 4 hours of one service
-full_hits = [i for i in full[&quot;timeout&quot;] if lines[i][0] == want and lines[i][1] in hours]
+raw_mb = sum(len(text) for _, _, text in lines) / 1e6
+print(f"{N_LINES:,} lines, {raw_mb:.1f} MB raw text, "
+      f"{N_SERVICES} services x 24 hours")
+print(f"full-text index:  {postings:,} postings "
+      f"(~{postings * 4 / 1e6:.1f} MB at 4 B each);")
+print(f"  grows with every line and distinct word")
+print(f"label-only index: {len(chunks):,} entries; "
+      f"grows with series x time, not with words")
+
+# ── 3. The same query, two ways ───────────────────────────────────────
+want = "svc3"
+hours = range(20, 24)             # the last 4 hours of one service
+
+# Full-text: filter the postings list of "timeout".
+full_hits = [i for i in full["timeout"]
+             if lines[i][0] == want and lines[i][1] in hours]
+
+# Label-only: labels and time pick chunks; scan just those lines.
 scan = [i for h in hours for i in chunks[(want, h)]]
-scan_hits = [i for i in scan if &quot;timeout&quot; in lines[i][2].split()]
-print(f&quot;\nquery: service=svc3, last 4 hours, line contains &#x27;timeout&#x27;&quot;)
-print(f&quot;  full-text: {len(full_hits)} matches; read a postings list of {len(full[&#x27;timeout&#x27;]):,} line ids and filtered it&quot;)
-print(f&quot;  label-only: {len(scan_hits)} matches; scanned {len(scan):,} lines ({len(scan)/len(lines):.1%} of the data) selected by labels and time&quot;)
-print(f&quot;  a query with no useful labels (just &#x27;timeout&#x27;) would scan all {len(lines):,} lines&quot;)</code></pre>
+scan_hits = [i for i in scan if "timeout" in lines[i][2].split()]
+
+# ── 4. Compare the work done ──────────────────────────────────────────
+print(f"\nquery: service=svc3, last 4 hours, line contains 'timeout'")
+print(f"  full-text: {len(full_hits)} matches; read a postings list of "
+      f"{len(full['timeout']):,} line ids")
+print(f"    and filtered it")
+print(f"  label-only: {len(scan_hits)} matches; scanned {len(scan):,} lines "
+      f"({len(scan) / len(lines):.1%} of the data)")
+print(f"    selected by labels and time")
+print(f"  a query with no useful labels (just 'timeout') would scan all "
+      f"{len(lines):,} lines")</code></pre>
 <pre class="terminal" data-title="output"><code>60,000 lines, 4.0 MB raw text, 20 services x 24 hours
-full-text index:  716,865 postings (~2.9 MB at 4 B each); grows with every line and distinct word
+full-text index:  716,865 postings (~2.9 MB at 4 B each);
+  grows with every line and distinct word
 label-only index: 480 entries; grows with series x time, not with words
 
 query: service=svc3, last 4 hours, line contains &#x27;timeout&#x27;
-  full-text: 73 matches; read a postings list of 8,663 line ids and filtered it
-  label-only: 73 matches; scanned 483 lines (0.8% of the data) selected by labels and time
+  full-text: 73 matches; read a postings list of 8,663 line ids
+    and filtered it
+  label-only: 73 matches; scanned 483 lines (0.8% of the data)
+    selected by labels and time
   a query with no useful labels (just &#x27;timeout&#x27;) would scan all 60,000 lines</code></pre>
 <p>The run makes the cost difference concrete on a toy corpus: the full-text index holds about 717,000 postings for 60,000 lines (and grows with every distinct word), while the label index has 480 entries because it indexes only (service, hour). For a query that names a service and a recent time window, the label-only approach reads under 1% of the data; a query with no useful labels would read all of it. That is the honest trade: <strong>you pay at query time what you saved at ingest time</strong>, and it works because incident queries nearly always start from labels (which service, which environment, which hour).</p>
 <p>Operationally, keep label sets small and bounded for the same reason metrics do (a label with unbounded values creates a stream per value, each with tiny chunks), parse structured fields at <em>query</em> time rather than promoting them to labels, and extract what you will alert on into real metrics (a counter of error lines) so alerting never depends on scanning text. For compliance sources that must be searchable for years, send a copy to cheap object storage with a coarse index and accept slow queries. Retention, deletion on request and redaction of secrets in log lines belong in the pipeline, not in the query layer (<a href="../../reliability/chapters/05-logs-events.html">logs and events</a>).</p>

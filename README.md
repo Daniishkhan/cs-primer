@@ -63,7 +63,16 @@ xdg-open index.html      # Linux
 start index.html         # Windows
 ```
 
-The only network requests go to Google Fonts. If you're offline, the pages fall back to system fonts.
+Reading needs no network beyond Google Fonts. If you're offline, the pages fall back to system fonts.
+
+### Running the examples in the page
+
+Every chapter script is a code cell with **Copy**, **✎ Edit** and **▶ Run**. Run executes it in the browser with [Pyodide](https://pyodide.org) (CPython compiled to WebAssembly), and the output appears under the printed output, with a note on whether the two match. Edit opens the script in an editor (the vendored [CodeMirror 5](https://codemirror.net/5/)), so you can change an assumption and run it again; ⌘/Ctrl + Enter runs, Esc closes, and **↺ Reset** restores the original.
+
+- Nothing is downloaded until you press Run. The first run fetches Python from jsDelivr (about 10 MB, then cached by the browser), so it needs a connection.
+- Python runs in a Web Worker, so the page stays responsive and **■ Stop** ends a long or endless script. Browser Python is two to three times slower than native, so the heaviest simulations take tens of seconds.
+- Scripts that need a real operating system (processes, threads, sockets, `fsync`, `mmap`) are marked **run locally**: copy them and run them with `python3`. That is most of How Programs Run, by design. The labs always run locally.
+
 
 Diagrams are drawn in a hand-drawn (Excalidraw/tldraw-like) style by default, using the vendored [Rough.js](https://github.com/rough-stuff/rough) and the Shantell Sans font. The **✎ Hand-drawn / ▭ Clean** button switches to crisp diagrams, and printing always uses the clean style.
 
@@ -71,7 +80,8 @@ Your browser's localStorage keeps:
 
 - progress per course;
 - design-studio notes and rubric ticks;
-- the theme choice: Tokyo Night, Catppuccin Mocha or high-contrast Gruvbox Dark.
+- the theme choice: Tokyo Night, Catppuccin Mocha or high-contrast Gruvbox Dark;
+- your edits to code cells (until you press Reset).
 
 ## Labs
 
@@ -108,8 +118,9 @@ assets/js/quiz.js           declarative quizzes
 assets/js/stepper.js        generic step-through diagrams
 assets/js/studio.js         design studios: autosaved notes, rubric
 assets/js/sketch.js         hand-drawn rendering of diagrams (Rough.js)
+assets/js/runner.js         code cells: copy, edit (CodeMirror), run (Pyodide in a worker)
 assets/js/widgets/          one script per interactive widget
-assets/vendor/              Rough.js (MIT)
+assets/vendor/              Rough.js (MIT), CodeMirror 5.65.18 (MIT)
 lab-support/llm.py          scripted stand-in models + optional real-model adapter, copied into AI-path labs
 <course>/chapters/code/     small helper modules some AI-path chapters import
 glossary-src/               per-chapter glossary terms for the AI path (JSON), merged by authoring/build_glossary.py

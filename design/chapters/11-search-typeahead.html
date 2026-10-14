@@ -50,74 +50,122 @@
 
 <h2>Estimate</h2>
 <p>The numbers separate the two problems: typeahead is a high-QPS, small-memory problem; search is a modest-QPS, huge-memory problem. Method as in <a href="02-estimation.html">chapter 2</a>.</p>
-<pre class="terminal" data-title="napkin.py"><code>&quot;&quot;&quot;Napkin maths for typeahead and search: keystroke load, trie size, index size, shard fan-out.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>search/s ← DAU × 5 ÷ 86,400;  typeahead/s ← search/s × 4 keystrokes</li>
+  <li>trie ← 2Q × (40 + 4k) + Q × avg_len;  replicas ← peak ÷ 50k</li>
+  <li>prefixes of length ≤ 3 over 27 symbols ← sum of 27^i for i in 1..3</li>
+  <li>index ← docs × 300 terms × 2 B;  shards ← index ÷ 50 GB</li>
+  <li>P(query slow) ← 1 − (1 − p)^shards, for p in (0.001, 0.01)</li>
+</ol></div>
+<pre class="terminal" data-title="napkin.py"><code>"""Napkin maths for typeahead and search: keystroke load, trie size,
+index size, and shard fan-out."""
+
 SECONDS = 86_400
-dau = 100_000_000                # assumption: 100M daily active users
-searches_per_user = 5            # assumption: searches per DAU per day
-keystrokes = 4                   # assumption: suggestion requests per search after debouncing and caching
+
+# ── 1. Request rate ───────────────────────────────────────────────────
+dau               = 100_000_000   # daily active users
+searches_per_user = 5             # searches per DAU per day
+keystrokes        = 4             # suggest calls per search, after
+                                  # debouncing and caching
+peak              = 3             # busiest second vs the daily average
+
 search_qps = dau * searches_per_user / SECONDS
-type_qps = search_qps * keystrokes
-print(f&quot;searches: {search_qps:,.0f}/s avg, {search_qps*3:,.0f}/s peak&quot;)
-print(f&quot;typeahead requests: {type_qps:,.0f}/s avg, {type_qps*3:,.0f}/s peak (~{keystrokes}x searches)&quot;)
+type_qps   = search_qps * keystrokes
 
-queries = 50_000_000             # assumption: distinct queries kept after dropping the long tail
-avg_len = 25                     # bytes per query string
-k = 10                           # suggestions per prefix
-node_overhead = 40               # assumed bytes per trie node (edge label, child map, pointers)
-# a compressed (radix) trie has roughly 2 nodes per stored query; each node keeps k pointers to query ids (4 B)
-nodes = 2 * queries
-trie = nodes * (node_overhead + k * 4) + queries * avg_len
-print(f&quot;\ntrie: ~{nodes/1e6:.0f}M nodes x ({node_overhead} + {k}x4 B) + strings = {trie/1e9:.1f} GB&quot;)
-print(f&quot;  fits in RAM on one box; replicate it {int(type_qps*3/50_000)+1}+ times at 50k lookups/s per replica for peak load&quot;)
-print(f&quot;  rebuilt every 15 minutes from a day of logs -&gt; build must finish well inside that&quot;)
+print(f"searches: {search_qps:,.0f}/s avg, "
+      f"{search_qps * peak:,.0f}/s peak")
+print(f"typeahead requests: {type_qps:,.0f}/s avg, "
+      f"{type_qps * peak:,.0f}/s peak (~{keystrokes}x searches)")
 
-# Short prefixes are the hot ones: how many distinct prefixes up to length 3?
-alpha = 27
-print(f&quot;\ndistinct prefixes of length &lt;=3 over a-z+space: {sum(alpha**i for i in range(1,4)):,}; precomputing every one is trivial&quot;)
+# ── 2. Trie size ──────────────────────────────────────────────────────
+queries       = 50_000_000    # distinct queries kept (long tail dropped)
+avg_len       = 25            # bytes per query string
+k             = 10            # suggestions per prefix
+node_overhead = 40            # bytes per node (edge label, children)
+replica_qps   = 50_000        # lookups/s one replica can serve
 
-# Search side.
-docs = 10_000_000_000            # assumption: 10B documents
-terms_per_doc = 300              # distinct indexed terms per doc, roughly
-posting_bytes = 2                # assumption: ~2 B per posting after compression
-index = docs * terms_per_doc * posting_bytes
-print(f&quot;\nindex: {docs:,} docs x {terms_per_doc} postings x {posting_bytes} B = {index/1e12:.0f} TB&quot;)
-shard_gb = 50
+# A compressed (radix) trie has roughly 2 nodes per stored query.
+# Each node keeps k pointers to query ids (4 B each).
+nodes    = 2 * queries
+trie     = nodes * (node_overhead + k * 4) + queries * avg_len
+replicas = int(type_qps * peak / replica_qps) + 1
+
+print(f"\ntrie: ~{nodes / 1e6:.0f}M nodes x ({node_overhead} + {k}x4 B)"
+      f" + strings = {trie / 1e9:.1f} GB")
+print(f"  fits in RAM on one box; replicate it {replicas}+ times at")
+print("  50k lookups/s per replica for peak load")
+print("  rebuilt every 15 minutes from a day of logs -&gt;")
+print("  build must finish well inside that")
+
+# ── 3. Short prefixes are the hot ones ────────────────────────────────
+alpha = 27                      # a-z plus space
+short = sum(alpha ** i for i in range(1, 4))
+
+print(f"\ndistinct prefixes of length &lt;=3 over a-z+space: {short:,};")
+print("  precomputing every one is trivial")
+
+# ── 4. Search side: index and shards ──────────────────────────────────
+docs          = 10_000_000_000  # documents
+terms_per_doc = 300             # distinct indexed terms per doc, roughly
+posting_bytes = 2               # per posting, after compression
+shard_gb      = 50              # size of one index shard
+
+index  = docs * terms_per_doc * posting_bytes
 shards = index / (shard_gb * 1e9)
-print(f&quot;shards of {shard_gb} GB: {shards:,.0f} (x2 replicas = {2*shards:,.0f} index servers)&quot;)
 
-# Scatter-gather tail: a query waits for the slowest of N shards.
-for p in (0.001, 0.01):          # chance one shard call is slow (hiccup)
-    print(f&quot;  doc-partitioned, hit all {int(shards)} shards, P(one shard slow)={p}: P(query slow) = {1-(1-p)**int(shards):.1%}&quot;)</code></pre>
+print(f"\nindex: {docs:,} docs x {terms_per_doc} postings x "
+      f"{posting_bytes} B = {index / 1e12:.0f} TB")
+print(f"shards of {shard_gb} GB: {shards:,.0f} "
+      f"(x2 replicas = {2 * shards:,.0f} index servers)")
+
+# ── 5. Scatter-gather tail: wait for the slowest of N shards ──────────
+n_shards = int(shards)
+for p in (0.001, 0.01):         # chance one shard call is slow
+    p_slow = 1 - (1 - p) ** n_shards
+    print(f"  doc-partitioned, hit all {n_shards} shards, "
+          f"P(one shard slow)={p}:")
+    print(f"    P(query slow) = {p_slow:.1%}")</code></pre>
 <pre class="terminal" data-title="output"><code>searches: 5,787/s avg, 17,361/s peak
 typeahead requests: 23,148/s avg, 69,444/s peak (~4x searches)
 
 trie: ~100M nodes x (40 + 10x4 B) + strings = 9.2 GB
-  fits in RAM on one box; replicate it 2+ times at 50k lookups/s per replica for peak load
-  rebuilt every 15 minutes from a day of logs -&gt; build must finish well inside that
+  fits in RAM on one box; replicate it 2+ times at
+  50k lookups/s per replica for peak load
+  rebuilt every 15 minutes from a day of logs -&gt;
+  build must finish well inside that
 
-distinct prefixes of length &lt;=3 over a-z+space: 20,439; precomputing every one is trivial
+distinct prefixes of length &lt;=3 over a-z+space: 20,439;
+  precomputing every one is trivial
 
 index: 10,000,000,000 docs x 300 postings x 2 B = 6 TB
 shards of 50 GB: 120 (x2 replicas = 240 index servers)
-  doc-partitioned, hit all 120 shards, P(one shard slow)=0.001: P(query slow) = 11.3%
-  doc-partitioned, hit all 120 shards, P(one shard slow)=0.01: P(query slow) = 70.1%</code></pre>
+  doc-partitioned, hit all 120 shards, P(one shard slow)=0.001:
+    P(query slow) = 11.3%
+  doc-partitioned, hit all 120 shards, P(one shard slow)=0.01:
+    P(query slow) = 70.1%</code></pre>
 <p>Reading the output. Typeahead is about four times the search rate (23,000 per second on average, about 70,000 at peak) but its data is small: a few billion bytes of trie fits in one machine's memory, so the design is "replicate the trie everywhere, shard only when you must", and a cache in front absorbs the short, hot prefixes. Search is the opposite: about 6 TB of index (an assumption built from the three inputs above, so treat it as an order of magnitude) needs on the order of a hundred shards. And the last two lines are the warning for Deep dive 3: if each query must touch all 120 shards, even a 1-in-1000 chance of a slow shard call makes more than one query in ten slow, and a 1-in-100 chance makes seven in ten slow.</p>
 
 <h2>API</h2>
-<pre class="terminal" data-title="surfaces"><code>GET /v1/suggest?q=wor&amp;limit=8&amp;lang=en
+<pre class="terminal" data-title="surfaces"><code># Typeahead: cacheable, called on (debounced) keystrokes
+GET /v1/suggest?q=wor&amp;limit=8&amp;lang=en
   -&gt; 200  Cache-Control: public, max-age=60
-     { "q": "wor", "suggestions": [ { "text": "wordle" }, { "text": "world cup" }, … ] }
+     { "q": "wor",
+       "suggestions": [ { "text": "wordle" }, { "text": "world cup" }, … ] }
 
+# Full search
 GET /v1/search?q=world+cup+schedule&amp;limit=10&amp;cursor=…
-  -&gt; 200 { "results": [ { "doc_id", "title", "snippet", "url" } ], "next_cursor": "opaque…",
-           "partial": false, "took_ms": 143 }
+  -&gt; 200 { "results": [ { "doc_id", "title", "snippet", "url" } ],
+           "next_cursor": "opaque…", "partial": false, "took_ms": 143 }
 
 -- Internal: indexing
-PUT    /internal/docs/{doc_id}    { fields… , "version": 17 }    -- idempotent upsert by version
+PUT    /internal/docs/{doc_id}    { fields… , "version": 17 }
+                                  -- idempotent upsert by version
 DELETE /internal/docs/{doc_id}
 
 -- Internal: operations
-PUT /internal/suggest/blocklist   { "phrase": "…", "match": "exact" | "contains" }</code></pre>
+PUT /internal/suggest/blocklist
+  { "phrase": "…", "match": "exact" | "contains" }</code></pre>
 <ul>
   <li><strong>Suggest is a cacheable GET.</strong> The same prefix gives the same answer for everyone (in the base design), so it can sit behind a CDN or edge cache with a short TTL. That one property removes most of the load.</li>
   <li><strong><code>partial</code> in search.</strong> If a shard misses the deadline, the aggregator returns what it has and says so, rather than failing the whole query (Deep dive 3).</li>
@@ -206,23 +254,41 @@ PUT /internal/suggest/blocklist   { "phrase": "…", "match": "exact" | "contain
 <h2>Deep dive 1: the typeahead data structure and where it lives</h2>
 <h3>Top-k stored at every node</h3>
 <p>A plain trie answers "which strings start with this prefix?" but then needs to visit the whole subtree to find the best ones, which for the prefix "a" is millions of nodes. The fix is to <strong>precompute the answer at every node</strong>: each node stores the top-k completions for its prefix, computed offline from the query counts. A lookup is then a walk of <em>L</em> steps (the prefix length) and a read of <em>k</em> items, independent of corpus size. The price is memory (k entries per node) and rebuild work, both easy to afford offline. This runs on real data below, checked against a brute-force scan.</p>
-<pre class="terminal" data-title="trie.py"><code>&quot;&quot;&quot;A trie where every node keeps its own top-k completions, built offline from query counts.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>build: for each query, offer (count, query) to every node on its path</li>
+  <li>suggest(prefix): walk down len(prefix) nodes;  return that node's top K</li>
+  <li>build the trie from 12 queries;  assert every prefix matches brute force</li>
+  <li>overlay: top K of (trie answers + fresh counts for matching queries)</li>
+</ol></div>
+<pre class="terminal" data-title="trie.py"><code>"""A trie where every node keeps its own top-k completions, built offline
+from query counts."""
 import heapq
 
+K = 3                           # completions kept per node
+
+
+def best_k(pairs):
+    """The K highest (count, query) pairs, best first."""
+    return heapq.nlargest(K, pairs, key=lambda t: (t[0], t[1]))
+
+
+# ── 1. Nodes and the trie ─────────────────────────────────────────────
 class Node:
-    __slots__ = (&quot;kids&quot;, &quot;top&quot;)
+    __slots__ = ("kids", "top")
+
     def __init__(self):
         self.kids = {}
-        self.top = []                  # up to K (count, query), best first
+        self.top = []           # up to K (count, query), best first
 
-K = 3
 
 class Trie:
     def __init__(self):
         self.root = Node()
 
     def build(self, counts):
-        &quot;&quot;&quot;Offline: insert each query, pushing it into the top-k list of every node on its path.&quot;&quot;&quot;
+        """Offline: insert each query, pushing it into the top-k list
+        of every node on its path."""
         for q, n in counts.items():
             node = self.root
             self._offer(node, n, q)
@@ -234,19 +300,32 @@ class Trie:
     @staticmethod
     def _offer(node, n, q):
         node.top.append((n, q))
-        if len(node.top) &gt; 2 * K:      # amortise: sort-and-trim occasionally, not on every insert
-            node.top = heapq.nlargest(K, node.top, key=lambda t: (t[0], t[1]))
+        # Amortise: sort-and-trim occasionally, not on every insert.
+        if len(node.top) &gt; 2 * K:
+            node.top = best_k(node.top)
 
     def finish(self):
+        """Final trim so every node holds exactly its best K."""
         stack = [self.root]
         while stack:
             node = stack.pop()
-            node.top = heapq.nlargest(K, node.top, key=lambda t: (t[0], t[1]))
+            node.top = best_k(node.top)
             stack.extend(node.kids.values())
         return self
 
+    def count_nodes(self):
+        total = 0
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            total += 1
+            stack.extend(node.kids.values())
+        return total
+
+    # ── 2. Query time ─────────────────────────────────────────────────
     def suggest(self, prefix):
-        &quot;&quot;&quot;O(len(prefix)) to walk down, then the answer is already stored: no subtree scan.&quot;&quot;&quot;
+        """O(len(prefix)) to walk down, then the answer is already
+        stored in the node: no subtree scan."""
         node = self.root
         for ch in prefix:
             node = node.kids.get(ch)
@@ -254,37 +333,46 @@ class Trie:
                 return []
         return [q for _, q in node.top]
 
-    def count_nodes(self):
-        total, stack = 0, [self.root]
-        while stack:
-            node = stack.pop(); total += 1; stack.extend(node.kids.values())
-        return total
 
 def brute_force(counts, prefix):
+    """Slow reference answer, used to check the trie."""
     hits = [(n, q) for q, n in counts.items() if q.startswith(prefix)]
-    return [q for _, q in heapq.nlargest(K, hits, key=lambda t: (t[0], t[1]))]
+    return [q for _, q in best_k(hits)]
 
-counts = {&quot;weather&quot;: 900, &quot;weather tomorrow&quot;: 400, &quot;web&quot;: 700, &quot;webcam&quot;: 120, &quot;wedding dress&quot;: 300,
-          &quot;wells fargo&quot;: 650, &quot;wellness&quot;: 90, &quot;world cup&quot;: 1500, &quot;world cup schedule&quot;: 800,
-          &quot;wordle&quot;: 2000, &quot;word&quot;: 60, &quot;wow&quot;: 45}
+
+# ── 3. Build and check against brute force ────────────────────────────
+counts = {
+    "weather": 900, "weather tomorrow": 400, "web": 700,
+    "webcam": 120, "wedding dress": 300, "wells fargo": 650,
+    "wellness": 90, "world cup": 1500, "world cup schedule": 800,
+    "wordle": 2000, "word": 60, "wow": 45,
+}
 trie = Trie().build(counts).finish()
-print(f&quot;{len(counts)} queries -&gt; {trie.count_nodes()} trie nodes, k={K}&quot;)
-for p in (&quot;w&quot;, &quot;we&quot;, &quot;wea&quot;, &quot;wor&quot;, &quot;world c&quot;, &quot;x&quot;):
+print(f"{len(counts)} queries -&gt; {trie.count_nodes()} trie nodes, k={K}")
+for p in ("w", "we", "wea", "wor", "world c", "x"):
     got = trie.suggest(p)
     assert got == brute_force(counts, p), p
-    print(f&quot;  {p!r:&lt;10} -&gt; {got}&quot;)
+    print(f"  {p!r:&lt;10} -&gt; {got}")
 
-# A trending overlay: a small separate map of fresh counts, merged at query time.
-fresh = {&quot;world cup final&quot;: 5000, &quot;wordle&quot;: 30}
+
+# ── 4. A trending overlay merged at query time ────────────────────────
+# A small separate map of fresh counts, so the big trie need not be
+# rebuilt to surface something that just started trending.
+fresh = {"world cup final": 5000, "wordle": 30}
+
+
 def suggest_with_overlay(prefix, base_counts, fresh_counts, weight=1.0):
-    seen = {q: n for q, n in ((q, base_counts.get(q, 0)) for q in trie.suggest(prefix))}
+    seen = {q: base_counts.get(q, 0) for q in trie.suggest(prefix)}
     for q, n in fresh_counts.items():
         if q.startswith(prefix):
             seen[q] = seen.get(q, 0) + weight * n
-    return [q for q, _ in sorted(seen.items(), key=lambda t: (-t[1], t[0]))[:K]]
-print(&quot;\nwith a trending overlay:&quot;)
-print(&quot;  &#x27;wor&#x27;      -&gt;&quot;, suggest_with_overlay(&quot;wor&quot;, counts, fresh))
-print(&quot;  &#x27;world c&#x27;  -&gt;&quot;, suggest_with_overlay(&quot;world c&quot;, counts, fresh))</code></pre>
+    ranked = sorted(seen.items(), key=lambda t: (-t[1], t[0]))
+    return [q for q, _ in ranked[:K]]
+
+
+print("\nwith a trending overlay:")
+print("  'wor'      -&gt;", suggest_with_overlay("wor", counts, fresh))
+print("  'world c'  -&gt;", suggest_with_overlay("world c", counts, fresh))</code></pre>
 <pre class="terminal" data-title="output"><code>12 queries -&gt; 66 trie nodes, k=3
   &#x27;w&#x27;        -&gt; [&#x27;wordle&#x27;, &#x27;world cup&#x27;, &#x27;weather&#x27;]
   &#x27;we&#x27;       -&gt; [&#x27;weather&#x27;, &#x27;web&#x27;, &#x27;wells fargo&#x27;]

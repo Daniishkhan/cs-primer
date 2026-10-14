@@ -51,46 +51,80 @@
 
 <h2>Estimate</h2>
 <p>The numbers decide three things: how many store shards, how much memory, and whether the algorithm's per-key state matters. All figures are assumptions in the script; change them and re-run. The method is the one from <a href="02-estimation.html">chapter 2</a>.</p>
-<pre class="terminal" data-title="napkin.py"><code>&quot;&quot;&quot;Napkin maths for the rate limiter: load, store capacity, memory per algorithm, sync error.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>avg ← requests/day ÷ 86,400;  peak ← avg × 3</li>
+  <li>shards ← ceil(peak ÷ (100k ops/s × 50%))</li>
+  <li>bytes/key ← state size + 48 B overhead;  GB ← keys × bytes/key</li>
+  <li>sync: extra ← min(offered × T, offered − limit)</li>
+  <li>static split: share ← limit ÷ gateways;  skewed key gets share ÷ limit</li>
+</ol></div>
+<pre class="terminal" data-title="napkin.py"><code>"""Napkin maths for the rate limiter: load, store capacity, memory per
+algorithm, and the error a periodic sync leaves behind."""
 import math
 
-SECONDS = 86_400
-req_per_day = 5_000_000_000          # assumption: 5 billion API requests/day through the gateway
-peak_factor = 3
-avg = req_per_day / SECONDS
+SECONDS_PER_DAY = 86_400
+
+# ── 1. Check rate ───────────────────────────────────────────────────
+req_per_day = 5_000_000_000   # assumption: API requests/day at the gateway
+peak_factor = 3               # busiest second vs the daily average
+
+avg  = req_per_day / SECONDS_PER_DAY
 peak = avg * peak_factor
-print(f&quot;avg {avg:,.0f} checks/s, peak {peak:,.0f} checks/s&quot;)
 
-redis_ops = 100_000                  # rough: simple ops/s on one in-memory node
-utilisation = 0.5
+print(f"avg {avg:,.0f} checks/s, peak {peak:,.0f} checks/s")
+
+# ── 2. Store shards ─────────────────────────────────────────────────
+redis_ops   = 100_000         # simple ops/s on one in-memory node
+utilisation = 0.5             # headroom for bursts and failover
+
 nodes = math.ceil(peak / (redis_ops * utilisation))
-print(f&quot;one script call per check -&gt; {nodes} store shards at {utilisation:.0%} utilisation (plus replicas)&quot;)
 
-keys = 10_000_000                    # assumption: 10M distinct active keys (user x endpoint class)
-limit = 100                          # 100 requests/minute per key
+print(f"one script call per check -&gt; {nodes} store shards "
+      f"at {utilisation:.0%} utilisation (plus replicas)")
+
+# ── 3. Memory per algorithm ─────────────────────────────────────────
+keys     = 10_000_000         # distinct active keys (user x endpoint class)
+limit    = 100                # requests per minute per key
+OVERHEAD = 48                 # assumed key + entry overhead, bytes
+
 state = {
-    &quot;token bucket (tokens + ts)&quot;:       16 + 48,          # two numbers + key/entry overhead (assumed ~48 B)
-    &quot;fixed window (one counter)&quot;:       8 + 48,
-    &quot;sliding window counter (2 ctrs)&quot;:  16 + 48,
-    &quot;sliding log (100 timestamps)&quot;:     limit * 8 + 48,   # 8 B per timestamp, ignoring set overhead
+    "token bucket (tokens + ts)":      16 + OVERHEAD,  # two numbers
+    "fixed window (one counter)":       8 + OVERHEAD,
+    "sliding window counter (2 ctrs)": 16 + OVERHEAD,
+    # The log keeps one 8-byte timestamp per request: it grows with limit.
+    "sliding log (100 timestamps)":    limit * 8 + OVERHEAD,
 }
-print(f&quot;\nmemory for {keys:,} active keys, limit {limit}/min:&quot;)
-for name, b in state.items():
-    print(f&quot;  {name:&lt;34}{b:&gt;5} B/key  -&gt; {keys*b/1e9:6.2f} GB&quot;)
 
-print(&quot;\nlocal limiter + periodic sync (each gateway counts locally, exchanges counts every T):&quot;)
-limit_per_s = 1000                   # global limit for one key
-for offered in (1_500, 10_000):      # offered load for that key, requests/s
+print(f"\nmemory for {keys:,} active keys, limit {limit}/min:")
+for name, b in state.items():
+    print(f"  {name:&lt;34}{b:&gt;5} B/key  -&gt; {keys * b / 1e9:6.2f} GB")
+
+# ── 4. Error from a local limiter with periodic sync ────────────────
+# Each gateway counts locally and exchanges counts every T.
+print("\nlocal limiter + periodic sync")
+print("  (each gateway counts locally, exchanges counts every T):")
+limit_per_s = 1000            # global limit for one key, requests/s
+
+for offered in (1_500, 10_000):       # offered load for that key, req/s
     for sync_ms in (100, 1000):
-        # until peers learn about our admissions, each gateway only sees its own slice of the traffic,
-        # so in the worst case the extra admitted is about offered_rate * T (capped by the offered load)
+        # Until peers learn about our admissions, each gateway sees only
+        # its own slice, so the worst case admits about offered * T extra
+        # (capped by how much load exceeds the limit at all).
         extra = min(offered * sync_ms / 1000, offered - limit_per_s)
-        print(f&quot;  offered {offered:&gt;6}/s, sync {sync_ms:&gt;4} ms: up to ~{extra:&gt;5,.0f} extra admitted per second &quot;
-              f&quot;({extra/limit_per_s:.0%} over the {limit_per_s}/s limit)&quot;)
-print(&quot;\nstatic split instead (limit/N per gateway, no sync): under-admits when traffic is skewed&quot;)
+        over  = extra / limit_per_s
+        print(f"  offered {offered:&gt;6}/s, sync {sync_ms:&gt;4} ms: "
+              f"up to ~{extra:&gt;5,.0f} extra admitted per second")
+        print(f"{'':&gt;34}({over:.0%} over the {limit_per_s}/s limit)")
+
+# ── 5. The alternative: a static split ──────────────────────────────
+print("\nstatic split instead (limit/N per gateway, no sync):")
+print("  under-admits when traffic is skewed")
 for gateways in (10, 50):
     share = limit_per_s / gateways
-    print(f&quot;  {gateways} gateways: {share:.0f}/s each; if all of one key&#x27;s traffic lands on one gateway it gets {share/limit_per_s:.0%} of its quota&quot;)</code></pre>
+    quota = share / limit_per_s
+    print(f"  {gateways} gateways: {share:.0f}/s each; if all of one key's")
+    print(f"    traffic lands on one gateway it gets {quota:.0%} of its quota")</code></pre>
 <pre class="terminal" data-title="output"><code>avg 57,870 checks/s, peak 173,611 checks/s
 one script call per check -&gt; 4 store shards at 50% utilisation (plus replicas)
 
@@ -100,20 +134,28 @@ memory for 10,000,000 active keys, limit 100/min:
   sliding window counter (2 ctrs)      64 B/key  -&gt;   0.64 GB
   sliding log (100 timestamps)        848 B/key  -&gt;   8.48 GB
 
-local limiter + periodic sync (each gateway counts locally, exchanges counts every T):
-  offered   1500/s, sync  100 ms: up to ~  150 extra admitted per second (15% over the 1000/s limit)
-  offered   1500/s, sync 1000 ms: up to ~  500 extra admitted per second (50% over the 1000/s limit)
-  offered  10000/s, sync  100 ms: up to ~1,000 extra admitted per second (100% over the 1000/s limit)
-  offered  10000/s, sync 1000 ms: up to ~9,000 extra admitted per second (900% over the 1000/s limit)
+local limiter + periodic sync
+  (each gateway counts locally, exchanges counts every T):
+  offered   1500/s, sync  100 ms: up to ~  150 extra admitted per second
+                                  (15% over the 1000/s limit)
+  offered   1500/s, sync 1000 ms: up to ~  500 extra admitted per second
+                                  (50% over the 1000/s limit)
+  offered  10000/s, sync  100 ms: up to ~1,000 extra admitted per second
+                                  (100% over the 1000/s limit)
+  offered  10000/s, sync 1000 ms: up to ~9,000 extra admitted per second
+                                  (900% over the 1000/s limit)
 
-static split instead (limit/N per gateway, no sync): under-admits when traffic is skewed
-  10 gateways: 100/s each; if all of one key&#x27;s traffic lands on one gateway it gets 10% of its quota
-  50 gateways: 20/s each; if all of one key&#x27;s traffic lands on one gateway it gets 2% of its quota</code></pre>
+static split instead (limit/N per gateway, no sync):
+  under-admits when traffic is skewed
+  10 gateways: 100/s each; if all of one key&#x27;s
+    traffic lands on one gateway it gets 10% of its quota
+  50 gateways: 20/s each; if all of one key&#x27;s
+    traffic lands on one gateway it gets 2% of its quota</code></pre>
 <p>Reading the output: 174k checks/s at peak is far past one in-memory node (roughly 100k simple ops/s) so the store is sharded, at least four shards with headroom, each with a replica for failover. Ten million active keys fit in a gigabyte or so for counter-style algorithms, but the sliding log costs about 13 times more per key, which is why it is rarely used at this scale. And the sync estimate shows that periodic synchronisation is only safe when the offered load is close to the limit; against a heavy abuser it overshoots badly, so abusive keys need a stricter mechanism. (That last block is a rough upper-bound model, not a measurement.)</p>
 
 <h2>API</h2>
 <p>There are two surfaces: the one the <em>caller</em> sees, and an internal one.</p>
-<pre class="terminal" data-title="surfaces"><code>-- What an API client sees (any endpoint):
+<pre class="terminal" data-title="surfaces"><code>-- 1. What an API client sees (any endpoint)
 HTTP/1.1 200 OK
 RateLimit-Policy: "default";q=100;w=60
 RateLimit: "default";r=37;t=21
@@ -122,11 +164,20 @@ HTTP/1.1 429 Too Many Requests
 Retry-After: 21
 RateLimit: "default";r=0;t=21
 
--- Internal: the check, called by the gateway middleware (library call or gRPC)
-Check(keys: [string], cost: int = 1) -&gt; { allowed: bool, remaining: int, reset_ms: int, retry_after_ms: int }
+-- 2. Internal: the check, called by the gateway middleware
+--    (library call or gRPC)
+Check(keys: [string], cost: int = 1)
+  -&gt; { allowed: bool,
+       remaining: int,
+       reset_ms: int,
+       retry_after_ms: int }
 
--- Admin: policies are data, not code
-PUT /admin/policies/{id}  { match: {route, plan}, dimension: "api_key", algo: "token_bucket", rate: 100, per: "60s", burst: 20 }</code></pre>
+-- 3. Admin: policies are data, not code
+PUT /admin/policies/{id}
+  { match: {route, plan},
+    dimension: "api_key",
+    algo: "token_bucket",
+    rate: 100, per: "60s", burst: 20 }</code></pre>
 <h3>Response headers: what is standard and what is not</h3>
 <table>
   <thead><tr><th>Header</th><th>Status</th><th>Use</th></tr></thead>
@@ -279,93 +330,154 @@ PUT /admin/policies/{id}  { match: {route, plan}, dimension: "api_key", algo: "t
   </tbody>
 </table>
 <p>The same comparison as code, with the traffic from the widget's first preset (limit 10 per second), so you can check the widget against it. The leaky bucket here is the queue variant: it admits the same requests as the token bucket, but a request can wait up to about a second.</p>
-<pre class="terminal" data-title="race.py"><code>&quot;&quot;&quot;Five rate-limit algorithms fed the same bursty trace. Limit: 10 requests per second.&quot;&quot;&quot;
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>trace ← 1 request per 150 ms + bursts of 30, 20 and 40</li>
+  <li>token/leaky bucket: refill or drain L per W;  admit if room</li>
+  <li>fixed: count per window;  sliding counter: prev × overlap + cur &lt; L</li>
+  <li>sliding log: drop timestamps older than W;  admit if len(log) &lt; L</li>
+  <li>per algorithm: admitted, rejected, max admitted in any 1 s span</li>
+</ol></div>
+<pre class="terminal" data-title="race.py"><code>"""Five rate-limit algorithms fed the same bursty trace.
+Limit: 10 requests per second."""
 from collections import deque
 
+# ── 1. The trace and the limit ──────────────────────────────────────
+L = 10                        # requests allowed per window
+W = 1000                      # window length, ms
+
 def trace():
+    """Request times in ms: a steady trickle plus three bursts."""
     t = []
-    t += list(range(0, 10000, 150))            # steady ~6.7 req/s
-    t += [2000 + 10 * i for i in range(30)]     # burst A: 30 requests in 290 ms
-    t += [4900 + 10 * i for i in range(20)]     # burst B: straddles the 5.0 s window edge
-    t += [7000 + 10 * i for i in range(40)]     # burst C: 40 requests in 390 ms
+    t += list(range(0, 10000, 150))           # steady ~6.7 req/s
+    t += [2000 + 10 * i for i in range(30)]   # A: 30 requests in 290 ms
+    t += [4900 + 10 * i for i in range(20)]   # B: straddles 5.0 s edge
+    t += [7000 + 10 * i for i in range(40)]   # C: 40 requests in 390 ms
     return sorted(t)
 
-L, W = 10, 1000   # limit per window (ms)
-
+# ── 2. Token bucket and leaky bucket ────────────────────────────────
 def token_bucket(ts):
-    tokens, last, out = float(L), 0, []
+    """Refill continuously at L per W; each request spends one token."""
+    tokens = float(L)
+    last = 0
+    out = []
     for t in ts:
-        tokens = min(L, tokens + (t - last) * L / W); last = t
+        tokens = min(L, tokens + (t - last) * L / W)
+        last = t
         ok = tokens &gt;= 1
-        if ok: tokens -= 1
+        if ok:
+            tokens -= 1
         out.append(ok)
     return out
 
-def leaky_queue(ts):                  # leaky bucket as a queue: accept if queue not full, drain 10/s
-    level, last, out = 0.0, 0, []
+def leaky_queue(ts):
+    """Leaky bucket as a queue: accept if not full; drain L per W."""
+    level = 0.0
+    last = 0
+    out = []
     for t in ts:
-        level = max(0.0, level - (t - last) * L / W); last = t
+        level = max(0.0, level - (t - last) * L / W)
+        last = t
         ok = level + 1 &lt;= L
-        if ok: level += 1
+        if ok:
+            level += 1
         out.append(ok)
     return out
 
+# ── 3. Window counters ──────────────────────────────────────────────
 def fixed_window(ts):
-    cnt, win, out = 0, 0, []
+    """One counter per clock-aligned window; resets at each edge."""
+    cnt = 0
+    win = 0
+    out = []
     for t in ts:
-        if t // W != win: win, cnt = t // W, 0
+        if t // W != win:
+            win = t // W
+            cnt = 0
         ok = cnt &lt; L
-        if ok: cnt += 1
-        out.append(ok)
-    return out
-
-def sliding_log(ts):
-    log, out = deque(), []
-    for t in ts:
-        while log and log[0] &lt;= t - W: log.popleft()
-        ok = len(log) &lt; L
-        if ok: log.append(t)
+        if ok:
+            cnt += 1
         out.append(ok)
     return out
 
 def sliding_counter(ts):
-    win, cur, prev, out = 0, 0, 0, []
+    """Weight the previous window by how much of it still overlaps."""
+    win = 0
+    cur = 0
+    prev = 0
+    out = []
     for t in ts:
         w = t // W
         if w != win:
+            # Only an adjacent window counts; a gap means prev is stale.
             prev = cur if w == win + 1 else 0
-            win, cur = w, 0
+            win = w
+            cur = 0
         est = prev * (1 - (t % W) / W) + cur
         ok = est &lt; L
-        if ok: cur += 1
+        if ok:
+            cur += 1
         out.append(ok)
     return out
 
+# ── 4. Sliding log ──────────────────────────────────────────────────
+def sliding_log(ts):
+    """Exact: keep every admitted timestamp in the last W ms."""
+    log = deque()
+    out = []
+    for t in ts:
+        while log and log[0] &lt;= t - W:
+            log.popleft()
+        ok = len(log) &lt; L
+        if ok:
+            log.append(t)
+        out.append(ok)
+    return out
+
+# ── 5. Measure what each one let through ────────────────────────────
 def peak_in_any_window(ts, ok):
+    """Most admitted requests inside any W-ms span (two pointers)."""
     adm = [t for t, o in zip(ts, ok) if o]
-    best, j = 0, 0
+    best = 0
+    j = 0
     for i, t in enumerate(adm):
-        while adm[j] &lt;= t - W: j += 1
+        while adm[j] &lt;= t - W:
+            j += 1
         best = max(best, i - j + 1)
     return best
 
 ts = trace()
-print(f&quot;{len(ts)} requests over 10 s; limit {L}/s&quot;)
-print(f&quot;{&#x27;algorithm&#x27;:&lt;22}{&#x27;admitted&#x27;:&gt;9}{&#x27;rejected&#x27;:&gt;9}{&#x27;peak in any 1 s&#x27;:&gt;17}&quot;)
-for name, f in [(&quot;token bucket&quot;, token_bucket), (&quot;leaky bucket (queue)&quot;, leaky_queue),
-                (&quot;fixed window&quot;, fixed_window), (&quot;sliding log&quot;, sliding_log),
-                (&quot;sliding window counter&quot;, sliding_counter)]:
-    ok = f(ts)
-    print(f&quot;{name:&lt;22}{sum(ok):&gt;9}{len(ok)-sum(ok):&gt;9}{peak_in_any_window(ts, ok):&gt;17}&quot;)
+algorithms = [
+    ("token bucket",           token_bucket),
+    ("leaky bucket (queue)",   leaky_queue),
+    ("fixed window",           fixed_window),
+    ("sliding log",            sliding_log),
+    ("sliding window counter", sliding_counter),
+]
 
-# how long does a request wait in the leaky-bucket queue? (level / drain rate)
-level, last, worst = 0.0, 0, 0.0
+print(f"{len(ts)} requests over 10 s; limit {L}/s")
+print(f"{'algorithm':&lt;22}{'admitted':&gt;9}{'rejected':&gt;9}"
+      f"{'peak in any 1 s':&gt;17}")
+for name, f in algorithms:
+    ok = f(ts)
+    admitted = sum(ok)
+    rejected = len(ok) - admitted
+    peak = peak_in_any_window(ts, ok)
+    print(f"{name:&lt;22}{admitted:&gt;9}{rejected:&gt;9}{peak:&gt;17}")
+
+# How long does a request wait in the leaky-bucket queue? level / rate.
+level = 0.0
+last = 0
+worst = 0.0
 for t in ts:
-    level = max(0.0, level - (t - last) * L / W); last = t
+    level = max(0.0, level - (t - last) * L / W)
+    last = t
     if level + 1 &lt;= L:
         level += 1
         worst = max(worst, level / L * W)
-print(f&quot;leaky bucket worst queueing delay: {worst:.0f} ms (the token bucket admits the same requests with no wait)&quot;)</code></pre>
+
+print(f"leaky bucket worst queueing delay: {worst:.0f} ms")
+print("  (the token bucket admits the same requests with no wait)")</code></pre>
 <pre class="terminal" data-title="output"><code>157 requests over 10 s; limit 10/s
 algorithm              admitted rejected  peak in any 1 s
 token bucket                 94       63               17
@@ -373,7 +485,8 @@ leaky bucket (queue)         94       63               17
 fixed window                 81       76               19
 sliding log                  76       81               10
 sliding window counter       76       81               11
-leaky bucket worst queueing delay: 990 ms (the token bucket admits the same requests with no wait)</code></pre>
+leaky bucket worst queueing delay: 990 ms
+  (the token bucket admits the same requests with no wait)</code></pre>
 <p>Notice what the numbers say. The fixed window let 19 requests through in some one-second span against a limit of 10, because bursts B straddled a window boundary. The token bucket let 17: a full bucket (10) plus a second of refill is a feature, so size the bucket as a burst allowance you actually mean. The sliding log is exact (10) and the sliding counter was off by one (11). The cost side was in the napkin run: the log needs about 13 times the memory.</p>
 <div class="callout note">
   <p class="callout-title">My default</p>
@@ -409,48 +522,79 @@ leaky bucket worst queueing delay: 990 ms (the token bucket admits the same requ
 </figure>
 <h3>Option A: a shared store with atomic scripts</h3>
 <p>Every gateway asks the same store. The check is a read-modify-write, so it must be atomic: otherwise concurrent gateways read the same count and all admit. The store executes a small script as one indivisible step; Redis-style stores do this with server-side scripts (single-threaded execution means no interleaving). The script below is a sketch of the token bucket from the algorithm table.</p>
-<pre class="terminal" data-title="atomic.py"><code>&quot;&quot;&quot;Why the check must be one atomic step: 50 gateways race for the last 5 slots of a limit of 10.&quot;&quot;&quot;
-LIMIT, GATEWAYS = 10, 50
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>limit ← 10;  50 gateways;  5 slots left (count = 5)</li>
+  <li>naive: every gateway GETs count first, then SETs seen + 1 if seen &lt; limit</li>
+  <li>atomic: count ← count + 1 in one step;  admit if count ≤ limit</li>
+  <li>print admitted and stored count for both</li>
+</ol></div>
+<pre class="terminal" data-title="atomic.py"><code>"""Why the check must be one atomic step: 50 gateways race for the last
+5 slots of a limit of 10."""
 
+# ── 1. Setup ────────────────────────────────────────────────────────
+LIMIT    = 10                 # requests allowed in the window
+GATEWAYS = 50                 # concurrent callers
+LEFT     = 5                  # slots still free when the race starts
+
+# ── 2. Naive GET, compare, SET ──────────────────────────────────────
 def check_then_set():
-    &quot;&quot;&quot;Naive GET, compare, SET. All gateways read before any of them writes (worst-case interleaving).&quot;&quot;&quot;
-    store = {&quot;count&quot;: LIMIT - 5}
-    reads = [store[&quot;count&quot;] for _ in range(GATEWAYS)]            # step 1: everyone GETs
+    """All gateways read before any writes (worst-case interleaving)."""
+    store = {"count": LIMIT - LEFT}
+    reads = [store["count"] for _ in range(GATEWAYS)]   # everyone GETs
     admitted = 0
-    for seen in reads:                                            # step 2: everyone decides and SETs
+    for seen in reads:                                  # everyone SETs
         if seen &lt; LIMIT:
-            store[&quot;count&quot;] = seen + 1                             # lost update: overwrites, not increments
+            # Lost update: each writes seen + 1 over the others' writes
+            # instead of incrementing the shared value.
+            store["count"] = seen + 1
             admitted += 1
-    return admitted, store[&quot;count&quot;]
+    return admitted, store["count"]
 
+# ── 3. Atomic increment ─────────────────────────────────────────────
 def atomic_incr():
-    &quot;&quot;&quot;INCR-style: the store does read-modify-write as one indivisible step, so each call sees the last.&quot;&quot;&quot;
-    store = {&quot;count&quot;: LIMIT - 5}
+    """INCR-style: read-modify-write is one indivisible store step, so
+    each call sees the result of the one before it."""
+    store = {"count": LIMIT - LEFT}
     admitted = 0
     for _ in range(GATEWAYS):
-        store[&quot;count&quot;] += 1                                       # atomic increment returns the new value
-        if store[&quot;count&quot;] &lt;= LIMIT:
+        store["count"] += 1                  # returns the new value
+        if store["count"] &lt;= LIMIT:
             admitted += 1
-    return admitted, store[&quot;count&quot;]
+    return admitted, store["count"]
 
+# ── 4. Compare ──────────────────────────────────────────────────────
 a, c = check_then_set()
-print(f&quot;GET/compare/SET : admitted {a} of {GATEWAYS} with only 5 slots left; stored count says {c}&quot;)
+print(f"GET/compare/SET : admitted {a} of {GATEWAYS} with only "
+      f"{LEFT} slots left; stored count says {c}")
 a, c = atomic_incr()
-print(f&quot;atomic increment: admitted {a} of {GATEWAYS}; stored count {c} (the surplus is rejected)&quot;)</code></pre>
+print(f"atomic increment: admitted {a} of {GATEWAYS}; stored count {c} "
+      f"(the surplus is rejected)")</code></pre>
 <pre class="terminal" data-title="output"><code>GET/compare/SET : admitted 50 of 50 with only 5 slots left; stored count says 6
 atomic increment: admitted 5 of 50; stored count 55 (the surplus is rejected)</code></pre>
 <pre class="terminal" data-title="token_bucket.lua (sketch, not run here)"><code>-- KEYS[1] = bucket key
 -- ARGV: capacity, refill_per_ms, cost, ttl_ms
-local t   = redis.call('TIME')                       -- use the STORE's clock, not each gateway's
+
+-- 1. Read the clock from the STORE, not from each gateway
+local t   = redis.call('TIME')
 local now = t[1] * 1000 + math.floor(t[2] / 1000)
-local d   = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
-local tokens = tonumber(d[1]) or tonumber(ARGV[1])   -- a new key starts full
+
+-- 2. Load state; a new key starts full
+local d = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(d[1]) or tonumber(ARGV[1])
 local ts     = tonumber(d[2]) or now
-tokens = math.min(tonumber(ARGV[1]), tokens + (now - ts) * tonumber(ARGV[2]))
+
+-- 3. Refill for the elapsed time, capped at capacity
+tokens = math.min(tonumber(ARGV[1]),
+                  tokens + (now - ts) * tonumber(ARGV[2]))
+
+-- 4. Spend tokens if enough are left
 local allowed = tokens &gt;= tonumber(ARGV[3])
 if allowed then tokens = tokens - tonumber(ARGV[3]) end
+
+-- 5. Save; idle keys expire so memory stays bounded
 redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))    -- idle keys vanish: memory stays bounded
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
 return { allowed and 1 or 0, math.floor(tokens) }</code></pre>
 <p>Two details worth saying aloud. Use the <em>store's</em> clock inside the script, not the gateways': skewed clocks across a fleet make refill maths wrong (<a href="../../distributed/chapters/07-time-revisited.html">time revisited</a>). And set a TTL on every key so the state for clients who left is reclaimed. Cost: one round trip (roughly half a millisecond inside a region, per <a href="02-estimation.html">chapter 2</a>), and a dependency.</p>
 <h3>Option B: local limiters with periodic sync</h3>
