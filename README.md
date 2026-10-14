@@ -59,13 +59,13 @@ LAB_MODEL=ollama:<model-name>  python3 your_script.py   # a local Ollama server
 
 ## Opening it
 
-There is no build step, no server and there are no dependencies. Open `index.html` (the hub) in a browser:
+There is no build step and there are no dependencies. Serve the folder over http and open the hub:
 
 ```sh
-open index.html          # macOS
-xdg-open index.html      # Linux
-start index.html         # Windows
+python3 -m http.server 8000      # in the site folder, then open http://localhost:8000
 ```
+
+Opening `index.html` straight from disk (`open index.html`) also works for reading, but browsers restrict pages loaded from `file://`: code cells then run without a Stop button, and lab workspaces cannot load their files. Any static host (GitHub Pages, Cloudflare Pages) serves the site as it is.
 
 Reading needs no network beyond Google Fonts. If you're offline, the pages fall back to system fonts.
 
@@ -75,7 +75,20 @@ Every chapter script is a code cell with **Copy**, **✎ Edit** and **▶ Run**.
 
 - Nothing is downloaded until you press Run. The first run fetches Python from jsDelivr (about 10 MB, then cached by the browser), so it needs a connection.
 - Python runs in a Web Worker, so the page stays responsive and **■ Stop** ends a long or endless script. Browser Python is two to three times slower than native, so the heaviest simulations take tens of seconds.
-- Scripts that need a real operating system (processes, threads, sockets, `fsync`, `mmap`) are marked **run locally**: copy them and run them with `python3`. That is most of How Programs Run, by design. The labs always run locally.
+- Scripts that need a real operating system (processes, threads, sockets, `fsync`, `mmap`) are marked **run locally**: copy them and run them with `python3`. That is most of How Programs Run, by design.
+- Every lab page has **Or work in the page**: `starter.py` as an editable cell whose **▶ Check** runs the lab's `check.py` against it (args: `solution`, or a milestone number). 100 of the 102 labs run this way; the rest say "run locally".
+
+### Equations
+
+Formulas are typeset with the vendored [KaTeX](https://katex.org). The equations a chapter is built around are **anatomy blocks**: the equation in plain words, a colour-coded legend that says what *kind* of thing each symbol is, a step-by-step build-up, and a runnable script that computes it on a few numbers.
+
+### Workbench: the real tools
+
+**Workbench** pages repeat a chapter's idea with PyTorch, Hugging Face, TRL or vLLM on a real machine: predict a number from the chapter, measure it, compare (measurement tables keep what you type). Each page is badged *Your laptop* or *A GPU box*. `workbench/requirements.txt` sets up the laptop; `workbench/wb` rents an RTX 4090 on RunPod with your models on a network volume, and stops a forgotten pod by itself. See `lab-machine.html#gpu`.
+
+### Review and search
+
+`review.html` asks the quiz questions of the pages you have finished, ten at a time, on a spaced-repetition schedule, and exports or imports all your progress. ⌘/Ctrl + K (or `/`) searches every page and section heading.
 
 
 Diagrams are drawn in a hand-drawn (Excalidraw/tldraw-like) style by default, using the vendored [Rough.js](https://github.com/rough-stuff/rough) and the Shantell Sans font. The **✎ Hand-drawn / ▭ Clean** button switches to crisp diagrams, and printing always uses the clean style.
@@ -85,7 +98,8 @@ Your browser's localStorage keeps:
 - progress per course;
 - design-studio notes and rubric ticks;
 - the theme choice: Tokyo Night, Catppuccin Mocha or high-contrast Gruvbox Dark;
-- your edits to code cells (until you press Reset).
+- your edits to code cells (until you press Reset);
+- workbench measurements and the review schedule (back them up from the Review page).
 
 ## Labs
 
@@ -107,12 +121,15 @@ After the first six courses were drafted, the whole path was reviewed against a 
 index.html                  hub: all courses and progress
 glossary.html               searchable glossary across courses, with a course filter
 curriculum.html             curriculum map: how the path lines up with university courses, the gap analysis, study plans
-lab-machine.html            setting up a local or cloud Linux VM for the Linux-only experiments
+lab-machine.html            a local or cloud Linux VM for the Linux-only experiments, and a rented GPU for workbenches
 <course>/index.html         course roadmap
 <course>/chapters/          one file per chapter
 <course>/labs/              labs; code in <course>/labs/code/labNN/
 <course>/cases/             case studies
 <course>/studios/           design studios
+<course>/workbench/         workbench pages; code in <course>/workbench/code/wNN/ (.py + .ipynb)
+workbench/                  laptop and GPU requirements, wb (RunPod helper), pod setup and idle stop
+review.html                 spaced review of quiz questions, progress backup
 assets/css/theme.css        colour tokens for the three themes
 assets/css/main.css         layout and shared components
 assets/css/widgets/         styles for individual interactive widgets
@@ -122,9 +139,12 @@ assets/js/quiz.js           declarative quizzes
 assets/js/stepper.js        generic step-through diagrams
 assets/js/studio.js         design studios: autosaved notes, rubric
 assets/js/sketch.js         hand-drawn rendering of diagrams (Rough.js)
-assets/js/runner.js         code cells: copy, edit (CodeMirror), run (Pyodide in a worker)
+assets/js/runner.js         code cells: copy, edit (CodeMirror), run (Pyodide in a worker); lab workspaces
+assets/js/equations.js      typeset maths (KaTeX) and equation anatomy blocks
+assets/js/review.js         spaced review of every quiz; progress export/import
+assets/js/*-data.js         generated: review-data, search-data (authoring/build_study.py), glossary-data
 assets/js/widgets/          one script per interactive widget
-assets/vendor/              Rough.js (MIT), CodeMirror 5.65.18 (MIT)
+assets/vendor/              Rough.js (MIT), CodeMirror 5.65.18 (MIT), KaTeX 0.16.11 (MIT)
 lab-support/llm.py          scripted stand-in models + optional real-model adapter, copied into AI-path labs
 <course>/chapters/code/     small helper modules some AI-path chapters import
 glossary-src/               per-chapter glossary terms for the AI path (JSON), merged by authoring/build_glossary.py
@@ -137,3 +157,5 @@ authoring/                  guide, link index, page linter, render check, glossa
 2. Copy a page of the same kind from that course and change its `data-*` attribute and content. Every page's `<body>` carries `data-root="../.."` and `data-course="<id>"`.
 
 The sidebar, table of contents, page header, "mark complete" box, cross-links and previous/next links are generated automatically.
+
+3. Re-run `python3 authoring/build_study.py` so the page's quiz joins the Review page and its sections join search, and `python3 authoring/check_page.py PAGE` to lint it (it also checks every formula).
