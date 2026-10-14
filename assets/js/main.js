@@ -31,6 +31,15 @@
       (k[1] || []).forEach(function (c) { c.kind = k[0]; c.dir = KIND_DIR[k[0]]; c.course = co; });
     });
   });
+  /* Builder spine (AI path): a course may list its spine chapter ids; every
+     other chapter of that course is an elective. "Spine only" hides electives
+     and makes prev/next walk the spine across courses. */
+  COURSES.forEach(function (co) {
+    if (!co.spine) return;
+    (co.chapters || []).forEach(function (c) { c.spine = co.spine.indexOf(c.id) !== -1; });
+  });
+  var spineOnly = load("cs-spine-only", false) === true;
+  document.documentElement.classList.toggle("spine-only", spineOnly);
   var course = COURSES.find(function (co) { return co.id === body.dataset.course; }) || null;
   var CHAPTERS = course ? course.chapters : [];
   var PARTS = course ? course.parts : [];
@@ -181,16 +190,19 @@
 
     PARTS.forEach(function (part, p) {
       var list = el("ul", { class: "nav-list" });
-      CHAPTERS.filter(function (c) { return c.part === p; }).forEach(function (c) {
-        var a = el("a", { href: href(c), "data-id": c.id, title: DEPTH[c.depth] + ": " + c.blurb }, [
+      var inPart = CHAPTERS.filter(function (c) { return c.part === p; });
+      inPart.forEach(function (c) {
+        var tip = DEPTH[c.depth] + (c.spine === false ? ", elective" : "") + ": " + c.blurb;
+        var a = el("a", { href: href(c), "data-id": c.id, title: tip, class: c.spine === false ? "elective" : "" }, [
           el("span", { class: "nav-num", html: "<span>" + chapterNum(c) + "</span>" }),
           el("span", { class: "nav-title", text: c.title }),
           el("span", { class: "nav-depth " + c.depth, "aria-hidden": "true" })
         ]);
         if (c.id === currentId) { a.classList.add("active"); a.setAttribute("aria-current", "page"); }
-        list.appendChild(el("li", null, [a]));
+        list.appendChild(el("li", { class: c.spine === false ? "elective" : "" }, [a]));
       });
-      side.appendChild(el("nav", { class: "nav-part", "aria-label": part.title }, [
+      var allElective = inPart.length && inPart.every(function (c) { return c.spine === false; });
+      side.appendChild(el("nav", { class: "nav-part" + (allElective ? " elective-part" : ""), "aria-label": part.title }, [
         el("p", { class: "nav-part-title", text: "Part " + p + " · " + part.title }),
         list
       ]));
@@ -226,7 +238,8 @@
     var legend = el("div", { class: "legend", html:
       '<span><span class="nav-depth deep" style="display:inline-block"></span> Deep dive</span>' +
       '<span><span class="nav-depth core" style="display:inline-block"></span> Core</span>' +
-      '<span><span class="nav-depth intro" style="display:inline-block"></span> Quick intro</span>' });
+      '<span><span class="nav-depth intro" style="display:inline-block"></span> Quick intro</span>' +
+      (course && course.spine ? '<span class="legend-elective">Dimmed: elective, off the builder spine</span>' : "") });
 
     return el("div", { class: "sidebar-foot" }, [
       course ? legend : null,
@@ -234,9 +247,48 @@
       course && (course.tools || []).length ? el("a", { href: root + "/" + course.dir + "/toolbox.html", text: "🧰  Toolbox" }) : null,
       el("a", { href: root + "/lab-machine.html", text: "🖥️  Your lab machine" }),
       el("a", { href: root + "/curriculum.html", text: "🗺️  Curriculum map" }),
+      course ? (course.spine ? spineButton() : null) : spineButton(),
       themeButton(),
       sketchButton()
     ]);
+  }
+
+  /* ---------- builder spine toggle ---------- */
+
+  function spineButton() {
+    var b = el("button", { class: "theme-toggle spine-toggle", type: "button",
+      title: "AI path: show only the builder spine (the chapters on the way to evolution and self-improving systems), or every chapter",
+      "aria-pressed": String(spineOnly) }, [
+      el("span", { class: "spine-icon", "aria-hidden": "true", text: spineOnly ? "◆" : "◇" }),
+      el("span", { class: "spine-name", text: spineOnly ? "Builder spine only" : "All chapters" })
+    ]);
+    b.addEventListener("click", function () { applySpine(!spineOnly); });
+    return b;
+  }
+  function applySpine(on) {
+    spineOnly = on;
+    save("cs-spine-only", on);
+    document.documentElement.classList.toggle("spine-only", on);
+    document.querySelectorAll(".spine-toggle").forEach(function (b) {
+      b.setAttribute("aria-pressed", String(on));
+      b.querySelector(".spine-name").textContent = on ? "Builder spine only" : "All chapters";
+      b.querySelector(".spine-icon").textContent = on ? "◆" : "◇";
+    });
+    var pager = document.querySelector("nav.pager");
+    if (pager) pager.replaceWith(buildPager());
+    refreshProgress();
+    updateContinue();
+  }
+  /* Every spine chapter of the AI path, in reading order. */
+  function spinePath() {
+    var out = [];
+    COURSES.forEach(function (co) {
+      if (!co.spine) return;
+      co.parts.forEach(function (part, p) {
+        co.chapters.forEach(function (c) { if (c.part === p && c.spine) out.push(c); });
+      });
+    });
+    return out;
   }
 
   /* Hub and glossary: the sidebar lists the courses instead of chapters. */
@@ -280,6 +332,12 @@
         return g[0] + " " + g[1].filter(function (c) { return done.has(c.id); }).length + "/" + g[1].length;
       });
       if (extra.length) card.appendChild(el("div", { class: "progress-extra", text: extra.join(" · ") }));
+      if (course.spine) {
+        var sp = CHAPTERS.filter(function (c) { return c.spine; });
+        card.appendChild(el("div", { class: "progress-extra", text: sp.length
+          ? "Builder spine " + sp.filter(function (c) { return done.has(c.id); }).length + "/" + sp.length
+          : "Elective course: off the builder spine" }));
+      }
     }
     document.querySelectorAll(".nav-list a[data-id]").forEach(function (a) {
       a.classList.toggle("done", done.has(a.dataset.id));
@@ -343,9 +401,12 @@
       el("span", { class: "part", text: "Part " + current.part + " · " + PARTS[current.part].title }),
       el("span", { text: "Chapter " + chapterNum(current) }),
       el("span", { class: "badge " + current.depth, text: DEPTH[current.depth] }),
+      current.spine === undefined ? null : el("span", { class: "badge " + (current.spine ? "spine" : "elective"),
+        title: current.spine ? "On the builder spine: needed on the way to evolution and self-improving systems" : "Elective: useful context, not needed for the builder spine",
+        text: current.spine ? "Spine" : "Elective" }),
       el("span", { text: "≈ " + minutes + " min read" })
     ];
-    head.insertBefore(el("div", { class: "chapter-eyebrow" }, eyebrow), head.firstChild);
+    head.insertBefore(el("div", { class: "chapter-eyebrow" }, eyebrow.filter(Boolean)), head.firstChild);
 
     // Labs and case studies list the chapters they build on.
     if (current.related && current.related.length) {
@@ -403,10 +464,29 @@
       btn
     ]));
 
+    article.appendChild(buildPager());
+    article.appendChild(el("p", { class: "site-foot", text: course.title + " · " + SITE + " · built for learning, one layer at a time." }));
+  }
+
+  function buildPager() {
     var pager = el("nav", { class: "pager", "aria-label": "Page navigation" });
     var prev = items[idx - 1], next = items[idx + 1];
     if (!next && currentKind === "lab" && CASES.length) next = CASES[0];
     if (!next && (currentKind === "lab" || currentKind === "case") && STUDIOS.length) next = STUDIOS[0];
+    // Spine only: walk the builder spine, across course boundaries.
+    if (spineOnly && currentKind === "chapter" && course.spine) {
+      var path = spinePath(), at = path.indexOf(current);
+      if (at === -1) {
+        // An elective: step to the nearest spine chapters around it.
+        var later = path.filter(function (c) { return c.course === course && CHAPTERS.indexOf(c) > idx; });
+        var earlier = path.filter(function (c) { return c.course === course && CHAPTERS.indexOf(c) < idx; });
+        prev = earlier[earlier.length - 1] || prev;
+        next = later[0] || next;
+      } else {
+        prev = path[at - 1];
+        next = path[at + 1];
+      }
+    }
     if (prev) pager.appendChild(el("a", { class: "prev", href: href(prev) }, [
       el("small", { text: "← Previous" }), el("span", { class: "title", text: longLabel(prev) })
     ]));
@@ -416,8 +496,7 @@
     else pager.appendChild(el("a", { class: "next", href: root + "/glossary.html" }, [
       el("small", { text: "Next →" }), el("span", { class: "title", text: "Glossary" })
     ]));
-    article.appendChild(pager);
-    article.appendChild(el("p", { class: "site-foot", text: course.title + " · " + SITE + " · built for learning, one layer at a time." }));
+    return pager;
   }
 
   /* At the end of a chapter: labs unlocked by finishing this part, and case
@@ -459,17 +538,20 @@
     if (!host || !course) return;
     PARTS.forEach(function (part, p) {
       var grid = el("div", { class: "road-grid" });
-      CHAPTERS.filter(function (c) { return c.part === p; }).forEach(function (c) {
-        grid.appendChild(el("a", { class: "road-card", href: href(c) }, [
+      var inPart = CHAPTERS.filter(function (c) { return c.part === p; });
+      inPart.forEach(function (c) {
+        grid.appendChild(el("a", { class: "road-card" + (c.spine === false ? " elective" : ""), href: href(c) }, [
           el("div", { class: "top" }, [
             el("span", { class: "num", "data-done-id": c.id, "data-label": "Ch " + chapterNum(c), text: "Ch " + chapterNum(c) }),
+            c.spine === false ? el("span", { class: "badge elective", text: "Elective" }) : null,
             el("span", { class: "badge " + c.depth, text: DEPTH[c.depth] })
           ]),
           el("div", { class: "title", text: c.title }),
           el("div", { class: "blurb", text: c.blurb })
         ]));
       });
-      host.appendChild(el("section", { class: "road-part" }, [
+      var allElective = inPart.length && inPart.every(function (c) { return c.spine === false; });
+      host.appendChild(el("section", { class: "road-part" + (allElective ? " elective-part" : "") }, [
         el("span", { class: "road-dot", text: String(p) }),
         el("h2", { text: part.title }),
         el("p", { text: part.blurb }),
@@ -498,13 +580,19 @@
       ]));
     });
 
+    updateContinue();
+  }
+
+  function updateContinue() {
     var cont = document.getElementById("continue-btn");
-    if (cont) {
-      cont.href = href(CHAPTERS[0]);
-      var firstTodo = CHAPTERS.find(function (c) { return !done.has(c.id); });
-      if (done.size && firstTodo) { cont.href = href(firstTodo); cont.textContent = "Continue: " + firstTodo.title + " →"; }
-      else if (!firstTodo) { cont.href = root + "/glossary.html"; cont.textContent = "All done! Review the glossary →"; }
-    }
+    if (!cont || !course) return;
+    if (!cont.dataset.label) cont.dataset.label = cont.textContent;
+    var list = spineOnly && course.spine && course.spine.length ? CHAPTERS.filter(function (c) { return c.spine; }) : CHAPTERS;
+    cont.href = href(list[0]);
+    cont.textContent = cont.dataset.label;
+    var firstTodo = list.find(function (c) { return !done.has(c.id); });
+    if (list.some(function (c) { return done.has(c.id); }) && firstTodo) { cont.href = href(firstTodo); cont.textContent = "Continue: " + firstTodo.title + " →"; }
+    else if (!firstTodo) { cont.href = root + "/glossary.html"; cont.textContent = "All done! Review the glossary →"; }
   }
 
   /* ---------- site hub: one card per course ---------- */
@@ -533,6 +621,9 @@
         var bar = el("div", { class: "bar" }, [el("span")]);
         bar.firstChild.style.width = Math.round((n / all.length) * 100) + "%";
         kids.push(el("div", { class: "meta", text: counts }), bar, el("div", { class: "meta", text: n ? n + " of " + all.length + " done" : "Not started" }));
+        if (co.spine) kids.push(el("div", { class: "meta spine-meta", text: co.spine.length
+          ? "Builder spine: " + co.spine.length + " of " + co.chapters.length + " chapters"
+          : "Elective course: off the builder spine" }));
       }
       host.appendChild(el("li", { class: "hub-step" + (planned ? " planned" : "") }, [
         el(planned ? "div" : "a", planned ? { class: "road-card hub-card" } : { class: "road-card hub-card", href: courseHome(co) }, kids)
@@ -667,7 +758,7 @@
 
   // Runnable code cells (runner.js) are loaded only on pages that have scripts.
   function loadRunner() {
-    if (!ASSETS || !document.querySelector('article pre[data-title*=".py"]')) return;
+    if (!ASSETS || !document.querySelector('article pre[data-title*=".py"], .lab-workspace')) return;
     window.NZ = { assets: ASSETS, highlightPython: highlightPython };
     var s = document.createElement("script");
     s.src = ASSETS + "js/runner.js";
@@ -681,6 +772,16 @@
     window.NZ.assets = ASSETS;
     var s = document.createElement("script");
     s.src = ASSETS + "js/equations.js";
+    document.body.appendChild(s);
+  }
+
+  // Glossary hover cards (glossary-hover.js) on AI-path pages.
+  function loadGlossaryHover() {
+    if (!ASSETS || !course || course.track !== "ai" || !document.querySelector("article.prose")) return;
+    window.NZ = window.NZ || {};
+    window.NZ.assets = ASSETS;
+    var s = document.createElement("script");
+    s.src = ASSETS + "js/glossary-hover.js";
     document.body.appendChild(s);
   }
 
@@ -711,6 +812,7 @@
     buildReadingBar();
     refreshProgress();
     loadSketch();
+    loadGlossaryHover();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();

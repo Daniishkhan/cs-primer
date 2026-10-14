@@ -23,14 +23,24 @@
   // Scripts that need a real operating system (processes, threads, sockets,
   // signals, system files) or what browser Python lacks (asyncio.run inside
   // the page's event loop, OpenSSL-only hashlib functions) offer Copy only.
-  var OS_ONLY = new RegExp([
-    /^[ \t]*(?:import|from)[ \t][^\n]*\b(?:socket|subprocess|threading|multiprocessing|signal|select|selectors|mmap|fcntl|resource|ctypes|concurrent\.futures)\b/.source,
+  function osOnly(modules) {
+    return new RegExp([
+      "^[ \\t]*(?:import|from)[ \\t][^\\n]*\\b(?:" + modules.join("|") + ")\\b"
+    ].concat(OS_CALLS).join("|"), "m");
+  }
+  var OS_MODULES = ["socket", "subprocess", "threading", "multiprocessing", "signal", "select",
+                    "selectors", "mmap", "fcntl", "resource", "ctypes", "concurrent\\.futures"];
+  var OS_CALLS = [
     /\bos\.(?:fork|fsync|fdatasync|kill|pipe|getpid|getppid|wait|_exit)\b/.source,
     /\basyncio\.run\(/.source,
     /\bhashlib\.(?:pbkdf2_hmac|scrypt)\b/.source,
     /\bopen\(\s*["']\/(?:etc|proc|sys|dev)\//.source,
     /\binput\(/.source
-  ].join("|"), "m");
+  ];
+  var OS_ONLY = osOnly(OS_MODULES);
+  // Lab checkers import signal only for an alarm-based timeout guarded by
+  // hasattr(signal, "SIGALRM"), which browser Python skips; allow it there.
+  var OS_ONLY_LAB = osOnly(OS_MODULES.filter(function (m) { return m !== "signal"; }));
 
   // A script's title starts with its filename ("demo1.py (uses lin.py, below)");
   // titles like "python3 x.py" are terminal transcripts, not code.
@@ -132,7 +142,12 @@
     py.setStdout(stream("out"));
     py.setStderr(stream("err"));
     try { py.FS.mkdirTree(job.dir); } catch (e) { /* exists */ }
-    job.files.forEach(function (f) { py.FS.writeFile(job.dir + "/" + f.name, f.src); });
+    job.files.forEach(function (f) {
+      var path = job.dir + "/" + f.name;
+      var slash = path.lastIndexOf("/");
+      try { py.FS.mkdirTree(path.slice(0, slash)); } catch (e) { /* exists */ }
+      py.FS.writeFile(path, f.src);
+    });
     var all = job.files.map(function (f) { return f.src; }).join("\n");
     // zoneinfo needs the time-zone database, which is a separate package.
     var extra = /\bzoneinfo\b/.test(all) ? py.loadPackage("tzdata") : Promise.resolve();
@@ -143,7 +158,8 @@
         g.set("RUN_DIR", job.dir);
         g.set("TARGET", job.dir + "/" + job.name);
         g.set("ARGV", py.toPy(job.argv || [job.name]));
-        g.set("MODULES", py.toPy(job.files.map(function (f) { return f.name.replace(/\.py$/, ""); })));
+        g.set("MODULES", py.toPy(job.files.filter(function (f) { return /^[\w-]+\.py$/.test(f.name); })
+          .map(function (f) { return f.name.replace(/\.py$/, ""); })));
         return py.runPythonAsync(job.code);
       })
       .then(function () {
@@ -289,15 +305,32 @@
 
   var pageFiles = [];       // every *.py block on the page, in order: {name, cell}
 
-  function Cell(pre, index) {
+  // opts (lab workspaces): run  - the file Run executes instead of this one
+  //                         extra - hidden files written alongside, {name, src}
+  //                         label - the Run button's label
+  //                         local - a reason this cell cannot run in the page
+  function Cell(pre, index, opts) {
+    opts = opts || {};
     this.pre = pre;
     this.title = pre.getAttribute("data-title");
     this.name = SCRIPT_TITLE.exec(this.title)[1];
+    this.target = opts.run || this.name;
+    this.extra = opts.extra || [];
+    this.runLabel = opts.label || "Run";
     this.original = (pre.querySelector("code") || pre).textContent;
-    this.key = "nz-code:" + location.pathname + ":" + index + ":" + this.title;
+    // Saved edits are keyed by file name (and which copy of it on the page),
+    // so adding or reordering other blocks does not lose them.
+    var copy = pageFiles.filter(function (f) { return f.cell.title === this.title; }, this).length;
+    this.key = "nz-code:" + location.pathname + ":" + this.title + (copy ? ":" + copy : "");
+    var legacy = "nz-code:" + location.pathname + ":" + index + ":" + this.title;
+    if (load(this.key) == null && load(legacy) != null) {
+      save(this.key, load(legacy));
+      save(legacy, null);
+    }
     this.cm = null;
     this.running = false;
-    this.runnable = pre.getAttribute("data-run") !== "off" && !OS_ONLY.test(this.original);
+    this.runnable = pre.getAttribute("data-run") !== "off" && !opts.local && !OS_ONLY.test(this.original);
+    this.localReason = opts.local;
     this.build();
     var saved = load(this.key);
     if (saved != null && saved !== this.original) this.setCode(saved);
@@ -323,17 +356,21 @@
     this.copyBtn = button("", "⧉", "Copy", "Copy the code");
     this.resetBtn = button("", "↺", "Reset", "Undo your edits");
     this.editBtn = button("", "✎", "Edit", "Edit the code (changes stay in this browser)");
-    this.runBtn = button("run", "▶", "Run", "Run in your browser (Ctrl/⌘ + Enter while editing)");
+    this.runBtn = button("run", "▶", this.runLabel, this.target === this.name
+      ? "Run in your browser (Ctrl/⌘ + Enter while editing)"
+      : "Run " + this.target + " against this file, in your browser (Ctrl/⌘ + Enter while editing)");
     this.editedPill = el("span", { class: "cell-edited", text: "edited" });
 
     var actions = [this.copyBtn];
-    if (this.runnable && /\bsys\.argv\b/.test(this.original)) {
+    var argvSrc = this.target === this.name ? this.original
+      : (this.extra.filter(function (f) { return f.name === this.target; }, this)[0] || {}).src || "";
+    if (this.runnable && /\bsys\.argv\b/.test(argvSrc)) {
       // The script reads command-line arguments: offer a field, prefilled
       // from the page's own "python3 name.py ..." example when there is one.
       this.argsInput = el("input", {
         type: "text", class: "cell-args-input", spellcheck: "false",
         "aria-label": "Command-line arguments", placeholder: "arguments",
-        value: exampleArgs(this.name)
+        value: this.target === this.name ? exampleArgs(this.name) : ""
       });
       actions.push(el("label", { class: "cell-args", title: "Command-line arguments (sys.argv)" }, [
         el("span", { class: "cell-args-label", text: "args" }), this.argsInput
@@ -346,7 +383,7 @@
     if (this.runnable) actions.push(this.resetBtn, this.editBtn, this.runBtn);
     else actions.push(el("span", {
       class: "cell-local", text: "run locally",
-      title: "Uses operating-system features (processes, threads, sockets, files) that a browser cannot provide. Copy it and run it with python3."
+      title: this.localReason || "Uses operating-system features (processes, threads, sockets, files) that a browser cannot provide. Copy it and run it with python3."
     }));
 
     // The result of a run, next to the button that started it; click to jump
@@ -526,7 +563,7 @@
     this.cell.classList.toggle("is-running", on);
     var stop = on && engine.canStop();
     this.runBtn.querySelector(".cell-btn-icon").textContent = stop ? "■" : "▶";
-    this.runBtn.querySelector(".cell-btn-label").textContent = stop ? "Stop" : "Run";
+    this.runBtn.querySelector(".cell-btn-label").textContent = stop ? "Stop" : this.runLabel;
     this.runBtn.disabled = on && !stop;
     pageFiles.forEach(function (f) { if (f.cell !== this && f.cell.runBtn) f.cell.runBtn.disabled = on; }, this);
   };
@@ -548,14 +585,19 @@
     // Every script on the page is written alongside, so one can import another
     // (toolkit.py above, lin.py "listed below"), exactly as in a folder.
     var name = this.name;
-    var files = pageFiles
-      .filter(function (f) { return f.name !== name; })
-      .map(function (f) { return { name: f.name, src: f.cell.code() }; });
+    // A lab workspace runs its own folder only; snippets elsewhere on the
+    // page (often titled solution.py) must not overwrite the real files.
+    var files = this.extra.length
+      ? this.extra.filter(function (f) { return f.name !== name; })
+      : pageFiles
+        .filter(function (f) { return f.name !== name && !f.cell.extra.length; })
+        .map(function (f) { return { name: f.name, src: f.cell.code() }; });
     // A file shown in parts ("paxos_sim.py (part 2: ...)") runs as one file.
     var parts = pageFiles.filter(function (f) { return f.name === name; });
-    if (parts.length > 1) src = parts.map(function (f) { return f.cell.code(); }).join("\n\n");
+    if (parts.length > 1 && !this.extra.length) src = parts.map(function (f) { return f.cell.code(); }).join("\n\n");
     files.push({ name: name, src: src });
-    var argv = [name].concat(this.argsInput ? splitArgs(this.argsInput.value) : []);
+    var target = this.target;
+    var argv = [target].concat(this.argsInput ? splitArgs(this.argsInput.value) : []);
 
     // Output arrives in many small pieces; paint at most once a frame.
     var pending = "";
@@ -591,7 +633,7 @@
         self.setStatus("busy", engine.canStop() ? "Still running… (slower than native Python; Stop to cancel)" : "Still running…", "Still running…");
       }, SLOW_S * 1000);
       limit = setTimeout(function () { hitLimit = true; engine.stop(); }, LIMIT_S * 1000);
-      return engine.run({ dir: RUN_DIR, name: name, files: files, argv: argv }, emit);
+      return engine.run({ dir: RUN_DIR, name: target, files: files, argv: argv }, emit);
     }).then(function () {
       clearTimeout(slow);
       clearTimeout(limit);
@@ -618,13 +660,61 @@
     });
   };
 
+  /* ---------- lab workspaces ----------
+
+     <div class="lab-workspace" data-dir="code/lab01/" data-files="check.py llm.py solution.py"></div>
+
+     Fetches the lab's files, shows starter.py as an editable cell whose
+     button runs check.py (args: "solution", a milestone number). Fetching
+     needs the site served over http(s); from a file:// page it says so. */
+
+  function fetchText(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error(r.status + " " + url);
+      return r.text();
+    });
+  }
+
+  function workspace(box) {
+    var dir = box.getAttribute("data-dir");
+    var edit = box.getAttribute("data-edit") || "starter.py";
+    var names = (box.getAttribute("data-files") || "").split(/\s+/).filter(Boolean);
+    var note = el("p", { class: "lab-ws-note", text: "Loading the lab's files…" });
+    box.appendChild(note);
+    if (location.protocol === "file:") {
+      note.textContent = "To run this lab in the page, open the site over http: the published site, or "
+        + "python3 -m http.server in the site folder and http://localhost:8000. "
+        + "Or download the files above and run python3 check.py.";
+      return Promise.resolve();
+    }
+    return Promise.all([edit].concat(names).map(function (n) { return fetchText(dir + n); }))
+      .then(function (srcs) {
+        var extra = names.map(function (n, i) { return { name: n, src: srcs[i + 1] }; });
+        var all = srcs.join("\n");
+        var local = OS_ONLY_LAB.test(all)
+          ? "This lab uses operating-system features (processes, threads, sockets) that browser Python lacks. Download the files and run python3 check.py."
+          : null;
+        var pre = el("pre", { class: "terminal", "data-title": edit }, [el("code", { text: srcs[0] })]);
+        note.remove();
+        box.appendChild(pre);
+        highlight(pre, srcs[0]);
+        var cell = new Cell(pre, index++, { run: "check.py", extra: extra, label: "Check", local: local });
+        pageFiles.push({ name: cell.name, cell: cell });
+        if (local) box.classList.add("is-local");
+      })
+      .catch(function (e) {
+        note.textContent = "Could not load the lab's files (" + e.message + "). Download them above and run python3 check.py.";
+      });
+  }
+
   /* ---------- go ---------- */
 
   var index = 0;
   document.querySelectorAll("article pre[data-title]").forEach(function (pre) {
     if (!SCRIPT_TITLE.test(pre.getAttribute("data-title"))) return;
-    if (pre.closest(".widget, .code-cell")) return;
+    if (pre.closest(".widget, .code-cell, .lab-workspace")) return;
     var cell = new Cell(pre, index++);
     pageFiles.push({ name: cell.name, cell: cell });
   });
+  document.querySelectorAll(".lab-workspace").forEach(workspace);
 })();

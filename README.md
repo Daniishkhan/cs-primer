@@ -37,6 +37,10 @@ A second path, in nine courses, from school mathematics to building, evaluating 
 
 Chapters that change fast (model rankings, prices, library and protocol versions) keep those facts in dated **State of play** boxes, so the main text stays about durable mechanisms.
 
+### The builder spine
+
+The second path has a **builder spine**: about 90 chapters on the way to course A7, for learners who want to build evolutionary and self-improving systems rather than deliver AI to customers. Each AI course lists its spine chapters in `assets/js/catalog.js` (`spine: [...]`), and every other chapter shows as *elective*. The **Builder spine only** button at the foot of the sidebar hides the electives, and its prev/next links then walk the spine across courses. A8 is wholly elective. One problem, online bin packing, runs through the spine as its worked example. `curriculum.html` has the full plan.
+
 ### Labs in the second path
 
 AI-path labs follow the same `starter.py` / `check.py` / `solution.py` layout, use the standard library only and are deterministic. Labs that talk to a model use **scripted stand-in models** from `lab-support/llm.py` (copied into each lab folder as `llm.py`), so `python3 check.py` is free, offline and repeatable. To try a lab's ideas against a real model, set `LAB_MODEL`:
