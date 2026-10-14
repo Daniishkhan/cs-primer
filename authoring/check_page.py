@@ -99,6 +99,76 @@ class Page(HTMLParser):
             self.text_parts.append(d)
 
 
+# Plain-English checks for the AI path (builder spine audit, October 2026).
+# Acronyms every reader of the path already knows; anything else must be
+# expanded on the page: "Monte Carlo tree search (MCTS)" or "MCTS (Monte ...)".
+KNOWN_ACRONYMS = set("""AI ML LLM LLMs GPU GPUs CPU CPUs API APIs JSON CSV HTML CSS URL URLs HTTP HTTPS SQL PDF PDFs
+RAM OS ID IDs UK US EU MB GB KB TB PhD CI README OK TODO FAQ UTF ASCII NumPy II III IV VI XML YAML NaN TL DR""".split())
+SENTENCE_AVG_MAX = 18
+SENTENCE_LONG = 35
+
+
+def prose_text(fragment):
+    """Visible prose of an HTML fragment: no code, SVG, scripts, quiz or sources."""
+    t = re.sub(r"(?s)<(script|style|svg|pre|code)\b.*?</\1>", " ", fragment)
+    t = re.sub(r'(?s)<ul class="sources".*?</ul>', " ", t)
+    t = re.sub(r'(?s)<div class="callout idea">.*?</div>', " ", t)        # pseudocode, not prose
+    t = re.sub(r"(?s)<table\b.*?</table>", " ", t)
+    t = re.sub(r"(?s)<(li|td|th|dd|dt)\b", r". <\1", t)                 # list items end a sentence
+    t = re.sub(r'(?s)<section class="quiz".*', " ", t)
+    t = re.sub(r"(?s)<(h1|h2|h3|h4|figcaption)\b.*?</\1>", " ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return html.unescape(re.sub(r"\s+", " ", t)).strip()
+
+
+def sentences(text):
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"(])", text)
+    return [x for x in parts if len(x.split()) >= 4]
+
+
+def plain_english(src, kind, depth):
+    """WARN-level advice: long sentences, unexplained acronyms and names in the
+    lede or 'Why this matters', and chapters without an analogy."""
+    warns = []
+    body = src.split("<article", 1)[-1]
+    sents = sentences(prose_text(body))
+    if sents:
+        lens = [len(x.split()) for x in sents]
+        avg = sum(lens) / len(lens)
+        if avg > SENTENCE_AVG_MAX:
+            warns.append(f"average sentence is {avg:.1f} words; aim for {SENTENCE_AVG_MAX - 1} or fewer")
+        long = [x for x in sents if len(x.split()) > SENTENCE_LONG]
+        if long:
+            warns.append(f"{len(long)} sentence(s) over {SENTENCE_LONG} words, e.g. \"{long[0][:90]}...\"")
+    full = prose_text(body)
+    def expanded(a):
+        return re.search(r"\(" + re.escape(a) + r"s?\)", full) or re.search(r"\b" + re.escape(a) + r"s? \([A-Za-z]", full) \
+            or re.search(r'class="term">[^<]*\b' + re.escape(a) + r"\b", src)
+    acr = sorted({a.rstrip("s") if a.endswith("s") and a[:-1].isupper() else a
+                  for a in re.findall(r"\b[A-Z]{2}[A-Z0-9]{0,5}s?\b", full)} - KNOWN_ACRONYMS)
+    acr = [a for a in acr if a.isupper() and not a.isdigit() and not expanded(a)]
+    if acr:
+        warns.append("acronyms never expanded on this page: " + ", ".join(acr[:12]) + (" ..." if len(acr) > 12 else ""))
+    # The opening must not lean on names the reader has not met yet.
+    opening = ""
+    m = re.search(r'(?s)<p class="lede">(.*?)</p>', src)
+    if m:
+        opening += m.group(1)
+    m = re.search(r'(?s)<div class="callout why">(.*?)</div>', src)
+    if m:
+        opening += " " + m.group(1)
+    if opening:
+        plain = re.sub(r'(?s)<span class="term">.*?</span>|<a\b.*?</a>', " ", opening)
+        plain = prose_text(plain)
+        names = sorted({w for w in re.findall(r"\b(?:[A-Z][a-z]+[A-Z]\w*|[A-Z]{2,}[a-z]*\w*)\b", plain)}
+                       - KNOWN_ACRONYMS)
+        if names:
+            warns.append("lede / 'Why this matters' names things before explaining them: " + ", ".join(names[:10]))
+    if kind == "chapter" and depth in ("deep", "core") and "callout analogy" not in src:
+        warns.append("no everyday analogy (callout analogy) in a deep or core chapter")
+    return warns
+
+
 def kind_of(path):
     parts = path.split(os.sep)
     for k, folder in (("chapter", "chapters"), ("lab", "labs"), ("case", "cases"), ("studio", "studios"),
@@ -236,6 +306,9 @@ def lint(path, cat, out):
                 lo, hi = {"deep": (4000, 9000), "core": (2500, 6500), "intro": (1100, 3500)}[entry["depth"]]
                 if words < lo * 0.8:
                     warns.append(f"about {words} words of prose; target for {entry['depth']} is {lo} to {hi}")
+    if course and course["track"] == "ai" and kind in ("chapter", "lab", "studio"):
+        entry = next((e for e in course["chapters"] if e["file"] == os.path.basename(rel)), None) if kind == "chapter" else None
+        warns.extend(plain_english(src, kind, entry["depth"] if entry else None))
     if "<pre" in src and 'data-title="output"' not in src and kind == "chapter":
         warns.append("no output blocks: chapters should show real output of code they run")
     if "data-tex" in src or "text-align:center" in src:

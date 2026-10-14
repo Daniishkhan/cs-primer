@@ -670,7 +670,7 @@
   /* ---------- A0: Math & Code for Machine Learning ---------- */
   var MLF_PARTS = [
     { title: "Orientation",            blurb: "What an AI systems engineer does, and the map of this second path." },
-    { title: "Python for ML Work",     blurb: "Arrays, vectorised thinking, tidy data and experiments you can rerun." },
+    { title: "Python for ML & Program Search", blurb: "Arrays, tidy data and experiments you can rerun, then functions, objects and programs as data: the Python an evolution loop is made of." },
     { title: "Linear Algebra",         blurb: "Vectors, matrices and decompositions: the language every model is written in." },
     { title: "Calculus & Optimisation", blurb: "Derivatives, automatic differentiation and the optimisers that train every network." },
     { title: "Probability & Information", blurb: "Distributions, likelihood, entropy and the statistics that tell signal from noise." },
@@ -682,6 +682,9 @@
     { id: "02", part: 1, depth: "deep",  file: "02-numpy-arrays.html",        title: "NumPy, Arrays & Broadcasting",             blurb: "Shapes, strides, axes and broadcasting: the mental model behind every tensor library." },
     { id: "03", part: 1, depth: "core",  file: "03-data-wrangling.html",      title: "Data Wrangling: pandas, SQL & Tidy Data",  blurb: "Loading, joining, grouping and cleaning tables, and the questions to ask any dataset." },
     { id: "04", part: 1, depth: "core",  file: "04-reproducible-experiments.html", title: "Reproducible Experiments",            blurb: "Environments, pinned versions, seeds, notebooks versus scripts and experiment logs." },
+    { id: "20", part: 1, depth: "deep",  file: "20-functions-objects.html",   title: "Functions, Closures & Objects",            blurb: "Functions as values, closures, small classes and dataclasses, dunder methods and exceptions." },
+    { id: "21", part: 1, depth: "deep",  file: "21-programs-as-data.html",    title: "Programs as Data",                         blurb: "Read Python source as a tree, change it, turn it back into code and run it with a step budget." },
+    { id: "22", part: 1, depth: "core",  file: "22-running-candidates.html",  title: "Running Many Candidates Safely",           blurb: "Timeouts, separate processes, worker pools, caching by content hash and archives you can replay." },
     { id: "05", part: 2, depth: "deep",  file: "05-vectors-similarity.html",  title: "Vectors, Dot Products & Similarity",       blurb: "Vectors as arrows and as lists, length, angle, cosine similarity and projections." },
     { id: "06", part: 2, depth: "deep",  file: "06-matrices.html",            title: "Matrices as Functions",                    blurb: "Matrix multiplication as composing transformations, shapes as contracts, and inverses." },
     { id: "07", part: 2, depth: "deep",  file: "07-decompositions.html",      title: "Eigenvectors, SVD & Low Rank",             blurb: "Eigenvectors, the singular value decomposition and why low-rank structure is everywhere." },
@@ -703,7 +706,8 @@
     { id: "L2", file: "lab-02-autograd.html",   title: "Build an Autograd Engine",        afterPart: 3, related: ["08", "09"],       blurb: "A scalar Value class with reverse-mode autodiff, checked against numerical gradients." },
     { id: "L3", file: "lab-03-optimisers.html", title: "The Optimiser Race",              afterPart: 3, related: ["10", "11"],       blurb: "SGD, momentum, RMSProp, Adam and AdamW on classic test surfaces, with schedules and clipping." },
     { id: "L4", file: "lab-04-likelihood.html", title: "Sampling, Likelihood & Entropy",  afterPart: 4, related: ["12", "13", "14"], blurb: "Samplers, maximum-likelihood fits, stable log-softmax, temperature, entropy and KL." },
-    { id: "L5", file: "lab-05-statistics.html", title: "A Statistics Toolkit for Experiments", afterPart: 4, related: ["15"],          blurb: "Bootstrap intervals, permutation tests, power by simulation and a demonstration of peeking." }
+    { id: "L5", file: "lab-05-statistics.html", title: "A Statistics Toolkit for Experiments", afterPart: 4, related: ["15"],          blurb: "Bootstrap intervals, permutation tests, power by simulation and a demonstration of peeking." },
+    { id: "L6", file: "lab-06-evolution-engine.html", title: "A Tiny Evolution Engine",     afterPart: 1, related: ["20", "21", "22"], blurb: "Mutate bin-packing heuristics as Python code, score them safely and keep an archive: evolution with no language model." }
   ];
   var MLF_CASES = [
     { id: "C1", file: "case-01-reinhart-rogoff.html", title: "A Spreadsheet Error That Shaped Policy", pattern: "Reproducible analysis", related: ["03", "04"], blurb: "An influential economics result that a student could not reproduce, and what the spreadsheet hid." },
@@ -1136,8 +1140,10 @@
   ];
   var OE_CHAPTERS = [
     { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                               blurb: "Objectives, search and open-ended discovery, and what this course builds." },
+    { id: "19", part: 1, depth: "deep",  file: "19-evolution-for-builders.html", title: "Evolution for Builders",              blurb: "What biology actually does: variation, inheritance, selection, genotype and phenotype, landscapes, drift and evolvability." },
     { id: "01", part: 1, depth: "deep",  file: "01-tree-search.html",         title: "Tree Search, Bandits & MCTS",              blurb: "Exploration versus exploitation, UCB, Monte Carlo tree search and the AlphaZero idea." },
     { id: "02", part: 1, depth: "deep",  file: "02-evolutionary-algorithms.html", title: "Evolutionary Algorithms",              blurb: "Populations, mutation, crossover, selection pressure and evolution strategies." },
+    { id: "20", part: 1, depth: "deep",  file: "20-gp-neuroevolution-cmaes.html", title: "Genetic Programming, Neuroevolution & CMA-ES", blurb: "Evolving program trees, evolving networks with NEAT, and the evolution strategy that learns its own step shape." },
     { id: "03", part: 1, depth: "core",  file: "03-novelty-search.html",      title: "Why Objectives Deceive",                   blurb: "Deceptive fitness landscapes, novelty search and the value of stepping stones." },
     { id: "04", part: 1, depth: "deep",  file: "04-quality-diversity.html",   title: "Quality-Diversity & MAP-Elites",           blurb: "Archives of diverse high performers, behaviour descriptors and illumination." },
     { id: "05", part: 2, depth: "core",  file: "05-open-ended-algorithms.html", title: "Open-Ended Algorithms",                  blurb: "POET and co-evolving problems with solutions, and what 'open-ended' means." },
@@ -1149,6 +1155,7 @@
     { id: "11", part: 3, depth: "core",  file: "11-evolving-prompts.html",    title: "Evolving Prompts & Pipelines",             blurb: "Prompt evolution, self-referential improvement and optimising LLM programs with DSPy." },
     { id: "12", part: 4, depth: "deep",  file: "12-meta-agent-search.html",   title: "Automated Design of Agentic Systems",      blurb: "A meta agent that writes agents as code, keeps an archive and searches for better designs." },
     { id: "13", part: 4, depth: "deep",  file: "13-self-improving-agents.html", title: "Self-Improving Coding Agents",           blurb: "The Darwin Gödel Machine: an agent that edits its own scaffold, validated empirically." },
+    { id: "21", part: 4, depth: "deep",  file: "21-self-referential-improvers.html", title: "Self-Referential Improvers",        blurb: "From the Gödel machine to STOP and the Darwin Gödel Machine: improvers that improve the improver, and what stops them." },
     { id: "14", part: 4, depth: "core",  file: "14-automated-science.html",   title: "Automated Science",                        blurb: "The AI Scientist: ideas, experiments, papers and automated review, and their limits." },
     { id: "15", part: 5, depth: "deep",  file: "15-evaluator-hacking.html",   title: "Evaluator Hacking & Reward Hacking",       blurb: "Search finds every loophole in the scorer: famous examples and how to harden evaluators." },
     { id: "16", part: 5, depth: "deep",  file: "16-held-out-evaluation.html", title: "Held-Out Evaluation for Self-Improvers",   blurb: "Separate search, selection and test sets, and the statistics of picking the best of many." },
@@ -1161,7 +1168,8 @@
     { id: "L3", file: "lab-03-program-evolution.html", title: "A Mini FunSearch",               afterPart: 3, related: ["09", "10"],       blurb: "Evolve bin-packing heuristics as code with an island archive and a pluggable mutation operator." },
     { id: "L4", file: "lab-04-ab-mcts.html",        title: "Adaptive Branching over Many Models", afterPart: 3, related: ["08"],           blurb: "Decide when to sample a new answer, refine an old one or switch models, under a call budget." },
     { id: "L5", file: "lab-05-meta-agent.html",     title: "A Mini Meta-Agent Search",          afterPart: 4, related: ["12", "16"],       blurb: "Search over agent designs on a small benchmark, with separate search and held-out splits." },
-    { id: "L6", file: "lab-06-gameable-evaluator.html", title: "The Gameable Evaluator",        afterPart: 5, related: ["15", "16"],       blurb: "Watch a search loop exploit a leaky scorer, then harden the harness until the exploits stop." }
+    { id: "L6", file: "lab-06-gameable-evaluator.html", title: "The Gameable Evaluator",        afterPart: 5, related: ["15", "16"],       blurb: "Watch a search loop exploit a leaky scorer, then harden the harness until the exploits stop." },
+    { id: "L7", file: "lab-07-improve-the-improver.html", title: "Improve the Improver",        afterPart: 5, related: ["21", "16", "09"], blurb: "A STOP-style loop: the bin-packing evolver searches over its own settings, judged on held-out instances it never sees." }
   ];
   var OE_CASES = [
     { id: "C1", file: "case-01-alphazero.html",     title: "AlphaGo to AlphaZero",              pattern: "Search plus learning",        related: ["01"],       blurb: "Tree search guided by a learned policy and value, and what self-play removed." },
@@ -1174,7 +1182,8 @@
   ];
   var OE_STUDIOS = [
     { id: "S1", file: "studio-01-optimisation-loop.html", title: "Design an Automated Optimisation Loop", afterPart: 3, related: ["09", "10", "16"], blurb: "Evolve a scheduling heuristic for a business: evaluator, budget, archive, safety and rollout." },
-    { id: "S2", file: "studio-02-review-claim.html",      title: "Review a Self-Improvement Claim",       afterPart: 5, related: ["15", "16", "17"], blurb: "A team says its agent improved itself by 30%. Decide what you need to see before you believe it." }
+    { id: "S2", file: "studio-02-review-claim.html",      title: "Review a Self-Improvement Claim",       afterPart: 5, related: ["15", "16", "17"], blurb: "A team says its agent improved itself by 30%. Decide what you need to see before you believe it." },
+    { id: "S3", file: "studio-03-build-a-self-improver.html", title: "Capstone: Build and Audit Your Own Self-Improver", afterPart: 5, related: ["19", "21", "16", "17"], blurb: "Choose a problem with an honest evaluator, build an evolving loop that improves its own search, and write the audit that proves it." }
   ];
   var OE_TOOLS = [
     { id: "openevolve", name: "OpenEvolve",                  chapters: ["09", "10"],             blurb: "An open-source implementation of AlphaEvolve-style program evolution." },
@@ -1281,7 +1290,7 @@
     { id: "mlf", dir: "ml-foundations", track: "ai", num: "A0", mark: "MF", title: "Math & Code for Machine Learning", subtitle: "the toolkit at the point of need",
       tagline: "Arrays, linear algebra, derivatives and autodiff, probability, information theory and the statistics of experiments, taught as each later course needs them.",
       status: "done", parts: MLF_PARTS, chapters: MLF_CHAPTERS, labs: MLF_LABS, cases: MLF_CASES, studios: MLF_STUDIOS, tools: MLF_TOOLS,
-      spine: ["00", "01", "02", "04", "05", "06", "08", "09", "10", "12", "13", "14", "15"] },
+      spine: ["00", "01", "02", "04", "20", "21", "22", "05", "06", "08", "09", "10", "12", "13", "14", "15"] },
     { id: "ml", dir: "ml", track: "ai", num: "A1", mark: "ML", title: "Machine Learning & Data Science", subtitle: "models you can trust",
       tagline: "Framing, metrics, linear models, trees and boosting, unsupervised learning, validation, leakage, calibration, features and proving value.",
       status: "done", parts: ML_PARTS, chapters: ML_CHAPTERS, labs: ML_LABS, cases: ML_CASES, studios: ML_STUDIOS, tools: ML_TOOLS,
@@ -1309,7 +1318,7 @@
     { id: "oe", dir: "open-ended", track: "ai", num: "A7", mark: "OE", title: "Search, Evolution & Self-Improving Agents", subtitle: "systems that keep discovering",
       tagline: "MCTS, evolution, novelty and quality-diversity, open-ended algorithms, LLM-guided program evolution, meta agents and the integrity of self-improvement.",
       status: "done", parts: OE_PARTS, chapters: OE_CHAPTERS, labs: OE_LABS, cases: OE_CASES, studios: OE_STUDIOS, tools: OE_TOOLS,
-      spine: ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18"] },
+      spine: ["00", "19", "01", "02", "20", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "21", "14", "15", "16", "17", "18"] },
     { id: "aid", dir: "ai-delivery", track: "ai", num: "A8", mark: "AD", title: "Applied AI Delivery Studio", subtitle: "capstone: from brief to production",
       tagline: "Discovery, requirements under ambiguity, prototypes, evaluation plans, domains, production delivery, security reviews, writing for customers and getting hired.",
       status: "done", parts: AID_PARTS, chapters: AID_CHAPTERS, labs: AID_LABS, cases: AID_CASES, studios: AID_STUDIOS, tools: AID_TOOLS,
