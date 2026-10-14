@@ -148,7 +148,7 @@
 
   function networkError(e, provider) {
     var hint = provider === "ollama"
-      ? "Could not reach Ollama. Is it running, and started with OLLAMA_ORIGINS set to this site's origin (or *) so a browser may call it?"
+      ? "Could not reach Ollama. Is it running, and started with OLLAMA_ORIGINS set to exactly this site's origin (" + (typeof location !== "undefined" ? location.origin : "the site origin") + ") so this page may call it? Do not use *, which would let every website call it."
       : "Could not reach the provider. Check the base URL, your connection, and that the server accepts browser (CORS) requests.";
     var err = new Error(hint + " (" + e.message + ")");
     err.cause = e;
@@ -731,7 +731,7 @@
     settingsBox.appendChild(urlLabel);
     settingsBox.appendChild(el("p", { class: "ask-note", text:
       "The key is kept in this browser's localStorage and is sent only to the provider above, straight from the page. " +
-      "Nothing goes through this site. For Ollama, start it with OLLAMA_ORIGINS set to this site's origin (or *) so a browser may call it." }));
+      "Nothing goes through this site. For Ollama, start it with OLLAMA_ORIGINS set to exactly this site's origin (" + location.origin + ") so this page may call it; not *, which would let every website call it." }));
     settingsBox.appendChild(el("div", { class: "ask-row" }, [saveBtn, cancel]));
     settingsBox.hidden = false;
     threadBox.hidden = true;
