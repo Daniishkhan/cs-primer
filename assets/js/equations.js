@@ -233,7 +233,17 @@
 
   /* ---------- boot ---------- */
 
+  // Pages that render content later (the Review page) call NZ.typeset(root).
+  function typesetIn(root) {
+    root.querySelectorAll("[data-tex]:not(.eq-done)").forEach(function (node) {
+      if (node.closest(".eq-steps")) return;
+      typeset(node, node.getAttribute("data-tex"), isDisplay(node) && node.tagName !== "DT");
+    });
+  }
+
   function run() {
+    window.NZ = window.NZ || {};
+    window.NZ.typeset = typesetIn;
     document.querySelectorAll("[data-tex]").forEach(function (node) {
       if (node.closest(".eq-steps")) return;     // step expressions render in buildSteps
       typeset(node, node.getAttribute("data-tex"), isDisplay(node) && node.tagName !== "DT");

@@ -251,6 +251,8 @@
 
     return el("div", { class: "sidebar-foot" }, [
       course ? legend : null,
+      searchButton(),
+      el("a", { href: root + "/review.html", text: "🔁  Review" }),
       el("a", { href: root + "/glossary.html", text: "📖  Glossary" }),
       course && (course.tools || []).length ? el("a", { href: root + "/" + course.dir + "/toolbox.html", text: "🧰  Toolbox" }) : null,
       el("a", { href: root + "/lab-machine.html", text: "🖥️  Your lab machine" }),
@@ -260,6 +262,87 @@
       sketchButton()
     ]);
   }
+
+  /* ---------- search: ⌘K, Ctrl+K or "/" anywhere ----------
+     The index (assets/js/search-data.js, built by authoring/build_study.py)
+     is fetched the first time search opens: every page title and blurb and
+     every section heading. All words must match; titles rank first. */
+
+  var searchBox = null;
+  function searchButton() {
+    var mac = /Mac|iPhone|iPad/.test(navigator.platform || "");
+    var b = el("button", { class: "theme-toggle search-toggle", type: "button", text: "🔎  Search (" + (mac ? "⌘" : "Ctrl+") + "K)" });
+    b.addEventListener("click", openSearch);
+    return b;
+  }
+
+  function openSearch() {
+    if (searchBox) { searchBox.hidden = false; searchBox.querySelector("input").select(); return; }
+    var input = el("input", { type: "search", class: "search-input", placeholder: "Search every page and section…", "aria-label": "Search" });
+    var list = el("ol", { class: "search-results", role: "listbox" });
+    var hint = el("p", { class: "search-hint", text: "Loading the index…" });
+    var panel = el("div", { class: "search-panel", role: "dialog", "aria-label": "Search" }, [input, hint, list]);
+    searchBox = el("div", { class: "search-backdrop" }, [panel]);
+    document.body.appendChild(searchBox);
+    var sel = 0, hits = [];
+    function close() { searchBox.hidden = true; }
+    function render() {
+      list.textContent = "";
+      var words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+      var data = window.CS_SEARCH || [];
+      if (!words.length) { hint.textContent = data.length ? data.length + " pages and sections. Type to search." : hint.textContent; hits = []; return; }
+      hits = [];
+      for (var i = 0; i < data.length && hits.length < 400; i++) {
+        var d = data[i], hay = (d.t + " " + d.s + " " + d.c).toLowerCase();
+        if (words.every(function (w) { return hay.indexOf(w) !== -1; })) {
+          var t = d.t.toLowerCase();
+          var score = (words.every(function (w) { return t.indexOf(w) !== -1; }) ? 0 : 2) + (d.k === "section" ? 1 : 0);
+          hits.push({ d: d, score: score, n: i });
+        }
+      }
+      hits.sort(function (a, b) { return a.score - b.score || a.n - b.n; });
+      hits = hits.slice(0, 30);
+      hint.textContent = hits.length ? "" : "No matches.";
+      sel = 0;
+      hits.forEach(function (h, k) {
+        var a = el("a", { href: root + "/" + h.d.h, class: "search-hit" + (k === 0 ? " on" : ""), role: "option" }, [
+          el("span", { class: "search-title", text: h.d.t }),
+          el("span", { class: "search-sub", text: (h.d.k === "section" ? h.d.s + " · " : "") + h.d.c })
+        ]);
+        list.appendChild(el("li", null, [a]));
+      });
+    }
+    function move(dir) {
+      var links = list.querySelectorAll("a");
+      if (!links.length) return;
+      links[sel].classList.remove("on");
+      sel = (sel + dir + links.length) % links.length;
+      links[sel].classList.add("on");
+      links[sel].scrollIntoView({ block: "nearest" });
+    }
+    input.addEventListener("input", render);
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowDown") { move(1); e.preventDefault(); }
+      else if (e.key === "ArrowUp") { move(-1); e.preventDefault(); }
+      else if (e.key === "Enter") { var a = list.querySelectorAll("a")[sel]; if (a) location.href = a.href; }
+      else if (e.key === "Escape") close();
+    });
+    searchBox.addEventListener("click", function (e) { if (e.target === searchBox) close(); });
+    var s = document.createElement("script");
+    s.src = ASSETS + "js/search-data.js";
+    s.onload = render;
+    s.onerror = function () { hint.textContent = "Could not load the search index."; };
+    document.head.appendChild(s);
+    input.focus();
+  }
+
+  document.addEventListener("keydown", function (e) {
+    var typing = /INPUT|TEXTAREA|SELECT/.test((e.target && e.target.tagName) || "") || (e.target && e.target.isContentEditable);
+    if ((e.key === "k" && (e.metaKey || e.ctrlKey)) || (e.key === "/" && !typing)) {
+      e.preventDefault();
+      openSearch();
+    }
+  });
 
   /* ---------- builder spine toggle ---------- */
 
@@ -788,7 +871,7 @@
 
   // Typeset maths (equations.js + vendored KaTeX) only on pages that have some.
   function loadEquations() {
-    if (!ASSETS || !document.querySelector("[data-tex]")) return;
+    if (!ASSETS || !document.querySelector("[data-tex], #review")) return;
     window.NZ = window.NZ || {};
     window.NZ.assets = ASSETS;
     var s = document.createElement("script");
