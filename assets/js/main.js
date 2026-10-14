@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  var SITE = "Zero to Systems";
+  var SITE = "Zero to AI Systems";
   // assets/ folder, from this script's own URL (runner.js and vendor files live there).
   var ASSETS = ((document.currentScript && document.currentScript.src) || "").replace(/js\/main\.js(?:[?#].*)?$/, "");
   var COURSES = window.CS_COURSES || [];
@@ -384,8 +384,7 @@
 
   /* Hub and glossary: the sidebar lists the courses instead of chapters. */
   function buildHubNav(side) {
-    [["The path", COURSES.filter(function (co) { return !co.track; })],
-     ["Zero to AI Systems", COURSES.filter(function (co) { return co.track === "ai"; })]].forEach(function (grp) {
+    [["Zero to AI Systems", COURSES]].forEach(function (grp) {
       if (!grp[1].length) return;
       var list = el("ul", { class: "nav-list" });
       grp[1].forEach(function (co) {

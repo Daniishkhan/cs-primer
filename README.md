@@ -1,49 +1,32 @@
-# Zero to Systems
+# Zero to AI Systems
 
-*Two paths: Zero to Systems (courses 0 to 7) and Zero to AI Systems (courses A0 to A8).*
+A first-principles path, in nine courses, from school mathematics to building, evaluating and improving AI systems. It's written for someone with no prior knowledge of the subject: every term is defined when it first appears, and every course uses analogies, hand-drawn-style diagrams, step-through animations, small interactive simulators, equations broken down symbol by symbol, and quizzes. Each course also has hands-on Python labs that run in the page, case studies of real systems with primary sources, design studios, and (in A2 and A3) workbench pages that measure the ideas with PyTorch on a laptop or a rented GPU.
 
-A first-principles path from how computers talk to senior-level system design. It's written for someone with no prior knowledge: every term is defined when it first appears, and every course uses analogies, hand-drawn-style diagrams, step-through animations, small interactive simulators, terminal experiments and quizzes. Each course also has hands-on Python labs, case studies of real systems with primary sources, and (from course 1 onward) interview-style **design studios**.
+## The courses
 
-## The path
-
-| # | Course | Folder | Status |
-|---|---|---|---|
-| 0 | **Networking from Zero**: bits to replication and consensus | `networking/` | 23 chapters · 6 labs · 10 case studies |
-| 1 | **How Programs Run**: CPU, memory, kernel, processes, durability, threads, locks, queues, event loops | `systems/` | 23 chapters · 5 labs · 8 case studies · 2 studios |
-| 2 | **Data Systems**: storage engines, indexes, transactions & isolation, caching, replication, sharding, streams | `data/` | 22 chapters · 6 labs · 8 case studies · 2 studios |
-| 3 | **Software Architecture & Design**: complexity, coupling, hexagonal design, APIs, microservices, events, sagas, resilience | `architecture/` | 22 chapters · 6 labs · 8 case studies · 2 studios |
-| 4 | **Distributed Systems, Deep**: system models, impossibility, failure detection, leases & fencing, consistency models, Paxos & Raft, atomic commit, distributed transactions, CRDTs, exactly-once, multi-region, Jepsen/simulation/TLA+ | `distributed/` | 22 chapters · 7 labs · 10 case studies · 3 studios |
-| 5 | **Reliability & Operations**: availability maths, SLOs & error budgets, metrics/logs/tracing, alerting, queueing theory, tail latency, load testing, overload, deploys, config, Kubernetes, blast radius, incidents, postmortems, DR, chaos, cost | `reliability/` | 22 chapters · 6 labs · 8 case studies · 3 studios |
-| 6 | **Security Engineering** (added after a curriculum gap analysis): threat modeling, applied crypto, keys & PKI, authentication, sessions & JWTs, OAuth/OIDC, authorization, injection, web security, SSRF, supply chain, zero trust, cloud, multi-tenancy, abuse, privacy, detection | `security/` | 21 chapters · 6 labs · 8 case studies · 3 studios |
-| 7 | **System Design Studio** (capstone): a design framework, estimation, building blocks, communication, 15 worked designs, ML/LLM systems, 8 mock design studios | `design/` | 22 chapters · 6 labs · 8 case studies · 8 studios |
-
-Chapters are tagged **Deep dive**, **Core** or **Quick intro** so you know where to spend your effort.
-
-## The second path: Zero to AI Systems
-
-A second path, in nine courses, from school mathematics to building, evaluating and delivering AI systems. It trains a broad AI systems / applied AI engineer and links back to the first path for the engineering underneath instead of repeating it.
+It assumes you can program in Python and know the software engineering around a model (processes, HTTP, databases, reliability, security); chapters recall those ideas in a sentence where they need them.
 
 | # | Course | Folder | Size |
 |---|---|---|---|
-| A0 | **Math & Code for Machine Learning**: arrays, linear algebra, SVD, derivatives and autodiff, optimisers, floating point, probability, likelihood, information theory, statistics of experiments | `ml-foundations/` | 20 chapters · 5 labs · 5 case studies · 2 studios |
+| A0 | **Math & Code for Machine Learning**: arrays, linear algebra, SVD, derivatives and autodiff, optimisers, floating point, probability, likelihood, information theory, statistics of experiments | `ml-foundations/` | 23 chapters · 6 labs · 5 case studies · 2 studios |
 | A1 | **Machine Learning & Data Science**: framing and metrics, linear models, trees and boosting, unsupervised learning, cross-validation, leakage, calibration, features, time series, competitions, proving value | `ml/` | 22 chapters · 6 labs · 7 case studies · 3 studios |
-| A2 | **Deep Learning & Transformers**: backpropagation, training dynamics, embeddings, attention, a GPT by hand, tokenisation, decoding, FLOPs and memory, scaling laws, modern architectures | `deep-learning/` | 23 chapters · 6 labs · 7 case studies · 2 studios |
-| A3 | **Training, Post-training & Serving LLMs**: pretraining data and parallelism, RL foundations, SFT, LoRA, RLHF, DPO, GRPO, distillation, merging, quantisation, KV cache, serving engines | `llm-training/` | 24 chapters · 7 labs · 7 case studies · 3 studios |
+| A2 | **Deep Learning & Transformers**: backpropagation, training dynamics, embeddings, attention, a GPT by hand, tokenisation, decoding, FLOPs and memory, scaling laws, modern architectures | `deep-learning/` | 23 chapters · 6 labs · 7 case studies · 2 studios · 4 workbenches |
+| A3 | **Training, Post-training & Serving LLMs**: pretraining data and parallelism, RL foundations, SFT, LoRA, RLHF, DPO, GRPO, distillation, merging, quantisation, KV cache, serving engines | `llm-training/` | 24 chapters · 7 labs · 7 case studies · 3 studios · 4 workbenches |
 | A4 | **Agents, Tools & Protocols**: the tool loop, tool design, function calling, MCP and A2A, context engineering, workflows, multi-agent systems, durable execution, deep research, computer use, agent security | `agents/` | 23 chapters · 7 labs · 7 case studies · 3 studios |
 | A5 | **Retrieval, Search & Document AI**: BM25, relevance metrics, dense and hybrid retrieval, vector indexes, RAG with verified citations, PDFs, OCR, tables and visual retrieval | `retrieval/` | 23 chapters · 6 labs · 7 case studies · 3 studios |
 | A6 | **Evals, Guardrails & Safe Operation**: error analysis, LLM judges, eval statistics, domain benchmarks, agent evals, hallucination, prompt injection, guardrails, red teaming, observability, governance | `evals/` | 23 chapters · 7 labs · 7 case studies · 3 studios |
-| A7 | **Search, Evolution & Self-Improving Agents**: MCTS, evolution, novelty and quality-diversity, open-ended algorithms, FunSearch and AlphaEvolve, meta agents, evaluator hacking | `open-ended/` | 19 chapters · 6 labs · 7 case studies · 2 studios |
+| A7 | **Search, Evolution & Self-Improving Agents**: MCTS, evolution, novelty and quality-diversity, open-ended algorithms, FunSearch and AlphaEvolve, meta agents, evaluator hacking | `open-ended/` | 22 chapters · 7 labs · 7 case studies · 3 studios |
 | A8 | **Applied AI Delivery Studio** (capstone): discovery, requirements under ambiguity, prototypes, evaluation plans, domains, production delivery, security reviews, writing for customers, getting hired | `ai-delivery/` | 20 chapters · 4 labs · 6 case studies · 8 take-home studios |
 
-Chapters that change fast (model rankings, prices, library and protocol versions) keep those facts in dated **State of play** boxes, so the main text stays about durable mechanisms.
+Chapters are tagged **Deep dive**, **Core** or **Quick intro** so you know where to spend your effort. Chapters that change fast (model rankings, prices, library and protocol versions) keep those facts in dated **State of play** boxes, so the main text stays about durable mechanisms.
 
 ### The builder spine
 
-The second path has a **builder spine**: about 90 chapters on the way to course A7, for learners who want to build evolutionary and self-improving systems rather than deliver AI to customers. Each AI course lists its spine chapters in `assets/js/catalog.js` (`spine: [...]`), and every other chapter shows as *elective*. The **Builder spine only** button at the foot of the sidebar hides the electives, and its prev/next links then walk the spine across courses. A8 is wholly elective. One problem, online bin packing, runs through the spine as its worked example. `curriculum.html` has the full plan.
+The path has a **builder spine**: about 90 chapters on the way to course A7, for learners who want to build evolutionary and self-improving systems rather than deliver AI to customers. Each AI course lists its spine chapters in `assets/js/catalog.js` (`spine: [...]`), and every other chapter shows as *elective*. The **Builder spine only** button at the foot of the sidebar hides the electives, and its prev/next links then walk the spine across courses. A8 is wholly elective. One problem, online bin packing, runs through the spine as its worked example. `curriculum.html` has the full plan.
 
-### Labs in the second path
+### Labs and stand-in models
 
-AI-path labs follow the same `starter.py` / `check.py` / `solution.py` layout, use the standard library only and are deterministic. Labs that talk to a model use **scripted stand-in models** from `lab-support/llm.py` (copied into each lab folder as `llm.py`), so `python3 check.py` is free, offline and repeatable. To try a lab's ideas against a real model, set `LAB_MODEL`:
+Labs use the standard library only and are deterministic. Labs that talk to a model use **scripted stand-in models** from `lab-support/llm.py` (copied into each lab folder as `llm.py`), so `python3 check.py` is free, offline and repeatable. To try a lab's ideas against a real model, set `LAB_MODEL`:
 
 ```sh
 LAB_MODEL=anthropic:<model-id> python3 your_script.py   # needs ANTHROPIC_API_KEY
@@ -55,7 +38,7 @@ LAB_MODEL=ollama:<model-name>  python3 your_script.py   # a local Ollama server
 
 ### Authoring
 
-`authoring/guide.md` is the page contract for the second path (voice, skeletons, diagrams, labs, cases, studios). `authoring/check_page.py` lints pages against it, `authoring/render_check.sh` loads pages in headless Chrome and reports JavaScript errors, and `authoring/build_glossary.py` rebuilds `glossary.html` from the frozen track-1 entries plus `glossary-src/*.json`.
+`authoring/guide.md` is the page contract (voice, skeletons, diagrams, labs, cases, studios). `authoring/check_page.py` lints pages against it, `authoring/render_check.sh` loads pages in headless Chrome and reports JavaScript errors, and `authoring/build_glossary.py` rebuilds `glossary.html` from `glossary-src/*.json`.
 
 ## Opening it
 
@@ -76,7 +59,7 @@ Every chapter script is a code cell with **Copy**, **✎ Edit** and **▶ Run**.
 - Nothing is downloaded until you press Run. The first run fetches Python from jsDelivr (about 10 MB, then cached by the browser), so it needs a connection.
 - Python runs in a Web Worker, so the page stays responsive and **■ Stop** ends a long or endless script. Browser Python is two to three times slower than native, so the heaviest simulations take tens of seconds.
 - Scripts that need a real operating system (processes, threads, sockets, `fsync`, `mmap`) are marked **run locally**: copy them and run them with `python3`. That is most of How Programs Run, by design.
-- Every lab page has **Or work in the page**: `starter.py` as an editable cell whose **▶ Check** runs the lab's `check.py` against it (args: `solution`, or a milestone number). 100 of the 102 labs run this way; the rest say "run locally".
+- Every lab page has **Or work in the page**: `starter.py` as an editable cell whose **▶ Check** runs the lab's `check.py` against it (args: `solution`, or a milestone number). All 56 labs have one; the two that start processes or threads (agents labs 3 and 6) say "run locally" instead.
 
 ### Equations
 
@@ -109,19 +92,15 @@ Every lab has `<course>/labs/code/labNN/` with three files:
 - `check.py`: run `python3 check.py` to see which milestones pass;
 - `solution.py`.
 
-Labs use Python 3.9+ and the standard library only (the second path's labs too; see above for its stand-in models). The How Programs Run labs use POSIX features (fork, signals, fsync), so on Windows run them in WSL. Distributed-systems labs run whole clusters inside one deterministic, seeded simulation, so any failure can be replayed from its seed. Security labs attack only deliberately vulnerable code inside the lab's own process.
-
-## Curriculum review
-
-After the first six courses were drafted, the whole path was reviewed against a university systems sequence (networking, operating systems, databases, software design, distributed systems, security, parallel computing) and against what senior system-design work actually needs. The review found one large gap and several small ones. The large gap, security, became Course 6. The small ones became **Extensions** chapters at the end of finished courses: cloud networking, parallelism and GPUs, performance engineering, data platforms, and engineering practice. Adding them as Extensions means nothing earlier was renumbered. `curriculum.html` documents the analysis and suggests study plans.
+Labs use Python 3.9+ and the standard library only, and are deterministic (see above for the stand-in models). A few agent labs start subprocesses or threads, so they say "run locally" instead of running in the page.
 
 ## Project layout
 
 ```
 index.html                  hub: all courses and progress
-glossary.html               searchable glossary across courses, with a course filter
-curriculum.html             curriculum map: how the path lines up with university courses, the gap analysis, study plans
-lab-machine.html            a local or cloud Linux VM for the Linux-only experiments, and a rented GPU for workbenches
+glossary.html               searchable glossary, with a course filter
+curriculum.html             curriculum map: how the courses fit together, university comparison, study plans
+lab-machine.html            the laptop environment and a rented GPU for workbenches
 <course>/index.html         course roadmap
 <course>/chapters/          one file per chapter
 <course>/labs/              labs; code in <course>/labs/code/labNN/
@@ -145,9 +124,9 @@ assets/js/review.js         spaced review of every quiz; progress export/import
 assets/js/*-data.js         generated: review-data, search-data (authoring/build_study.py), glossary-data
 assets/js/widgets/          one script per interactive widget
 assets/vendor/              Rough.js (MIT), CodeMirror 5.65.18 (MIT), KaTeX 0.16.11 (MIT)
-lab-support/llm.py          scripted stand-in models + optional real-model adapter, copied into AI-path labs
-<course>/chapters/code/     small helper modules some AI-path chapters import
-glossary-src/               per-chapter glossary terms for the AI path (JSON), merged by authoring/build_glossary.py
+lab-support/llm.py          scripted stand-in models + optional real-model adapter, copied into labs
+<course>/chapters/code/     small helper modules some chapters import
+glossary-src/               per-chapter glossary terms (JSON), merged by authoring/build_glossary.py
 authoring/                  guide, link index, page linter, render check, glossary builder, unit briefs
 ```
 

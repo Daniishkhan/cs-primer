@@ -1,6 +1,6 @@
 # Authoring guide: Zero to AI Systems
 
-This guide is the contract for every page in the second path (courses A0 to A8). The site already has eight finished courses (Zero to Systems); the new pages must be indistinguishable from them in format, voice and quality. Read this whole file before writing anything, then read the sample pages it names.
+This guide is the contract for every page of Zero to AI Systems (courses A0 to A8). New pages must be indistinguishable from the existing ones in format, voice and quality. Read this whole file before writing anything, then read the sample pages it names.
 
 Site root: `/Users/danish/Desktop/projects/cs-refresh/networking/` (all paths below are relative to it).
 
@@ -8,9 +8,9 @@ Site root: `/Users/danish/Desktop/projects/cs-refresh/networking/` (all paths be
 
 - `assets/js/catalog.js` is the single source of truth: every course, part, chapter, lab, case, studio and tool, with ids, file names, titles, blurbs, depth and `related` links. **Do not edit it.** If you believe a title or blurb is wrong, say so in your final report; the coordinator changes it.
 - `assets/js/main.js`, `quiz.js`, `stepper.js`, `studio.js`, `sketch.js`, `assets/css/main.css`, `assets/css/theme.css`: shared. **Do not edit.**
-- `authoring/link-index.md`: every page on the site (both paths) with its exact path, title and blurb. Use it for every cross-link. Never invent a file name.
+- `authoring/link-index.md`: every page on the site with its exact path, title and blurb. Use it for every cross-link. Never invent a file name.
 - `lab-support/llm.py`: the shared stand-in model module for labs (section 8).
-- Track-1 pages you will link to often (the engineering underneath): `systems/chapters/21-parallelism-gpus.html`, `systems/chapters/22-performance-engineering.html`, `networking/chapters/16-failure.html`, `networking/chapters/10-http.html`, `networking/chapters/12-apis.html`, `data/chapters/17-specialised-stores.html` (search engines and vector stores), `reliability/chapters/` (SLOs, metrics, tracing, queueing, tail latency, incidents), `security/chapters/` (threat modelling, OAuth, authorisation, injection, SSRF, supply chain, multi-tenancy, privacy), `distributed/chapters/17-logs-exactly-once.html`, `design/chapters/20-ml-systems.html` (Designing with ML & LLMs). Link instead of re-teaching: one sentence of reminder plus a link.
+- The engineering underneath (processes, networks, storage, reliability, security) is assumed, not taught. Remind the reader of such an idea in one sentence; there are no other courses to link to.
 
 The courses (id, folder):
 
@@ -32,11 +32,11 @@ The path is **broad**: it trains a general AI systems / applied AI engineer, not
 
 Open and read at least the ones for the kind of page you are writing. They are the quality bar.
 
-- Chapter: `architecture/chapters/03-abstractions.html` (structure, callouts, code with real output, diagrams, quiz). For a stepper: `architecture/chapters/15-sagas.html` lines 70 to 130. For an existing ML chapter in this voice: `design/chapters/20-ml-systems.html`.
-- Lab page: `design/labs/lab-01-estimation.html`; lab code: `reliability/labs/code/lab01/check.py`, `starter.py`, `solution.py`.
-- Case study: `design/cases/case-06-stripe-idempotency.html`.
-- Design studio: `design/studios/studio-03-code-judge.html`.
-- Course roadmap: `design/index.html`. Toolbox: `design/toolbox.html`.
+- Chapter: `deep-learning/chapters/09-attention.html` (structure, callouts, code with real output, diagrams, an equation anatomy block, quiz). For a stepper, search any chapter for `widget stepper`.
+- Lab page: `ml/labs/lab-01-linear-models.html`; lab code: `ml/labs/code/lab01/check.py`, `starter.py`, `solution.py`.
+- Case study: `llm-training/cases/case-01-instructgpt.html`.
+- Design studio: `llm-training/studios/studio-01-domain-adaptation.html`.
+- Course roadmap: `llm-training/index.html`. Toolbox: `llm-training/toolbox.html`.
 
 ## 3. Voice and style (strict)
 
@@ -151,10 +151,10 @@ These are targets, not quotas: depth comes from mechanism, worked examples and f
 3. At least one `callout analogy` (with "Where it breaks down") in deep and core chapters.
 4. At least one `callout warn` titled "Common misconception".
 5. At least one `callout try` titled "Try it yourself" with a small experiment (a script to run, a parameter to change, a question to answer). Use `pre.terminal` with `<span class="prompt">$</span> <span class="cmd">…</span>` for commands.
-6. Where relevant, a `callout ds` titled "Systems connection" that links to track-1 chapters (networks, processes, storage, reliability, security) which this idea depends on or mirrors. (The CSS class is `ds` for historical reasons.)
+6. Where relevant, a `callout ds` titled "Systems connection" that names the engineering idea (networks, processes, storage, reliability, security) this idea depends on or mirrors. (The CSS class is `ds` for historical reasons.)
 7. Volatile facts in dated `callout note` boxes (section 3).
 8. `callout key` takeaways, then Further reading (`ul.sources`, 3 to 8 primary sources: papers, specs, official docs, the original blog posts), then the quiz.
-9. In-text links to other chapters in this path and to track-1 chapters, using paths from `authoring/link-index.md`. Link to pages that do not exist yet as well (labs, cases, studios and chapters are being written in parallel): use the exact path from the link index and the linter's broken-link errors for them are expected. Never downgrade such a link to plain text. Labs, cases and studios are linked automatically at the end of a part; you may also mention them in text.
+9. In-text links to other chapters in this path, using paths from `authoring/link-index.md`. Link to pages that do not exist yet as well (labs, cases, studios and chapters are being written in parallel): use the exact path from the link index and the linter's broken-link errors for them are expected. Never downgrade such a link to plain text. Labs, cases and studios are linked automatically at the end of a part; you may also mention them in text.
 
 Other components available (see `assets/css/main.css`): `<dl class="terms">` for a term list, `<div class="table-wrap"><table>…</table></div>` for tables, `<ol class="steps">` for numbered procedures, `<div class="cols"><div class="card accent-blue"><h4>…</h4><p>…</p></div>…</div>` for 2 or 3 side-by-side cards (accent-blue/green/purple/orange/red/cyan), `<details class="deeper"><summary>Go deeper <span class="hint">optional</span></summary>…</details>` for optional depth (derivations, proofs, edge cases), `<span class="badge deep|core|intro">`.
 
@@ -232,7 +232,7 @@ A widget is a small self-contained simulator or calculator: attention-weight exp
 A lab is a page (`<dir>/labs/lab-NN-name.html`) plus code in `<dir>/labs/code/labNN/` (two-digit NN = lab number):
 
 - `starter.py`: the learner's file. All scaffolding given (imports, constants, data classes, helper functions not central to the lesson, docstrings with the contract and examples). Every function the learner writes raises `NotImplementedError("TODO milestone N: function_name")`.
-- `check.py`: the self-check, modelled exactly on `reliability/labs/code/lab01/check.py`: `python3 check.py` checks `starter.py`, `python3 check.py solution` checks `solution.py`, `python3 check.py solution 3` runs only milestone 3. One `check(number, name, fn)` per milestone printing `✔ name`, `✘ name: reason` or `… name: not implemented yet (…)`, then a final line `N/M milestones passing  (T s)`. Failures must explain what was expected, what was got, and a hint at the likely mistake. Seeded randomness; print the seed on failure so it can be replayed.
+- `check.py`: the self-check, modelled exactly on `ml/labs/code/lab01/check.py`: `python3 check.py` checks `starter.py`, `python3 check.py solution` checks `solution.py`, `python3 check.py solution 3` runs only milestone 3. One `check(number, name, fn)` per milestone printing `✔ name`, `✘ name: reason` or `… name: not implemented yet (…)`, then a final line `N/M milestones passing  (T s)`. Failures must explain what was expected, what was got, and a hint at the likely mistake. Seeded randomness; print the seed on failure so it can be replayed.
 - `solution.py`: a complete, clean, commented reference answer.
 - Optional data/fixtures (`corpus.json`, `traces.jsonl`, …) and, when a model is involved, an **exact copy** of `lab-support/llm.py` named `llm.py`. Do not modify the copy; put lab-specific fake models in the lab's own files (e.g. a `RuleModel` configured in `starter.py` or a `fixtures.py`).
 - **Standard library only** (Python 3.9+). No NumPy, no pip installs. Labs about ML implement the maths over lists; keep sizes small enough that `python3 check.py solution` finishes in under 60 seconds (aim for under 15). Deterministic: same output every run.
@@ -256,7 +256,7 @@ then "Going further" ideas, then a quiz of 4 to 6 questions. Lab page length is 
 
 ## 9. Case studies
 
-A case study is a real system, paper, product or incident, built around one pattern (the catalog gives the pattern). Model: `design/cases/case-06-stripe-idempotency.html`.
+A case study is a real system, paper, product or incident, built around one pattern (the catalog gives the pattern). Model: `llm-training/cases/case-01-instructgpt.html`.
 
 - **Read the primary sources** with WebFetch/WebSearch before writing: the paper, the engineering post, the court ruling, the official post-mortem, the spec. Prefer the original over news coverage. If a source cannot be fetched, say so.
 - Start with `<div class="callout note"><p class="callout-title">What I could and could not read</p>…</div>` listing what was fetched and read, what was only seen through secondary coverage, and anything uncertain.
@@ -269,7 +269,7 @@ A case study is a real system, paper, product or incident, built around one patt
 
 ## 10. Design studios
 
-Model: `design/studios/studio-03-code-judge.html`. A studio is a 45 to 90 minute mock design session or (in A8) a take-home simulation.
+Model: `llm-training/studios/studio-01-domain-adaptation.html`. A studio is a 45 to 90 minute mock design session or (in A8) a take-home simulation.
 
 - `callout why` titled "How a design studio works" (adapt the sample's text), then `div.studio-brief` with `p.brief-title` "📐 The brief", the prompt in quotes, constraints as bullets, "Builds on" links and a time box.
 - `<h2>Your notes</h2>` + `<textarea class="studio-notes" aria-label="…" placeholder="…"></textarea>`.

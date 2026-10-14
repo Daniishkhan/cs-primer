@@ -1,5 +1,5 @@
-"""Rebuild glossary.html: the track-1 entries (authoring/glossary-track1.html, frozen)
-plus every AI-track glossary-src/*.json file. Safe to rerun.
+"""Rebuild glossary.html from every glossary-src/*.json file, inside the page
+shell authoring/glossary-template.html. Safe to rerun.
 
     python3 authoring/build_glossary.py
 """
@@ -16,7 +16,7 @@ cat = json.loads(subprocess.check_output(["node", "-e",
     % os.path.join(ROOT, "assets/js/catalog.js")]))
 by_dir = {c["dir"]: c for c in cat}
 
-base = open(os.path.join(ROOT, "authoring/glossary-track1.html"), encoding="utf-8").read()
+base = open(os.path.join(ROOT, "authoring/glossary-template.html"), encoding="utf-8").read()
 old = re.findall(r'  <div class="gloss" data-course="[^"]+" data-text="[^"]*"><dt>.*?</dd></div>', base)
 entries = []  # (sort_key, html)
 for line in old:
@@ -39,7 +39,7 @@ for path in sorted(glob.glob(os.path.join(ROOT, "glossary-src", "*.json"))):
             continue
         key = term.lower()
         if key in seen:
-            # same term already defined (possibly in track 1): keep both only if from a different course
+            # same term already defined: keep both only if from a different course
             if any(k == key and f'data-course="{course["id"]}"' in h for k, h in entries):
                 continue
         seen.add(key)
@@ -74,8 +74,7 @@ end = out.index("</div>\n</article>") if "</div>\n</article>" in out else None
 if end is None:
     raise SystemExit("could not find the end of the glossary list")
 out = out[:start] + "\n" + "\n".join(parts) + "\n" + out[end:]
-out = re.sub(r"<p class=\"lede\">\d+ terms from across the path", f'<p class="lede">{len(entries)} terms from across both paths', out)
-out = out.replace("<title>Glossary · Zero to Systems</title>", "<title>Glossary · Zero to Systems</title>")
+out = re.sub(r"<p class=\"lede\">\d+ terms from across the path", f'<p class="lede">{len(entries)} terms from across the path', out)
 open(os.path.join(ROOT, "glossary.html"), "w", encoding="utf-8").write(out)
 
 # Hover-card data for glossary-hover.js: [term, definition, file, course id, on spine].
