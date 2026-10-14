@@ -42,7 +42,9 @@ LAB_MODEL=ollama:<model-name>  python3 your_script.py   # a local Ollama server
 
 ## Opening it
 
-There is no build step and there are no dependencies. Serve the folder over http and open the hub:
+**Live site: https://daniishkhan.github.io/cs-primer/** (GitHub Pages, served from `main`; every push republishes it).
+
+To run it locally instead (there is no build step and there are no dependencies), serve the folder over http and open the hub:
 
 ```sh
 python3 -m http.server 8000      # in the site folder, then open http://localhost:8000
