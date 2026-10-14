@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Query Rewriting, Agentic Retrieval &amp; GraphRAG · Retrieval, Search &amp; Document AI</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="ret" data-chapter="15">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Query Rewriting, Agentic Retrieval &amp; GraphRAG</h1>
+  <p class="lede">One question, one search, one answer works for questions that look like the documents. It breaks on follow-ups, on questions whose answer needs a chain of facts, and on questions about the whole collection. This chapter covers the three families of fixes (rewrite the query, search repeatedly, build a graph), what each costs, and how to tell which one your failures need.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Once a basic RAG system works (<a href="13-rag-end-to-end.html">chapter 13</a>) the next failures are not about chunking or embedders. Users type "and what about contractors?", ask who the boss of someone's boss is, or want the total across 40 documents. A single top-k search has no way to succeed at these, however well tuned. The fixes are tempting and expensive: every extra model call adds latency, cost and a new way to be wrong. After this chapter you can recognise the shape of the failure, pick the cheapest technique that addresses it, write the budget and stop conditions that keep a search loop from running away, and measure whether the technique paid for itself. It extends the pipeline of chapter 13, reuses the fusion of <a href="10-hybrid-search.html">chapter 10</a>, and leads towards the agent loops of <a href="../../agents/chapters/16-deep-research.html">deep research agents</a>.</p>
+</div>
+
+<h2>When one search is not enough</h2>
+
+<p>Four question shapes defeat a single retrieval, and each calls for a different tool.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Shape</th><th>Example</th><th>Why one search fails</th><th>Tool</th></tr></thead>
+  <tbody>
+    <tr><td>Context-dependent</td><td>"Who approved it, and when?" after a question about the Lisbon lease</td><td>The query alone has no subject. The words it does have match other documents.</td><td>Rewrite to a standalone query</td></tr>
+    <tr><td>Vocabulary gap</td><td>"Which vendor provides the chillers for the Norwegian site?"</td><td>The document says "cooling equipment supplied by Nordcool" for the "Oslo" contract. Few words are shared.</td><td>Multiple rewrites, or a hypothetical answer</td></tr>
+    <tr><td>Multi-hop</td><td>"What is the job title of the boss of the boss of the Aurora project lead?"</td><td>The answer is in the fourth document in a chain. Only the first link resembles the question.</td><td>Iterative search, or a graph</td></tr>
+    <tr><td>Global</td><td>"What is the total 2025 budget across all departments?" or "What are the main themes in these reports?"</td><td>The answer is spread over many documents, so no small top-k contains it. The need is coverage, not relevance.</td><td>Aggregation over all matches, or a graph or summary hierarchy</td></tr>
+  </tbody>
+</table></div>
+
+<p>Throughout the chapter we use one small, constructed knowledge base of 18 one-line company notes (<code>corpus15.py</code>: who approved which contract, who reports to whom, department budgets), searched by the same hybrid retriever as before (BM25 plus a stand-in trigram vector, fused with reciprocal rank fusion; <code>search15.py</code>). Eighteen notes are enough to show the mechanisms; they say nothing about how often each failure occurs in a real collection, which is something only your own logs can tell you.</p>
+
+<h2>Query rewriting</h2>
+
+<p><span class="term">Query rewriting</span> uses a language model to turn the user's words into queries that retrieve better. It happens before retrieval, so it composes with everything else in the pipeline. Ma et al., "Query Rewriting for Retrieval-Augmented Large Language Models" (2023), formalised the "rewrite, retrieve, read" pattern. The common forms:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Query-side techniques as a fan-out. The user question and conversation history go to a standalone rewrite step. The rewritten question then feeds four alternatives: several differently worded variants, a hypothetical answer passage (HyDE), a more general step-back question, and independent sub-questions. Each produces one or more queries that are all searched, and the result lists are fused into one ranking.">
+    <defs><marker id="ahRET15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="10" y="85" width="120" height="70" rx="8" class="fs-green s-green sw-2"/>
+    <text x="70" y="115" text-anchor="middle" class="t-sm t-bold">Question</text><text x="70" y="133" text-anchor="middle" class="t-xs t-muted">+ history</text>
+    <rect x="160" y="85" width="120" height="70" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="220" y="115" text-anchor="middle" class="t-sm t-bold">Standalone</text><text x="220" y="133" text-anchor="middle" class="t-xs t-muted">resolve "it", "that"</text>
+    <rect x="320" y="14" width="200" height="44" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="420" y="34" text-anchor="middle" class="t-sm t-bold">Variants</text><text x="420" y="50" text-anchor="middle" class="t-xs t-muted">same need, other words</text>
+    <rect x="320" y="70" width="200" height="44" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="420" y="90" text-anchor="middle" class="t-sm t-bold">Hypothetical answer</text><text x="420" y="106" text-anchor="middle" class="t-xs t-muted">HyDE: embed a draft</text>
+    <rect x="320" y="126" width="200" height="44" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="420" y="146" text-anchor="middle" class="t-sm t-bold">Step back</text><text x="420" y="162" text-anchor="middle" class="t-xs t-muted">ask the general question</text>
+    <rect x="320" y="182" width="200" height="44" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="420" y="202" text-anchor="middle" class="t-sm t-bold">Sub-questions</text><text x="420" y="218" text-anchor="middle" class="t-xs t-muted">split independent parts</text>
+    <rect x="560" y="85" width="90" height="70" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="605" y="115" text-anchor="middle" class="t-sm t-bold">Search</text><text x="605" y="133" text-anchor="middle" class="t-xs t-muted">each query</text>
+    <rect x="675" y="85" width="75" height="70" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="712" y="115" text-anchor="middle" class="t-sm t-bold">Fuse</text><text x="712" y="133" text-anchor="middle" class="t-xs t-muted">RRF</text>
+    <line x1="130" y1="120" x2="158" y2="120" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="280" y1="105" x2="318" y2="40" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="280" y1="112" x2="318" y2="92" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="280" y1="128" x2="318" y2="148" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="280" y1="135" x2="318" y2="204" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="520" y1="36" x2="558" y2="104" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="520" y1="92" x2="558" y2="112" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="520" y1="148" x2="558" y2="128" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="520" y1="204" x2="558" y2="138" class="line" marker-end="url(#ahRET15a)"/>
+    <line x1="650" y1="120" x2="673" y2="120" class="line" marker-end="url(#ahRET15a)"/>
+    <text x="380" y="242" text-anchor="middle" class="t-xs t-muted">Use one or two of the four, not all. Each is an extra model call before the first search.</text>
+  </svg>
+  <figcaption><strong>Rewrite before you retrieve.</strong> The first step fixes dependence on the conversation; the second layer widens the net in different ways. All the resulting searches are independent, so they can run in parallel.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Standalone (condensed) question.</strong> The model reads the conversation and rewrites the last message so that it makes sense alone: "Who approved it, and when?" becomes "Who approved the Lisbon office lease, and when?". Almost every chat-style RAG system needs this, because the embedder and BM25 see only the string they are given.</li>
+  <li><strong>Multi-query.</strong> Ask for several differently worded versions, search each, and fuse the lists. It targets vocabulary gaps: one of the phrasings may share words with the document.</li>
+  <li><strong>Hypothetical answer (HyDE).</strong> Gao et al., "Precise Zero-Shot Dense Retrieval without Relevance Labels" (2022), had a model write a plausible answer passage, embedded that instead of the question, and retrieved real documents nearest to it. A question and its answer often look different in embedding space; two answer-like passages look alike. The draft may contain false facts, so it is used only to find documents and never shown as an answer.</li>
+  <li><strong>Step-back.</strong> Zheng et al., "Take a Step Back: Evoking Reasoning via Abstraction in Large Language Models" (2023), ask a more general question first ("What are the rules on working abroad?" before "Can I work from Spain for a month?"). Retrieval of the general principle can succeed where the specific query matches nothing.</li>
+  <li><strong>Independent sub-questions.</strong> "Compare the Facilities and Platform budgets" splits into two searches that do not depend on each other. (Questions whose parts <em>do</em> depend on each other need the loop in the next section.)</li>
+</ul>
+
+<p>The listing runs the first two on the knowledge base. The rewriter is a <code>ScriptedModel</code> from the course's <code>llm.py</code>: its replies are written in advance to be what a good model would return, so what is real is the retrieval that follows.</p>
+
+<pre class="terminal" data-title="rewrite15.py"><code>&quot;&quot;&quot;Query rewriting: make a follow-up standalone, then fan out into several queries (chapter 15).&quot;&quot;&quot;
+from search15 import *
+from llm import ScriptedModel, text_of
+import json
+
+def rrf(lists, k=60):
+    s = Counter()
+    for lst in lists:
+        for r, d in enumerate(lst, 1): s[d] += 1 / (k + r)
+    return [d for d, _ in s.most_common()]
+
+# The rewriter is a ScriptedModel: its replies are what a good model would return for this prompt.
+REWRITER = ScriptedModel([
+    &quot;Who approved the Lisbon office lease, and when?&quot;,
+    json.dumps([&quot;Which supplier provides cooling equipment for the Oslo data-centre contract?&quot;,
+                &quot;Who supplies the chillers for the Norway data centre?&quot;,
+                &quot;vendor of cooling equipment, Oslo&quot;]),
+])
+SYSTEM = &quot;Rewrite the user&#x27;s last message as one standalone search query, using the conversation.&quot;
+
+history = [(&quot;user&quot;, &quot;Tell me about the Lisbon office lease.&quot;), (&quot;assistant&quot;, &quot;It was approved earlier this year.&quot;),
+           (&quot;user&quot;, &quot;Who approved it, and when?&quot;)]
+literal = history[-1][1]
+standalone = text_of(REWRITER.complete([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: json.dumps(history)}], system=SYSTEM))
+print(&quot;follow-up as typed :&quot;, literal, &quot;-&gt;&quot;, search(literal, 3))
+print(&quot;rewritten          :&quot;, standalone, &quot;-&gt;&quot;, search(standalone, 3))
+print(&quot;(the answer is in n06)\n&quot;)
+
+q = &quot;Which vendor provides the chillers for the Norwegian site?&quot;
+variants = json.loads(text_of(REWRITER.complete([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Write 3 differently worded search queries for: &quot; + q}])))
+print(&quot;one query          :&quot;, search(q, 3), &quot; (answer is in n04)&quot;)
+for v in variants: print(&quot;  variant          :&quot;, search(v, 3), v)
+print(&quot;fused, 3 variants only      :&quot;, rrf([search(x, 5) for x in variants])[:3])
+print(&quot;fused, original + 3 variants :&quot;, rrf([search(x, 5) for x in [q] + variants])[:3])</code></pre>
+<pre class="terminal" data-title="output"><code>follow-up as typed : Who approved it, and when? -&gt; [&#x27;n06&#x27;, &#x27;n01&#x27;, &#x27;n17&#x27;]
+rewritten          : Who approved the Lisbon office lease, and when? -&gt; [&#x27;n06&#x27;, &#x27;n18&#x27;, &#x27;n17&#x27;]
+(the answer is in n06)
+
+one query          : [&#x27;n17&#x27;, &#x27;n08&#x27;, &#x27;n12&#x27;]  (answer is in n04)
+  variant          : [&#x27;n04&#x27;, &#x27;n01&#x27;, &#x27;n08&#x27;] Which supplier provides cooling equipment for the Oslo data-centre contract?
+  variant          : [&#x27;n01&#x27;, &#x27;n04&#x27;, &#x27;n09&#x27;] Who supplies the chillers for the Norway data centre?
+  variant          : [&#x27;n04&#x27;, &#x27;n01&#x27;, &#x27;n05&#x27;] vendor of cooling equipment, Oslo
+fused, 3 variants only      : [&#x27;n04&#x27;, &#x27;n01&#x27;, &#x27;n17&#x27;]
+fused, original + 3 variants : [&#x27;n01&#x27;, &#x27;n17&#x27;, &#x27;n04&#x27;]</code></pre>
+
+<p>Three things to read from the output. First, in the follow-up case, the literal query still finds the right note first (lucky: "approved" and "when" match its text), but also drags in <code>n01</code>, the Oslo contract, as number two. After the rewrite, the Oslo note is gone from the top three. The rewrite removed an ambiguity that was waiting to cause a wrong answer on a larger collection.</p>
+
+<p>Second, the vocabulary gap is real: the original query finds three irrelevant notes, none of them the answer <code>n04</code>. Each of the three rewrites puts <code>n04</code> in the top two. Third, the last two lines are a warning: <strong>fusing the original query with the good variants made the result worse</strong> (<code>n04</code> fell from first to third, behind a note the bad original query promoted). Fusion treats every list as an equal voice, so one poor list counts as much as a good one. Keep the original query in the mix when it contains identifiers or exact phrases that a rewrite could lose, but when you know the original is weak, weight it down.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p><strong>"Rewriting can only help, because the model understands the question better than the retriever."</strong> A rewrite is a second chance to lose information. Models drop product codes and error numbers, silently normalise "not" away, widen a narrow date range, or inject a plausible entity that was never in the question. The checks that matter: log the original and rewritten query side by side, compare retrieval with and without the rewrite on a judged set (<a href="05-test-collections.html">chapter 5</a>), and keep exact tokens (IDs, quoted strings, numbers) verbatim in at least one query. The same principle that makes <a href="03-query-understanding.html">query understanding</a> hard for classic search applies here.</p>
+</div>
+
+<h2>Iterative and agentic retrieval</h2>
+
+<p>Rewrites can all be written before the first search. Some questions cannot be planned that way, because the second query depends on what the first returned. "What is the job title of the boss of the boss of the Aurora project lead?" needs the lead's name (from one note), then that person's manager (from another), then that manager's manager, then a title. The query for step two literally contains the answer to step one. These are <span class="term">multi-hop</span> questions; HotpotQA (Yang et al., 2018) is the best-known benchmark for them.</p>
+
+<p>The remedy is a loop: search, read, decide what is still missing, search again, and stop when there is enough. Trivedi et al., "Interleaving Retrieval with Chain-of-Thought Reasoning for Knowledge-Intensive Multi-Step Questions" (IRCoT, 2022), interleaved reasoning steps with retrieval in exactly this way. In current practice the loop is <span class="term">agentic retrieval</span>: search is a tool (<a href="../../agents/chapters/02-tool-loop.html">the tool-calling loop</a>) that the model calls as many times as it judges necessary, within a budget.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="A four-step search loop on the question: job title of the boss of the boss of the Aurora project lead. Step 1 queries 'Aurora project lead' and finds note n08. Step 2 queries 'Priya Nair reports to' and finds n09. Step 3 queries 'Chen Wu reports to' and finds n10. Step 4 queries 'Jonas Eklund job title' and finds n03. The answer, chief operating officer, is produced from the four notes. A note says each query contains the answer to the previous step, and a budget of five searches stops the loop.">
+    <defs><marker id="ahRET15b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="10" y="20" class="t-xs t-muted">each query is built from what the previous search returned</text>
+    <rect x="10" y="34" width="165" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="92" y="56" text-anchor="middle" class="t-sm t-bold">1 Search</text><text x="92" y="74" text-anchor="middle" class="t-xs">Aurora project lead</text>
+    <rect x="195" y="34" width="165" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="277" y="56" text-anchor="middle" class="t-sm t-bold">2 Search</text><text x="277" y="74" text-anchor="middle" class="t-xs">Priya Nair reports to</text>
+    <rect x="380" y="34" width="165" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="462" y="56" text-anchor="middle" class="t-sm t-bold">3 Search</text><text x="462" y="74" text-anchor="middle" class="t-xs">Chen Wu reports to</text>
+    <rect x="565" y="34" width="185" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="657" y="56" text-anchor="middle" class="t-sm t-bold">4 Search</text><text x="657" y="74" text-anchor="middle" class="t-xs">Jonas Eklund job title</text>
+    <line x1="175" y1="60" x2="193" y2="60" class="line" marker-end="url(#ahRET15b)"/>
+    <line x1="360" y1="60" x2="378" y2="60" class="line" marker-end="url(#ahRET15b)"/>
+    <line x1="545" y1="60" x2="563" y2="60" class="line" marker-end="url(#ahRET15b)"/>
+    <line x1="92" y1="86" x2="92" y2="116" class="line" marker-end="url(#ahRET15b)"/>
+    <line x1="277" y1="86" x2="277" y2="116" class="line" marker-end="url(#ahRET15b)"/>
+    <line x1="462" y1="86" x2="462" y2="116" class="line" marker-end="url(#ahRET15b)"/>
+    <line x1="657" y1="86" x2="657" y2="116" class="line" marker-end="url(#ahRET15b)"/>
+    <rect x="10" y="118" width="165" height="50" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="92" y="139" text-anchor="middle" class="t-sm t-bold">n08</text><text x="92" y="157" text-anchor="middle" class="t-xs">lead is Priya Nair</text>
+    <rect x="195" y="118" width="165" height="50" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="277" y="139" text-anchor="middle" class="t-sm t-bold">n09</text><text x="277" y="157" text-anchor="middle" class="t-xs">reports to Chen Wu</text>
+    <rect x="380" y="118" width="165" height="50" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="462" y="139" text-anchor="middle" class="t-sm t-bold">n10</text><text x="462" y="157" text-anchor="middle" class="t-xs">reports to Jonas Eklund</text>
+    <rect x="565" y="118" width="185" height="50" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="657" y="139" text-anchor="middle" class="t-sm t-bold">n03</text><text x="657" y="157" text-anchor="middle" class="t-xs">chief operating officer</text>
+    <path d="M92,168 V190 H380" class="line-dash"/><path d="M277,168 V190" class="line-dash"/><path d="M462,168 V190" class="line-dash"/><path d="M657,168 V190 H380" class="line-dash"/>
+    <line x1="380" y1="190" x2="380" y2="210" class="line" marker-end="url(#ahRET15b)"/>
+    <rect x="230" y="212" width="300" height="40" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="380" y="237" text-anchor="middle" class="t-sm t-bold">Answer: chief operating officer</text>
+    <text x="380" y="278" text-anchor="middle" class="t-xs t-muted">Stops when the answer is supported, or when the budget (here 5 searches) is spent.</text>
+  </svg>
+  <figcaption><strong>A dependent chain.</strong> No rewrite written before the first search could contain "Priya Nair", "Chen Wu" or "Jonas Eklund". The loop discovers them one hop at a time.</figcaption>
+</figure>
+
+<p>The next listing runs this loop on three questions and compares it with a single search. The loop's decisions come from a small policy function standing in for the model's reasoning: it reads the latest search results, extracts the name it needs and writes the next query. A real model does that with language understanding rather than regular expressions, but the structure, the retrieval and the accounting are the same. <code>ScriptedModel</code> records every request, so the input-token totals are real counts under the course's four-characters-per-token estimate.</p>
+
+<pre class="terminal" data-title="agentic15.py"><code>&quot;&quot;&quot;Single-shot retrieval versus an iterative search loop on multi-hop questions (chapter 15).&quot;&quot;&quot;
+import re
+from search15 import *
+from llm import ScriptedModel, tool_use, tool_result, tool_calls, text_of
+
+SEARCH_TOOL = {&quot;name&quot;: &quot;search&quot;, &quot;description&quot;: &quot;Search the company notes; returns the top 2 notes.&quot;,
+               &quot;input_schema&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;query&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;query&quot;]}}
+
+def make_policy(first_query, entity, hops, title=False):
+    &quot;&quot;&quot;A stand-in for the model&#x27;s reasoning: read the latest observation, choose the next query.
+    entity = the thing the first note must mention; hops = how many &#x27;reports to&#x27; links to follow.&quot;&quot;&quot;
+    st = {&quot;phase&quot;: 0, &quot;name&quot;: None, &quot;left&quot;: hops, &quot;misses&quot;: 0}
+    def policy(messages, tools, system):
+        if st[&quot;phase&quot;] == 0:
+            st[&quot;phase&quot;] = 1
+            return [tool_use(&quot;search&quot;, {&quot;query&quot;: first_query})]
+        lines = &quot; &quot;.join(b[&quot;content&quot;] for b in messages[-1][&quot;content&quot;]).split(&quot;\n&quot;)
+        if st[&quot;phase&quot;] == 1:
+            for ln in lines:
+                if entity in ln and (m := re.search(r&quot;(?:approved by|project lead is) ([A-Z]\w+ [A-Z]\w+)&quot;, ln)):
+                    st[&quot;name&quot;], st[&quot;phase&quot;] = m.group(1), 2
+                    return [tool_use(&quot;search&quot;, {&quot;query&quot;: f&quot;{st[&#x27;name&#x27;]} reports to&quot;})]
+        elif st[&quot;phase&quot;] == 2:
+            for ln in lines:
+                if st[&quot;name&quot;] in ln and (m := re.search(r&quot;reports to ([A-Z]\w+ [A-Z]\w+)&quot;, ln)):
+                    st[&quot;name&quot;], st[&quot;left&quot;] = m.group(1), st[&quot;left&quot;] - 1
+                    if st[&quot;left&quot;] &gt; 0:
+                        return [tool_use(&quot;search&quot;, {&quot;query&quot;: f&quot;{st[&#x27;name&#x27;]} reports to&quot;})]
+                    if not title:
+                        return f&quot;{st[&#x27;name&#x27;]}.&quot;
+                    st[&quot;phase&quot;] = 3
+                    return [tool_use(&quot;search&quot;, {&quot;query&quot;: f&quot;{st[&#x27;name&#x27;]} job title&quot;})]
+        elif st[&quot;phase&quot;] == 3:
+            for ln in lines:
+                if st[&quot;name&quot;] in ln and (m := re.search(r&quot;is the ([\w ]+)\.&quot;, ln)):
+                    return f&quot;{m.group(1)}.&quot;
+        st[&quot;misses&quot;] += 1
+        if st[&quot;misses&quot;] == 1:
+            return [tool_use(&quot;search&quot;, {&quot;query&quot;: first_query + &quot; who&quot;})]
+        return &quot;I could not find that in the notes.&quot;
+    return policy
+
+def run(question, policy, max_searches=5):
+    model = ScriptedModel(policy); msgs = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: question}]
+    n_search = tokens_in = 0; seen = []
+    while True:
+        r = model.complete(msgs, tools=[SEARCH_TOOL]); tokens_in += r.usage[&quot;input_tokens&quot;]
+        calls = tool_calls(r)
+        if not calls: return text_of(r), n_search, tokens_in, seen
+        msgs.append(r.as_message()); results = []
+        for c in calls:
+            if n_search &gt;= max_searches: results.append(tool_result(c[&quot;id&quot;], &quot;search budget used up&quot;)); continue
+            n_search += 1; hits = search(c[&quot;input&quot;][&quot;query&quot;], 2); seen += hits
+            print(f&quot;    search {n_search}: {c[&#x27;input&#x27;][&#x27;query&#x27;]!r:&lt;42} -&gt; {hits}&quot;)
+            results.append(tool_result(c[&quot;id&quot;], &quot;\n&quot;.join(f&quot;[{d}] {DOCS[d]}&quot; for d in hits)))
+        msgs.append({&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: results})
+
+CASES = [
+ (&quot;Who does the person who approved the Oslo contract report to?&quot;, {&quot;n01&quot;, &quot;n02&quot;},
+  make_policy(&quot;Oslo contract approved&quot;, &quot;Oslo&quot;, 1)),
+ (&quot;What is the job title of the boss of the boss of the Aurora project lead?&quot;, {&quot;n08&quot;, &quot;n09&quot;, &quot;n10&quot;, &quot;n03&quot;},
+  make_policy(&quot;Aurora project lead&quot;, &quot;Aurora&quot;, 2, title=True)),
+ (&quot;Who does the person who approved the Paris contract report to?&quot;, set(),
+  make_policy(&quot;Paris contract approved&quot;, &quot;Paris&quot;, 1)),
+]
+if __name__ == &quot;__main__&quot;:
+    for question, gold, policy in CASES:
+        print(question + (&quot;&quot; if gold else &quot;   [no note about Paris exists]&quot;))
+        if gold:
+            for k in (3, 5):
+                got = set(search(question, k))
+                print(f&quot;  one search, k={k}: finds {len(gold &amp; got)} of {len(gold)} needed notes {sorted(gold &amp; got)}&quot;)
+        print(&quot;  search loop:&quot;)
+        answer, n, tokens, seen = run(question, policy)
+        found = f&quot;, needed notes found: {len(gold &amp; set(seen))} of {len(gold)}&quot; if gold else &quot;&quot;
+        print(f&quot;    answer: {answer}&quot;)
+        print(f&quot;    {n} searches, {tokens} input tokens in total{found}\n&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>Who does the person who approved the Oslo contract report to?
+  one search, k=3: finds 1 of 2 needed notes [&#x27;n01&#x27;]
+  one search, k=5: finds 2 of 2 needed notes [&#x27;n01&#x27;, &#x27;n02&#x27;]
+  search loop:
+    search 1: &#x27;Oslo contract approved&#x27;                   -&gt; [&#x27;n01&#x27;, &#x27;n04&#x27;]
+    search 2: &#x27;Mira Voss reports to&#x27;                     -&gt; [&#x27;n02&#x27;, &#x27;n01&#x27;]
+    answer: Jonas Eklund.
+    2 searches, 328 input tokens in total, needed notes found: 2 of 2
+
+What is the job title of the boss of the boss of the Aurora project lead?
+  one search, k=3: finds 1 of 4 needed notes [&#x27;n08&#x27;]
+  one search, k=5: finds 1 of 4 needed notes [&#x27;n08&#x27;]
+  search loop:
+    search 1: &#x27;Aurora project lead&#x27;                      -&gt; [&#x27;n08&#x27;, &#x27;n17&#x27;]
+    search 2: &#x27;Priya Nair reports to&#x27;                    -&gt; [&#x27;n09&#x27;, &#x27;n08&#x27;]
+    search 3: &#x27;Chen Wu reports to&#x27;                       -&gt; [&#x27;n10&#x27;, &#x27;n09&#x27;]
+    search 4: &#x27;Jonas Eklund job title&#x27;                   -&gt; [&#x27;n03&#x27;, &#x27;n10&#x27;]
+    answer: chief operating officer.
+    4 searches, 812 input tokens in total, needed notes found: 4 of 4
+
+Who does the person who approved the Paris contract report to?   [no note about Paris exists]
+  search loop:
+    search 1: &#x27;Paris contract approved&#x27;                  -&gt; [&#x27;n01&#x27;, &#x27;n04&#x27;]
+    search 2: &#x27;Paris contract approved who&#x27;              -&gt; [&#x27;n01&#x27;, &#x27;n04&#x27;]
+    answer: I could not find that in the notes.
+    2 searches, 328 input tokens in total</code></pre>
+
+<p>What the output teaches:</p>
+
+<ul>
+  <li><strong>Bigger k rescues a short chain but not a long one.</strong> For the two-hop question, a single search with <em>k</em> = 5 happens to include both needed notes (not with <em>k</em> = 3). For the four-note question it finds one of four at any <em>k</em> tried, because three of the four notes share no words with the question: "boss of the boss" appears nowhere in the data.</li>
+  <li><strong>The loop found all four notes in four searches</strong> and the right title. That is four searches plus a final reasoning step, at 812 input tokens in total, because each call re-sends the growing conversation. The cost is superlinear in the number of steps if you keep appending, one reason loops compress or drop old tool results (<a href="../../agents/chapters/10-context-engineering.html">context engineering</a>).</li>
+  <li><strong>The Paris case is the one to study.</strong> The question mentions a contract that does not exist. The first search returns the Oslo contract notes (the nearest thing), and the loop correctly does not accept them, because the note does not mention Paris. It retries once with a rewritten query and then stops with "I could not find that." A naive loop would have followed the Oslo note's approver and answered with confidence about the wrong contract. The check was a single condition (<code>entity in line</code>); in a real system it is part of the prompt and of the verification of <a href="16-grounded-citations.html">chapter 16</a>.</li>
+</ul>
+
+<h3>What keeps a loop honest</h3>
+
+<ol class="steps">
+  <li><strong>A hard budget.</strong> Cap the number of searches, tokens and seconds; return what you have when it is spent (the example caps at five). Anthropic's description of its multi-agent research system reports that early versions over-invested effort on simple queries (spawning dozens of sub-agents for a simple fact) and fixed it by writing explicit effort rules into the prompts: roughly one agent and a handful of tool calls for a simple fact, a few sub-agents for a comparison, many for open-ended research. Match effort to the question.</li>
+  <li><strong>A stop condition that is checked, not assumed.</strong> "I have enough" is a claim. Require the final answer to cite the notes it used and check that the cited text supports it.</li>
+  <li><strong>Loop detection.</strong> Models repeat themselves. If a query is identical (or near-identical) to an earlier one, refuse it and tell the model so. Stand-in policies like ours fell into this trap during development.</li>
+  <li><strong>The same permissions on every call.</strong> Each search the loop makes runs under the end user's principal and filters (<a href="12-filters-permissions.html">chapter 12</a>). A loop that holds a service account can wander into documents the user could not have searched for directly.</li>
+  <li><strong>Trace everything.</strong> Log each query, its results and the reason for the next step (<a href="../../evals/chapters/17-observability.html">tracing for LLM systems</a>), so a wrong answer can be diagnosed by finding the first bad step.</li>
+</ol>
+
+<h3>Retrieve at all? And how much?</h3>
+
+<p>Not every question needs retrieval, and not every retrieval needs a loop. Asai et al., "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection" (2023), train a model to decide when to retrieve and to critique its own passages. Jeong et al., "Adaptive-RAG" (2024), train a small classifier to route a question by its complexity: no retrieval, one retrieval, or iterative. A cheap router built on your query logs does most of the work: greetings and arithmetic skip retrieval; simple lookups take the single-search path; only questions that look multi-part or comparative go to the loop. The goal is that the average question pays for one search, and only the hard ones pay for four.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the reference librarian</p>
+  <p>A good reference librarian does not run your sentence through the catalogue. They ask what you mean by "it" (rewrite), try a few synonyms when the first term gets nothing (variants), and when you ask who the boss of the boss is, they look up the first person, then the next, then the next, without fetching all the books at once (loop). They also stop after a few tries and tell you the library does not have it (budget and abstention).</p>
+  <p><em>Where it breaks down:</em> a librarian recognises when the first search returned the wrong thing and is embarrassed to carry on. A model that has been told to answer will often carry on with a plausible bridge unless the loop forces it to check.</p>
+</div>
+
+<h2>Knowledge graphs and GraphRAG</h2>
+
+<p>The loop finds chains by searching text repeatedly. The alternative is to find the chain <em>once</em>, at indexing time, and store it. A <span class="term">knowledge graph</span> holds facts as <span class="term">triples</span>: (subject, relation, object), such as (Priya Nair, reports_to, Chen Wu). Subjects and objects are nodes; relations are labelled edges. A multi-hop question becomes a walk along edges, which is cheap and exact once the edges exist. The hard part is building them: extracting triples from prose is typically done with a language model, one call per chunk, and resolving mentions ("Chen", "C. Wu", "the head of Platform") into one node is its own problem, <span class="term">entity resolution</span>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="A path in a knowledge graph. Five nodes in a row: Project Aurora, Priya Nair, Chen Wu, Jonas Eklund, chief operating officer. Labelled arcs connect them: lead, reports to, reports to, title. Under each node is the id of the note the edge came from: n08, n09, n10, n03. A box below explains that a text search for the question finds only the Aurora note because the later notes share no words with it, while the graph reaches them by following edges.">
+    <defs><marker id="ahRET15c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="10" y="66" width="116" height="48" rx="24" class="fs-green s-green sw-2"/><text x="68" y="95" text-anchor="middle" class="t-sm t-bold">Project Aurora</text>
+    <rect x="160" y="66" width="116" height="48" rx="24" class="fs-purple s-purple sw-2"/><text x="218" y="95" text-anchor="middle" class="t-sm t-bold">Priya Nair</text>
+    <rect x="310" y="66" width="116" height="48" rx="24" class="fs-purple s-purple sw-2"/><text x="368" y="95" text-anchor="middle" class="t-sm t-bold">Chen Wu</text>
+    <rect x="460" y="66" width="116" height="48" rx="24" class="fs-purple s-purple sw-2"/><text x="518" y="95" text-anchor="middle" class="t-sm t-bold">Jonas Eklund</text>
+    <rect x="610" y="66" width="140" height="48" rx="24" class="fs-yellow s-yellow sw-2"/><text x="680" y="95" text-anchor="middle" class="t-sm t-bold">chief operating officer</text>
+    <path d="M68,66 Q143,22 218,66" class="line" fill="none" marker-end="url(#ahRET15c)"/><text x="143" y="30" text-anchor="middle" class="t-xs">lead</text>
+    <path d="M218,66 Q293,22 368,66" class="line" fill="none" marker-end="url(#ahRET15c)"/><text x="293" y="30" text-anchor="middle" class="t-xs">reports to</text>
+    <path d="M368,66 Q443,22 518,66" class="line" fill="none" marker-end="url(#ahRET15c)"/><text x="443" y="30" text-anchor="middle" class="t-xs">reports to</text>
+    <path d="M518,66 Q598,22 680,66" class="line" fill="none" marker-end="url(#ahRET15c)"/><text x="598" y="30" text-anchor="middle" class="t-xs">title</text>
+    <text x="143" y="140" text-anchor="middle" class="t-xs t-faint">n08</text><text x="293" y="140" text-anchor="middle" class="t-xs t-faint">n09</text><text x="443" y="140" text-anchor="middle" class="t-xs t-faint">n10</text><text x="598" y="140" text-anchor="middle" class="t-xs t-faint">n03</text>
+    <rect x="30" y="160" width="700" height="74" rx="8" class="box"/>
+    <text x="380" y="184" text-anchor="middle" class="t-xs">Text search for the question finds only n08: the later notes share no words with it.</text>
+    <text x="380" y="204" text-anchor="middle" class="t-xs">The graph reaches them by following edges, and every edge remembers the note that justifies it,</text>
+    <text x="380" y="222" text-anchor="middle" class="t-xs">so the answer can still be cited. An edge the extractor missed is a hole the graph cannot see.</text>
+  </svg>
+  <figcaption><strong>Relations made explicit.</strong> The question's hops are edges. Keeping the source note on each edge keeps the graph auditable.</figcaption>
+</figure>
+
+<p>The listing builds a graph from the same 18 notes with regular expressions standing in for LLM extraction, and tries four things: a multi-hop walk, an aggregation, a deliberately missed fact, and the cost of building at scale.</p>
+
+<pre class="terminal" data-title="graph15.py"><code>&quot;&quot;&quot;A knowledge graph from the notes: triples, multi-hop paths, aggregation, and a silent miss (chapter 15).&quot;&quot;&quot;
+import re
+from collections import defaultdict
+from corpus15 import DOCS
+from search15 import search
+
+# Stand-in for LLM extraction: regular expressions that find (subject, relation, object) in each note.
+def extract(note_id, text):
+    triples, subject = [], None
+    for sent in re.split(r&quot;(?&lt;=\.) &quot;, text):
+        if m := re.match(r&quot;The (.+?) was approved by ([A-Z]\w+ [A-Z]\w+)&quot;, sent):
+            triples.append((m.group(1), &quot;approved_by&quot;, m.group(2)))
+        elif m := re.match(r&quot;([A-Z]\w+ [A-Z]\w+) is the head of (\w+)&quot;, sent):
+            subject = m.group(1); triples.append((subject, &quot;head_of&quot;, m.group(2)))
+        elif m := re.match(r&quot;([A-Z]\w+ [A-Z]\w+) is a senior engineer in (\w+)&quot;, sent):
+            subject = m.group(1); triples.append((subject, &quot;member_of&quot;, m.group(2)))
+        elif m := re.match(r&quot;([A-Z]\w+ [A-Z]\w+) is the (chief [\w ]+)\.&quot;, sent):
+            triples.append((m.group(1), &quot;title&quot;, m.group(2)))
+        elif (m := re.match(r&quot;(?:She|He) reports to ([A-Z]\w+ [A-Z]\w+)&quot;, sent)) and subject:
+            triples.append((subject, &quot;reports_to&quot;, m.group(1)))
+        elif m := re.match(r&quot;The (\w+) budget for 2025 is (\d+) million euros&quot;, sent):
+            triples.append((m.group(1), &quot;budget_m&quot;, int(m.group(2))))
+        elif m := re.match(r&quot;Project (\w+) .*?project lead is ([A-Z]\w+ [A-Z]\w+)&quot;, &quot; &quot;.join(text.split(&quot;. &quot;))):
+            triples.append((&quot;Project &quot; + m.group(1), &quot;lead&quot;, m.group(2)))
+    return [(s, r, o, note_id) for s, r, o in triples]
+
+def build(docs):
+    g = defaultdict(dict)                               # subject -&gt; relation -&gt; (object, source note)
+    for nid, text in docs.items():
+        for s, r, o, src in extract(nid, text): g[s][r] = (o, src)
+    return g
+
+G = build(DOCS)
+print(f&quot;{sum(len(v) for v in G.values())} edges from {len(DOCS)} notes; e.g. Priya Nair -&gt;&quot;, {r: o for r, (o, _) in G[&quot;Priya Nair&quot;].items()}, &quot;\n&quot;)
+
+# 1. Multi-hop by walking edges: no search at query time.
+node, path = &quot;Project Aurora&quot;, []
+for rel in (&quot;lead&quot;, &quot;reports_to&quot;, &quot;reports_to&quot;, &quot;title&quot;):
+    obj, src = G[node][rel]; path.append(f&quot;{node} -{rel}-&gt; {obj} [{src}]&quot;); node = obj
+print(&quot;Q: job title of the boss of the boss of the Aurora lead&quot;)
+print(&quot;\n&quot;.join(&quot;   &quot; + p for p in path)); print(&quot;   answer:&quot;, node, &quot;\n&quot;)
+
+# 2. Aggregation: a question about the whole collection.
+budgets = {s: r[&quot;budget_m&quot;][0] for s, r in G.items() if &quot;budget_m&quot; in r}
+print(&quot;Q: total 2025 budget across all departments&quot;)
+top = [d for d in search(&quot;total 2025 budget across all departments&quot;, 3)]
+print(&quot;   top-3 retrieval sees:&quot;, top, &quot;-&gt; sum&quot;, sum(int(re.search(r&quot;is (\d+) million&quot;, DOCS[d]).group(1)) for d in top if &quot;budget&quot; in DOCS[d]))
+print(&quot;   graph over all notes :&quot;, budgets, &quot;-&gt; sum&quot;, sum(budgets.values()), &quot;\n&quot;)
+
+# 3. The silent miss: a reorganisation note the extractor&#x27;s patterns do not recognise.
+DOCS2 = dict(DOCS, n19=&quot;Following the reorganisation, Tomas Reis now answers to Chen Wu.&quot;)
+G2 = build(DOCS2)
+print(&quot;Q: who does Tomas Reis report to?&quot;)
+print(&quot;   graph answer :&quot;, G2[&quot;Tomas Reis&quot;][&quot;reports_to&quot;][0], &quot;(from&quot;, G2[&quot;Tomas Reis&quot;][&quot;reports_to&quot;][1] + &quot;, out of date)&quot;)
+print(&quot;   edges extracted from the new note n19:&quot;, extract(&quot;n19&quot;, DOCS2[&quot;n19&quot;]), &quot;(the pattern &#x27;reports to&#x27; never matched &#x27;answers to&#x27;)&quot;)
+
+# 4. What building it costs (illustrative assumptions, not a quote).
+print(&quot;\nindexing cost of one extraction call per chunk (assumed: 600-token chunks, 500-token prompt, 300 tokens out,&quot;)
+print(&quot;a small model at $0.25 / $1.25 per million tokens in / out)&quot;)
+for corpus_tokens in (1e6, 100e6):
+    calls = corpus_tokens / 600
+    cost = calls * (600 + 500) * 0.25 / 1e6 + calls * 300 * 1.25 / 1e6
+    print(f&quot;  {corpus_tokens / 1e6:&gt;5.0f}M tokens: {calls:&gt;9,.0f} calls, about ${cost:,.2f}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>18 edges from 18 notes; e.g. Priya Nair -&gt; {&#x27;member_of&#x27;: &#x27;Platform&#x27;, &#x27;reports_to&#x27;: &#x27;Chen Wu&#x27;} 
+
+Q: job title of the boss of the boss of the Aurora lead
+   Project Aurora -lead-&gt; Priya Nair [n08]
+   Priya Nair -reports_to-&gt; Chen Wu [n09]
+   Chen Wu -reports_to-&gt; Jonas Eklund [n10]
+   Jonas Eklund -title-&gt; chief operating officer [n03]
+   answer: chief operating officer 
+
+Q: total 2025 budget across all departments
+   top-3 retrieval sees: [&#x27;n12&#x27;, &#x27;n14&#x27;, &#x27;n11&#x27;] -&gt; sum 18
+   graph over all notes : {&#x27;Infrastructure&#x27;: 12, &#x27;Facilities&#x27;: 4, &#x27;Platform&#x27;: 9, &#x27;Legal&#x27;: 2, &#x27;Sales&#x27;: 7, &#x27;Security&#x27;: 3} -&gt; sum 37 
+
+Q: who does Tomas Reis report to?
+   graph answer : Jonas Eklund (from n07, out of date)
+   edges extracted from the new note n19: [] (the pattern &#x27;reports to&#x27; never matched &#x27;answers to&#x27;)
+
+indexing cost of one extraction call per chunk (assumed: 600-token chunks, 500-token prompt, 300 tokens out,
+a small model at $0.25 / $1.25 per million tokens in / out)
+      1M tokens:     1,667 calls, about $1.08
+    100M tokens:   166,667 calls, about $108.33</code></pre>
+
+<p>The walk answers the four-hop question with no search at query time and with a source note on every step. The aggregation question shows the other strength: top-3 retrieval saw three of the six budget notes and summed to 18, while the graph, which holds all six budgets as edges, gives 37. This is a <em>coverage</em> problem, not a ranking one (retrieval of the top few is the wrong operation for "all"); a SQL-like aggregation over extracted fields solves it, and a graph is one way to hold those fields.</p>
+
+<p>The third block is the price. A reorganisation note says Tomas Reis "now answers to Chen Wu". The extractor's pattern did not recognise "answers to", so no edge was created, and the graph confidently reports the old manager with a source note that is out of date. This is the characteristic failure of graph methods: <strong>a missed extraction is silent</strong>, whereas a text search over the new note would at least have a chance of finding it. Real LLM extractors are better than regular expressions, but they miss and mislabel too, and the errors compound across hops.</p>
+
+<p>The last block shows that for a small model the indexing bill is moderate (about $1 per million tokens of corpus, under the assumed prices; recompute with current ones), so cost is rarely the real obstacle. The obstacles are quality (extraction recall, entity resolution), freshness (every edit must update edges, and deleting a document must delete its edges) and permissions: an edge such as (Project X, approved_by, Alice) is itself information, and its source note carries an access level. The graph needs the same ACL stamping as chunks, and a path that passes through a restricted note must be cut for users who cannot read it (<a href="12-filters-permissions.html">chapter 12</a>).</p>
+
+<h3>GraphRAG and its relatives</h3>
+
+<p>Edge et al., "From Local to Global: A Graph RAG Approach to Query-Focused Summarization" (Microsoft Research, 2024), target the fourth question shape. They argue that standard RAG fails on <em>global</em> questions over a whole corpus ("what are the main themes?"), which are really summarisation tasks. Their GraphRAG uses an LLM to extract an entity graph from the documents, groups closely related entities into communities, and pre-writes a summary for each community. At question time each community summary produces a partial answer, and the partial answers are combined into a final one. On question sets over corpora of roughly a million tokens, the authors report substantial gains over a conventional RAG baseline in the comprehensiveness and diversity of answers; the price is a heavy indexing step, and the benefit is largest for exactly the global questions that ordinary retrieval cannot answer.</p>
+
+<p>Related designs trade differently. HippoRAG (Gutiérrez et al., 2024) builds a graph from extracted triples and ranks documents with personalised PageRank starting from the entities in the question, which targets multi-hop questions without an LLM loop at query time. RAPTOR (Sarthi et al., 2024) clusters chunks and recursively summarises them into a tree, so a query can match at different levels of abstraction. All three move work from query time to indexing time, and all three inherit the maintenance burden of a derived structure that must be kept in step with the documents.</p>
+
+<h2>When each technique pays off</h2>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Technique</th><th>Pays off when</th><th>Extra cost per query</th><th>Main risk</th></tr></thead>
+  <tbody>
+    <tr><td>Standalone rewrite</td><td>Chat interfaces with follow-ups</td><td>One small model call</td><td>Rewrite drops or invents details</td></tr>
+    <tr><td>Multi-query, HyDE, step-back</td><td>Vocabulary gaps; users and documents speak differently</td><td>One model call plus n searches</td><td>Noise from weak variants; drift</td></tr>
+    <tr><td>Independent sub-questions</td><td>Comparisons and multi-part questions</td><td>One model call plus n parallel searches</td><td>Splits that should not be split</td></tr>
+    <tr><td>Iterative or agentic loop</td><td>Multi-hop, exploratory or underspecified questions</td><td>Several model calls and searches, serial latency</td><td>Runaway cost, repeats, confident wrong bridges</td></tr>
+    <tr><td>Knowledge graph</td><td>Many relational questions over stable entities</td><td>Low at query time; high at indexing</td><td>Silent extraction misses; stale edges</td></tr>
+    <tr><td>GraphRAG-style community summaries</td><td>Global, thematic questions over a large corpus</td><td>Map-reduce over summaries</td><td>Heavy indexing, summaries go stale</td></tr>
+    <tr><td>None of the above</td><td>Most questions that resemble a passage</td><td>Zero</td><td>Hard cases silently fail</td></tr>
+  </tbody>
+</table></div>
+
+<p>The row that matters most is the last one. A sensible order of work: log real questions; classify failures into the four shapes (the failure triage of chapter 13 and <a href="17-rag-failures.html">chapter 17</a> helps); apply the cheapest technique that addresses the most frequent shape; measure with and without it on a judged set that contains enough questions of that shape; and report cost and tail latency next to quality. Adding a loop because "agents are the future" and finding that 3% of your questions needed it is a poor trade.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>A search loop is serial: latency adds across steps, so four steps of 800 ms is over three seconds before any answer is written, and its tail is worse than the average (<a href="../../reliability/chapters/09-tail-latency.html">tail latency at scale</a>). Parallel techniques (multi-query, sub-questions) keep latency near the slowest search but multiply load on the index, which matters under load (<a href="../../reliability/chapters/11-overload.html">overload and load shedding</a>). Loops need the durability thinking of <a href="../../agents/chapters/15-durable-execution.html">durable execution</a> if a request can run for minutes, and a retry of a half-finished loop must not repeat side effects. Anthropic reports that its multi-agent research system used about 15 times the tokens of a chat interaction (agents alone about 4 times), so the bill, not only the latency, grows with every added hop.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Put <code>corpus15.py</code>, <code>search15.py</code>, <code>rewrite15.py</code>, <code>agentic15.py</code>, <code>graph15.py</code> and a copy of <code>lab-support/llm.py</code> in one folder.</p>
+  <ul>
+    <li>In <code>rewrite15.py</code> fuse the three variants with a weighted version of <code>rrf</code> that gives the original query half the weight. Does <code>n04</code> return to first place? What weight is needed?</li>
+    <li>In <code>agentic15.py</code> set <code>max_searches=3</code> for the Aurora question. What does the loop return, and is the answer right, wrong or absent? What would you want a user to see?</li>
+    <li>Add a note <code>n19</code> to <code>corpus15.py</code> saying "Tomas Reis answers to Chen Wu since July". Without changing <code>graph15.py</code>, does the hybrid search rank it first for "who does Tomas Reis report to"? Then add a pattern to the extractor so the graph sees it. What other phrasings would you need?</li>
+  </ul>
+  <pre class="terminal" data-title="terminal"><code><span class="prompt">$</span> <span class="cmd">python3 rewrite15.py &amp;&amp; python3 agentic15.py &amp;&amp; python3 graph15.py</span></code></pre>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The vocabulary is unsettled. Many products now describe retrieval that a model drives over several steps as "agentic retrieval" or "deep research", and "GraphRAG" is used both for Microsoft's specific method and loosely for any graph-assisted retrieval. Read the details before comparing claims. Verified for this chapter: the GraphRAG paper (arXiv 2404.16130, revised February 2025) and Anthropic's engineering write-up of its multi-agent research system, which reports that a lead agent with parallel sub-agents outperformed a single agent by 90.2% on its internal research evaluation, at roughly 15 times the tokens of a chat. Both are the authors' own measurements on their own tasks. Treat benchmark gains as hypotheses to test on your data, and prefer the cheapest technique that fixes your measured failures.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Four question shapes defeat a single search: context-dependent, vocabulary-gapped, multi-hop and global. Name the shape before choosing the fix.</li>
+    <li>Rewriting (standalone, multi-query, HyDE, step-back, sub-questions) is cheap and parallel but can lose identifiers and constraints. Keep exact tokens, log both queries, and weight weak lists down in fusion.</li>
+    <li>When the next query depends on the last result, you need a loop. Give it a search budget, a checked stop condition, loop detection, the user's permissions on every call and a trace.</li>
+    <li>A larger k can rescue a two-hop question and will not rescue a longer chain.</li>
+    <li>Knowledge graphs move the chain-finding to indexing time and give exact multi-hop and aggregation answers with sources, but extraction misses are silent and edges need ACLs and updates.</li>
+    <li>GraphRAG-style community summaries target global questions; they cost heavily at indexing and are worth it only where such questions are common.</li>
+    <li>Pick the cheapest technique that fixes your measured failures, and report quality, cost and latency together.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2404.16130" target="_blank" rel="noopener">Edge et al., "From Local to Global: A Graph RAG Approach to Query-Focused Summarization" (2024)</a>. The GraphRAG method and its argument about global questions.</li>
+  <li><a href="https://arxiv.org/abs/2212.10496" target="_blank" rel="noopener">Gao et al., "Precise Zero-Shot Dense Retrieval without Relevance Labels" (HyDE, 2022)</a>. Embedding a generated hypothetical document instead of the query.</li>
+  <li><a href="https://arxiv.org/abs/2212.10509" target="_blank" rel="noopener">Trivedi et al., "Interleaving Retrieval with Chain-of-Thought Reasoning for Knowledge-Intensive Multi-Step Questions" (IRCoT, 2022)</a>. Alternating reasoning and retrieval for multi-hop questions.</li>
+  <li><a href="https://arxiv.org/abs/2310.11511" target="_blank" rel="noopener">Asai et al., "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection" (2023)</a>. A model that decides when to retrieve and critiques what it retrieved.</li>
+  <li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">Anthropic, "How we built our multi-agent research system"</a>. An engineering account of effort scaling, token use and evaluation for an agentic search system.</li>
+  <li><a href="https://arxiv.org/abs/2305.14283" target="_blank" rel="noopener">Ma et al., "Query Rewriting for Retrieval-Augmented Large Language Models" (2023)</a>. The rewrite-retrieve-read framework.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">A chat assistant answers "And what about contractors?" with irrelevant text. Which fix addresses the cause most directly?</p>
+    <ol class="q-options">
+      <li>Rewrite the last message into a standalone question using the conversation, and retrieve with that.</li>
+      <li>Increase the number of chunks retrieved.</li>
+      <li>Switch to a larger embedding model.</li>
+      <li>Build a knowledge graph of the policy documents.</li>
+    </ol>
+    <div class="q-explain">The retriever sees only the string it is given, and "And what about contractors?" has no subject. Resolving the reference restores it. More chunks, a better embedder or a graph all still receive the same subjectless query.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">You fuse the results of the original query with three good rewrites by reciprocal rank fusion, and the right document drops from first to third. What is the most likely cause, and a reasonable response?</p>
+    <ol class="q-options">
+      <li>RRF is broken; use raw scores instead.</li>
+      <li>The rewrites were too similar; remove two of them.</li>
+      <li>The original query returned a poor list that RRF treats as an equal vote; weight it down or exclude it when it is known to be weak, while keeping exact identifiers in some query.</li>
+      <li>The right document is not in the index.</li>
+    </ol>
+    <div class="q-explain">RRF gives each list the same voice unless you weight it. A poor original list promotes its own favourites. Raw scores are not comparable across queries (chapter 10). The document was in every variant's top two, so it is indexed.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">"Who is the boss of the boss of the Aurora lead?" A single search with k = 10 returns the Aurora note and nothing useful about management. Why is retrieving more chunks unlikely to be a reliable fix?</p>
+    <ol class="q-options">
+      <li>Models cannot read more than three chunks.</li>
+      <li>The other notes in the chain do not resemble the question, so no k within reason is guaranteed to include them; the next query depends on what the first search returns.</li>
+      <li>BM25 cannot handle names.</li>
+      <li>Vector search is not allowed to return the same document twice.</li>
+    </ol>
+    <div class="q-explain">The later hops share no words with the question; their relevance only becomes visible once you know the earlier answer (the lead's name). That dependency is why iterative retrieval or a graph is needed. A larger k can work by chance for a short chain, as the chapter's two-hop example showed, but it does not scale to longer chains.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A search loop is asked about a "Paris contract" that does not exist. The first search returns notes about the Oslo contract. What should a well-built loop do?</p>
+    <ol class="q-options">
+      <li>Follow the Oslo approver, since it is the closest match.</li>
+      <li>Keep searching with the same query until the budget is spent.</li>
+      <li>Answer from the model's own knowledge of Paris.</li>
+      <li>Notice that the retrieved note does not mention Paris, retry at most once with a reformulation, then stop and say the information was not found.</li>
+    </ol>
+    <div class="q-explain">The nearest match is not the right entity. Accepting it yields a confident answer about the wrong contract. Repeating an identical query wastes the budget, and answering from memory abandons the grounding that RAG exists to provide.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">Which question is best suited to GraphRAG-style community summaries rather than to a search loop?</p>
+    <ol class="q-options">
+      <li>"What are the main themes across these 4,000 incident reports?"</li>
+      <li>"What is the refund window for subscriptions?"</li>
+      <li>"Who approved the Oslo contract?"</li>
+      <li>"What does error E4021 mean?"</li>
+    </ol>
+    <div class="q-explain">The first is a global, thematic question whose answer is spread over the whole corpus; summaries built at indexing time can be combined into an answer. The others are lookups that one targeted search handles at far lower cost.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A regular-expression extractor builds a knowledge graph from notes. A reorganisation note says "Tomas now answers to Chen." and the extractor's patterns look for "reports to". What happens, and what does it show about graph methods?</p>
+    <ol class="q-options">
+      <li>The graph raises an error, so the problem is found immediately.</li>
+      <li>No edge is created; the graph keeps returning the old manager with an old source, silently. Missed extractions give wrong answers without any signal.</li>
+      <li>The graph automatically infers the new edge from context.</li>
+      <li>Nothing: a graph is always more accurate than text search.</li>
+    </ol>
+    <div class="q-explain">A graph answers from the edges that exist. When extraction misses a fact, the older edge stands unchallenged. LLM-based extraction misses less than regular expressions but not never, so graph systems need extraction-quality measurements, updates on edits, and often a text-search fallback.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

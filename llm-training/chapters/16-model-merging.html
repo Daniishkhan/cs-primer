@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Merging &amp; Evolutionary Merging · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="16">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Model Merging &amp; Evolutionary Merging</h1>
+  <p class="lede">You have three fine-tunes of the same base model, one good at maths, one at code, one in another language. Can you get one model with all three skills without training anything? Sometimes you can, by doing arithmetic on the weights. This chapter explains why that works, the main recipes (averaging, task vectors, TIES, DARE), and how an evolutionary search can find a merge recipe no one would have guessed.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapters 10 to 14 each produced a model by gradient training, which needs data, GPUs and days. Merging produces a model in minutes on a CPU, with no training data, and it is how a large share of the open-weight models on public hubs are made. It is also easy to do badly: a merge can look fine on a leaderboard and be broken on your task, and a search over merge recipes can overfit its own evaluation set. After this chapter you will be able to say when two models can be merged at all, compute a task vector and a merged weight by hand, explain what TIES and DARE repair, read a merge configuration, and describe how evolutionary merging searches for a recipe and why it needs a held-out test set.</p>
+</div>
+
+<h2>Why averaging weights can work at all</h2>
+
+<p>A trained network is a point in a space with one axis per weight. Averaging two networks means taking the point halfway between them. For two models trained independently, that should be a terrible idea, and it is. For two models fine-tuned from the <em>same</em> starting model, it often works well. The experiment below shows both cases in a network small enough to run in a second: two interleaved rings to classify, a 64-unit hidden layer, and four models. Two are fine-tuned from one shared starting point (a "base" trained briefly), and two are trained independently from different random initialisations. For each pair we evaluate the model at weights (1&minus;t)&middot;first + t&middot;second.</p>
+
+<pre class="terminal" data-title="interp.py"><code>import numpy as np
+
+def data(n, rng):
+    # two interleaved rings: class 0 at radius ~1, class 1 at radius ~2
+    y = rng.integers(0, 2, n); r = 1.0 + y + rng.normal(0, 0.15, n); a = rng.uniform(0, 2 * np.pi, n)
+    return np.c_[r * np.cos(a), r * np.sin(a)], y
+
+def init(rng, h=64):
+    return [rng.normal(0, 0.7, (2, h)), np.zeros(h), rng.normal(0, 0.3, h), np.zeros(1)]
+
+def fwd(p, x):
+    z = np.maximum(x @ p[0] + p[1], 0)
+    return z, z @ p[2] + p[3][0]
+
+def loss(p, x, y):
+    _, o = fwd(p, x)
+    return float(np.mean(np.logaddexp(0, o) - y * o))     # logistic loss
+
+def train(p, x, y, steps, lr, rng, bs=64):
+    p = [a.copy() for a in p]
+    for _ in range(steps):
+        i = rng.integers(0, len(x), bs); xb, yb = x[i], y[i]
+        z, o = fwd(p, xb); g = (1 / (1 + np.exp(-o)) - yb) / bs
+        dz = np.outer(g, p[2]) * (z &gt; 0)
+        p[2] -= lr * z.T @ g; p[3] -= lr * g.sum()
+        p[0] -= lr * xb.T @ dz; p[1] -= lr * dz.sum(0)
+    return p
+
+def mix(a, b, t): return [(1 - t) * u + t * v for u, v in zip(a, b)]
+
+x, y = data(2000, np.random.default_rng(0)); xt, yt = data(2000, np.random.default_rng(1))
+base = train(init(np.random.default_rng(10)), x, y, 60, 0.05, np.random.default_rng(11))
+ft1 = train(base, x, y, 1500, 0.05, np.random.default_rng(12))        # two fine-tunes of the SAME base
+ft2 = train(base, x, y, 1500, 0.05, np.random.default_rng(13))
+ind1 = train(init(np.random.default_rng(20)), x, y, 1800, 0.05, np.random.default_rng(21))   # two independent runs
+ind2 = train(init(np.random.default_rng(30)), x, y, 1800, 0.05, np.random.default_rng(31))
+
+print("test loss at interpolation t (0 = first model, 1 = second model)")
+print(f"{'t':&gt;5} {'same start':&gt;11} {'different starts':&gt;17}")
+for t in np.linspace(0, 1, 6):
+    print(f"{t:5.1f} {loss(mix(ft1, ft2, t), xt, yt):11.3f} {loss(mix(ind1, ind2, t), xt, yt):17.3f}")
+
+def dist(a, b): return float(np.sqrt(sum(((u - v) ** 2).sum() for u, v in zip(a, b))))
+print()
+print(f"weight distance: base to fine-tune {dist(base, ft1):.2f}, between the two fine-tunes {dist(ft1, ft2):.2f}, between independent runs {dist(ind1, ind2):.2f}")
+print(f"test loss: base {loss(base, xt, yt):.3f}, fine-tune 1 {loss(ft1, xt, yt):.3f}, fine-tune 2 {loss(ft2, xt, yt):.3f}, independent runs {loss(ind1, xt, yt):.3f} and {loss(ind2, xt, yt):.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>test loss at interpolation t (0 = first model, 1 = second model)
+    t  same start  different starts
+  0.0       0.031             0.027
+  0.2       0.031             0.106
+  0.4       0.031             0.205
+  0.6       0.031             0.176
+  0.8       0.031             0.084
+  1.0       0.031             0.027
+
+weight distance: base to fine-tune 4.78, between the two fine-tunes 0.07, between independent runs 15.94
+test loss: base 0.600, fine-tune 1 0.031, fine-tune 2 0.031, independent runs 0.027 and 0.027</code></pre>
+
+<p>The two fine-tunes of the shared base differ by only 0.07 in weight space (Euclidean distance over all weights), against 4.78 for the distance each moved from the base, so every point on the line between them is a model about as good as either end: the loss stays at 0.031. The independently trained pair is 16 apart, and the path between them passes through models with loss up to 0.205, about eight times worse than either end. Both ends are fine; what lies between is not. The usual explanation is symmetry: hidden unit 7 in one network may do the job of hidden unit 41 in the other, so averaging position by position mixes unrelated units. Two descendants of one parent keep the parent's unit ordering, so position <em>i</em> still means the same thing in both.</p>
+
+<p>That is the first rule of merging. <strong>Merge models that share an ancestor and an architecture</strong>, which in practice means fine-tunes of the same base checkpoint, with the same tensor shapes (the mergekit documentation, read October 2026, says non-vocabulary dimensions must match). Wortsman et al. (2022), in "Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time", averaged models fine-tuned from one pre-trained model with different hyperparameters; they report that this often beats the best single model and costs nothing at inference, unlike an ensemble, and that a soup built from ViT-G fine-tunes reached 90.94% top-1 accuracy on ImageNet. A soup merges models for the <em>same</em> task. The rest of this chapter merges models for <em>different</em> tasks.</p>
+
+<h2>Task vectors</h2>
+
+<p>Ilharco et al. (2023), in "Editing Models with Task Arithmetic", gave the idea a name. A <span class="term">task vector</span> is the difference between a fine-tuned model's weights and the base it started from: &tau; = &theta;<sub>ft</sub> &minus; &theta;<sub>base</sub>. It is the whole of what fine-tuning changed, as a vector with one entry per weight. (LoRA's merged update from <a href="11-lora.html">chapter 11</a> is a task vector of low rank.) Three operations follow, each reported in the paper:</p>
+
+<ul>
+  <li><strong>Addition.</strong> &theta; = &theta;<sub>base</sub> + &lambda; &sum;<sub>i</sub> &tau;<sub>i</sub> combines skills, where &lambda; is a scaling coefficient you choose, typically between about 0.3 and 1, and tune on held-out data.</li>
+  <li><strong>Negation.</strong> &theta;<sub>base</sub> &minus; &lambda;&tau; reduces the behaviour &tau; added. The authors report that subtracting a task vector lowers performance on that task while barely changing unrelated control tasks, and propose it for removing unwanted behaviour.</li>
+  <li><strong>Analogy.</strong> If tasks relate as "A is to B as C is to D", combining three of the vectors can improve the fourth even without data for it.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="A two-dimensional picture of weight space. The base model is a purple dot. An arrow tau A leads from it to fine-tune A, and an arrow tau B to fine-tune B. Dashed lines complete a parallelogram to the point base plus tau A plus tau B. A yellow dot halfway along the diagonal marks the merge with lambda one half. A short dashed arrow in the opposite direction from the base marks negation.">
+    <defs><marker id="ahLT16a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="240" y1="230" x2="450" y2="60" class="line-dash"/>
+    <line x1="390" y1="190" x2="450" y2="60" class="line-dash"/>
+    <line x1="300" y1="100" x2="450" y2="60" class="line-dash"/>
+    <line x1="240" y1="230" x2="386" y2="191" class="line s-blue sw-3" marker-end="url(#ahLT16a)"/>
+    <line x1="240" y1="230" x2="299" y2="103" class="line s-green sw-3" marker-end="url(#ahLT16a)"/>
+    <line x1="240" y1="230" x2="100" y2="262" class="line-dash" marker-end="url(#ahLT16a)"/>
+    <circle cx="240" cy="230" r="9" class="f-purple"/>
+    <circle cx="390" cy="190" r="8" class="f-blue"/>
+    <circle cx="300" cy="100" r="8" class="f-green"/>
+    <circle cx="450" cy="60" r="6" class="box"/>
+    <circle cx="345" cy="145" r="9" class="f-yellow"/>
+    <text x="240" y="256" text-anchor="middle" class="t-sm t-bold">base</text>
+    <text x="410" y="214" class="t-xs t-bold tc-blue">fine-tune A</text>
+    <text x="316" y="88" class="t-xs t-bold tc-green">fine-tune B</text>
+    <text x="318" y="228" class="t-xs tc-blue">&#964;A</text>
+    <text x="256" y="160" class="t-xs tc-green">&#964;B</text>
+    <text x="458" y="56" class="t-xs t-muted">base + &#964;A + &#964;B (&#955; = 1)</text>
+    <text x="362" y="164" class="t-xs t-bold" text-anchor="start">merge, &#955; = 0.5</text>
+    <text x="100" y="286" class="t-xs t-muted">negation: base &#8722; &#955;&#964;A</text>
+    <text x="520" y="150" class="t-xs">merged = base + &#955; ( &#964;A + &#964;B )</text>
+    <text x="520" y="172" class="t-xs t-muted">no gradient steps, no training data.</text>
+    <text x="520" y="190" class="t-xs t-muted">The axes stand for millions of weights.</text>
+  </svg>
+  <figcaption><strong>Fine-tuning is a displacement; merging adds displacements.</strong> Each fine-tune moved the base by a task vector. The merge starts at the base and moves along their sum, scaled by &lambda;. A coefficient of 1 goes all the way to the far corner; 0.5 goes halfway, which for two vectors is the plain average of the two models.</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: two editors' tracked changes</p>
+  <p>Take a manuscript (the base). Editor A returns it with tracked changes for tone, editor B with tracked changes for facts. If they touched different paragraphs, you can accept both sets of changes and get a document with both improvements: that is adding task vectors. Where both edited the same sentence you have a conflict, and you must pick one or blend them. Rejecting editor A's changes (subtracting) removes A's tone edits and leaves the rest.</p>
+  <p><em>Where it breaks down:</em> tracked changes are separate, discrete edits that do not interact once accepted. Weight changes are continuous, and the effect of two changes together is not the sum of their separate effects, because the network is non-linear. Adding vectors works only while the model stays in a region where the effects are roughly additive, which is why it works for fine-tunes of a common base and fails for much larger departures.</p>
+</div>
+
+<h2>Interference, and the repairs: TIES and DARE</h2>
+
+<p>When tasks are added, their vectors interfere. Yadav et al. (2023), in "TIES-Merging: Resolving Interference When Merging Models", identify two sources: <strong>redundant parameter values</strong> (many entries of a task vector changed only slightly and carry little of the task, but still add noise to the sum) and <strong>sign disagreement</strong> (for some weights, one fine-tune pushes up and another pushes down, and in a plain sum they cancel, or the result is worse than either). TIES has three steps, which the stepper walks through on six parameters.</p>
+
+<ol class="steps">
+  <li><strong>Trim.</strong> In each task vector, keep only the largest entries by magnitude (a chosen fraction, such as the top 20% or 30%) and set the rest to zero.</li>
+  <li><strong>Elect a sign.</strong> For each weight, add up the surviving entries of all task vectors and take the sign of the total. The sign with more total magnitude wins.</li>
+  <li><strong>Disjoint merge.</strong> For each weight, average only the entries that agree with the elected sign. Entries that disagree are dropped.</li>
+</ol>
+
+<div class="widget stepper" data-autoplay-ms="4500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">TIES on six weights</h4></div>
+  <svg viewBox="0 0 760 330" role="img" aria-label="A table of six parameters with a row for each of two task vectors. Step one shows the raw values. Step two trims each vector to its three largest entries, setting the others to zero. Step three adds a row with the elected sign for each parameter and outlines in red the entry of task vector A in the third column, which disagrees with the elected sign. Step four shows the merged row, 0.70, 0, minus 0.70, minus 0.55, 0, 0, against a plain average of 0.70, 0.15, minus 0.10, minus 0.55, 0.04, 0.10.">
+    <text x="160" y="22" class="t-xs t-muted">six parameters of one weight matrix, flattened</text>
+    <g data-steps="1">
+    <text x="20" y="53" class="t-sm t-bold">task vector A</text>
+    <text x="20" y="69" class="t-xs t-muted">fine-tune A - base</text>
+    <text x="20" y="109" class="t-sm t-bold">task vector B</text>
+    <text x="20" y="125" class="t-xs t-muted">fine-tune B - base</text>
+    <rect x="160" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="202" y="61.0" text-anchor="middle" class="t-sm mono">+0.80</text>
+    <rect x="160" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="202" y="117.0" text-anchor="middle" class="t-sm mono">+0.60</text>
+    <rect x="252" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="294" y="61.0" text-anchor="middle" class="t-sm mono">&#8722;0.10</text>
+    <rect x="252" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="294" y="117.0" text-anchor="middle" class="t-sm mono">+0.40</text>
+    <rect x="344" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="386" y="61.0" text-anchor="middle" class="t-sm mono">+0.50</text>
+    <rect x="344" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="386" y="117.0" text-anchor="middle" class="t-sm mono">&#8722;0.70</text>
+    <rect x="436" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="478" y="61.0" text-anchor="middle" class="t-sm mono">&#8722;0.60</text>
+    <rect x="436" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="478" y="117.0" text-anchor="middle" class="t-sm mono">&#8722;0.50</text>
+    <rect x="528" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="570" y="61.0" text-anchor="middle" class="t-sm mono">+0.05</text>
+    <rect x="528" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="570" y="117.0" text-anchor="middle" class="t-sm mono">+0.02</text>
+    <rect x="620" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="662" y="61.0" text-anchor="middle" class="t-sm mono">+0.30</text>
+    <rect x="620" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="662" y="117.0" text-anchor="middle" class="t-sm mono">&#8722;0.10</text>
+    </g>
+    <g data-steps="2-">
+    <text x="20" y="53" class="t-sm t-bold">task vector A</text>
+    <text x="20" y="69" class="t-xs t-muted">after trim, top 3</text>
+    <text x="20" y="109" class="t-sm t-bold">task vector B</text>
+    <text x="20" y="125" class="t-xs t-muted">after trim, top 3</text>
+    <rect x="160" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="202" y="61.0" text-anchor="middle" class="t-sm mono">+0.80</text>
+    <rect x="160" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="202" y="117.0" text-anchor="middle" class="t-sm mono">+0.60</text>
+    <rect x="252" y="36" width="84" height="40" rx="6" class="box"/>
+    <text x="294" y="61.0" text-anchor="middle" class="t-sm mono">0</text>
+    <rect x="252" y="92" width="84" height="40" rx="6" class="box"/>
+    <text x="294" y="117.0" text-anchor="middle" class="t-sm mono">0</text>
+    <rect x="344" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="386" y="61.0" text-anchor="middle" class="t-sm mono">+0.50</text>
+    <rect x="344" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="386" y="117.0" text-anchor="middle" class="t-sm mono">&#8722;0.70</text>
+    <rect x="436" y="36" width="84" height="40" rx="6" class="fs-blue s-blue sw-2"/>
+    <text x="478" y="61.0" text-anchor="middle" class="t-sm mono">&#8722;0.60</text>
+    <rect x="436" y="92" width="84" height="40" rx="6" class="fs-green s-green sw-2"/>
+    <text x="478" y="117.0" text-anchor="middle" class="t-sm mono">&#8722;0.50</text>
+    <rect x="528" y="36" width="84" height="40" rx="6" class="box"/>
+    <text x="570" y="61.0" text-anchor="middle" class="t-sm mono">0</text>
+    <rect x="528" y="92" width="84" height="40" rx="6" class="box"/>
+    <text x="570" y="117.0" text-anchor="middle" class="t-sm mono">0</text>
+    <rect x="620" y="36" width="84" height="40" rx="6" class="box"/>
+    <text x="662" y="61.0" text-anchor="middle" class="t-sm mono">0</text>
+    <rect x="620" y="92" width="84" height="40" rx="6" class="box"/>
+    <text x="662" y="117.0" text-anchor="middle" class="t-sm mono">0</text>
+    </g>
+    <g data-steps="3-" data-active="3">
+    <rect x="20" y="146" width="720" height="1" class="line-thin"/>
+    <text x="20" y="177" class="t-sm t-bold">elected sign</text>
+    <text x="20" y="193" class="t-xs t-muted">sign of the sum</text>
+    <rect x="160" y="160" width="84" height="40" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="202" y="185.0" text-anchor="middle" class="t-sm mono">+  (+1.40)</text>
+    <rect x="252" y="160" width="84" height="40" rx="6" class="box"/>
+    <text x="294" y="185.0" text-anchor="middle" class="t-sm mono">none</text>
+    <rect x="344" y="160" width="84" height="40" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="386" y="185.0" text-anchor="middle" class="t-sm mono">&#8722;  (&#8722;0.20)</text>
+    <rect x="436" y="160" width="84" height="40" rx="6" class="fs-yellow s-yellow sw-2"/>
+    <text x="478" y="185.0" text-anchor="middle" class="t-sm mono">&#8722;  (&#8722;1.10)</text>
+    <rect x="528" y="160" width="84" height="40" rx="6" class="box"/>
+    <text x="570" y="185.0" text-anchor="middle" class="t-sm mono">none</text>
+    <rect x="620" y="160" width="84" height="40" rx="6" class="box"/>
+    <text x="662" y="185.0" text-anchor="middle" class="t-sm mono">none</text>
+    <rect x="341" y="33" width="90" height="46" rx="8" fill="none" class="s-red sw-3"/>
+    </g>
+    <g data-steps="4" data-active="4">
+    <text x="20" y="241" class="t-sm t-bold">TIES result</text>
+    <text x="20" y="257" class="t-xs t-muted">mean of agreeing</text>
+    <rect x="160" y="224" width="84" height="40" rx="6" class="fs-orange s-orange sw-3"/>
+    <text x="202" y="249.0" text-anchor="middle" class="t-sm mono">+0.70</text>
+    <rect x="252" y="224" width="84" height="40" rx="6" class="fs-orange s-orange sw-3"/>
+    <text x="294" y="249.0" text-anchor="middle" class="t-sm mono">0</text>
+    <rect x="344" y="224" width="84" height="40" rx="6" class="fs-orange s-orange sw-3"/>
+    <text x="386" y="249.0" text-anchor="middle" class="t-sm mono">&#8722;0.70</text>
+    <rect x="436" y="224" width="84" height="40" rx="6" class="fs-orange s-orange sw-3"/>
+    <text x="478" y="249.0" text-anchor="middle" class="t-sm mono">&#8722;0.55</text>
+    <rect x="528" y="224" width="84" height="40" rx="6" class="fs-orange s-orange sw-3"/>
+    <text x="570" y="249.0" text-anchor="middle" class="t-sm mono">0</text>
+    <rect x="620" y="224" width="84" height="40" rx="6" class="fs-orange s-orange sw-3"/>
+    <text x="662" y="249.0" text-anchor="middle" class="t-sm mono">0</text>
+    <text x="20" y="301" class="t-sm t-bold">plain average</text>
+    <text x="20" y="317" class="t-xs t-muted">for comparison</text>
+    <rect x="160" y="284" width="84" height="40" rx="6" class="box"/>
+    <text x="202" y="309.0" text-anchor="middle" class="t-sm mono">+0.70</text>
+    <rect x="252" y="284" width="84" height="40" rx="6" class="box"/>
+    <text x="294" y="309.0" text-anchor="middle" class="t-sm mono">+0.15</text>
+    <rect x="344" y="284" width="84" height="40" rx="6" class="box"/>
+    <text x="386" y="309.0" text-anchor="middle" class="t-sm mono">&#8722;0.10</text>
+    <rect x="436" y="284" width="84" height="40" rx="6" class="box"/>
+    <text x="478" y="309.0" text-anchor="middle" class="t-sm mono">&#8722;0.55</text>
+    <rect x="528" y="284" width="84" height="40" rx="6" class="box"/>
+    <text x="570" y="309.0" text-anchor="middle" class="t-sm mono">+0.04</text>
+    <rect x="620" y="284" width="84" height="40" rx="6" class="box"/>
+    <text x="662" y="309.0" text-anchor="middle" class="t-sm mono">+0.10</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Two task vectors.</strong> A and B are what two fine-tunes changed, over the same six weights. Small entries (&minus;0.10, 0.05, 0.02) are most likely noise from training; large entries (0.8, &minus;0.7) carry the task.</li>
+    <li><strong>Trim.</strong> Keep the three largest magnitudes in each vector and zero the rest. The sums now contain only entries that mattered.</li>
+    <li><strong>Elect a sign.</strong> Column 3 is a conflict: A wants +0.5, B wants &minus;0.7. The summed mass is &minus;0.20, so the elected sign is negative and A's entry (outlined) loses. Columns 1 and 4 agree. Columns 2, 5 and 6 have nothing left.</li>
+    <li><strong>Disjoint merge.</strong> Average only the agreeing entries: column 1 gives (0.8 + 0.6)/2 = 0.70, column 3 keeps B's &minus;0.70, column 4 gives (&minus;0.6 &minus; 0.5)/2 = &minus;0.55. A plain average would have blurred column 3 to &minus;0.10 and added noise in columns 2, 5 and 6.</li>
+  </ol>
+</div>
+
+<p>Yu et al. (2024), in "Language Models are Super Mario: Absorbing Abilities from Homologous Models as a Free Lunch" (DARE: Drop And REscale), attack redundancy differently. They observe that the delta parameters of supervised fine-tuning are tiny (within about 0.002 in their models) and extremely redundant, and propose to drop each delta entry at random with probability <em>p</em> and rescale the survivors by 1/(1&minus;<em>p</em>). The rescale keeps the expected value of each entry: with m a random variable equal to 1 with probability 1&minus;<em>p</em> and 0 otherwise, E[m &middot; &tau; / (1&minus;<em>p</em>)] = &tau;. They report that DARE can remove 90%, even 99%, of delta parameters without hurting the fine-tuned model's abilities, and that the effect is more pronounced for larger models. Fewer surviving entries per model also means fewer collisions when several models are added, and DARE is often combined with TIES' sign election ("DARE-TIES" in mergekit).</p>
+
+<h3>A comparison you can run</h3>
+
+<p>The toy below has six classes in 20 dimensions. Task A is the first three classes, task B the last three. A base network is trained briefly on both; two fine-tunes then train on one task each. (This is a six-way classifier, so a model fine-tuned only on A learns to put almost no probability on the B classes: it forgets B.) First, the shared functions.</p>
+
+<pre class="terminal" data-title="merge_lib.py"><code>import numpy as np
+D, H, K = 20, 256, 6                                  # input dim, hidden units, classes (3 per task)
+
+def make(seed):
+    rng = np.random.default_rng(seed)
+    means = rng.normal(0, 1.0, (K, D))
+    def sample(classes, n, r):
+        y = r.choice(classes, n); return means[y] + r.normal(0, 1.6, (n, D)), y
+    return sample
+
+def init(rng):
+    return [rng.normal(0, 1 / np.sqrt(D), (D, H)), np.zeros(H), rng.normal(0, 1 / np.sqrt(H), (H, K)), np.zeros(K)]
+
+def logits(p, x):
+    z = np.maximum(x @ p[0] + p[1], 0); return z, z @ p[2] + p[3]
+
+def train(p, x, y, steps, lr, rng, bs=64):
+    p = [a.copy() for a in p]
+    for _ in range(steps):
+        i = rng.integers(0, len(x), bs); z, o = logits(p, x[i])
+        e = np.exp(o - o.max(1, keepdims=True)); g = e / e.sum(1, keepdims=True); g[np.arange(bs), y[i]] -= 1; g /= bs
+        dz = (g @ p[2].T) * (z &gt; 0)
+        p[2] -= lr * z.T @ g; p[3] -= lr * g.sum(0); p[0] -= lr * x[i].T @ dz; p[1] -= lr * dz.sum(0)
+    return p
+
+def acc(p, x, y): return float((logits(p, x)[1].argmax(1) == y).mean())
+
+def task_vector(ft, base): return [f - b for f, b in zip(ft, base)]
+def add(base, tvs, lam): return [b + lam * sum(t[k] for t in tvs) for k, b in enumerate(base)]
+
+def trim(tv, keep):                                    # TIES step 1: keep the top `keep` fraction by magnitude
+    out = []
+    for t in tv:
+        thr = np.quantile(np.abs(t), 1 - keep); out.append(np.where(np.abs(t) &gt;= thr, t, 0.0))
+    return out
+
+def ties(tvs, keep):
+    tvs = [trim(t, keep) for t in tvs]; merged = []
+    for k in range(len(tvs[0])):
+        stack = np.stack([t[k] for t in tvs]); sign = np.sign(stack.sum(0))      # elect sign by total mass
+        agree = (np.sign(stack) == sign) &amp; (stack != 0)
+        merged.append((stack * agree).sum(0) / np.maximum(agree.sum(0), 1))      # mean over agreeing entries
+    return merged
+
+def dare(tv, p, rng):                                  # random drop with rescale 1/(1-p)
+    return [np.where(rng.random(t.shape) &gt;= p, t / (1 - p), 0.0) for t in tv]</code></pre>
+
+<p>Then the comparison, ten random seeds, each with its own data, base and fine-tunes. Accuracy is on fresh test samples from each task, six-way.</p>
+
+<pre class="terminal" data-title="compare.py"><code>import numpy as np
+import merge_lib as m
+
+sample = m.make(0)
+rows = {}
+for seed in range(10):
+    r = np.random.default_rng(seed)
+    xa, ya = sample([0, 1, 2], 4000, r); xb, yb = sample([3, 4, 5], 4000, r)
+    xta, yta = sample([0, 1, 2], 3000, r); xtb, ytb = sample([3, 4, 5], 3000, r)
+    xm, ym = np.r_[xa[:300], xb[:300]], np.r_[ya[:300], yb[:300]]
+    base = m.train(m.init(r), xm, ym, 150, 0.05, r)                 # a weak "pretrained" base on both tasks
+    fa, fb = m.train(base, xa, ya, 300, 0.05, r), m.train(base, xb, yb, 300, 0.05, r)
+    ta, tb = m.task_vector(fa, base), m.task_vector(fb, base)
+    cands = {"base": base, "fine-tuned on A": fa, "fine-tuned on B": fb,
+             "average of A and B": m.add(base, [ta, tb], 0.5),
+             "task arithmetic, lambda 1.0": m.add(base, [ta, tb], 1.0),
+             "TIES, keep 30%, lambda 1.0": m.add(base, [m.ties([ta, tb], 0.3)], 1.0),
+             "DARE p=0.9 then add, lambda 0.5": m.add(base, [m.dare(ta, 0.9, r), m.dare(tb, 0.9, r)], 0.5)}
+    for name, p in cands.items():
+        rows.setdefault(name, []).append((m.acc(p, xta, yta), m.acc(p, xtb, ytb)))
+print(f"{'model':36} {'task A':&gt;7} {'task B':&gt;7} {'mean':&gt;6}   (10 seeds)")
+for name, v in rows.items():
+    a, b = np.mean(v, 0); print(f"{name:36} {a:7.3f} {b:7.3f} {(a + b) / 2:6.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>model                                 task A  task B   mean   (10 seeds)
+base                                   0.831   0.870  0.851
+fine-tuned on A                        0.926   0.090  0.508
+fine-tuned on B                        0.127   0.957  0.542
+average of A and B                     0.850   0.882  0.866
+task arithmetic, lambda 1.0            0.846   0.870  0.858
+TIES, keep 30%, lambda 1.0             0.841   0.857  0.849
+DARE p=0.9 then add, lambda 0.5        0.815   0.836  0.826</code></pre>
+
+<p>Read it row by row. Each fine-tune reaches 93% to 96% on its own task and falls to 9% to 13% on the other: specialisation and forgetting in one table. The plain average (task arithmetic with &lambda; = 0.5) is the best of the merges here, at 85.0% on A and 88.2% on B. It keeps most of both skills, though neither reaches the specialist's level, which is the usual price of a merge: one set of weights has to serve both. Task arithmetic with &lambda; = 1 is close, TIES is no better than averaging, and DARE with <em>p</em> = 0.9 is worse. Three things about this honest result are worth saying out loud. The base here is already decent at both tasks, so the headroom is small. Only two task vectors are merged, so there is little interference to repair, and TIES's benefit grows with the number of models. And DARE is designed for large models: our network has 6,918 weights. The next experiment tests that last point directly, by applying DARE to one fine-tune at three widths and measuring how much of its accuracy survives.</p>
+
+<pre class="terminal" data-title="dare_width.py"><code>import numpy as np
+import merge_lib as m
+
+print(f"{'hidden units':&gt;12} {'weights':&gt;9} " + " ".join(f"{'drop '+str(p):&gt;9}" for p in (0.0, 0.5, 0.9, 0.99)) + "   (task-A accuracy after DARE on a fine-tune, 8 seeds)")
+for H in (16, 256, 4096):
+    m.H = H
+    sample = m.make(0); res = []
+    for seed in range(8):
+        r = np.random.default_rng(seed)
+        xa, ya = sample([0, 1, 2], 4000, r); xt, yt = sample([0, 1, 2], 3000, r)
+        xm, ym = sample(range(6), 600, r)
+        base = m.train(m.init(r), xm, ym, 150, 0.05, r)
+        fa = m.train(base, xa, ya, 300, 0.05, r); tv = m.task_vector(fa, base)
+        row = []
+        for p in (0.0, 0.5, 0.9, 0.99):
+            tvd = tv if p == 0 else m.dare(tv, p, r)
+            row.append(m.acc(m.add(base, [tvd], 1.0), xt, yt))
+        res.append(row)
+    print(f"{H:12d} {H*(m.D+m.K)+H+m.K:9d} " + " ".join(f"{v:9.3f}" for v in np.mean(res, 0)))</code></pre>
+<pre class="terminal" data-title="output"><code>hidden units   weights  drop 0.0  drop 0.5  drop 0.9 drop 0.99   (task-A accuracy after DARE on a fine-tune, 8 seeds)
+          16       438     0.923     0.899     0.730     0.607
+         256      6918     0.923     0.919     0.884     0.665
+        4096    110598     0.894     0.891     0.878     0.696</code></pre>
+
+<p>With 16 hidden units (438 weights) dropping 90% of the update costs 19 points of accuracy (0.923 to 0.730). With 256 units it costs 4 (0.923 to 0.884), and with 4,096 units (about 110,000 weights) the model keeps 0.878 of 0.894 at a 90% drop. Redundancy in the update grows with the size of the model, which is consistent with the paper's claim about large language models; a 7-billion-parameter model has about 60,000 times more weights than our largest toy. At a 99% drop even the widest toy loses a lot, so we do not reproduce the 99% claim, and we make no claim about LLM-scale behaviour from a toy.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A merged model has the average of its parents' abilities." The ability of a merge is not the average of anything. It can be better than both parents on a mixed task (a soup of fine-tunes often beats its best member), roughly the average, or collapsed, as in our independent pair in <code>interp.py</code>. Whether a merge works is an empirical question about the geometry between the models, so you answer it by evaluating the merge on held-out tasks, including ones the parents were never meant to do (chapter 23).</p>
+</div>
+
+<h2>Merging in practice</h2>
+
+<p>Merges are usually specified in a configuration file and run with a tool. mergekit (Goddard et al., 2024) is the widely used open-source toolkit: the YAML config names the method, the base model, the models with their weights and densities, and the output precision, and one command writes a new checkpoint. The repository lists methods including <code>linear</code>, <code>slerp</code>, <code>task_arithmetic</code>, <code>ties</code>, <code>dare_linear</code> and <code>dare_ties</code> (read October 2026). SLERP (spherical linear interpolation) interpolates along the arc between two weight tensors instead of the straight line, which keeps the tensor's norm from shrinking in the middle; it merges exactly two models.</p>
+
+<pre class="terminal" data-title="merge.yml (mergekit, illustrative, not run here)"><code>merge_method: dare_ties
+base_model: example-org/base-7b            # the common ancestor
+models:
+  - model: example-org/base-7b-math        # a fine-tune of the base
+    parameters: {weight: 0.5, density: 0.4}  # density = fraction of delta entries kept
+  - model: example-org/base-7b-code
+    parameters: {weight: 0.5, density: 0.4}
+parameters:
+  normalize: true
+dtype: bfloat16
+tokenizer_source: base</code></pre>
+
+<p>The file is a recipe: base, ingredients, amounts. That is why it belongs in version control next to the evaluation that justified it. Four practical points.</p>
+
+<ul>
+  <li><strong>Do the arithmetic in 32-bit.</strong> A fine-tune's delta can be small relative to the weight it modifies. bfloat16 keeps only 8 bits of precision (two to three significant decimal digits), so a delta smaller than roughly 0.2% to 0.4% of a weight can be rounded away when added in bf16. Compute in fp32 and cast once at the end (the same caution as merging LoRA into a quantised base in chapter 11).</li>
+  <li><strong>Check what the merge inherits.</strong> A merge of a chat-tuned model and a base model mixes their formats. Safety behaviour from instruction tuning can be diluted. The licences of all parents apply. The tokeniser and chat template must be chosen deliberately.</li>
+  <li><strong>Pick &lambda; and the densities on held-out data</strong>, not on the benchmark you will report.</li>
+  <li><strong>Compare with the alternatives.</strong> Merging is one of several ways to combine skills.</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Approach</th><th>Training needed</th><th>Serving cost</th><th>When it fits</th></tr></thead>
+  <tbody>
+    <tr><td>Multi-task fine-tuning on all data</td><td>Full run over all datasets</td><td>One model</td><td>You have all the data and the compute; usually the best quality ceiling</td></tr>
+    <tr><td>Merge the fine-tunes</td><td>None beyond a few evaluations</td><td>One model</td><td>Fine-tunes of one base already exist; data is private or gone; you need a fast experiment</td></tr>
+    <tr><td>Keep adapters separate (<a href="11-lora.html">chapter 11</a>)</td><td>One cheap run per task</td><td>One base plus small adapters, switched per request</td><td>Many tenants or tasks, each needing its own behaviour on demand</td></tr>
+    <tr><td>Ensemble the outputs</td><td>None</td><td>N models running on every request</td><td>Quality matters more than cost</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Serving three separate 7-billion-parameter fine-tunes in bf16 takes about 3 &times; 14 GB = 42 GB of weights (assuming 7.0 billion parameters at 2 bytes each), against 14 GB for one merged model, and the memory-bound decoding of <a href="18-kv-cache.html">chapter 18</a> reads those weights on every step. The merge saves that, but the specialists are gone: you cannot route a request to the pure maths model. Treat the YAML as <a href="../../reliability/chapters/13-config-iac.html">configuration as code</a>: reviewed, versioned, and reproducible from the parents' exact checkpoint hashes.</p>
+</div>
+
+<h2>Evolutionary merging: searching for the recipe</h2>
+
+<p>A merge has many knobs: which models, how much of each, in which layers, with which density. Tuning them by hand is guesswork. Akiba et al. (2024), in "Evolutionary Optimization of Model Merging Recipes" (Sakana AI), propose to let an evolutionary algorithm search. An <span class="term">evolutionary algorithm</span> keeps a population of candidates, scores each, keeps the best, and creates new candidates by randomly perturbing and recombining them, repeatedly; it needs only a score, not a gradient, which is the point, because "merge, then evaluate" is not differentiable. They search in two spaces, as the paper's abstract describes: <strong>parameter space</strong>, the mixing weights for each model's layers, and <strong>data-flow space</strong>, which layers a token passes through and in what order.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 230" role="img" aria-label="A loop of five boxes. A population of merge recipes feeds a merge step with no gradients. The merged models are scored on a search set. The best recipes are selected. They are mutated and recombined, producing the next population. A note below says the held-out test set is used once at the end.">
+    <defs><marker id="ahLT16b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="12" y="30" width="130" height="80" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="77" y="58" text-anchor="middle" class="t-xs t-bold">Population</text>
+    <text x="77" y="76" text-anchor="middle" class="t-xs">of recipes: layer</text>
+    <text x="77" y="91" text-anchor="middle" class="t-xs">weights, densities</text>
+    <line x1="142" y1="70" x2="170" y2="70" class="line" marker-end="url(#ahLT16b)"/>
+    <rect x="172" y="30" width="130" height="80" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="237" y="58" text-anchor="middle" class="t-xs t-bold">Merge</text>
+    <text x="237" y="76" text-anchor="middle" class="t-xs">weight arithmetic,</text>
+    <text x="237" y="91" text-anchor="middle" class="t-xs">no gradients</text>
+    <line x1="302" y1="70" x2="330" y2="70" class="line" marker-end="url(#ahLT16b)"/>
+    <rect x="332" y="30" width="130" height="80" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="397" y="58" text-anchor="middle" class="t-xs t-bold">Score</text>
+    <text x="397" y="76" text-anchor="middle" class="t-xs">accuracy on the</text>
+    <text x="397" y="91" text-anchor="middle" class="t-xs">search set</text>
+    <line x1="462" y1="70" x2="490" y2="70" class="line" marker-end="url(#ahLT16b)"/>
+    <rect x="492" y="30" width="130" height="80" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="557" y="58" text-anchor="middle" class="t-xs t-bold">Select</text>
+    <text x="557" y="76" text-anchor="middle" class="t-xs">keep the best few,</text>
+    <text x="557" y="91" text-anchor="middle" class="t-xs">drop the rest</text>
+    <line x1="622" y1="70" x2="650" y2="70" class="line" marker-end="url(#ahLT16b)"/>
+    <rect x="652" y="30" width="100" height="80" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="702" y="58" text-anchor="middle" class="t-xs t-bold">Mutate</text>
+    <text x="702" y="76" text-anchor="middle" class="t-xs">add noise,</text>
+    <text x="702" y="91" text-anchor="middle" class="t-xs">recombine</text>
+    <path d="M702,110 V160 H77 V112" fill="none" class="line-dash" marker-end="url(#ahLT16b)"/>
+    <text x="390" y="180" text-anchor="middle" class="t-xs t-muted">next generation</text>
+    <rect x="160" y="192" width="440" height="30" rx="8" class="box"/>
+    <text x="380" y="212" text-anchor="middle" class="t-xs t-bold">Held-out test set: used once, on the final recipe.</text>
+  </svg>
+  <figcaption><strong>Search without gradients.</strong> Each candidate recipe is merged and scored; no network is trained. Because the score is the only signal, whatever the score rewards is what the search will find, which is why the search set and the final test set must be different data.</figcaption>
+</figure>
+
+<p>Their main example, EvoLLM-JP, merged a Japanese language model (Shisa-Gamma) with two maths models (WizardMath and Abel), and evolved the merge recipe to improve Japanese maths. The authors report that the result performs strongly on Japanese benchmarks, outperforming models with considerably more parameters, though it was not explicitly trained for them; a second product, a Japanese vision-language model, was built the same way. Two details of the method deserve imitation. The evolution ran against a separate Japanese maths training set, and the final model was evaluated once on the held-out test set (the Japanese version of MGSM), in the authors' words to guard against over-training and overestimation. And the search found combinations a person would not have tried: an average of Japanese and maths models may fail where a per-layer recipe works. <a href="../cases/case-05-evolutionary-merge.html">Case 5</a> examines the paper in depth, and <a href="../labs/lab-05-evolutionary-merge.html">Lab 5</a> has you build the loop yourself.</p>
+
+<h3>Why the held-out set matters: a demonstration</h3>
+
+<p>Return to the toy. A recipe now has four numbers: how much of &tau;A and &tau;B to add in the first layer, and in the second. A small evolutionary search (population 16, keep 4, 15 generations, noise shrinking by 15% a generation) tunes them to maximise accuracy on a <em>search set</em>, then we measure on 6,000 fresh examples. We run it with a search set of 60 examples and of 600, ten seeds each, against the untuned average.</p>
+
+<pre class="terminal" data-title="evolve.py"><code>import numpy as np
+import merge_lib as m
+
+def recipe(base, ta, tb, w):                  # w = [A in layer 1, B in layer 1, A in layer 2, B in layer 2]
+    out = []
+    for k, b in enumerate(base):
+        li = 0 if k &lt; 2 else 1
+        out.append(b + w[2 * li] * ta[k] + w[2 * li + 1] * tb[k])
+    return out
+
+def evolve(fitness, rng, pop=16, keep=4, gens=15, sigma=0.4):
+    parents = [np.full(4, 0.5)] + [rng.normal(0.5, sigma, 4) for _ in range(keep - 1)]
+    for g in range(gens):
+        kids = [p + rng.normal(0, sigma, 4) for p in parents for _ in range(pop // keep)]
+        pool = parents + kids
+        pool.sort(key=fitness, reverse=True)
+        parents, sigma = pool[:keep], sigma * 0.85
+    return parents[0]
+
+sample = m.make(0)
+print(f"{'search set size':&gt;16} {'average: search':&gt;16} {'evolved: search':&gt;16} {'average: test':&gt;14} {'evolved: test':&gt;14} {'evolved wins':&gt;13}")
+for n_search in (60, 600):
+    out = []
+    for seed in range(10):
+        r = np.random.default_rng(seed)
+        xa, ya = sample([0, 1, 2], 4000, r); xb, yb = sample([3, 4, 5], 4000, r)
+        xs, ys = np.r_[xa[:300], xb[:300]], np.r_[ya[:300], yb[:300]]
+        base = m.train(m.init(r), xs, ys, 150, 0.05, r)
+        fa, fb = m.train(base, xa, ya, 300, 0.05, r), m.train(base, xb, yb, 300, 0.05, r)
+        ta, tb = m.task_vector(fa, base), m.task_vector(fb, base)
+        xq, yq = sample(range(6), n_search, r)                # the data the search is allowed to see
+        xt, yt = sample(range(6), 6000, r)                    # held-out test, never used in the search
+        fit = lambda w: m.acc(recipe(base, ta, tb, w), xq, yq)
+        w = evolve(fit, r); avg = np.full(4, 0.5)
+        out.append([fit(avg), fit(w), m.acc(recipe(base, ta, tb, avg), xt, yt), m.acc(recipe(base, ta, tb, w), xt, yt)])
+    o = np.mean(out, 0); wins = sum(q[3] &gt; q[2] for q in out)
+    print(f"{n_search:16d} {o[0]:16.3f} {o[1]:16.3f} {o[2]:14.3f} {o[3]:14.3f} {wins:10d}/10")</code></pre>
+<pre class="terminal" data-title="output"><code> search set size  average: search  evolved: search  average: test  evolved: test  evolved wins
+              60            0.882            0.912          0.862          0.850          1/10
+             600            0.858            0.869          0.864          0.861          2/10</code></pre>
+
+<p>With 60 search examples the evolved recipe scores 91.2% on the data it searched and 85.0% on fresh data, below the untuned average's 86.2%; it beat the average on the test set in only 1 of 10 seeds. The search fit the 60 examples' quirks. With 600 examples the gap largely closes, but the evolved recipe still does not beat the plain average (86.1% against 86.4%). In this toy, with two similar parents and a decent base, the average was already close to the best recipe, so there was little for the search to find. The method earns its keep when simple averaging fails, as when merging models from different domains, and in every case the search set is the thing the search can overfit. The discipline from <a href="../../ml-foundations/chapters/15-statistics.html">A0 on statistics for experiments</a> applies unchanged: tune on one set, report on another that you touch once.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>mergekit's repository (read October 2026) lists 18 merge methods under an LGPL-3.0 licence, and its configuration format and method names move between releases, so pin the version in your recipe. Sakana AI has published follow-up merging work since the 2024 paper (quality-diversity and competition-based variants); I did not read those papers for this chapter, so treat the method as an active research area and not a settled recipe. Leaderboards of open models contain many merges, and a high rank of a merge of fine-tunes on a public benchmark is weak evidence about your task, since parents may have seen the benchmark. Measure on your own held-out data.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In <code>compare.py</code>, change <code>0.5</code> in the plain-average row to 0.3 and 0.8, and print both accuracies. Then raise the number of fine-tune steps from 300 to 1,500, so the task vectors grow, and rerun. In <code>interp.py</code>, change the base training steps from 60 to 1 and look at how the "same start" column changes.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 compare.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 interp.py</span></code></pre>
+  <p>Questions: at what &lambda; does the merged model's accuracy on A start to fall, and why does a larger &lambda; hurt B too? Do longer fine-tunes make the merge better or worse, and what does that say about how far from the base a fine-tune can wander before the additive picture fails? When the base is barely trained, is the "same start" path still flat?</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Averaging weights works for models that share an ancestor and architecture, because they stay in the same region of weight space; independently trained networks do not average (loss up to 0.205 against 0.027 in the toy).</li>
+    <li>A task vector is fine-tuned weights minus base weights. Adding scaled task vectors combines skills, and subtracting one removes a behaviour.</li>
+    <li>TIES trims small entries, elects a sign per weight and averages the agreeing entries. DARE drops entries at random and rescales by 1/(1&minus;p). Both reduce interference, and DARE depends on the update being redundant, which grows with model size.</li>
+    <li>A merge is a recipe, not a training run: keep it as a versioned config, do the arithmetic in fp32, and evaluate on tasks the merge was not tuned for.</li>
+    <li>Evolutionary merging searches recipes (per-layer weights, layer order) by merge-then-evaluate, with no gradients. It needs a search set and a different final test set, because it will overfit the first.</li>
+    <li>A merge keeps one model's serving cost but cannot give back the individual specialists, so compare it with adapters, multi-task training and routing.</li>
+  </ul>
+</div>
+
+<p>The next chapter goes one step further: instead of merging adapters you already have, it asks whether a network can <em>generate</em> an adapter for a task from a description of that task.</p>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2203.05482" target="_blank" rel="noopener">Wortsman et al., "Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time" (2022)</a>. Why averaging fine-tunes of one model helps, with the flatness argument.</li>
+  <li><a href="https://arxiv.org/abs/2212.04089" target="_blank" rel="noopener">Ilharco et al., "Editing Models with Task Arithmetic" (2023)</a>. Task vectors, addition, negation and analogies.</li>
+  <li><a href="https://arxiv.org/abs/2306.01708" target="_blank" rel="noopener">Yadav et al., "TIES-Merging: Resolving Interference When Merging Models" (2023)</a>. Trim, elect sign, disjoint merge.</li>
+  <li><a href="https://arxiv.org/abs/2311.03099" target="_blank" rel="noopener">Yu et al., "Language Models are Super Mario: Absorbing Abilities from Homologous Models as a Free Lunch" (2024)</a>. DARE and the redundancy of delta parameters.</li>
+  <li><a href="https://arxiv.org/abs/2403.13187" target="_blank" rel="noopener">Akiba et al., "Evolutionary Optimization of Model Merging Recipes" (2024)</a>. Evolutionary search in parameter and data-flow space.</li>
+  <li><a href="https://sakana.ai/evolutionary-model-merge/" target="_blank" rel="noopener">Sakana AI, blog post on Evolutionary Model Merge (2024)</a>. The authors' own account of EvoLLM-JP and its train and test split.</li>
+  <li><a href="https://arxiv.org/abs/2403.13257" target="_blank" rel="noopener">Goddard et al., "Arcee's MergeKit: A Toolkit for Merging Large Language Models" (2024)</a>, and the <a href="https://github.com/arcee-ai/mergekit" target="_blank" rel="noopener">mergekit repository</a>. The tool, its methods and configuration format.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">Why can two fine-tunes of one base model usually be averaged, while two networks trained from different random initialisations usually cannot?</p>
+    <ol class="q-options">
+      <li>Fine-tunes have fewer parameters, so there is less to go wrong</li>
+      <li>Independent networks always have larger weights</li>
+      <li>Fine-tunes stay close to a common starting point in which each unit already has the same role, whereas independently trained networks arrange their hidden units differently, so position-by-position averaging mixes unrelated units</li>
+      <li>Averaging only works if the two networks were trained on the same task</li>
+    </ol>
+    <div class="q-explain">In the toy, the two fine-tunes were 0.07 apart and the loss stayed flat along the path; the independent pair was 16 apart and the loss rose about eightfold in the middle. Parameter counts are identical in both cases, and merging models for different tasks (the whole point of task vectors) works despite option 4.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">A weight is 1.00 in the base. Fine-tune A moved it to 1.40 and fine-tune B moved it to 0.80. With task arithmetic and &lambda; = 0.5, what is the merged weight?</p>
+    <ol class="q-options">
+      <li>1.10</li>
+      <li>1.20</li>
+      <li>1.00</li>
+      <li>0.60</li>
+    </ol>
+    <div class="q-explain">&tau;A = +0.40 and &tau;B = &minus;0.20, so the sum is +0.20, and 1.00 + 0.5 &times; 0.20 = 1.10. The value 1.20 is the answer for &lambda; = 1; 1.00 would be the result if the two vectors cancelled exactly.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">DARE uses a drop probability p = 0.9. A task-vector entry of 0.03 survives the random drop. What value does it have afterwards, and why?</p>
+    <ol class="q-options">
+      <li>0.03, since survivors are left unchanged</li>
+      <li>0.003, because the entry is scaled down by 1 &minus; p</li>
+      <li>0.09, because the scale is p</li>
+      <li>0.30, because survivors are divided by 1 &minus; p = 0.1 so that the expected value of every entry stays the same</li>
+    </ol>
+    <div class="q-explain">An entry survives with probability 0.1, so E[kept value] = 0.1 &times; (0.03 / 0.1) + 0.9 &times; 0 = 0.03. Without the rescale, the expected update would shrink to a tenth of its size. Dividing by p instead would not give an unbiased estimate.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">An evolutionary search for merge weights reaches 91% on the 60 examples it was scored on, but 85% on a fresh test set, below the plain average's 86%. What is the most likely cause and the best response?</p>
+    <ol class="q-options">
+      <li>The mutation rate was too low; run more generations</li>
+      <li>The search overfit a tiny search set; use a larger search set that is separate from the final test set, and report the test score once</li>
+      <li>The merge method is wrong; switch from averaging to SLERP</li>
+      <li>The test set is contaminated, so ignore it</li>
+    </ol>
+    <div class="q-explain">A big gap between the score the search optimised and the score on unseen data is the signature of overfitting the search set; more generations make it worse. The method choice does not explain a gap between two sets of the same data distribution, and treating the fresh set as contaminated would throw away the one honest number you have.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">Which pair of models can you not sensibly merge with these methods?</p>
+    <ol class="q-options">
+      <li>Two LoRA-merged fine-tunes of the same 7B base</li>
+      <li>A maths fine-tune and a code fine-tune of the same checkpoint</li>
+      <li>A fine-tune of one 7B model family and a fine-tune of an unrelated model with different layer sizes</li>
+      <li>Three fine-tunes of one base with different hyperparameters on the same task</li>
+    </ol>
+    <div class="q-explain">Merging needs matching tensor shapes and, for the arithmetic to mean anything, a common ancestor. Unrelated architectures fail the first test and unrelated training runs fail the second. The other three are the standard cases: adapters folded into the same base, two tasks from one checkpoint, and a soup.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">You merge three 7B fine-tunes into one with TIES. What do you gain and lose compared with serving the three separately?</p>
+    <ol class="q-options">
+      <li>You cut weight memory to a third (about 14 GB instead of 42 GB in bf16) but lose the ability to route a request to a pure specialist</li>
+      <li>You keep all three specialists at full quality and use a third of the memory</li>
+      <li>You gain quality on every task, because merging always improves on its parents</li>
+      <li>You lose nothing, since a merge is lossless</li>
+    </ol>
+    <div class="q-explain">One set of weights replaces three, so memory drops, and in our toy the merged model reached only about 85 to 88% where each specialist reached 93 to 96% on its own task, so some quality per task is traded for breadth. Merging does not always beat its parents on their own tasks, and it is not lossless.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+</body>
+</html>

@@ -1,5 +1,7 @@
 # Zero to Systems
 
+*Two paths: Zero to Systems (courses 0 to 7) and Zero to AI Systems (courses A0 to A8).*
+
 A first-principles path from how computers talk to senior-level system design. It's written for someone with no prior knowledge: every term is defined when it first appears, and every course uses analogies, hand-drawn-style diagrams, step-through animations, small interactive simulators, terminal experiments and quizzes. Each course also has hands-on Python labs, case studies of real systems with primary sources, and (from course 1 onward) interview-style **design studios**.
 
 ## The path
@@ -16,6 +18,40 @@ A first-principles path from how computers talk to senior-level system design. I
 | 7 | **System Design Studio** (capstone): a design framework, estimation, building blocks, communication, 15 worked designs, ML/LLM systems, 8 mock design studios | `design/` | 22 chapters · 6 labs · 8 case studies · 8 studios |
 
 Chapters are tagged **Deep dive**, **Core** or **Quick intro** so you know where to spend your effort.
+
+## The second path: Zero to AI Systems
+
+A second path, in nine courses, from school mathematics to building, evaluating and delivering AI systems. It trains a broad AI systems / applied AI engineer and links back to the first path for the engineering underneath instead of repeating it.
+
+| # | Course | Folder | Size |
+|---|---|---|---|
+| A0 | **Math & Code for Machine Learning**: arrays, linear algebra, SVD, derivatives and autodiff, optimisers, floating point, probability, likelihood, information theory, statistics of experiments | `ml-foundations/` | 20 chapters · 5 labs · 5 case studies · 2 studios |
+| A1 | **Machine Learning & Data Science**: framing and metrics, linear models, trees and boosting, unsupervised learning, cross-validation, leakage, calibration, features, time series, competitions, proving value | `ml/` | 22 chapters · 6 labs · 7 case studies · 3 studios |
+| A2 | **Deep Learning & Transformers**: backpropagation, training dynamics, embeddings, attention, a GPT by hand, tokenisation, decoding, FLOPs and memory, scaling laws, modern architectures | `deep-learning/` | 23 chapters · 6 labs · 7 case studies · 2 studios |
+| A3 | **Training, Post-training & Serving LLMs**: pretraining data and parallelism, RL foundations, SFT, LoRA, RLHF, DPO, GRPO, distillation, merging, quantisation, KV cache, serving engines | `llm-training/` | 24 chapters · 7 labs · 7 case studies · 3 studios |
+| A4 | **Agents, Tools & Protocols**: the tool loop, tool design, function calling, MCP and A2A, context engineering, workflows, multi-agent systems, durable execution, deep research, computer use, agent security | `agents/` | 23 chapters · 7 labs · 7 case studies · 3 studios |
+| A5 | **Retrieval, Search & Document AI**: BM25, relevance metrics, dense and hybrid retrieval, vector indexes, RAG with verified citations, PDFs, OCR, tables and visual retrieval | `retrieval/` | 23 chapters · 6 labs · 7 case studies · 3 studios |
+| A6 | **Evals, Guardrails & Safe Operation**: error analysis, LLM judges, eval statistics, domain benchmarks, agent evals, hallucination, prompt injection, guardrails, red teaming, observability, governance | `evals/` | 23 chapters · 7 labs · 7 case studies · 3 studios |
+| A7 | **Search, Evolution & Self-Improving Agents**: MCTS, evolution, novelty and quality-diversity, open-ended algorithms, FunSearch and AlphaEvolve, meta agents, evaluator hacking | `open-ended/` | 19 chapters · 6 labs · 7 case studies · 2 studios |
+| A8 | **Applied AI Delivery Studio** (capstone): discovery, requirements under ambiguity, prototypes, evaluation plans, domains, production delivery, security reviews, writing for customers, getting hired | `ai-delivery/` | 20 chapters · 4 labs · 6 case studies · 8 take-home studios |
+
+Chapters that change fast (model rankings, prices, library and protocol versions) keep those facts in dated **State of play** boxes, so the main text stays about durable mechanisms.
+
+### Labs in the second path
+
+AI-path labs follow the same `starter.py` / `check.py` / `solution.py` layout, use the standard library only and are deterministic. Labs that talk to a model use **scripted stand-in models** from `lab-support/llm.py` (copied into each lab folder as `llm.py`), so `python3 check.py` is free, offline and repeatable. To try a lab's ideas against a real model, set `LAB_MODEL`:
+
+```sh
+LAB_MODEL=anthropic:<model-id> python3 your_script.py   # needs ANTHROPIC_API_KEY
+LAB_MODEL=openai:<model-id>    python3 your_script.py   # needs OPENAI_API_KEY; OPENAI_BASE_URL for compatible servers
+LAB_MODEL=ollama:<model-name>  python3 your_script.py   # a local Ollama server
+```
+
+`check.py` never uses a real model. Chapter examples use the standard library and NumPy; where a chapter imports a small shared helper, the chapter links it from `<course>/chapters/code/`.
+
+### Authoring
+
+`authoring/guide.md` is the page contract for the second path (voice, skeletons, diagrams, labs, cases, studios). `authoring/check_page.py` lints pages against it, `authoring/render_check.sh` loads pages in headless Chrome and reports JavaScript errors, and `authoring/build_glossary.py` rebuilds `glossary.html` from the frozen track-1 entries plus `glossary-src/*.json`.
 
 ## Opening it
 
@@ -45,7 +81,7 @@ Every lab has `<course>/labs/code/labNN/` with three files:
 - `check.py`: run `python3 check.py` to see which milestones pass;
 - `solution.py`.
 
-Labs use Python 3.9+ and the standard library only. The How Programs Run labs use POSIX features (fork, signals, fsync), so on Windows run them in WSL. Distributed-systems labs run whole clusters inside one deterministic, seeded simulation, so any failure can be replayed from its seed. Security labs attack only deliberately vulnerable code inside the lab's own process.
+Labs use Python 3.9+ and the standard library only (the second path's labs too; see above for its stand-in models). The How Programs Run labs use POSIX features (fork, signals, fsync), so on Windows run them in WSL. Distributed-systems labs run whole clusters inside one deterministic, seeded simulation, so any failure can be replayed from its seed. Security labs attack only deliberately vulnerable code inside the lab's own process.
 
 ## Curriculum review
 
@@ -74,6 +110,10 @@ assets/js/studio.js         design studios: autosaved notes, rubric
 assets/js/sketch.js         hand-drawn rendering of diagrams (Rough.js)
 assets/js/widgets/          one script per interactive widget
 assets/vendor/              Rough.js (MIT)
+lab-support/llm.py          scripted stand-in models + optional real-model adapter, copied into AI-path labs
+<course>/chapters/code/     small helper modules some AI-path chapters import
+glossary-src/               per-chapter glossary terms for the AI path (JSON), merged by authoring/build_glossary.py
+authoring/                  guide, link index, page linter, render check, glossary builder, unit briefs
 ```
 
 ## Adding a page

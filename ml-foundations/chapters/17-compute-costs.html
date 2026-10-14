@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUs, Clouds &amp; What Compute Costs · Math &amp; Code for Machine Learning</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="mlf" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>GPUs, Clouds &amp; What Compute Costs</h1>
+  <p class="lede">Every plan in AI work eventually meets three numbers: how many operations, how many bytes, and how many dollars an hour. This chapter explains what a GPU is built to do, why moving data usually costs more than computing on it, how to tell whether a job fits in memory, and how to turn a model size and a token count into a defensible bill.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Before a project is approved someone asks "what will it cost and how long will it take?", and "we will see" is not an answer. The engineers who can answer within a factor of two in ten minutes, and say which assumption the answer is most sensitive to, make the plans that get funded and avoid the runs that burn a month of budget before failing. This chapter gives you the vocabulary (FLOP/s, bandwidth, memory, utilisation), a handful of rules of thumb you can derive, and a script. The later courses refine each piece: <a href="../../deep-learning/chapters/16-resource-accounting.html">Parameters, FLOPs &amp; Memory</a> counts a transformer exactly, <a href="../../llm-training/chapters/02-gpu-memory.html">GPU Memory &amp; Why Training Runs Out of It</a> goes deep on memory, and <a href="../../llm-training/chapters/22-token-economics.html">The Economics of a Token</a> prices serving. The studio <a href="../studios/studio-02-compute-budget.html">Budget the Compute for a Project</a> puts this chapter to work.</p>
+</div>
+
+<h2>What a GPU is good at</h2>
+
+<p>A <span class="term">CPU</span> is built to run one stream of instructions as fast as possible, with big caches and clever prediction to hide delays. A <span class="term">GPU</span> (graphics processing unit) makes the opposite trade: thousands of simpler arithmetic units that all do the same kind of operation on different data at once, and a very wide connection to memory. Graphics needed this because every pixel is computed independently by the same small program. Neural networks need it for the same reason: a layer's output is thousands of independent dot products, as you saw in <a href="06-matrices.html">Matrices as Functions</a>.</p>
+
+<p>Modern data-centre GPUs add dedicated <span class="term">tensor cores</span>, units that multiply small matrix tiles in one step at low precision (the bf16 and fp8 formats from <a href="11-numerics.html">Floating Point &amp; Numerical Stability</a>). That is why the peak numbers on a datasheet are quoted per precision: the same chip is several times faster in bf16 than in fp32. The earlier engineering course covers the hardware idea in <a href="../../systems/chapters/21-parallelism-gpus.html">Parallelism, SIMD &amp; GPUs</a>; here we need only the consequences:</p>
+
+<ul>
+  <li>GPUs are fast when there is <strong>a lot of regular, parallel arithmetic</strong>: large matrix multiplications, the same operation over many tokens or images.</li>
+  <li>GPUs are slow at <strong>branching, small irregular work and one-at-a-time sequential steps</strong>. A Python loop over a thousand tiny operations keeps a GPU idle.</li>
+  <li>GPU memory is a separate, limited pool. Data must be copied in from the host and fits only if the total fits.</li>
+</ul>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: one master chef and a hall of line cooks</p>
+  <p>A CPU is a master chef who can cook anything, quickly, one dish at a time. A GPU is a hall of line cooks who each chop the same vegetable the same way: far more chopping per hour, if you can hand every cook a pile to chop. The kitchen's limit is often not the cooks but the single door through which ingredients arrive from the store room.</p>
+  <p><em>Where it breaks down:</em> line cooks are interchangeable and can stop and start freely, while GPU threads run in lock-step groups, and the hall is only fast when the whole group works on the same step. A dish that needs one cook to wait for another leaves most of the hall standing around.</p>
+</div>
+
+<h2>FLOPs versus bytes</h2>
+
+<p>A <span class="term">FLOP</span> is one floating-point operation: one addition or one multiplication. <span class="term">FLOP/s</span> (written FLOPS on datasheets) is how many per second. Do not confuse it with the lowercase plural FLOPs, a count of operations in a job. A matrix product of an (m, k) matrix by a (k, n) matrix needs m&times;n&times;k multiplies and about the same number of adds, so <strong>2mnk FLOPs</strong>. Multiplying two 1,024 &times; 1,024 matrices costs 2 &times; 1,024<sup>3</sup>, about 2.1 billion FLOPs.</p>
+
+<p>Doing arithmetic requires that the operands first arrive from memory. <span class="term">Memory bandwidth</span> is how many bytes per second the processor can read and write from its main memory. The ratio of the two is the key quantity: <span class="term">arithmetic intensity</span> is FLOPs performed per byte moved. Adding two vectors does 1 FLOP per element but must read two numbers and write one: with 4-byte floats that is 12 bytes, an intensity of about 0.083 FLOP/byte. The matrix product above reads two inputs and writes one output of 1,024 &times; 1,024 numbers, 12.6 MB at 4 bytes each, and does 2.1 billion FLOPs, an ideal intensity of about 170 FLOP/byte in fp32. Run the experiment on your own computer:</p>
+
+<pre class="terminal" data-title="bench.py"><code>import time
+import numpy as np
+
+def best_time(fn, repeats=5):
+    fn()                                   # warm-up
+    times = []
+    for _ in range(repeats):
+        t = time.perf_counter(); fn(); times.append(time.perf_counter() - t)
+    return min(times)
+
+n = 1024
+a = np.random.default_rng(0).standard_normal((n, n), dtype=np.float32)
+b = np.random.default_rng(1).standard_normal((n, n), dtype=np.float32)
+t = best_time(lambda: a @ b)
+flops = 2 * n**3                           # n^2 outputs, each n multiplies and n adds
+bytes_moved = 3 * n * n * 4                # read a, read b, write c (ideal, each once)
+print(f"matmul {n}x{n}: {flops/t/1e9:7.1f} GFLOP/s, intensity {flops/bytes_moved:6.1f} FLOP/byte")
+
+m = 20_000_000
+x = np.random.default_rng(2).standard_normal(m, dtype=np.float32)
+y = np.random.default_rng(3).standard_normal(m, dtype=np.float32)
+out = np.empty_like(x)
+t = best_time(lambda: np.add(x, y, out=out))
+bytes_moved = 3 * m * 4                    # read x, read y, write out
+print(f"vector add {m:,}: {m/t/1e9:7.1f} GFLOP/s, intensity {m/bytes_moved:6.3f} FLOP/byte, {bytes_moved/t/1e9:5.1f} GB/s")</code></pre>
+<pre class="terminal" data-title="output"><code>matmul 1024x1024:  2036.6 GFLOP/s, intensity  170.7 FLOP/byte
+vector add 20,000,000:     9.5 GFLOP/s, intensity  0.083 FLOP/byte, 113.8 GB/s</code></pre>
+
+<p>These numbers come from the machine this book was written on and will differ on yours, but the shape will not. The matrix product runs at hundreds of times the FLOP/s of the vector add, even though both are plain arithmetic, because the vector add spends nearly all its time waiting for memory. Its 113.8 GB/s is close to what this machine's memory can deliver, so no amount of faster arithmetic would help it. Programs like that are <span class="term">memory-bound</span>. Programs whose speed is limited by the arithmetic units are <span class="term">compute-bound</span>.</p>
+
+<h3>The roofline</h3>
+
+<p>Put the two limits on one chart and you get the <span class="term">roofline model</span> (Williams, Waterman and Patterson, 2009). For a chip with peak compute <em>P</em> and bandwidth <em>B</em>, the best a program with intensity <em>I</em> can achieve is</p>
+
+<p style="text-align:center">attainable FLOP/s = min(P, B &times; I)</p>
+
+<p>On the left of the <span class="term">ridge point</span> I = P/B you are on the sloped memory roof; on the right, the flat compute roof. For an NVIDIA H100 SXM, the datasheet lists 3.35 TB/s of HBM3 memory bandwidth and 1,979 TFLOP/s of bf16 tensor-core throughput <em>with structured sparsity</em>; the dense figure is half of that, about 989 TFLOP/s. Using the dense number, the ridge is 989 &times; 10<sup>12</sup> / 3.35 &times; 10<sup>12</sup> &asymp; 295 FLOP/byte. Any operation with lower intensity cannot come close to the chip's peak, whatever the code does.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="A log-log roofline plot for an H100. The x axis is arithmetic intensity from 0.01 to 10,000 FLOP per byte; the y axis is attainable TFLOP per second from 0.1 to 1,000. A sloped line rises from the lower left to a ridge point at about 295 FLOP per byte and 989 TFLOP per second, then continues flat. Four points sit on the roof: an element-wise add at 0.083 FLOP per byte, decoding with batch 1 at about 1, decoding with batch 64 at about 64, and a large matrix multiply at about 1,365.">
+    <defs><marker id="ahMF17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="90" y1="30" x2="90" y2="220" class="line"/>
+    <line x1="90" y1="220" x2="700" y2="220" class="line"/>
+    <text x="84" y="224" text-anchor="end" class="t-xs t-muted">0.1</text>
+    <text x="84" y="176" text-anchor="end" class="t-xs t-muted">1</text>
+    <text x="84" y="129" text-anchor="end" class="t-xs t-muted">10</text>
+    <text x="84" y="81" text-anchor="end" class="t-xs t-muted">100</text>
+    <text x="84" y="34" text-anchor="end" class="t-xs t-muted">1000</text>
+    <line x1="90" y1="172.5" x2="700" y2="172.5" class="line-thin" opacity="0.3"/>
+    <line x1="90" y1="125" x2="700" y2="125" class="line-thin" opacity="0.3"/>
+    <line x1="90" y1="77.5" x2="700" y2="77.5" class="line-thin" opacity="0.3"/>
+    <text x="90" y="238" text-anchor="middle" class="t-xs t-muted">0.01</text>
+    <text x="191.7" y="238" text-anchor="middle" class="t-xs t-muted">0.1</text>
+    <text x="293.3" y="238" text-anchor="middle" class="t-xs t-muted">1</text>
+    <text x="395" y="238" text-anchor="middle" class="t-xs t-muted">10</text>
+    <text x="496.7" y="238" text-anchor="middle" class="t-xs t-muted">100</text>
+    <text x="598.3" y="238" text-anchor="middle" class="t-xs t-muted">1,000</text>
+    <text x="700" y="238" text-anchor="middle" class="t-xs t-muted">10,000</text>
+    <text x="395" y="262" text-anchor="middle" class="t-xs t-muted">arithmetic intensity, FLOP per byte (log scale)</text>
+    <text x="22" y="125" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 22 125)">attainable TFLOP/s (log)</text>
+    <polyline points="138.3,220 544.4,30.2 700,30.2" fill="none" class="s-blue sw-2"/>
+    <text x="222" y="150" class="t-xs tc-blue" transform="rotate(-25 222 150)">memory-bound roof: 3.35 TB/s</text>
+    <text x="640" y="22" text-anchor="middle" class="t-xs tc-blue">compute roof: 989 TFLOP/s</text>
+    <line x1="544.4" y1="30.2" x2="544.4" y2="220" class="line-dash"/>
+    <text x="548" y="212" class="t-xs t-muted">ridge: 295</text>
+    <circle cx="183.4" cy="198.9" r="5" class="f-red"/>
+    <text x="193" y="214" class="t-xs">element-wise add</text>
+    <circle cx="293.3" cy="147.6" r="5" class="f-orange"/>
+    <text x="303" y="164" class="t-xs">decode, batch 1</text>
+    <circle cx="477" cy="61.8" r="5" class="f-yellow"/>
+    <text x="395" y="58" class="t-xs">decode, batch 64</text>
+    <circle cx="612.1" cy="30.2" r="5" class="f-green"/>
+    <text x="616" y="52" class="t-xs">large matmul</text>
+  </svg>
+  <figcaption><strong>Where operations sit under the roof.</strong> Points show the best an operation could achieve at its arithmetic intensity on an H100 (dense bf16). Decoding one sequence at a time reads each weight once for about two FLOPs and sits far to the left; batching 64 sequences multiplies the intensity by 64.</figcaption>
+</figure>
+
+<p>This explains two facts that otherwise seem strange. <strong>Training</strong> large networks is mostly big matrix products with high intensity, so it can approach the compute roof. <strong>Generating text one token at a time</strong> reads every weight to produce one token's worth of arithmetic, so it sits on the memory roof, and speed is set by how fast weights stream from memory, not by FLOP/s. That is why batching many requests together is the central trick in serving, and why cutting weights to 4 bits speeds decoding even though it adds arithmetic; the full story is in <a href="../../llm-training/chapters/18-kv-cache.html">The KV Cache &amp; the Cost of Decoding</a>. Fusing several small operations into one kernel (<a href="../../llm-training/chapters/04-kernels.html">Kernels &amp; Performance</a>) raises intensity by avoiding round trips to memory in the middle.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A GPU with twice the peak FLOP/s will run my job twice as fast." Only if the job is compute-bound and the code keeps the arithmetic units busy. A memory-bound job speeds up with bandwidth, not peak FLOP/s; a job dominated by small operations is limited by launch overhead and by the CPU feeding it. Always ask first which roof you are under, and measure what fraction of the peak you actually reach.</p>
+</div>
+
+<h2>Will it fit? Memory arithmetic</h2>
+
+<p>The cheapest check you can make is whether the job fits in GPU memory, since a job that does not fit does not run slowly, it fails. Two things fill the memory.</p>
+
+<p><strong>Inference</strong> needs the weights, plus the KV cache for the sequences in flight (the cached keys and values of earlier tokens; <a href="../../llm-training/chapters/18-kv-cache.html">the KV cache chapter</a> sizes it). Weight memory is parameters &times; bytes per parameter: 2 for bf16, 1 for int8 or fp8, about 0.5 for 4-bit formats.</p>
+
+<p><strong>Training</strong> also needs gradients and, with the Adam optimiser from <a href="10-optimisers.html">Gradient Descent &amp; Optimisers</a>, two more numbers per weight. The usual mixed-precision recipe (Micikevicius et al., 2018; the ZeRO paper of Rajbhandari et al., 2020, tabulates it) keeps bf16 or fp16 weights and gradients for the fast arithmetic, plus an fp32 master copy of the weights and fp32 Adam moments for accuracy:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Item</th><th>Precision</th><th>Bytes per parameter</th></tr></thead>
+  <tbody>
+    <tr><td>Weights for forward and backward</td><td>bf16</td><td>2</td></tr>
+    <tr><td>Gradients</td><td>bf16</td><td>2</td></tr>
+    <tr><td>Master copy of weights</td><td>fp32</td><td>4</td></tr>
+    <tr><td>Adam first moment (m)</td><td>fp32</td><td>4</td></tr>
+    <tr><td>Adam second moment (v)</td><td>fp32</td><td>4</td></tr>
+    <tr><td><strong>Total</strong></td><td></td><td><strong>16</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Sixteen bytes per parameter, before <span class="term">activations</span>, the intermediate results the backward pass needs, which grow with batch size, sequence length and depth. A 7-billion-parameter model therefore needs 7 &times; 10<sup>9</sup> &times; 16 = 112 GB of state alone, more than one 80 GB GPU holds. The remedy is to spread the state across several GPUs (sharding, <a href="../../llm-training/chapters/03-parallelism.html">Parallel Training</a>) or to avoid training every weight (the low-rank adapters of <a href="../../llm-training/chapters/11-lora.html">LoRA</a>, built on the SVD ideas of <a href="07-decompositions.html">Eigenvectors, SVD &amp; Low Rank</a>).</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Three horizontal bars to scale, 5 pixels per gigabyte. The top bar, training state for a 7 billion parameter model, is 112 gigabytes, made of bf16 weights 14, bf16 gradients 14, fp32 master weights 28, Adam first moment 28 and Adam second moment 28. A dashed line at 80 gigabytes marks one GPU, which the top bar overshoots. The middle bar, bf16 inference weights, is 14 gigabytes. The bottom bar, 4-bit weights, is 3.5 gigabytes.">
+    <rect x="100" y="30" width="70" height="46" class="fs-blue s-blue sw-2"/>
+    <rect x="170" y="30" width="70" height="46" class="fs-cyan s-cyan sw-2"/>
+    <rect x="240" y="30" width="140" height="46" class="fs-purple s-purple sw-2"/>
+    <rect x="380" y="30" width="140" height="46" class="fs-purple s-purple sw-2"/>
+    <rect x="520" y="30" width="140" height="46" class="fs-purple s-purple sw-2"/>
+    <text x="135" y="58" text-anchor="middle" class="t-xs">weights</text>
+    <text x="205" y="58" text-anchor="middle" class="t-xs">grads</text>
+    <text x="310" y="58" text-anchor="middle" class="t-xs">fp32 master</text>
+    <text x="450" y="58" text-anchor="middle" class="t-xs">Adam m</text>
+    <text x="590" y="58" text-anchor="middle" class="t-xs">Adam v</text>
+    <text x="135" y="24" text-anchor="middle" class="t-xs t-muted">14</text>
+    <text x="205" y="24" text-anchor="middle" class="t-xs t-muted">14</text>
+    <text x="310" y="24" text-anchor="middle" class="t-xs t-muted">28</text>
+    <text x="450" y="24" text-anchor="middle" class="t-xs t-muted">28</text>
+    <text x="590" y="24" text-anchor="middle" class="t-xs t-muted">28</text>
+    <text x="672" y="58" class="t-sm t-bold">112 GB</text>
+    <text x="20" y="58" class="t-xs t-muted">train, 7B</text>
+    <text x="20" y="70" class="t-xs t-muted">(+ acts)</text>
+    <line x1="500" y1="16" x2="500" y2="196" class="line-dash s-red"/>
+    <text x="504" y="190" class="t-xs tc-red">one 80 GB GPU</text>
+    <rect x="100" y="110" width="70" height="38" class="fs-blue s-blue sw-2"/>
+    <text x="180" y="134" class="t-sm t-bold">14 GB</text>
+    <text x="20" y="134" class="t-xs t-muted">serve, bf16</text>
+    <rect x="100" y="170" width="17.5" height="38" class="fs-blue s-blue sw-2"/>
+    <text x="127" y="194" class="t-sm t-bold">3.5 GB</text>
+    <text x="20" y="194" class="t-xs t-muted">serve, 4-bit</text>
+    <text x="380" y="262" text-anchor="middle" class="t-xs t-muted">to scale: 5 px per GB. Serving also needs the KV cache; training also needs activations.</text>
+  </svg>
+  <figcaption><strong>The same 7-billion-parameter model, three memory bills.</strong> Training state (112 GB) overshoots one 80 GB GPU; serving fits easily. Optimiser state, not the weights, is the largest piece of training memory.</figcaption>
+</figure>
+
+<h2>How many FLOPs does training take?</h2>
+
+<p>For a dense transformer there is a famous shortcut. A forward pass through a layer does about one multiply and one add per weight per token, so about <strong>2 FLOPs per parameter per token</strong>. The backward pass computes gradients with respect to both activations and weights, about twice the forward work. Together:</p>
+
+<p style="text-align:center">training FLOPs &asymp; 6 &times; N &times; D</p>
+
+<p>where N is the number of parameters and D the number of training tokens (Kaplan et al., 2020, and Hoffmann et al., 2022, use this approximation). It ignores attention's extra cost over long sequences and some smaller terms, and for sparse mixture-of-experts models N must be the parameters active per token. Check it against a published figure: the Llama 3 paper trained a 405-billion-parameter model on 15.6 trillion tokens and reports about 3.8 &times; 10<sup>25</sup> FLOPs. The rule gives 6 &times; 405 &times; 10<sup>9</sup> &times; 15.6 &times; 10<sup>12</sup> = 3.79 &times; 10<sup>25</sup>. It agrees well enough to plan with. The exact counting, with attention and embeddings, is in <a href="../../deep-learning/chapters/16-resource-accounting.html">Parameters, FLOPs &amp; Memory</a>; the Chinchilla rule of thumb for choosing D given a compute budget is in <a href="../../deep-learning/chapters/18-scaling-laws.html">Scaling Laws</a>.</p>
+
+<p>FLOPs become time through <span class="term">MFU</span> (model FLOPs utilisation): the fraction of the chip's peak that useful model arithmetic achieves. It is never 100%: memory-bound operations, communication between GPUs, data loading and idle waiting all take a share. Large well-tuned runs are commonly reported at somewhere between a third and a half of peak; a first attempt with a new code base is often well below. We will assume 40% for planning and treat it as the assumption to measure on a short real run.</p>
+
+<h2>Renting hardware</h2>
+
+<p>Few teams buy GPUs for exploratory work. You rent, and the choices that matter are:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Option</th><th>You pay for</th><th>Good for</th><th>Watch out for</th></tr></thead>
+  <tbody>
+    <tr><td>On-demand VM</td><td>Each hour the instance exists, used or not</td><td>Experiments, bursts, learning</td><td>Highest hourly rate; capacity may not be available</td></tr>
+    <tr><td>Reserved or committed</td><td>A fixed term (months to years) at a discount</td><td>Steady production load, long training</td><td>Paying for idle GPUs if the plan changes</td></tr>
+    <tr><td>Spot or pre-emptible</td><td>Spare capacity at a steep discount</td><td>Fault-tolerant work with checkpoints</td><td>The provider can take it back at short notice</td></tr>
+    <tr><td>Specialist GPU cloud</td><td>GPU-hours, often simpler pricing</td><td>Training and fine-tuning</td><td>Fewer managed services, egress and support differ</td></tr>
+    <tr><td>Hyperscaler (AWS, Azure, Google Cloud)</td><td>GPU-hours plus the surrounding services</td><td>Production with existing cloud estates, compliance</td><td>Higher list prices, quota requests</td></tr>
+    <tr><td>Managed model API</td><td>Tokens in and out</td><td>Most application work, low volume</td><td>Per-token price at high volume; less control</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The decision between renting GPUs and calling an API is the same <em>build versus buy</em> trade-off as elsewhere in engineering. At low volume the API wins because you pay nothing when idle; at high, steady volume owning the serving can win, but only if you can keep the GPUs busy, which is where <a href="../../reliability/chapters/10-load-testing-capacity.html">Load Testing &amp; Capacity Planning</a> and <a href="../../reliability/chapters/20-cost-efficiency.html">Cost &amp; Efficiency</a> apply directly. GPU cost is also not the whole bill: storage for checkpoints and datasets, network egress, a 24/7 on-call for a serving fleet, and engineers' time often matter as much.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Hardware specifications are stable once published; <strong>prices are not</strong>. H100 figures in this chapter come from NVIDIA's datasheet (80 GB HBM3, 3.35 TB/s, 700 W maximum for SXM, as repeated in several copies) and were cross-checked in secondary sources; the dense bf16 figure is half the headline number because the headline assumes sparsity. For rental prices, public roundups I could read in 2026 put H100 on-demand rates anywhere from about $1.4 to more than $8 per GPU-hour, with a market median of roughly $2.3 to $3.1 on specialist clouds and higher list prices at the hyperscalers, plus much cheaper interruptible capacity. Some of these roundups are published by GPU sellers, so they are leads, not benchmarks. Newer GPU generations keep arriving and push the price of older ones down. Before you commit to a budget, read the provider's own pricing page that day, and keep the price as an explicit input you can change.</p>
+</div>
+
+<h2>Estimating a bill</h2>
+
+<p>An estimate is a chain of small calculations, each with a stated assumption. Here is the chain for a training run:</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 170" role="img" aria-label="A left-to-right chain. Parameters N and tokens D feed FLOPs equals 6 N D. That is divided by peak FLOP per second times MFU to give seconds, then converted to GPU-hours. GPU-hours multiplied by price per hour gives the bill. A final box multiplies by an overhead factor for experiments, failures and evaluation.">
+    <defs><marker id="ahMF17b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="30" width="110" height="64" rx="8" class="fs-green s-green sw-2"/>
+    <text x="75" y="58" text-anchor="middle" class="t-sm t-bold">N and D</text>
+    <text x="75" y="78" text-anchor="middle" class="t-xs t-muted">params, tokens</text>
+    <rect x="170" y="30" width="110" height="64" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="225" y="58" text-anchor="middle" class="t-sm t-bold">6 N D</text>
+    <text x="225" y="78" text-anchor="middle" class="t-xs t-muted">total FLOPs</text>
+    <rect x="320" y="30" width="110" height="64" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="375" y="58" text-anchor="middle" class="t-sm t-bold">GPU-hours</text>
+    <text x="375" y="78" text-anchor="middle" class="t-xs t-muted">÷ (peak × MFU)</text>
+    <rect x="470" y="30" width="110" height="64" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="525" y="58" text-anchor="middle" class="t-sm t-bold t-dark">Bill</text>
+    <text x="525" y="78" text-anchor="middle" class="t-xs t-dark">× price per hour</text>
+    <rect x="620" y="30" width="120" height="64" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="680" y="58" text-anchor="middle" class="t-sm t-bold">Total</text>
+    <text x="680" y="78" text-anchor="middle" class="t-xs t-muted">× overhead</text>
+    <line x1="130" y1="62" x2="168" y2="62" class="line" marker-end="url(#ahMF17b)"/>
+    <line x1="280" y1="62" x2="318" y2="62" class="line" marker-end="url(#ahMF17b)"/>
+    <line x1="430" y1="62" x2="468" y2="62" class="line" marker-end="url(#ahMF17b)"/>
+    <line x1="580" y1="62" x2="618" y2="62" class="line" marker-end="url(#ahMF17b)"/>
+    <text x="75" y="124" text-anchor="middle" class="t-xs t-muted">known</text>
+    <text x="225" y="124" text-anchor="middle" class="t-xs t-muted">rule of thumb</text>
+    <text x="375" y="124" text-anchor="middle" class="t-xs tc-orange">assumption: MFU</text>
+    <text x="525" y="124" text-anchor="middle" class="t-xs tc-orange">assumption: price</text>
+    <text x="680" y="124" text-anchor="middle" class="t-xs tc-orange">assumption: 2 to 10×</text>
+    <text x="380" y="154" text-anchor="middle" class="t-xs t-muted">The two ends are facts about the job. The orange boxes are guesses to be named, ranged and tested.</text>
+  </svg>
+  <figcaption><strong>An estimate is a chain, and the weakest link sets its accuracy.</strong> MFU, the price and the overhead multiplier each move the result by tens of percent or more; the 6ND step rarely does.</figcaption>
+</figure>
+
+<p>This script does the memory and cost calculations from this chapter. Every input is a named constant you can change.</p>
+
+<pre class="terminal" data-title="bill.py"><code>GB = 1e9
+
+def weights_gb(params, bytes_per_param):
+    return params * bytes_per_param / GB
+
+def train_state_gb(params):
+    """Mixed-precision Adam: bf16 weights (2) + bf16 grads (2) + fp32 master, m, v (12) = 16 bytes/param.
+    Activations and framework overhead are extra."""
+    return params * 16 / GB
+
+def train_flops(params, tokens):
+    return 6 * params * tokens                   # the 6ND rule: ~2ND forward + ~4ND backward
+
+def gpu_hours(flops, peak_flops, mfu):
+    return flops / (peak_flops * mfu) / 3600
+
+H100_PEAK_BF16 = 989e12                          # dense bf16 FLOP/s, NVIDIA datasheet
+H100_BANDWIDTH = 3.35e12                         # bytes/s
+print(f"H100 ridge point: {H100_PEAK_BF16 / H100_BANDWIDTH:.0f} FLOP/byte")
+
+print("\n-- memory --")
+for name, p in [("1B", 1e9), ("7B", 7e9), ("70B", 70e9)]:
+    print(f"{name:&gt;3}: bf16 weights {weights_gb(p,2):6.1f} GB | int4 weights {weights_gb(p,0.5):5.1f} GB"
+          f" | full training state {train_state_gb(p):6.0f} GB")
+
+print("\n-- a 7B model on 2T tokens, 40% MFU, $2.50 per GPU-hour (assumed) --")
+f = train_flops(7e9, 2e12)
+h = gpu_hours(f, H100_PEAK_BF16, 0.40)
+print(f"FLOPs {f:.2e} | GPU-hours {h:,.0f} | 1,024 GPUs: {h/1024/24:.1f} days | bill ${h*2.5:,.0f}")
+
+print("\n-- sanity checks against published numbers --")
+f = train_flops(405e9, 15.6e12)
+print(f"Llama 3 405B: 6ND = {f:.2e} FLOPs (paper reports about 3.8e25)")
+h = 2_788_000
+print(f"DeepSeek-V3: {h:,} GPU-hours x $2 = ${h*2:,} (report: $5.576M)")</code></pre>
+<pre class="terminal" data-title="output"><code>H100 ridge point: 295 FLOP/byte
+
+-- memory --
+ 1B: bf16 weights    2.0 GB | int4 weights   0.5 GB | full training state     16 GB
+ 7B: bf16 weights   14.0 GB | int4 weights   3.5 GB | full training state    112 GB
+70B: bf16 weights  140.0 GB | int4 weights  35.0 GB | full training state   1120 GB
+
+-- a 7B model on 2T tokens, 40% MFU, $2.50 per GPU-hour (assumed) --
+FLOPs 8.40e+22 | GPU-hours 58,982 | 1,024 GPUs: 2.4 days | bill $147,455
+
+-- sanity checks against published numbers --
+Llama 3 405B: 6ND = 3.79e+25 FLOPs (paper reports about 3.8e25)
+DeepSeek-V3: 2,788,000 GPU-hours x $2 = $5,576,000 (report: $5.576M)</code></pre>
+
+<p>The 7-billion-parameter example costs about 59,000 GPU-hours or roughly $147,000 at the assumed $2.50 an hour. On 1,024 GPUs the arithmetic says 2.4 days; that assumes perfectly linear scaling, which never holds, since communication between GPUs grows with the cluster. The last two lines are sanity checks. The 6ND rule reproduces the Llama 3 405B figure. The DeepSeek-V3 line only multiplies the report's own numbers: its technical report (DeepSeek-AI, 2024) states 2.788 million H800 GPU-hours priced at an assumed $2 an hour, $5.576 million. Read the fine print of that number: the report presents it as the cost of the official training run at an assumed rental price, and it excludes the research, ablations and failed experiments that came before. That is the **overhead multiplier** in the diagram. Projects often spend several times the cost of the final run on everything around it. Choose a multiplier, write it down, and label it as an assumption.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>First run <code>bench.py</code> on your own machine and compute the ratio between the matrix-product and vector-add FLOP/s. Then edit <code>bill.py</code> for a plan you care about: a 1-billion-parameter model on 100 billion tokens, or fine-tuning a 7B model on 50 million tokens. Change MFU from 40% to 25% and the price from $2.50 to $4, and see which assumption moves the bill more. Which input would you spend an hour checking?</p>
+  <pre class="terminal"><span class="prompt">$</span> <span class="cmd">python3 bench.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 bill.py</span></pre>
+</div>
+
+<h2>Cost in practice: avoiding waste</h2>
+
+<ul>
+  <li><strong>Test small first.</strong> A smoke test on a small model catches shape bugs and out-of-memory errors for cents, before the expensive run. Use the same code path, smaller sizes.</li>
+  <li><strong>Measure throughput early.</strong> Run 100 steps, compute tokens per second and MFU, then extrapolate. Replace the assumptions in your estimate with measured values.</li>
+  <li><strong>Checkpoint and tolerate loss.</strong> Spot capacity is cheap only if a pre-emption costs you minutes, not a day (<a href="../../llm-training/chapters/05-long-runs.html">Checkpoints, Failures &amp; Long Runs</a>).</li>
+  <li><strong>Turn it off.</strong> A GPU instance costs money while idle. Set auto-shutdown, tag resources with an owner, and check the bill weekly. Forgotten notebooks are the most common cause of a surprise invoice.</li>
+  <li><strong>Log cost with the run.</strong> Add GPU-hours and dollars to the run record from <a href="04-reproducible-experiments.html">Reproducible Experiments</a>, so a later comparison knows what each result cost.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Everything here has a counterpart you have met. Memory bandwidth versus compute is the <a href="../../systems/chapters/02-memory-hierarchy.html">memory hierarchy</a> again, with the cache replaced by a few megabytes of on-chip memory in front of much slower HBM. Estimating with stated assumptions is the method of <a href="../../design/chapters/02-estimation.html">Back-of-the-Envelope Estimation</a>. Making a program faster by finding the true bottleneck is <a href="../../systems/chapters/22-performance-engineering.html">Performance Engineering</a>. Keeping utilisation high and idle capacity low is the story of <a href="../../reliability/chapters/20-cost-efficiency.html">Cost &amp; Efficiency</a>.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A GPU trades single-thread speed for a huge amount of parallel arithmetic and fast memory. It is fast on large, regular, batched matrix work and slow on small or sequential steps.</li>
+    <li>Arithmetic intensity (FLOPs per byte) tells you which roof you are under. On an H100 the ridge is near 295 FLOP/byte (dense bf16); one-token-at-a-time decoding sits far below it and is memory-bound.</li>
+    <li>Memory is a hard limit: inference needs about 2 bytes per parameter in bf16 plus the KV cache; mixed-precision Adam training needs about 16 bytes per parameter before activations.</li>
+    <li>Training FLOPs are roughly 6ND. Divide by peak FLOP/s times MFU for time, and multiply by the hourly price for dollars.</li>
+    <li>Prices and GPU generations change monthly. Keep them as named inputs, date them, and read the provider's page before committing.</li>
+    <li>A good estimate names its weakest assumptions and ranges them. Measure real throughput on a short run as soon as you can.</li>
+    <li>The studio <a href="../studios/studio-02-compute-budget.html">Budget the Compute for a Project</a> turns this into a full plan.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA, H100 Tensor Core GPU datasheet</a>. The source for memory size, bandwidth and per-precision throughput, with the sparsity footnote.</li>
+  <li><a href="https://doi.org/10.1145/1498765.1498785" target="_blank" rel="noopener">S. Williams, A. Waterman, D. Patterson, "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (CACM, 2009)</a>. The roofline model as originally presented.</li>
+  <li><a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">S. Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (2020)</a>. The clearest accounting of training memory per parameter, and how to shard it.</li>
+  <li><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">J. Kaplan et al., "Scaling Laws for Neural Language Models" (2020)</a>. Source of the FLOPs-per-token approximation used here.</li>
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Llama Team, "The Llama 3 Herd of Models" (2024)</a>. Gives training compute, tokens and cluster details for a frontier-scale open model.</li>
+  <li><a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-AI, "DeepSeek-V3 Technical Report" (2024)</a>. Includes a GPU-hour cost table and states its pricing assumption.</li>
+  <li><a href="https://horace.io/brrr_intro.html" target="_blank" rel="noopener">H. He, "Making Deep Learning Go Brrrr From First Principles" (2022)</a>. An accessible tour of compute-bound, memory-bound and overhead-bound work.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">Adding two large fp32 vectors element by element on a GPU achieves a small fraction of the chip's peak FLOP/s. Why?</p>
+    <ol class="q-options">
+      <li>GPUs cannot add numbers efficiently; they are built only for multiplication.</li>
+      <li>The vectors are too small to occupy the GPU, regardless of how large they are.</li>
+      <li>Each element needs one FLOP but 12 bytes of memory traffic, so the operation is limited by memory bandwidth, not arithmetic.</li>
+      <li>fp32 is not supported by GPUs, so the operation falls back to the CPU.</li>
+    </ol>
+    <div class="q-explain">At about 0.083 FLOP per byte the operation is far to the left of the ridge point, under the memory roof. Faster arithmetic would not help. Size is not the problem here: large vectors make it bandwidth-bound. GPUs do support fp32 and addition.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">You want to fully fine-tune a 3-billion-parameter model with Adam in the usual bf16-plus-fp32 mixed-precision recipe. Roughly how much GPU memory do weights, gradients and optimiser state need, before activations?</p>
+    <ol class="q-options">
+      <li>About 48 GB (16 bytes per parameter).</li>
+      <li>About 6 GB (2 bytes per parameter).</li>
+      <li>About 12 GB (4 bytes per parameter).</li>
+      <li>About 3 GB, because only the changed weights are stored.</li>
+    </ol>
+    <div class="q-explain">3 &times; 10<sup>9</sup> &times; 16 bytes is 48 GB: bf16 weights and gradients (4) plus fp32 master weights and two Adam moments (12). The 6 GB figure is the bf16 weights alone, which is all that inference needs. Nothing is saved by "changed weights only" unless you use a parameter-efficient method such as LoRA.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A plan trains a 20-billion-parameter model on 1 trillion tokens. Using the 6ND rule, about how many FLOPs is that?</p>
+    <ol class="q-options">
+      <li>About 1.2 &times; 10<sup>20</sup></li>
+      <li>About 1.2 &times; 10<sup>22</sup></li>
+      <li>About 2 &times; 10<sup>22</sup></li>
+      <li>About 1.2 &times; 10<sup>23</sup></li>
+    </ol>
+    <div class="q-explain">6 &times; 20 &times; 10<sup>9</sup> &times; 10<sup>12</sup> = 120 &times; 10<sup>21</sup> = 1.2 &times; 10<sup>23</sup>. The options below it are off by factors of ten or forget the 6 (2 &times; 10<sup>22</sup> is 1ND).</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">Your estimate assumes 40% MFU, but a 100-step test run measures 20%. What happens to GPU-hours and the bill, other things equal?</p>
+    <ol class="q-options">
+      <li>Both stay the same; MFU only affects speed, not cost.</li>
+      <li>Both double, because the same FLOPs take twice as long on the same rented GPUs.</li>
+      <li>Both halve, because lower utilisation means the GPUs work less.</li>
+      <li>GPU-hours double but the bill stays the same, since the price per hour is fixed.</li>
+    </ol>
+    <div class="q-explain">GPU-hours are FLOPs divided by (peak &times; MFU), so halving MFU doubles them, and you pay per hour, so the bill doubles too. A rented GPU is billed whether or not the arithmetic units are busy, which is why measuring MFU early matters.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A published report says a model "cost $5.6 million to train". What is the most careful way to treat that number when planning your own project?</p>
+    <ol class="q-options">
+      <li>As the total cost of building the model, including all research.</li>
+      <li>As a price you can obtain from any cloud provider today.</li>
+      <li>As meaningless, since rental prices vary.</li>
+      <li>As the cost of the final run at a stated rental price, to be multiplied by an explicit overhead for experiments and failures.</li>
+    </ol>
+    <div class="q-explain">Such figures usually price GPU-hours of the main run at an assumed hourly rate and exclude earlier research and failed runs. They are useful as a scale reference, not as a total or a quote. Calling them meaningless discards the real information (GPU-hours); treating them as total cost underestimates by a large factor.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">Why does generating text for a single user, one token at a time, run far below an H100's peak FLOP/s?</p>
+    <ol class="q-options">
+      <li>The model's arithmetic is too complicated for tensor cores.</li>
+      <li>Python is slow, and that is the only bottleneck.</li>
+      <li>Each token needs every weight read from memory for only a couple of FLOPs per weight, so the work has low arithmetic intensity and is memory-bound.</li>
+      <li>GPUs can only run one operation at a time, which stops them batching.</li>
+    </ol>
+    <div class="q-explain">With batch size 1 the intensity is about 1 FLOP per byte in bf16, far left of the 295 FLOP/byte ridge. Serving many requests together reuses each weight read across tokens and raises the intensity. Framework overhead can matter, but it is not the core reason, and GPUs batch very well.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

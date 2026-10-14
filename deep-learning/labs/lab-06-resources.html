@@ -1,0 +1,951 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 6: The Model Resource Calculator · Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dl" data-lab="L6">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 6: The Model Resource Calculator</h1>
+  <p class="lede">Before anyone trains or serves a model, three numbers decide whether the plan is real: how many parameters it has, how many floating-point operations it needs, and how many bytes must sit in GPU memory while it runs. <a href="../chapters/16-resource-accounting.html">Chapter 16</a> derived all three from the shape of a Transformer, and <a href="../chapters/18-scaling-laws.html">chapter 18</a> asked how big the model should be for a budget. In this lab you turn both chapters into a calculator, in plain Python, and check it against published models: Llama 3, Llama 2, GPT-2, GPT-3, Mixtral and Chinchilla. You count parameters (with grouped-query attention, SwiGLU and mixtures of experts), count FLOPs and turn them into days and GPU-hours, account for training memory, work out the KV cache and the bandwidth limit on decoding, compute compute-optimal sizes, and finally choose a model size that minimises training plus serving cost.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>The expensive mistakes in deep learning are planning mistakes. A job that runs out of memory after twenty minutes on a rented cluster has already cost money; a run planned for three weeks that needs three months was a spreadsheet error, not bad luck; a model chosen at 70 billion parameters because "bigger is better" may cost twice as much to serve for a loss it could have reached with 35 billion. All of these are predictable on paper, from the configuration, before a single GPU is booked. The skill is not memorising numbers. It is knowing which few lines of arithmetic answer "will it fit, how long will it take, what will it cost to run", and being able to defend each term.</p>
+  <p>The lab also builds a habit that matters beyond models: <strong>check your formulas against things that are known</strong>. Every formula you write is tested against published sizes (8,030,261,248 parameters for Llama 3 8B, 3.8 &times; 10<sup>25</sup> FLOPs for the 405B run, 128 KiB of cache per token) and against an independent way of counting. Where the formula does not reproduce a published number, as it does not for Chinchilla's 70 billion, you find out here, with the paper open, and not in a design review. Everything below is arithmetic on a handful of integers, so the whole check runs in a fraction of a second.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Pure arithmetic: no GPU, no clock, no network</p>
+  <p>Python 3.9 or newer and nothing else. Nothing is measured on your machine: every number is computed from a model shape, a datasheet figure or a fitted constant, so <code>python3 check.py solution</code> gives identical output everywhere and finishes in well under a second. Random property tests use seeded random model shapes and print their seed on failure (replay with <code>python3 check.py solution 1 17</code>, milestone 1, seed 17). Units follow the chapters: 1 GB is 10<sup>9</sup> bytes, FLOPs (small s) are a count of work and FLOP/s is a speed. The hardware figures in the starter file are the dense bf16 peaks and memory bandwidths from vendor datasheets as of this writing; they are dated facts, and the formulas do not depend on them.</p>
+</div>
+
+<h2>What you'll build</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="One model shape, a Config of width C, layers L, heads H, key/value heads KV, MLP width F, vocabulary V and optional experts, feeds three accounts: parameters N counted from the shape, FLOPs from 6 times the matrix-multiply weights times tokens plus an attention-score term, and bytes for training states, activations, weights and the KV cache. Those answer four questions: will it fit on this card, how many days and GPU-hours at a given utilisation, how many tokens per second can one GPU decode, and what size and token count minimise cost for a target loss.">
+    <defs><marker id="ahDL-L6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="110" width="150" height="110" rx="8" class="fs-green s-green sw-2"/>
+    <text x="95" y="140" text-anchor="middle" class="t-sm t-bold">Config</text>
+    <text x="95" y="160" text-anchor="middle" class="t-xs t-muted">C, L, H, KV, F, V</text>
+    <text x="95" y="176" text-anchor="middle" class="t-xs t-muted">experts, top_k</text>
+    <text x="95" y="192" text-anchor="middle" class="t-xs t-muted">tied, bias, norm</text>
+    <rect x="250" y="30" width="210" height="76" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="355" y="56" text-anchor="middle" class="t-sm t-bold">1 Parameters N</text>
+    <text x="355" y="74" text-anchor="middle" class="t-xs t-muted">count_params, active=True for MoE</text>
+    <text x="355" y="92" text-anchor="middle" class="t-xs t-muted">milestone 1</text>
+    <rect x="250" y="127" width="210" height="76" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="355" y="153" text-anchor="middle" class="t-sm t-bold">2 FLOPs</text>
+    <text x="355" y="171" text-anchor="middle" class="t-xs t-muted">6ND, plus 12 L C T for attention</text>
+    <text x="355" y="189" text-anchor="middle" class="t-xs t-muted">milestone 2</text>
+    <rect x="250" y="224" width="210" height="76" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="355" y="250" text-anchor="middle" class="t-sm t-bold">3 Bytes</text>
+    <text x="355" y="268" text-anchor="middle" class="t-xs t-muted">states, activations, KV cache</text>
+    <text x="355" y="286" text-anchor="middle" class="t-xs t-muted">milestones 3 and 4</text>
+    <line x1="172" y1="150" x2="248" y2="76" class="line sw-2" marker-end="url(#ahDL-L6a)"/>
+    <line x1="172" y1="165" x2="248" y2="165" class="line sw-2" marker-end="url(#ahDL-L6a)"/>
+    <line x1="172" y1="180" x2="248" y2="258" class="line sw-2" marker-end="url(#ahDL-L6a)"/>
+    <line x1="462" y1="68" x2="528" y2="48" class="line sw-2" marker-end="url(#ahDL-L6a)"/>
+    <line x1="462" y1="165" x2="528" y2="120" class="line sw-2" marker-end="url(#ahDL-L6a)"/>
+    <line x1="462" y1="262" x2="528" y2="212" class="line sw-2" marker-end="url(#ahDL-L6a)"/>
+    <line x1="462" y1="270" x2="528" y2="282" class="line sw-2" marker-end="url(#ahDL-L6a)"/>
+    <rect x="530" y="22" width="210" height="52" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="635" y="44" text-anchor="middle" class="t-sm t-bold">What size is it really?</text>
+    <text x="635" y="62" text-anchor="middle" class="t-xs t-muted">vs the published number</text>
+    <rect x="530" y="94" width="210" height="52" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="635" y="116" text-anchor="middle" class="t-sm t-bold">Days, GPU-hours, cost</text>
+    <text x="635" y="134" text-anchor="middle" class="t-xs t-muted">FLOPs / (peak x MFU)</text>
+    <rect x="530" y="186" width="210" height="52" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="635" y="208" text-anchor="middle" class="t-sm t-bold">Does it fit this card?</text>
+    <text x="635" y="226" text-anchor="middle" class="t-xs t-muted">largest microbatch or batch</text>
+    <rect x="530" y="256" width="210" height="52" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="635" y="278" text-anchor="middle" class="t-sm t-bold">Tokens per second</text>
+    <text x="635" y="296" text-anchor="middle" class="t-xs t-muted">bandwidth or compute bound</text>
+  </svg>
+  <figcaption><strong>One shape, three accounts, four answers.</strong> Green is the input, blue the counting, purple the stored bytes, yellow the questions you can now answer. Milestones 5 and 6 add a fifth question that sits outside the picture: given a loss you want, how large should the model be, and for how long should it train?</figcaption>
+</figure>
+<p>Six milestones, each adding a group of functions that the next one uses:</p>
+<ol class="steps">
+  <li><strong>Counting parameters:</strong> attention with grouped-query heads, SwiGLU or GELU MLPs, norms, embeddings, tied or untied heads, and the active parameters of a mixture of experts. Check against eight published models.</li>
+  <li><strong>FLOPs, time and cost:</strong> the weights that take part in matrix products, 6 FLOPs per weight per token plus the attention-score term, and the division by peak speed and MFU that gives days and GPU-hours.</li>
+  <li><strong>Memory for training:</strong> 16 bytes per parameter of state, the Korthikanti activation formula in three variants, and the largest microbatch that fits a card.</li>
+  <li><strong>Inference:</strong> the KV cache, how many sequences fit beside the weights, and the tokens-per-second limit set by memory bandwidth, with the ridge point where decoding turns compute-bound.</li>
+  <li><strong>Compute-optimal sizes:</strong> the parametric loss L(N, D), its closed-form optimum under C = 6ND, the 20-tokens-per-parameter rule, and the price of missing the optimum.</li>
+  <li><strong>Lifetime cost:</strong> add the cost of serving, and find the model size that reaches a target loss at the least total FLOPs.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are in <code>deep-learning/labs/code/lab06/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab06/starter.py"><code>starter.py</code></a></td><td>Your file. The <code>Config</code> data class, the zoo of eight published model shapes (<code>MODELS</code>), the rounded published sizes (<code>PUBLISHED</code>), the GPU table (<code>GPUS</code>) and the two sets of fitted scaling-law constants (<code>FITS</code>) are given; every function you write has a docstring with the contract and a <code>TODO</code> for its milestone.</td></tr>
+    <tr><td><a href="code/lab06/check.py"><code>check.py</code></a></td><td>The self-check: exact published counts, the numbers from chapters 16 and 18, an independent tensor-by-tensor parameter counter, seeded random model shapes, and a minimiser cross-checked by its own neighbours.</td></tr>
+    <tr><td><a href="code/lab06/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+    <tr><td><a href="code/lab06/demo.py"><code>demo.py</code></a></td><td>Prints a one-line report for each model, the memory options for training Llama 3 8B, a decoding table, and the size-versus-serving table (<code>python3 demo.py</code> for your file, <code>python3 demo.py solution</code> for the reference).</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Everything is unimplemented, and it says so cleanly:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd deep-learning/labs/code/lab06</span>
+<span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">  … Milestone 1: counting parameters: not implemented yet (TODO milestone 1: head_dim)
+  … Milestone 2: FLOPs, time and cost: not implemented yet (TODO milestone 2: matmul_flops)
+  … Milestone 3: memory for training: not implemented yet (TODO milestone 3: state_bytes)
+  … Milestone 4: the KV cache and the bandwidth limit: not implemented yet (TODO milestone 4: kv_bytes_per_token)
+  … Milestone 5: compute-optimal sizes: not implemented yet (TODO milestone 5: loss)
+  … Milestone 6: lifetime cost and over-training: not implemented yet (TODO milestone 6: lifetime_flops)
+
+0/6 milestones passing  (0.0 s)</span></code></pre><p>Notation is the course's: C (or d<sub>model</sub>) the model width, L the number of layers, H query heads and KV key/value heads with head width d<sub>k</sub> = C/H, F the MLP hidden width, V the vocabulary, N parameters, D training tokens, T sequence length, b the microbatch. Open <code>starter.py</code> and read the model zoo first. Each entry cites where its numbers come from: the shapes of GPT-3 and Chinchilla are from their papers' tables, GPT-2, Llama 2 and Mixtral from their released configurations, and Llama 3 from Table 3 of its paper.</p>
+
+<h2>Milestone 1: counting parameters</h2>
+
+<p>A <span class="term">parameter</span> is one learned number, and nearly all of them live in matrices, so counting them is multiplying shapes. <a href="../chapters/16-resource-accounting.html">Chapter 16</a> gave the recipe for a modern decoder, and this milestone writes it as six small functions so that each term can be tested alone:</p>
+<ul>
+  <li><strong>Attention</strong> has four matrices: W<sub>q</sub> and W<sub>o</sub> are C &times; C, and W<sub>k</sub>, W<sub>v</sub> are C &times; (KV &middot; d<sub>k</sub>). With <span class="term">grouped-query attention</span> (GQA, chapter 19) there are fewer key/value heads than query heads (8 against 32 for Llama 3 8B), so the keys and values are a quarter as wide and the attention block shrinks from 4C<sup>2</sup> to 2.5C<sup>2</sup>. Older models like GPT-2 and Llama 2 7B have KV = H.</li>
+  <li>The <strong>MLP</strong> has three C &times; F matrices for a SwiGLU (gate, up, down; chapter 10) and two for a GELU MLP. GPT-style models use F = 4C; Llama-style models pick F so that the three matrices cost about the same as two with 4C.</li>
+  <li><strong>Norms</strong> add C weights per RMSNorm (Llama) or 2C per LayerNorm with a bias (GPT-2), two per block and one at the end. <strong>Biases</strong>, if the model has them, add a vector per projection.</li>
+  <li><strong>Embeddings</strong> are a V &times; C table for the input; the output head is another V &times; C unless it is <em>tied</em> to the input table (GPT-2 ties, Llama 3 does not). GPT-2 also has a learned table of position vectors.</li>
+  <li>A <span class="term">mixture of experts</span> (chapter 20) replaces the one MLP by E of them and a small <em>router</em> (C &times; E weights) that picks top_k for each token. The model <em>stores</em> E MLPs but each token <em>uses</em> only top_k of them, so there are two honest answers to "how many parameters", and the function takes <code>active=True</code> for the second.</li>
+</ul>
+<p>Here is what the finished functions say about Llama 3 8B, the model whose 8,030,261,248 weights chapter 16 counted by hand:</p>
+<pre class="terminal" data-title="snippet.py"><code>import solution as m
+c = m.MODELS["Llama 3 8B"]
+n = m.count_params(c)
+parts = {"attention": c.L * m.attn_params(c), "MLP": c.L * m.mlp_params(c), "norms": c.L * m.norm_params(c) + c.C,
+         "embeddings": m.embedding_params(c)}
+print(f"Llama 3 8B: {n:,} parameters")
+for k, v in parts.items():
+    print(f"  {k:&lt;11}{v:&gt;15,}  {v / n:6.1%}")
+print(f"  parts add up: {sum(parts.values()) == n}")
+g = m.MODELS["GPT-2 small"]
+print(f"GPT-2 small: {m.count_params(g):,}  (embeddings are {m.embedding_params(g) / m.count_params(g):.0%} of it)")
+x = m.MODELS["Mixtral 8x7B"]
+print(f"Mixtral 8x7B: {m.count_params(x):,} stored, {m.count_params(x, active=True):,} used per token")</code></pre><pre class="terminal" data-title="output"><code>Llama 3 8B: 8,030,261,248 parameters
+  attention    1,342,177,280   16.7%
+  MLP          5,637,144,576   70.2%
+  norms              266,240    0.0%
+  embeddings   1,050,673,152   13.1%
+  parts add up: True
+GPT-2 small: 124,439,808  (embeddings are 32% of it)
+Mixtral 8x7B: 46,702,792,704 stored, 12,879,925,248 used per token</code></pre><p>Notice three things. The MLP is 70% of the weights and attention only 17%, the pattern chapter 16 pointed out. Norms are a rounding error (266,240 weights), which is why people ignore them in back-of-envelope counts. And embeddings are a third of GPT-2 small but only 13% of Llama 3 8B, which is why a "non-embedding parameter count" (Kaplan et al., 2020) differs from the full count by a third for small models and hardly at all for large ones.</p>
+
+<h3>The published models</h3>
+<p>The last test in the checker is a table of eight models against the sizes in their papers and model cards. It is where you find out whether your formula describes reality:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Model</th><th>Counted</th><th>Published</th><th>Source of the shape</th></tr></thead>
+  <tbody>
+    <tr><td>GPT-2 small</td><td>124,439,808</td><td>124 M</td><td>Released config: 768 wide, 12 layers, 12 heads, 1,024 positions; tied head, biases, LayerNorm</td></tr>
+    <tr><td>GPT-3 175B</td><td>174,604,259,328</td><td>175.0 B</td><td>Brown et al. (2020), Table 2.1: 96 layers, 12,288 wide, 96 heads, d<sub>ff</sub> = 4 d<sub>model</sub>, 2,048 context</td></tr>
+    <tr><td>Llama 2 7B</td><td>6,738,415,616</td><td>6.7 B</td><td>Released config: 32 layers, 4,096 wide, F = 11,008, V = 32,000</td></tr>
+    <tr><td>Llama 3 8B / 70B / 405B</td><td>8.03 B / 70.55 B / 405.85 B</td><td>8 B / 70 B / 405 B</td><td>Llama 3 paper, Table 3; V = 128,256 in the release</td></tr>
+    <tr><td>Mixtral 8x7B</td><td>46,702,792,704 (12,879,925,248 active)</td><td>46.7 B (12.9 B)</td><td>Released config: 8 experts, 2 per token, 8 key/value heads</td></tr>
+    <tr><td>Chinchilla 70B</td><td>64,951,435,264</td><td>70 B</td><td>Hoffmann et al. (2022), Table 4: 80 layers, 64 heads, 8,192 wide, d<sub>ff</sub> = 4 d<sub>model</sub></td></tr>
+  </tbody>
+</table></div>
+<p>Seven of the eight agree with the published figure to within 1% (the differences are rounding in the model names: "8B" for 8.03 billion, "70B" for 70.55). The odd one is Chinchilla: counting its published table gives 64.95 billion, 7.2% below the "70B" in its name. The checker allows 10% for it and prints the gap. The gap is 5.05 billion weights, close to 80 &times; 8,192<sup>2</sup> = 5.37 billion, which is the size of one extra C &times; C matrix in each of the 80 layers. Chinchilla uses Gopher's architecture, and my hypothesis is that the extra matrices are Gopher's relative-position weights, but I have not verified that against the papers, so treat it as a lead and not a fact. The practical lesson stands either way: a count from a configuration is an estimate to be checked, and "70B" is a name, not a measurement.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A model's parameter count is the number in its name." Names are rounded and sometimes loose, and papers disagree about what to count: with or without embeddings, with or without every expert, with or without the output head if tied. A scaling-law constant fitted with non-embedding N does not transfer to a formula that uses the total. Whenever you reuse a number, ask which N it is.</p>
+</div>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>head_dim</code>, <code>attn_params</code>, <code>mlp_params</code> (one expert), <code>norm_params</code>, <code>block_params(cfg, active=False)</code>, <code>embedding_params</code> and <code>count_params(cfg, active=False)</code>. The <code>Config</code> fields are documented in the starter: <code>mlp</code> is <code>"swiglu"</code> or <code>"gelu"</code>, <code>norm</code> is <code>"rms"</code> or <code>"layer"</code>, and <code>bias</code>, <code>tied</code>, <code>positions</code>, <code>experts</code> and <code>top_k</code> default to the Llama-style values.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the parts of Llama 3 8B and GPT-2 small by hand (41,943,040 attention weights, 176,160,768 MLP weights, 4,722,432 for a biased GELU MLP), the exact totals of six models, the active count of Mixtral, then 60 seeded random model shapes against a counter that lists every weight tensor of the model and adds up their sizes, and finally the table of eight published sizes.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>head_dim</code> is <code>cfg.C // cfg.H</code>; the key/value width is <code>cfg.KV * head_dim(cfg)</code>.</li>
+      <li><code>attn_params</code>: <code>C*C</code> for W<sub>q</sub>, <code>2 * C * kv_width</code> for W<sub>k</sub> and W<sub>v</sub>, <code>C*C</code> for W<sub>o</sub>. With biases add <code>C</code>, <code>2 * kv_width</code> and <code>C</code>.</li>
+      <li><code>mlp_params</code>: <code>mats = 3 if cfg.mlp == "swiglu" else 2</code>, so <code>mats * C * F</code>. With biases, the matrices feeding the hidden layer (1 for GELU, 2 for SwiGLU) each have an <code>F</code> bias and the output has <code>C</code>.</li>
+      <li><code>block_params</code>: attention + (experts or top_k) &times; MLP + the router + norms. The router is <code>C * experts</code> only when <code>experts &gt; 1</code>, and it is always present in full: the router is small and is used by every token.</li>
+      <li><code>count_params</code>: <code>cfg.L * block_params(...) + embedding_params(cfg) + final_norm</code>, where the final norm is <code>C</code> for RMS and <code>2C</code> for LayerNorm.</li>
+      <li>If GPT-2 small is off by about 1,500, you forgot the final LayerNorm; if it is off by 38 million, check the tied head; if Llama 3 is off by exactly 525,336,576, you tied the head (V &times; C = 128,256 &times; 4,096).</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> head_dim(cfg):
+    <span class="str">"""d_k = C / H."""</span>
+    <span class="kw">return</span> cfg.C // cfg.H
+
+<span class="kw">def</span> attn_params(cfg):
+    <span class="str">"""W_q (C x C), W_k and W_v (C x KV*d_k each), W_o (C x C), plus biases if cfg.bias."""</span>
+    kv_width = cfg.KV * head_dim(cfg)
+    n = cfg.C * cfg.C + <span class="num">2</span> * cfg.C * kv_width + cfg.C * cfg.C
+    <span class="kw">if</span> cfg.bias:
+        n += cfg.C + <span class="num">2</span> * kv_width + cfg.C
+    <span class="kw">return</span> n
+
+<span class="kw">def</span> mlp_params(cfg):
+    <span class="str">"""ONE expert's MLP: 3 matrices for SwiGLU, 2 for GELU, plus biases if cfg.bias."""</span>
+    mats = <span class="num">3</span> <span class="kw">if</span> cfg.mlp == <span class="str">"swiglu"</span> <span class="kw">else</span> <span class="num">2</span>
+    n = mats * cfg.C * cfg.F
+    <span class="kw">if</span> cfg.bias:
+        n += (mats - <span class="num">1</span>) * cfg.F + cfg.C            <span class="cmt"># hidden-layer biases, then the output bias</span>
+    <span class="kw">return</span> n
+
+<span class="kw">def</span> norm_params(cfg):
+    <span class="str">"""The two normalisations in one block."""</span>
+    per = cfg.C <span class="kw">if</span> cfg.norm == <span class="str">"rms"</span> <span class="kw">else</span> <span class="num">2</span> * cfg.C
+    <span class="kw">return</span> <span class="num">2</span> * per
+
+<span class="kw">def</span> block_params(cfg, active=<span class="kw">False</span>):
+    <span class="str">"""One layer: attention + MLP(s) + router + norms. active=True counts only top_k experts."""</span>
+    n_exp = cfg.top_k <span class="kw">if</span> active <span class="kw">else</span> cfg.experts
+    router = cfg.C * cfg.experts <span class="kw">if</span> cfg.experts &gt; <span class="num">1</span> <span class="kw">else</span> <span class="num">0</span>
+    <span class="kw">return</span> attn_params(cfg) + n_exp * mlp_params(cfg) + router + norm_params(cfg)
+
+<span class="kw">def</span> embedding_params(cfg):
+    <span class="str">"""Input table V*C, a separate output head V*C unless tied, and a learned position table."""</span>
+    <span class="kw">return</span> cfg.V * cfg.C * (<span class="num">1</span> <span class="kw">if</span> cfg.tied <span class="kw">else</span> <span class="num">2</span>) + cfg.positions * cfg.C
+
+<span class="kw">def</span> count_params(cfg, active=<span class="kw">False</span>):
+    <span class="str">"""All parameters: L blocks + embeddings + the final norm. active=True: per-token (MoE) count."""</span>
+    final_norm = cfg.C <span class="kw">if</span> cfg.norm == <span class="str">"rms"</span> <span class="kw">else</span> <span class="num">2</span> * cfg.C
+    <span class="kw">return</span> cfg.L * block_params(cfg, active) + embedding_params(cfg) + final_norm</code></pre>
+  </details>
+</div>
+<h2>Milestone 2: FLOPs, time and cost</h2>
+
+<p>A <span class="term">FLOP</span> is one floating-point operation, an addition or a multiplication, and the work of a run is counted in them. The whole count rests on one formula: multiplying an (m, k) matrix by a (k, n) matrix makes m &times; n outputs, each a sum of k products, so <strong>2mkn FLOPs</strong>. Applied to a linear layer on n tokens that is 2 FLOPs per weight per token on the forward pass, and the backward pass needs two such products (one for the weight gradient, one for the input gradient), so 4 more. A training run over D tokens therefore costs about 6ND FLOPs, where N counts the weights that take part in matrix products (chapter 16 derives this and checks it by instrumenting a real forward and backward pass).</p>
+
+<p>Two refinements make the calculator more honest than the rule of thumb, and both are in chapter 16:</p>
+<ul>
+  <li><strong>Which weights count.</strong> The input embedding is a lookup, not a product, so it costs no FLOPs; the output head is a product and does. Norms and biases are a few operations per number, not matrix products. For a mixture of experts only the top_k active experts' matrices are multiplied. <code>matmul_weights</code> captures this, and for a dense model it is the active parameter count minus norms and the input table (the checker verifies exactly that on random shapes).</li>
+  <li><strong>The attention scores have no weights.</strong> Q&middot;K<sup>T</sup> and (softmax weights)&middot;V are matrix products between activations. For a context of T tokens they add 12 &middot; L &middot; C &middot; T FLOPs per training token (4TC per layer forward, three times that with the backward pass), a term that grows with context while the weight term does not. It is small at T = 2,048 and dominant at 128K.</li>
+</ul>
+<pre class="terminal" data-title="snippet.py"><code>import solution as m
+c = m.MODELS["Llama 3 8B"]
+N = m.count_params(c)
+print("Llama 3 8B: training FLOPs per token, exact count against 6N")
+for T in (2048, 8192, 131072):
+    f = m.train_flops_per_token(c, T)
+    score = 12 * c.L * c.C * T
+    print(f"  T={T:&gt;6}  exact {f:.3e}  6N {6 * N:.3e}  ratio {f / (6 * N):5.3f}  attention-score share {score / f:5.1%}")
+big = m.MODELS["Llama 3 405B"]
+flops = m.rule_6nd(m.count_params(big), 15.6e12)
+H100 = m.GPUS["H100 SXM"]["peak"]
+print(f"405B on 15.6T tokens: 6ND = {flops:.2e} FLOPs")
+for mfu in (0.2, 0.3, 0.4, 0.5):
+    print(f"  MFU {mfu:.0%}: {m.train_seconds(flops, H100, mfu, 16384) / 86400:6.1f} days on 16,384 H100s, {m.gpu_hours(flops, H100, mfu) / 1e6:5.1f}M GPU-hours")</code></pre><pre class="terminal" data-title="output"><code>Llama 3 8B: training FLOPs per token, exact count against 6N
+  T=  2048  exact 4.825e+10  6N 4.818e+10  ratio 1.001  attention-score share  6.7%
+  T=  8192  exact 5.791e+10  6N 4.818e+10  ratio 1.202  attention-score share 22.2%
+  T=131072  exact 2.512e+11  6N 4.818e+10  ratio 5.213  attention-score share 82.1%
+405B on 15.6T tokens: 6ND = 3.80e+25 FLOPs
+  MFU 20%:  135.7 days on 16,384 H100s,  53.3M GPU-hours
+  MFU 30%:   90.4 days on 16,384 H100s,  35.6M GPU-hours
+  MFU 40%:   67.8 days on 16,384 H100s,  26.7M GPU-hours
+  MFU 50%:   54.3 days on 16,384 H100s,  21.3M GPU-hours</code></pre><p>The first block reproduces chapter 16's table: at 2,048 tokens 6N is accurate to 0.1%, at 8,192 it is 20% low for the 8B shape, and at 131,072 tokens attention scores are 82% of the arithmetic. The second block is the credibility check of the whole method: 6 &times; 405.85 billion &times; 15.6 trillion is 3.80 &times; 10<sup>25</sup> FLOPs, the figure Meta reports for pre-training Llama 3 405B.</p>
+
+<p>FLOPs are the same on any hardware; <strong>time</strong> is FLOPs divided by the speed you actually get. A GPU's datasheet gives a peak (989 TFLOP/s dense bf16 for an H100 SXM, 312 for an A100), and a real run reaches a fraction of it, the <span class="term">model FLOPs utilisation</span> (MFU) of PaLM (Chowdhery et al., 2022): the model FLOP/s you actually deliver, divided by peak. Well-tuned large runs land at 30% to 50%. So</p>
+<p style="text-align:center">seconds = FLOPs / (peak &times; MFU &times; number of GPUs), &nbsp; GPU-hours = FLOPs / (peak &times; MFU) / 3600</p>
+<p>The MFU rows of the output are the single most useful result in the milestone: the same 405B plan takes 135.7 days at 20% and 54.3 days at 50%. A guess of "about 40%" is the biggest source of error in a schedule, so you want it to be a measurement. This is a calculation, not a report of how long Meta's run took; real runs also lose time to failures and restarts (A3 chapter 05).</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The two peak figures in <code>GPUS</code> (312 TFLOP/s for the A100, 989 TFLOP/s for the H100 SXM, dense bf16) are from vendor datasheets and describe two widely deployed generations; newer accelerators have more memory, higher bandwidth and lower-precision formats with much higher quoted peaks, and their prices and the MFU that real code reaches on them change with each software release. Take current figures from the datasheet of the exact part, and MFU from a measurement of your own code. Prices are deliberately not in the starter file: cost is GPU-hours times whatever you pay, and that number is yours to supply.</p>
+</div>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>matmul_flops</code>, <code>matmul_weights</code>, <code>train_flops_per_token(cfg, T)</code>, <code>rule_6nd</code>, <code>train_flops(cfg, tokens, T)</code>, <code>train_seconds(flops, peak, mfu, n_gpus=1)</code>, <code>gpu_hours</code> and <code>mfu_from_throughput</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks <code>matmul_weights</code> for Llama 3 8B (7,504,658,432), the ratios 1.001, 1.202 and 5.213 of chapter 16 and 1.078 for the 405B at 8,192 tokens, that the score term grows by exactly 12LC per extra context token, the 3.8 &times; 10<sup>25</sup> FLOP budget, 67.8 days and 26.7 million GPU-hours for the 405B plan, 16.6 GPU-hours for GPT-2 small on 10 billion tokens, that GPU-hours do not depend on the number of GPUs, and, on 40 seeded random dense shapes, that <code>matmul_weights</code> equals the active parameters minus norms and the input table.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>matmul_weights</code>: per layer, the attention matrices (<code>2*C*C + 2*C*kv_width</code>), plus <code>top_k</code> experts times the MLP matrices (3 or 2 times <code>C*F</code>) plus the router if <code>experts &gt; 1</code>; times <code>L</code>; plus the output head <code>C*V</code> once.</li>
+      <li><code>train_flops_per_token</code>: <code>6 * matmul_weights(cfg) + 12 * L * C * T</code>.</li>
+      <li><code>train_seconds</code> is a single division: <code>flops / (peak * mfu * n_gpus)</code>. <code>gpu_hours</code> is the same without the GPU count, over 3,600.</li>
+      <li><code>mfu_from_throughput</code> is the inverse question: you measured 400 TFLOP/s per GPU of useful model FLOPs on a 989 TFLOP/s part, so the answer is 0.404.</li>
+      <li>If the 8B ratio at 2,048 tokens comes out near 0.935 instead of 1.001, you left out the output head <code>C * V</code>; if it comes out near 1.07, you included the input table.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> matmul_flops(m, k, n):
+    <span class="str">"""Multiplying an (m, k) matrix by a (k, n) matrix: m*n outputs, k multiplies and k adds each."""</span>
+    <span class="kw">return</span> <span class="num">2</span> * m * k * n
+
+<span class="kw">def</span> matmul_weights(cfg):
+    <span class="str">"""Weights that take part in a matrix product for one token: attention matrices, the MLP matrices of
+    the top_k active experts, the router, and the output head. Norms, biases and the input lookup excluded."""</span>
+    kv_width = cfg.KV * head_dim(cfg)
+    attn = <span class="num">2</span> * cfg.C * cfg.C + <span class="num">2</span> * cfg.C * kv_width
+    mats = <span class="num">3</span> <span class="kw">if</span> cfg.mlp == <span class="str">"swiglu"</span> <span class="kw">else</span> <span class="num">2</span>
+    mlp = cfg.top_k * mats * cfg.C * cfg.F
+    router = cfg.C * cfg.experts <span class="kw">if</span> cfg.experts &gt; <span class="num">1</span> <span class="kw">else</span> <span class="num">0</span>
+    <span class="kw">return</span> cfg.L * (attn + mlp + router) + cfg.C * cfg.V
+
+<span class="kw">def</span> train_flops_per_token(cfg, T):
+    <span class="str">"""6 FLOPs per matmul weight, plus 12*L*C*T for the QK^T and (weights)V products (chapter 16)."""</span>
+    <span class="kw">return</span> <span class="num">6</span> * matmul_weights(cfg) + <span class="num">12</span> * cfg.L * cfg.C * T
+
+<span class="kw">def</span> rule_6nd(N, D):
+    <span class="str">"""The rule of thumb: 6 * N * D."""</span>
+    <span class="kw">return</span> <span class="num">6</span> * N * D
+
+<span class="kw">def</span> train_flops(cfg, tokens, T):
+    <span class="str">"""Exact-count training FLOPs for `tokens` tokens at sequence length T."""</span>
+    <span class="kw">return</span> train_flops_per_token(cfg, T) * tokens
+
+<span class="kw">def</span> train_seconds(flops, peak, mfu, n_gpus=<span class="num">1</span>):
+    <span class="str">"""Wall-clock seconds: FLOPs / (peak FLOP/s per GPU * MFU * number of GPUs)."""</span>
+    <span class="kw">return</span> flops / (peak * mfu * n_gpus)
+
+<span class="kw">def</span> gpu_hours(flops, peak, mfu):
+    <span class="str">"""GPU-hours (independent of how many GPUs share the work)."""</span>
+    <span class="kw">return</span> flops / (peak * mfu) / <span class="num">3600</span>
+
+<span class="kw">def</span> mfu_from_throughput(model_flops_per_s_per_gpu, peak):
+    <span class="str">"""Model FLOPs utilisation: achieved model FLOP/s over the datasheet peak."""</span>
+    <span class="kw">return</span> model_flops_per_s_per_gpu / peak</code></pre>
+  </details>
+</div>
+<h2>Milestone 3: memory for training</h2>
+
+<p>Compute decides how long a run takes; <strong>memory decides whether it starts</strong>. GPU memory is a hard wall: when the total exceeds the card, the job stops with an out-of-memory error. Training holds two kinds of memory, and they are best counted separately.</p>
+
+<p><strong>Model states</strong> depend only on the parameter count. Mixed-precision training with AdamW (A0 chapter 10; chapter 17) keeps five numbers per parameter: a bf16 weight (2 bytes), a bf16 gradient (2), an fp32 master copy of the weight (4) and Adam's two running averages in fp32 (4 and 4). That is 2 + 2 + 4 + 4 + 4 = <strong>16 bytes per parameter</strong>, the accounting of the ZeRO paper (Rajbhandari et al., 2020). It is a baseline, not a law: it explains why <code>state_bytes</code> takes the five sizes as keyword arguments, so that you can ask what an 8-bit optimiser would save.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 260" role="img" aria-label="A horizontal bar of 128.5 GB split into five segments for Llama 3 8B training: bf16 weights 16.1 GB, bf16 gradients 16.1 GB, fp32 master copy 32.1 GB, Adam first moment 32.1 GB and Adam second moment 32.1 GB. A red line at 80 GB marks the capacity of one card, which is crossed inside the master-copy and first-moment segments. Below, a second bar shows serving the same model in bf16 needs only the 16.1 GB of weights, plus 1.07 GB of KV cache per 8,192-token conversation.">
+    <text x="30" y="22" class="t-sm t-bold">Training states of Llama 3 8B: 16 bytes for every parameter</text>
+    <rect x="30.0" y="44" width="73.9" height="60" class="fs-blue s-blue sw-2"/>
+    <text x="66.9" y="70" text-anchor="middle" class="t-xs t-bold">weights</text>
+    <text x="66.9" y="88" text-anchor="middle" class="t-xs">16.1 GB</text>
+    <rect x="103.9" y="44" width="73.9" height="60" class="fs-cyan s-cyan sw-2"/>
+    <text x="140.8" y="70" text-anchor="middle" class="t-xs t-bold">gradients</text>
+    <text x="140.8" y="88" text-anchor="middle" class="t-xs">16.1 GB</text>
+    <rect x="177.8" y="44" width="147.8" height="60" class="fs-purple s-purple sw-2"/>
+    <text x="251.6" y="70" text-anchor="middle" class="t-xs t-bold">master copy</text>
+    <text x="251.6" y="88" text-anchor="middle" class="t-xs">32.1 GB</text>
+    <rect x="325.5" y="44" width="147.8" height="60" class="fs-orange s-orange sw-2"/>
+    <text x="399.4" y="70" text-anchor="middle" class="t-xs t-bold">Adam m</text>
+    <text x="399.4" y="88" text-anchor="middle" class="t-xs">32.1 GB</text>
+    <rect x="473.3" y="44" width="147.8" height="60" class="fs-pink s-pink sw-2"/>
+    <text x="547.1" y="70" text-anchor="middle" class="t-xs t-bold">Adam v</text>
+    <text x="547.1" y="88" text-anchor="middle" class="t-xs">32.1 GB</text>
+    <text x="30" y="124" class="t-xs t-muted">2 bytes</text>
+    <text x="108" y="124" class="t-xs t-muted">2</text>
+    <text x="218" y="124" class="t-xs t-muted">4</text>
+    <text x="386" y="124" class="t-xs t-muted">4</text>
+    <text x="533" y="124" class="t-xs t-muted">4 bytes per parameter</text>
+    <line x1="398" y1="34" x2="398" y2="150" class="line s-red sw-2"/>
+    <text x="404" y="146" class="t-xs tc-red">80 GB card (3 GB of it is overhead)</text>
+    <text x="617" y="40" text-anchor="end" class="t-xs t-muted">total 128.5 GB</text>
+    <text x="30" y="176" class="t-sm t-bold">Serving the same model in bf16 needs only the weights, plus a cache per sequence</text>
+    <rect x="30" y="190" width="73.9" height="40" class="fs-blue s-blue sw-2"/>
+    <text x="66.9" y="215" text-anchor="middle" class="t-xs t-bold">16.1 GB</text>
+    <rect x="103.9" y="190" width="4.9" height="40" class="fs-cyan s-cyan sw-2"/>
+    <text x="116.8" y="215" class="t-xs t-muted">+ 1.07 GB of KV cache for each 8,192-token conversation</text>
+  </svg>
+  <figcaption><strong>The states alone overflow a card.</strong> Only 2 of the 16 bytes per parameter are the weights the forward pass uses; gradients, the full-precision master copy and Adam's two averages are the other 14. Serving drops everything except the weights and adds a cache.</figcaption>
+</figure>
+
+<p><strong>Activations</strong> are the intermediate tensors the forward pass saves for the backward pass. Korthikanti et al. (2022) counted them tensor by tensor for a GPT-style layer in 16-bit numbers: with sequence length s, microbatch b, width h and a heads, one layer saves s &middot; b &middot; h &middot; (34 + 5 &middot; a &middot; s / h) bytes. The 34 s b h part is linear in the sequence; the 5 a s<sup>2</sup> b part is the (s, s) attention tables, quadratic in s. Two standard techniques attack the terms. A <strong>fused attention kernel</strong> (FlashAttention, chapter 19) never stores the (s, s) tables, so the second part vanishes. <strong>Recomputation</strong> (gradient checkpointing, Chen et al., 2016) stores only each layer's input, 2 s b h bytes, and recomputes the rest in the backward pass at the price of roughly a third more compute. The formula is for a GELU block with full multi-head attention, so for Llama-style blocks treat it as an estimate within tens of per cent, as chapter 16 says.</p>
+<pre class="terminal" data-title="snippet.py"><code>import solution as m
+GB = 1e9
+c = m.MODELS["Llama 3 8B"]
+print(f"states {m.state_bytes(m.count_params(c)) / GB:.1f} GB")
+print(f"{'seq len':&gt;8} {'keep all':&gt;10} {'fused attention':&gt;16} {'recompute':&gt;10}")
+for s in (2048, 4096, 8192, 16384):
+    print(f"{s:&gt;8} " + " ".join(f"{m.activation_bytes(c, s, 1, mode) / GB:&gt;{w}.1f}" for mode, w in (("full", 7), ("flash", 12), ("recompute", 10))) + " GB")
+small = m.Config("1B-class", C=2048, L=20, H=16, KV=16, F=8192, V=32000, mlp="gelu", tied=True)
+n = m.count_params(small)
+print(f"\n1B-class model: {n / 1e9:.2f} B parameters, states {m.state_bytes(n) / GB:.1f} GB, 24 GB card, 2,048 tokens")
+for mode in ("full", "flash", "recompute"):
+    print(f"  {mode:&lt;10} largest microbatch: {m.max_microbatch(small, 2048, mode, 24 * GB)}")
+print(f"largest model whose states fit 80 GB: {m.max_trainable_params(80 * GB) / GB:.2f} B parameters")</code></pre><pre class="terminal" data-title="output"><code>states 128.5 GB
+ seq len   keep all  fused attention  recompute
+    2048    30.6          9.1        0.5 GB
+    4096   104.2         18.3        1.1 GB
+    8192   380.1         36.5        2.1 GB
+   16384  1447.4         73.0        4.3 GB
+
+1B-class model: 1.07 B parameters, states 17.2 GB, 24 GB card, 2,048 tokens
+  full       largest microbatch: 0
+  flash      largest microbatch: 1
+  recompute  largest microbatch: 22
+largest model whose states fit 80 GB: 4.81 B parameters</code></pre><p>The first table is chapter 16's. At 4,096 tokens a single sequence wants 104 GB of activations if everything is kept, 18 GB with a fused kernel and 1 GB with full recomputation; at 16,384 tokens, 1.4 terabytes against 73 GB against 4 GB. The 8B model's states (128.5 GB) do not fit an 80 GB card in any of these cases, which is the point: that model needs its states <em>sharded</em> across GPUs (ZeRO and FSDP, <a href="../../llm-training/chapters/02-gpu-memory.html">A3 chapter 02</a>), and your calculator tells you so before the first rental. The second experiment is the worked example of the chapter: a 1.07-billion-parameter model on a 24 GB card has 17.2 GB of states, so only about 4 GB (after a 3 GB allowance for the CUDA context, buffers and fragmentation) is left for activations. Keeping everything does not fit at all; a fused kernel allows a microbatch of one; recomputation allows 22. The last line is the rule of thumb to remember: an 80 GB card holds the states of a model of at most about 4.8 billion parameters, with nothing left over.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In <code>demo.py</code> (or an interpreter), ask what an 8-bit optimiser buys you: <code>state_bytes(n, m=1, v=1)</code> is 10 bytes per parameter instead of 16, so the 24 GB card's largest trainable model grows from about 1.3 B to about 2.1 B parameters. Then find the largest microbatch of the 1B-class model at a 4,096-token sequence with each of the three modes. Which technique helped most, and which one would you reach for first on a real run?</p>
+  <pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 demo.py solution | head -20</span></code></pre>
+</div>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>state_bytes(n, weights=2, grads=2, master=4, m=4, v=4)</code>, <code>act_bytes_per_layer(s, b, h, a, mode)</code> (modes <code>"full"</code>, <code>"flash"</code>, <code>"recompute"</code>; anything else raises <code>ValueError</code>), <code>activation_bytes(cfg, s, b, mode)</code>, <code>training_memory(cfg, s, b, mode)</code> (a dict with keys <code>states</code>, <code>activations</code>, <code>total</code>), <code>fits(total_bytes, gpu_mem, overhead=3e9)</code>, <code>max_microbatch(cfg, s, mode, gpu_mem)</code> and <code>max_trainable_params(gpu_mem)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks 16 bytes per parameter and the 8-bit variant, the three activation formulas on hand values (312, 272 and 16 bytes for s = 2, b = 1, h = 4, a = 2), the 12 entries of chapter 16's table to within 1%, that activations scale linearly with the microbatch and the score term quadratically with the sequence, the boundary of <code>fits</code>, and <code>max_microbatch</code> for a 1B-class model on a 24 GB card in all three modes against a brute-force search.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>state_bytes</code> is <code>n * (weights + grads + master + m + v)</code>.</li>
+      <li><code>act_bytes_per_layer</code>: <code>"full"</code> is <code>s*b*h*(34 + 5*a*s/h)</code>, <code>"flash"</code> is <code>s*b*h*34</code>, <code>"recompute"</code> is <code>2*s*b*h</code>. Raise <code>ValueError</code> for any other mode.</li>
+      <li><code>activation_bytes</code> multiplies by <code>cfg.L</code> and passes <code>cfg.C</code> as <code>h</code> and <code>cfg.H</code> as <code>a</code>.</li>
+      <li><code>fits</code> is <code>total + overhead &lt;= gpu_mem</code>.</li>
+      <li><code>max_microbatch</code>: start at 0 and keep adding one while <code>fits(training_memory(cfg, s, b + 1, mode)["total"], ...)</code>. Stop at 4,096 so that a tiny model cannot loop forever.</li>
+      <li><code>max_trainable_params</code> is <code>(gpu_mem - overhead) / 16</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> state_bytes(n, weights=<span class="num">2</span>, grads=<span class="num">2</span>, master=<span class="num">4</span>, m=<span class="num">4</span>, v=<span class="num">4</span>):
+    <span class="str">"""Bytes of model state: bf16 weights and gradients, fp32 master copy and Adam's two moments."""</span>
+    <span class="kw">return</span> n * (weights + grads + master + m + v)
+
+<span class="kw">def</span> act_bytes_per_layer(s, b, h, a, mode=<span class="str">"full"</span>):
+    <span class="str">"""Korthikanti et al. activations for one layer, 16-bit: 'full' s*b*h*(34 + 5*a*s/h),
+    'flash' s*b*h*34 (no stored score matrices), 'recompute' 2*s*b*h (only the layer input)."""</span>
+    <span class="kw">if</span> mode == <span class="str">"full"</span>:
+        <span class="kw">return</span> s * b * h * (<span class="num">34</span> + <span class="num">5</span> * a * s / h)
+    <span class="kw">if</span> mode == <span class="str">"flash"</span>:
+        <span class="kw">return</span> s * b * h * <span class="num">34</span>
+    <span class="kw">if</span> mode == <span class="str">"recompute"</span>:
+        <span class="kw">return</span> <span class="num">2</span> * s * b * h
+    <span class="kw">raise</span> ValueError(<span class="str">f"unknown activation mode {mode!r}"</span>)
+
+<span class="kw">def</span> activation_bytes(cfg, s, b, mode=<span class="str">"full"</span>):
+    <span class="str">"""Activations of the whole stack: L layers (width cfg.C, cfg.H heads)."""</span>
+    <span class="kw">return</span> cfg.L * act_bytes_per_layer(s, b, cfg.C, cfg.H, mode)
+
+<span class="kw">def</span> training_memory(cfg, s, b, mode=<span class="str">"full"</span>):
+    <span class="str">"""{'states': ..., 'activations': ..., 'total': ...} in bytes, using 16 bytes per parameter."""</span>
+    states = state_bytes(count_params(cfg))
+    acts = activation_bytes(cfg, s, b, mode)
+    <span class="kw">return</span> {<span class="str">"states"</span>: states, <span class="str">"activations"</span>: acts, <span class="str">"total"</span>: states + acts}
+
+<span class="kw">def</span> fits(total_bytes, gpu_mem, overhead=<span class="num">3</span> * GB):
+    <span class="str">"""True if the total plus a fixed allowance for the CUDA context and fragmentation fits the card."""</span>
+    <span class="kw">return</span> total_bytes + overhead &lt;= gpu_mem
+
+<span class="kw">def</span> max_microbatch(cfg, s, mode, gpu_mem, overhead=<span class="num">3</span> * GB):
+    <span class="str">"""The largest microbatch b that fits on one card (0 if even b = 1 does not)."""</span>
+    b = <span class="num">0</span>
+    <span class="kw">while</span> fits(training_memory(cfg, s, b + <span class="num">1</span>, mode)[<span class="str">"total"</span>], gpu_mem, overhead):
+        b += <span class="num">1</span>
+        <span class="kw">if</span> b &gt;= <span class="num">4096</span>:
+            <span class="kw">break</span>
+    <span class="kw">return</span> b
+
+<span class="kw">def</span> max_trainable_params(gpu_mem, overhead=<span class="num">3</span> * GB):
+    <span class="str">"""The most parameters whose 16-bytes-each states fit the card, with nothing left for activations."""</span>
+    <span class="kw">return</span> (gpu_mem - overhead) / <span class="num">16</span></code></pre>
+  </details>
+</div>
+<h2>Milestone 4: inference, the KV cache and the bandwidth limit</h2>
+
+<p>Serving drops the gradients and the optimiser state: the states shrink to the weights alone, 2 bytes per parameter in bf16 (a quarter of that in 4-bit quantisation, <a href="../../llm-training/chapters/19-quantisation.html">A3 chapter 19</a>). A new item appears. To produce the next token, attention needs the keys and values of every earlier token, and recomputing them for each new token would be wasteful, so they are stored: the <span class="term">KV cache</span>. For each token, in each of the L layers, it holds one key and one value of KV heads times d<sub>k</sub> numbers:</p>
+<p style="text-align:center">KV bytes per token = 2 &times; L &times; KV &times; d<sub>k</sub> &times; (bytes per number)</p>
+<p>For Llama 3 8B in bf16 that is 2 &times; 32 &times; 8 &times; 128 &times; 2 = 131,072 bytes, 128 KiB per token, about 1.07 GB for one 8,192-token conversation. With full multi-head attention (KV = H = 32, as in Llama 2 7B) the cache is four times larger, 512 KiB per token, which is the reason GQA exists. Memory capacity then limits how many conversations a card can serve at once: the weights are paid once, the cache once for every sequence.</p>
+
+<p>The second constraint is speed. To generate one token the GPU must read every weight (and the sequence's cache) from memory, and it does only 2 FLOPs per weight read. Compare the two ways of spending a step: the memory time, bytes read divided by the memory bandwidth, and the compute time, FLOPs divided by the peak. Whichever is larger sets the step time (the idea of the <em>roofline</em> model of Williams, Waterman and Patterson, 2009). With one sequence the memory time dominates by a factor of hundreds, so <strong>decoding is limited by bytes, not FLOP/s</strong>: at 3.35 TB/s an H100 cannot read the 16.1 GB of Llama 3 8B's weights more than about 209 times a second, which is 209 tokens per second for one user, however fast its arithmetic units are. Batching shares the weight reads: with b sequences in the batch, one pass over the weights produces b tokens, so throughput rises almost linearly with b until the arithmetic units become the limit. The batch where the two times are equal is the <span class="term">ridge</span>: batch = peak &times; weight bytes / (2 &times; matmul weights &times; bandwidth), which is 316 for this model on an H100.</p>
+<pre class="terminal" data-title="snippet.py"><code>import solution as m
+GB = 1e9
+for name in ("Llama 2 7B", "Llama 3 8B", "Llama 3 70B"):
+    c = m.MODELS[name]
+    print(f"{name:&lt;12} KV cache {m.kv_bytes_per_token(c) // 1024:&gt;4} KiB/token, {m.kv_cache_bytes(c, 8192) / GB:5.2f} GB for 8,192 tokens, "
+          f"bf16 weights {m.weight_bytes(c) / GB:6.1f} GB, 80 GB card holds {m.max_batch(c, 8192, 80 * GB)} such sequences")
+c = m.MODELS["Llama 3 8B"]
+g = m.GPUS["H100 SXM"]
+print(f"\nridge batch (memory-bound below, compute-bound above): {m.ridge_batch(c, g['bw'], g['peak']):.0f}")
+print(f"{'batch':&gt;6} {'tokens/s':&gt;10} {'per user':&gt;9}   (context 0, as if the cache were free)")
+for b in (1, 8, 64, 316, 1024, 4096):
+    t = m.decode_tokens_per_second(c, 0, b, g["bw"], g["peak"])
+    print(f"{b:&gt;6} {t:&gt;10,.0f} {t / b:&gt;9.1f}")</code></pre><pre class="terminal" data-title="output"><code>Llama 2 7B   KV cache  512 KiB/token,  4.29 GB for 8,192 tokens, bf16 weights   13.5 GB, 80 GB card holds 14 such sequences
+Llama 3 8B   KV cache  128 KiB/token,  1.07 GB for 8,192 tokens, bf16 weights   16.1 GB, 80 GB card holds 56 such sequences
+Llama 3 70B  KV cache  320 KiB/token,  2.68 GB for 8,192 tokens, bf16 weights  141.1 GB, 80 GB card holds 0 such sequences
+
+ridge batch (memory-bound below, compute-bound above): 316
+ batch   tokens/s  per user   (context 0, as if the cache were free)
+     1        209     208.6
+     8      1,669     208.6
+    64     13,350     208.6
+   316     65,892     208.5
+  1024     65,892      64.3
+  4096     65,892      16.1</code></pre><p>Read the first block for the capacity story: the 70B model in bf16 needs 141 GB for its weights, so it does not fit one 80 GB card at all, and Llama 2 7B (without GQA) holds 14 conversations beside its weights where Llama 3 8B holds 56. The second block is the bandwidth story: 209 tokens per second for one user, rising in proportion to the batch up to the ridge at 316 sequences and flat at 65,892 tokens a second after it, which is the H100's peak divided by 2 FLOPs per weight. The per-user column shows the trade that every serving system manages: more throughput costs each user speed once the arithmetic is saturated. The next figure plots both lines on log axes.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="A log-log plot of decode throughput in tokens per second against batch size for Llama 3 8B on one H100. With the cache ignored, throughput rises in a straight line from 209 tokens per second at batch 1 to 65,892 at batch 316 and is flat after that. With 2,048-token contexts the line bends below it, because each extra sequence adds cache to read, and it stops at batch 227 where the 80 GB card is full, at about 9,877 tokens per second.">
+    <defs><marker id="ahDL-L6b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="80" y1="230" x2="720" y2="230" class="line-thin"/>
+    <text x="72" y="234" text-anchor="end" class="t-xs t-muted">100</text>
+    <line x1="80" y1="163" x2="720" y2="163" class="line-thin"/>
+    <text x="72" y="167" text-anchor="end" class="t-xs t-muted">1,000</text>
+    <line x1="80" y1="97" x2="720" y2="97" class="line-thin"/>
+    <text x="72" y="101" text-anchor="end" class="t-xs t-muted">10,000</text>
+    <line x1="80" y1="30" x2="720" y2="30" class="line-thin"/>
+    <text x="72" y="34" text-anchor="end" class="t-xs t-muted">100,000</text>
+    <line x1="80" y1="230" x2="80" y2="235" class="line-thin"/>
+    <text x="80" y="248" text-anchor="middle" class="t-xs t-muted">1</text>
+    <line x1="187" y1="230" x2="187" y2="235" class="line-thin"/>
+    <text x="187" y="248" text-anchor="middle" class="t-xs t-muted">4</text>
+    <line x1="293" y1="230" x2="293" y2="235" class="line-thin"/>
+    <text x="293" y="248" text-anchor="middle" class="t-xs t-muted">16</text>
+    <line x1="400" y1="230" x2="400" y2="235" class="line-thin"/>
+    <text x="400" y="248" text-anchor="middle" class="t-xs t-muted">64</text>
+    <line x1="507" y1="230" x2="507" y2="235" class="line-thin"/>
+    <text x="507" y="248" text-anchor="middle" class="t-xs t-muted">256</text>
+    <line x1="613" y1="230" x2="613" y2="235" class="line-thin"/>
+    <text x="613" y="248" text-anchor="middle" class="t-xs t-muted">1,024</text>
+    <line x1="720" y1="230" x2="720" y2="235" class="line-thin"/>
+    <text x="720" y="248" text-anchor="middle" class="t-xs t-muted">4,096</text>
+    <line x1="80" y1="230" x2="720" y2="230" class="line"/>
+    <line x1="80" y1="230" x2="80" y2="24" class="line"/>
+    <polyline points="80.0,208.7 133.3,188.6 186.7,168.6 240.0,148.5 293.3,128.4 346.7,108.4 400.0,88.3 453.3,68.2 506.7,48.2 522.9,42.1 560.0,42.1 613.3,42.1 666.7,42.1 720.0,42.1" fill="none" class="s-blue sw-2"/>
+    <polyline points="80.0,209.2 133.3,189.6 186.7,170.5 240.0,152.1 293.3,135.3 346.7,120.8 400.0,109.4 453.3,101.4 497.4,97.0" fill="none" class="s-orange sw-2"/>
+    <line x1="523" y1="230" x2="523" y2="30" class="line-dash"/>
+    <circle cx="497.4" cy="97.0" r="5" class="f-orange"/>
+    <text x="489" y="117" text-anchor="end" class="t-xs tc-orange">80 GB is full at batch 227</text>
+    <text x="529" y="40" class="t-xs t-muted">ridge: batch 316</text>
+    <text x="643" y="34" text-anchor="middle" class="t-xs tc-blue">compute ceiling 65,892 tokens/s</text>
+    <text x="204" y="137" class="t-xs tc-blue">cache free (context 0)</text>
+    <text x="395" y="156" class="t-xs tc-orange">2,048-token contexts</text>
+    <text x="400" y="268" text-anchor="middle" class="t-xs t-muted">batch: sequences decoded together (log scale)</text>
+    <text x="16" y="130" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 16 130)">tokens per second, whole batch (log)</text>
+  </svg>
+  <figcaption><strong>Memory-bound, then compute-bound; except that memory runs out first.</strong> The blue line is the ideal roofline for weights alone. The orange line adds each sequence's 2,048-token cache to the bytes read (a longer context bends it further) and ends where the card is full. Real servers sit on the orange line, which is why long contexts, cache compression and paged caches (A3 chapters <a href="../../llm-training/chapters/18-kv-cache.html">18</a> and <a href="../../llm-training/chapters/20-serving-engines.html">20</a>) matter more than raw FLOP/s.</figcaption>
+</figure>
+
+<p>This is the lesson of the milestone, and the checker prints the same table for a 2,048-token context: batch 1 gives 205 tokens per second, batch 8 gives 1,472, batch 64 gives 6,450 and the largest batch that fits, 227, gives 9,877: about 15% of the compute ceiling. <strong>Memory capacity caps the batch before compute does</strong>, so the lever for cheaper serving is to shrink bytes: 4-bit weights read a quarter as much, grouped-query attention shrinks the cache by 4 times, and shorter contexts shrink it in proportion.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>This is the same arithmetic as the roofline in <a href="../../systems/chapters/21-parallelism-gpus.html">Zero to Systems chapter 21</a> and the capacity model of <a href="../../systems/chapters/22-performance-engineering.html">chapter 22</a>: a kernel is memory-bound when its arithmetic intensity (FLOPs per byte) is below the machine's ratio of peak FLOP/s to bandwidth, here 989 &times; 10<sup>12</sup> / 3.35 &times; 10<sup>12</sup> = 295 FLOPs per byte. A decode step at batch 1 performs 1 FLOP per byte of bf16 weights, hundreds of times too little to keep the arithmetic units busy. The cure is the same as for any memory-bound system: reuse each byte more (batching), or move fewer bytes (quantisation, GQA). Utilisation numbers like MFU play the part of CPU utilisation in <a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>: a low one tells you to profile, not to buy more machines.</p>
+</div>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>kv_bytes_per_token(cfg, bytes_per=2)</code>, <code>kv_cache_bytes(cfg, ctx, batch=1, bytes_per=2)</code>, <code>weight_bytes(cfg, bytes_per=2)</code>, <code>max_batch(cfg, ctx, gpu_mem, ...)</code>, <code>decode_step_seconds(cfg, ctx, batch, bw, peak, ...)</code>, <code>decode_tokens_per_second</code> and <code>ridge_batch(cfg, bw, peak, w_bytes=2)</code>. Every parameter of a mixture of experts must be in <code>weight_bytes</code>, even the idle experts.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks 131,072 and 524,288 bytes per token for Llama 3 8B and Llama 2 7B, the 1.07 GB conversation, 56 and 227 sequences per 80 GB card, 0 for the 70B, 208.6 tokens per second at batch 1 with no context (chapter 16's 209), the 4-times speed-up from 4-bit weights, the compute ceiling for huge batches, the ridge at 316, that throughput never falls as the batch grows, and that below the ridge the step time does not depend on the batch.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>kv_bytes_per_token</code> is <code>2 * L * KV * head_dim(cfg) * bytes_per</code>; the cache for a batch is that times <code>ctx * batch</code>.</li>
+      <li><code>max_batch</code>: free bytes are <code>gpu_mem - overhead - weight_bytes(cfg, w_bytes)</code>; divide by the cache of one sequence, take the integer part, and return 0 if the free bytes are negative.</li>
+      <li><code>decode_step_seconds</code>: <code>mem_time = (weights + cache of the whole batch) / bw</code> and <code>flop_time = batch * (2 * matmul_weights + 4 * L * C * ctx) / peak</code>; the step takes the larger of the two.</li>
+      <li><code>decode_tokens_per_second</code> is <code>batch / step_seconds</code>: one new token for each sequence per step.</li>
+      <li><code>ridge_batch</code> solves <code>batch * 2 * W / peak = bytes / bw</code> for the batch, with W the matmul weights and bytes the weights in memory.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> kv_bytes_per_token(cfg, bytes_per=<span class="num">2</span>):
+    <span class="str">"""Keys and values of one token in every layer: 2 * L * KV * d_k * bytes."""</span>
+    <span class="kw">return</span> <span class="num">2</span> * cfg.L * cfg.KV * head_dim(cfg) * bytes_per
+
+<span class="kw">def</span> kv_cache_bytes(cfg, ctx, batch=<span class="num">1</span>, bytes_per=<span class="num">2</span>):
+    <span class="str">"""The cache of `batch` sequences, each `ctx` tokens long."""</span>
+    <span class="kw">return</span> kv_bytes_per_token(cfg, bytes_per) * ctx * batch
+
+<span class="kw">def</span> weight_bytes(cfg, bytes_per=<span class="num">2</span>):
+    <span class="str">"""All parameters at `bytes_per` each (a mixture of experts keeps every expert in memory)."""</span>
+    <span class="kw">return</span> count_params(cfg) * bytes_per
+
+<span class="kw">def</span> max_batch(cfg, ctx, gpu_mem, w_bytes=<span class="num">2</span>, kv_bytes=<span class="num">2</span>, overhead=<span class="num">3</span> * GB):
+    <span class="str">"""How many sequences of length ctx fit next to the weights (0 if the weights alone do not fit)."""</span>
+    free = gpu_mem - overhead - weight_bytes(cfg, w_bytes)
+    per_seq = kv_cache_bytes(cfg, ctx, <span class="num">1</span>, kv_bytes)
+    <span class="kw">return</span> max(<span class="num">0</span>, int(free // per_seq))
+
+<span class="kw">def</span> decode_step_seconds(cfg, ctx, batch, bw, peak, w_bytes=<span class="num">2</span>, kv_bytes=<span class="num">2</span>):
+    <span class="str">"""One decode step for `batch` sequences at context ctx: the slower of reading the bytes
+    (weights once, plus every sequence's cache) and doing the FLOPs (2 per weight, 4*L*C*ctx for attention)."""</span>
+    mem_time = (weight_bytes(cfg, w_bytes) + kv_cache_bytes(cfg, ctx, batch, kv_bytes)) / bw
+    flop_time = batch * (<span class="num">2</span> * matmul_weights(cfg) + <span class="num">4</span> * cfg.L * cfg.C * ctx) / peak
+    <span class="kw">return</span> max(mem_time, flop_time)
+
+<span class="kw">def</span> decode_tokens_per_second(cfg, ctx, batch, bw, peak, w_bytes=<span class="num">2</span>, kv_bytes=<span class="num">2</span>):
+    <span class="str">"""Tokens per second summed over the batch."""</span>
+    <span class="kw">return</span> batch / decode_step_seconds(cfg, ctx, batch, bw, peak, w_bytes, kv_bytes)
+
+<span class="kw">def</span> ridge_batch(cfg, bw, peak, w_bytes=<span class="num">2</span>):
+    <span class="str">"""The batch size at which weights-only decoding stops being memory-bound:
+    batch * 2 * W / peak == bytes / bw  -&gt;  batch = peak * bytes / (2 * W * bw)."""</span>
+    <span class="kw">return</span> peak * weight_bytes(cfg, w_bytes) / (<span class="num">2</span> * matmul_weights(cfg) * bw)</code></pre>
+  </details>
+</div>
+<h2>Milestone 5: compute-optimal sizes</h2>
+
+<p>The first four milestones answer "what does this model cost?". The last two ask the harder question of chapter 18: <em>what should the model be?</em> Given a compute budget C, should you train a bigger model on fewer tokens or a smaller one on more? Hoffmann et al. (2022, "Training Compute-Optimal Large Language Models") modelled the held-out loss of a language model as</p>
+<p style="text-align:center">L(N, D) = E + A / N<sup>&alpha;</sup> + B / D<sup>&beta;</sup></p>
+<p>an irreducible floor E (the entropy of the text), a penalty for having only N parameters, and a penalty for having seen only D tokens. Fix the budget with C = 6ND (so D = C / 6N) and ask which N gives the lowest loss. Setting the derivative with respect to N to zero (the derivation is in a "Go deeper" box of chapter 18) gives a closed form:</p>
+<p style="text-align:center">N<sub>opt</sub> = G &middot; (C/6)<sup>&beta;/(&alpha;+&beta;)</sup>, &nbsp; D<sub>opt</sub> = C / (6 N<sub>opt</sub>), &nbsp; G = (&alpha;A / &beta;B)<sup>1/(&alpha;+&beta;)</sup></p>
+<p>The constants matter, and chapter 18 told a cautionary story about them: the numbers printed in the Chinchilla paper (E = 1.69, A = 406.4, B = 410.7, &alpha; = 0.34, &beta; = 0.28) imply an optimal tokens-per-parameter ratio that <em>rises</em> with budget, contradicting the paper's own "about 20 tokens per parameter"; a replication by Besiroglu et al. (2024) refitted the data and got constants that agree with the paper's other methods. The starter file carries both in <code>FITS</code> so that you can see the difference.</p>
+<pre class="terminal" data-title="snippet.py"><code>import solution as m
+for name, fit in m.FITS.items():
+    print(name)
+    for C in (1e19, 1e21, 5.76e23, 3.8e25):
+        N, D, L = m.optimum(C, fit)
+        print(f"  C={C:8.2e}  N={N:9.3e}  D={D:9.3e}  D/N={D / N:5.1f}  loss {L:.3f}")
+print("20-tokens-per-parameter rule at 5.76e23:", "N=%.3e D=%.3e" % m.chinchilla_rule(5.76e23))
+fit = m.BESIROGLU
+print("price of straying from the optimum at C = 1e22 (Besiroglu fit):")
+for f in (0.25, 0.5, 1, 2, 4, 8):
+    print(f"  {f:&gt;5} x optimal size: +{m.excess_loss(1e22, f, fit):.4f} nats")</code></pre><pre class="terminal" data-title="output"><code>Hoffmann et al. 2022 (as printed)
+  C=1.00e+19  N=2.280e+08  D=7.311e+09  D/N= 32.1  loss 2.986
+  C=1.00e+21  N=1.824e+09  D=9.136e+10  D/N= 50.1  loss 2.329
+  C=5.76e+23  N=3.219e+10  D=2.982e+12  D/N= 92.6  loss 1.931
+  C=3.80e+25  N=2.135e+11  D=2.967e+13  D/N=139.0  loss 1.817
+Besiroglu et al. 2024 (replication)
+  C=1.00e+19  N=2.622e+08  D=6.357e+09  D/N= 24.2  loss 2.927
+  C=1.00e+21  N=2.778e+09  D=5.999e+10  D/N= 21.6  loss 2.306
+  C=5.76e+23  N=7.225e+10  D=1.329e+12  D/N= 18.4  loss 1.974
+  C=3.80e+25  N=6.187e+11  D=1.024e+13  D/N= 16.5  loss 1.892
+20-tokens-per-parameter rule at 5.76e23: N=6.928e+10 D=1.386e+12
+price of straying from the optimum at C = 1e22 (Besiroglu fit):
+   0.25 x optimal size: +0.0401 nats
+    0.5 x optimal size: +0.0099 nats
+      1 x optimal size: +0.0000 nats
+      2 x optimal size: +0.0100 nats
+      4 x optimal size: +0.0408 nats
+      8 x optimal size: +0.0944 nats</code></pre><p>Three observations. First, the printed constants and the refit disagree about the shape of the answer. The printed ones say tokens per parameter should climb from 32 to 139 as the budget grows; the refit says it should stay near 20 and drift down from 24 to 16.5. At Gopher's budget (5.76 &times; 10<sup>23</sup> FLOPs) the refit gives 72 billion parameters on 1.33 trillion tokens, almost exactly what DeepMind trained as Chinchilla (70 billion on 1.4 trillion), while the printed constants give 32 billion on 3 trillion. Quote the finding (about 20 tokens per parameter) and the method, not the third significant digit. Second, the <code>chinchilla_rule</code> shortcut D = 20N with C = 6ND gives N = &radic;(C/120): 69 billion parameters at that budget, the same answer to a few per cent. Third, the bottom of the curve is <strong>flat</strong>: at a fixed 10<sup>22</sup> FLOPs a model half or twice the optimal size costs only about 0.01 nats of loss, and four times about 0.04. That flatness is what gives you freedom to choose a size for other reasons, and milestone 6 uses it.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Chinchilla says every model should be trained on 20 tokens per parameter." The 20 is the answer to one question: the lowest loss for a fixed <em>training</em> compute, fitted for one data distribution and one family of models. It says nothing about the cost of using the model afterwards. The next milestone makes that cost explicit, and you will see the optimal tokens per parameter move from 18 to over 600 as the expected usage grows.</p>
+</div>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>loss(N, D, fit)</code>, <code>optimum(C, fit)</code> (returning <code>(N, D, loss)</code>), <code>chinchilla_rule(C, ratio=20)</code> (returning <code>(N, D)</code>), <code>isoflop_loss(C, N, fit)</code> and <code>excess_loss(C, factor, fit)</code>. A fit is the tuple <code>(E, A, B, alpha, beta)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks the loss formula, the Besiroglu optimum at Gopher's budget (7.225 &times; 10<sup>10</sup> parameters, 1.329 &times; 10<sup>12</sup> tokens), the printed-constants optimum at 10<sup>19</sup> FLOPs (2.28 &times; 10<sup>8</sup>, 32.1 tokens per parameter), the 20-token rule, the chapter's excess-loss table (0.0099 nats at half the optimal size, 0.0408 at four times), and then 30 seeded random fits and budgets: 6ND must equal C exactly, and models 0.5, 0.8, 0.95, 1.05, 1.25 and 2 times the optimal size must all have higher loss. That last test checks your closed form without knowing the answer.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>loss</code>: <code>E + A / N**alpha + B / D**beta</code> after unpacking the tuple.</li>
+      <li><code>optimum</code>: <code>G = (a*A / (b*B)) ** (1/(a+b))</code>, <code>N = G * (C/6) ** (b/(a+b))</code>, <code>D = C / (6*N)</code>. Note that N takes the exponent of <em>beta</em> over the sum, and D the exponent of alpha: the data penalty's exponent sets how fast the model should grow.</li>
+      <li><code>chinchilla_rule</code>: from <code>C = 6 * N * (ratio * N)</code>, <code>N = sqrt(C / (6 * ratio))</code>.</li>
+      <li><code>isoflop_loss</code> is <code>loss(N, C / (6*N), fit)</code>; <code>excess_loss</code> compares it at <code>factor * N_opt</code> with the optimum's own loss.</li>
+      <li>If the random-fit test says a model 0.8 times the optimal size has lower loss, your exponents on N and D are swapped.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> loss(N, D, fit):
+    <span class="str">"""L(N, D) = E + A / N^alpha + B / D^beta."""</span>
+    E, A, B, a, b = fit
+    <span class="kw">return</span> E + A / N ** a + B / D ** b
+
+<span class="kw">def</span> optimum(C, fit):
+    <span class="str">"""The (N, D, loss) minimising L(N, D) subject to 6*N*D = C (closed form, chapter 18)."""</span>
+    E, A, B, a, b = fit
+    G = (a * A / (b * B)) ** (<span class="num">1</span> / (a + b))
+    N = G * (C / <span class="num">6</span>) ** (b / (a + b))
+    D = C / (<span class="num">6</span> * N)
+    <span class="kw">return</span> N, D, loss(N, D, fit)
+
+<span class="kw">def</span> chinchilla_rule(C, ratio=<span class="num">20</span>):
+    <span class="str">"""The rule of thumb D = ratio * N with C = 6*N*D: returns (N, D)."""</span>
+    N = math.sqrt(C / (<span class="num">6</span> * ratio))
+    <span class="kw">return</span> N, ratio * N
+
+<span class="kw">def</span> isoflop_loss(C, N, fit):
+    <span class="str">"""Loss of a model with N parameters trained to use exactly C FLOPs (D = C / 6N)."""</span>
+    <span class="kw">return</span> loss(N, C / (<span class="num">6</span> * N), fit)
+
+<span class="kw">def</span> excess_loss(C, factor, fit):
+    <span class="str">"""How much worse than the optimum a model `factor` times the optimal size is, at the same budget."""</span>
+    N_opt = optimum(C, fit)[<span class="num">0</span>]
+    <span class="kw">return</span> isoflop_loss(C, factor * N_opt, fit) - optimum(C, fit)[<span class="num">2</span>]</code></pre>
+  </details>
+</div>
+<h2>Milestone 6: lifetime cost and over-training</h2>
+
+<p>Chinchilla minimises the bill for training. A model that will be queried billions of times has a second bill, and it grows with the size of the model: every token it generates costs about 2N FLOPs (and reads N weights). If two models reach the same loss, the smaller one is cheaper to use forever. Sardana et al. (2023, "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws") add that cost to the Chinchilla analysis and find that a model with heavy expected usage should be smaller and trained for longer than the compute-optimal one. In this milestone you do their calculation in its simplest form.</p>
+
+<p>Choose a <strong>target loss</strong>, the quality you need. For any model size N, the fitted law says how many tokens D(N) it takes to reach that loss: solve B / D<sup>&beta;</sup> = target &minus; E &minus; A / N<sup>&alpha;</sup> for D. If the right-hand side is zero or negative, that N can never reach the target, whatever the data. The <strong>lifetime cost</strong> of a candidate is then</p>
+<p style="text-align:center">6 &middot; N &middot; D(N) &nbsp;+&nbsp; 2 &middot; N &middot; (tokens the model will generate)</p>
+<p>and it is a function of N alone. It is enormous just above the smallest feasible size (D explodes) and enormous for large N (6ND explodes), with one minimum between: a one-dimensional search, which you can do by ternary search on log N. With no serving, the minimum is exactly the compute-optimal model for the budget it costs (the checker verifies this against your milestone 5 formula). With serving, the minimum moves to smaller models trained on more data.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="A log-log plot of the cheapest model size, in billions of parameters, against the number of tokens the model will generate in its lifetime, for a target loss of 1.974. With no serving the best size is 73 billion parameters. It falls to 58 billion at 10^12 served tokens, 34 billion at 10^13, 21 billion at 10^14 and 16 billion at 10^15, while the best number of training tokens per parameter rises from 18 to 30, 109, 619 and 3,703.">
+    <defs><marker id="ahDL-L6c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="90" y1="220" x2="720" y2="220" class="line-thin"/>
+    <text x="82" y="224" text-anchor="end" class="t-xs t-muted">10 B</text>
+    <line x1="90" y1="163" x2="720" y2="163" class="line-thin"/>
+    <text x="82" y="167" text-anchor="end" class="t-xs t-muted">20 B</text>
+    <line x1="90" y1="87" x2="720" y2="87" class="line-thin"/>
+    <text x="82" y="91" text-anchor="end" class="t-xs t-muted">50 B</text>
+    <line x1="90" y1="30" x2="720" y2="30" class="line-thin"/>
+    <text x="82" y="34" text-anchor="end" class="t-xs t-muted">100 B</text>
+    <line x1="90" y1="220" x2="90" y2="225" class="line-thin"/>
+    <text x="90" y="238" text-anchor="middle" class="t-xs t-muted">10^10</text>
+    <line x1="216" y1="220" x2="216" y2="225" class="line-thin"/>
+    <text x="216" y="238" text-anchor="middle" class="t-xs t-muted">10^11</text>
+    <line x1="342" y1="220" x2="342" y2="225" class="line-thin"/>
+    <text x="342" y="238" text-anchor="middle" class="t-xs t-muted">10^12</text>
+    <line x1="468" y1="220" x2="468" y2="225" class="line-thin"/>
+    <text x="468" y="238" text-anchor="middle" class="t-xs t-muted">10^13</text>
+    <line x1="594" y1="220" x2="594" y2="225" class="line-thin"/>
+    <text x="594" y="238" text-anchor="middle" class="t-xs t-muted">10^14</text>
+    <line x1="720" y1="220" x2="720" y2="225" class="line-thin"/>
+    <text x="720" y="238" text-anchor="middle" class="t-xs t-muted">10^15</text>
+    <line x1="90" y1="220" x2="720" y2="220" class="line"/>
+    <line x1="90" y1="220" x2="90" y2="24" class="line"/>
+    <polyline points="90.0,56.3 150.1,56.8 216.0,58.7 276.1,63.4 342.0,75.4 402.1,93.7 468.0,117.8 528.1,138.8 594.0,158.1 654.1,171.9 720.0,183.4" fill="none" class="s-blue sw-2"/>
+    <circle cx="342.0" cy="75.4" r="4.5" class="f-yellow"/>
+    <text x="350" y="67" text-anchor="start" class="t-xs">58 B, 30 tok/param</text>
+    <circle cx="468.0" cy="117.8" r="4.5" class="f-yellow"/>
+    <text x="476" y="110" text-anchor="start" class="t-xs">34 B, 109 tok/param</text>
+    <circle cx="594.0" cy="158.1" r="4.5" class="f-yellow"/>
+    <text x="602" y="150" text-anchor="start" class="t-xs">21 B, 619 tok/param</text>
+    <circle cx="720.0" cy="183.4" r="4.5" class="f-yellow"/>
+    <text x="712" y="175" text-anchor="end" class="t-xs">16 B, 3,703 tok/param</text>
+    <text x="98" y="48" class="t-xs t-muted">73 B, 18 tok/param with no serving</text>
+    <text x="400" y="258" text-anchor="middle" class="t-xs t-muted">tokens the model will generate in its lifetime (log scale)</text>
+    <text x="16" y="125" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 16 125)">cheapest model for the target loss (log)</text>
+  </svg>
+  <figcaption><strong>The more a model will be used, the smaller and the longer-trained it should be.</strong> Each point is the least-cost model reaching the same loss (1.974, the fit's value for Chinchilla's 70 billion parameters on 1.4 trillion tokens). Computed with the Besiroglu constants by the solution to this milestone.</figcaption>
+</figure>
+<p>The table below is from the demo. All five rows reach the same predicted loss; the first is the Chinchilla-style answer, and the last spends 43 times the training tokens on a model about one fifth the size:</p>
+<pre class="terminal" data-title="python3 demo.py solution (last block)"><code>How big should the model be? Target: the loss the Besiroglu fit gives for Chinchilla (70B, 1.4T tokens)
+  target loss 1.974
+   tokens served    params  train tokens  tokens/param  lifetime FLOPs
+           0e+00     73.0B        1.34 T            18        5.88e+23
+           1e+12     57.7B        1.73 T            30        7.16e+23
+           1e+13     34.5B        3.75 T           109        1.47e+24
+           1e+14     21.2B       13.12 T           619        5.90e+24
+           1e+15     15.6B       57.74 T          3703        3.66e+25</code></pre><p>Read the last column. Lifetime FLOPs are 5.9 &times; 10<sup>23</sup> with no serving and rise as more tokens are served: serving 10<sup>13</sup> tokens (about ten billion replies of 1,000 tokens, an assumption you can change) costs 1.47 &times; 10<sup>24</sup> FLOPs in total for the 34-billion-parameter plan, where the compute-optimal 73-billion plan would cost 2.05 &times; 10<sup>24</sup>: the checker prints the saving, 28%. At 10<sup>15</sup> served tokens the best model is 16 billion parameters seeing 58 trillion tokens, nearly 3,700 tokens per parameter. This is what models intended for heavy use look like: chapter 18's note that Llama 3 405B sits at about 39 tokens per parameter, and that small models in the family train far beyond that ratio, is this calculation done by a company with a large user base. Two honest caveats: the law is fitted on one family of models and one corpus, so it says nothing quantitative about newer data and recipes (chapter 18's state-of-play note), and a real plan must also consider that the data may not exist (Muennighoff et al., 2023, on repeated data). The method, not the constants, is what carries over.</p>
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>lifetime_flops(N, D, inference_tokens)</code>, <code>tokens_for_loss(N, target, fit)</code> (<code>None</code> if the target is unreachable at that size) and <code>best_size_for_loss(target, inference_tokens, fit)</code> returning <code>(N, D, lifetime_flops)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks 6ND with and without serving, that a 1-billion-parameter model cannot reach a loss of 1.9, that <code>tokens_for_loss</code> inverts <code>loss</code>, that with no serving <code>best_size_for_loss</code> matches the compute-optimal model for the budget it spends, and, for serving of 10<sup>12</sup> to 10<sup>15</sup> tokens, that each answer reaches the target loss, shrinks the model, raises tokens per parameter and never costs more than the compute-optimal plan. Finally 10 seeded random fits check that nothing 0.7, 0.9, 1.1 or 1.4 times your returned size is cheaper.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>lifetime_flops</code> is <code>6*N*D + 2*N*inference_tokens</code>.</li>
+      <li><code>tokens_for_loss</code>: <code>room = target - E - A / N**a</code>; if <code>room &lt;= 0</code> return <code>None</code>; otherwise <code>D = (B / room) ** (1/b)</code>.</li>
+      <li><code>best_size_for_loss</code>: the smallest feasible size is <code>n_min = (A / (target - E)) ** (1/a)</code>. Search <code>log N</code> between <code>log(n_min * (1 + 1e-9))</code> and <code>log(n_min * 1e4)</code>; for 200 rounds compare the cost at the two third-points and discard the third of the interval on the worse side. Return the final <code>N</code>, its <code>D</code> and its cost.</li>
+      <li>The cost function must evaluate <code>tokens_for_loss</code> at each trial size; it never returns <code>None</code> inside the search interval because the interval starts above <code>n_min</code>.</li>
+      <li>If the result is stuck at the left end of the interval, your comparison in the ternary search is the wrong way round.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> lifetime_flops(N, D, inference_tokens):
+    <span class="str">"""Training 6*N*D plus serving 2*N FLOPs for each token generated."""</span>
+    <span class="kw">return</span> <span class="num">6</span> * N * D + <span class="num">2</span> * N * inference_tokens
+
+<span class="kw">def</span> tokens_for_loss(N, target, fit):
+    <span class="str">"""The D that makes L(N, D) == target, or None if N is too small to reach it at any D."""</span>
+    E, A, B, a, b = fit
+    room = target - E - A / N ** a
+    <span class="kw">if</span> room &lt;= <span class="num">0</span>:
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">return</span> (B / room) ** (<span class="num">1</span> / b)
+
+<span class="kw">def</span> best_size_for_loss(target, inference_tokens, fit):
+    <span class="str">"""The (N, D, lifetime FLOPs) reaching `target` loss at the least total cost of training plus serving.
+
+    For each N the data D is fixed by the target (tokens_for_loss); lifetime_flops is then a function of
+    N alone that falls and rises, so a ternary search over log N finds its minimum.
+    """</span>
+    E, A, B, a, b = fit
+    n_min = (A / (target - E)) ** (<span class="num">1</span> / a)           <span class="cmt"># below this no amount of data reaches the target</span>
+    lo, hi = math.log(n_min * (<span class="num">1</span> + <span class="num">1e-9</span>)), math.log(n_min * <span class="num">1e4</span>)
+
+    <span class="kw">def</span> cost(logn):
+        N = math.exp(logn)
+        <span class="kw">return</span> lifetime_flops(N, tokens_for_loss(N, target, fit), inference_tokens)
+
+    <span class="kw">for</span> _ <span class="kw">in</span> range(<span class="num">200</span>):
+        m1, m2 = lo + (hi - lo) / <span class="num">3</span>, hi - (hi - lo) / <span class="num">3</span>
+        <span class="kw">if</span> cost(m1) &lt; cost(m2):
+            hi = m2
+        <span class="kw">else</span>:
+            lo = m1
+    N = math.exp((lo + hi) / <span class="num">2</span>)
+    D = tokens_for_loss(N, target, fit)
+    <span class="kw">return</span> N, D, lifetime_flops(N, D, inference_tokens)</code></pre>
+  </details>
+</div>
+<h2>Run the whole check</h2>
+
+<p>When every milestone passes you should see this. The detail lines under each milestone are computed by the checker:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution</span>
+<span class="out">  ✔ Milestone 1: counting parameters
+      GPT-2 small          124,439,808 counted vs 124M published (+0.4%)
+      GPT-3 175B       174,604,259,328 counted vs 175B published (-0.2%)
+      Llama 2 7B         6,738,415,616 counted vs 6.7B published (+0.6%)
+      Llama 3 8B         8,030,261,248 counted vs 8B published (+0.4%)
+      Llama 3 70B       70,553,706,496 counted vs 70B published (+0.8%)
+      Llama 3 405B     405,853,388,800 counted vs 405B published (+0.2%)
+      Mixtral 8x7B      46,702,792,704 counted vs 46.7B published (+0.0%)
+      Chinchilla 70B    64,951,435,264 counted vs 70B published (-7.2%)
+  ✔ Milestone 2: FLOPs, time and cost
+      405B: 6ND = 3.80e+25 FLOPs, 67.8 days on 16,384 H100s at 40% MFU, 26.7M GPU-hours
+      Mixtral 8x7B trains at 0.28 x (6 x total params) per token because only 2 of 8 experts run; a dense 8B model: 1.00
+  ✔ Milestone 3: memory for training
+      1B-class model on a 24 GB card at 2,048 tokens: largest microbatch 0 (keep all), 1 (fused attention), 22 (recompute)
+      Llama 3 8B: states 128 GB; largest card here is 80 GB, so it must be sharded
+      Llama 3 70B: states 1,129 GB; largest card here is 80 GB, so it must be sharded
+  ✔ Milestone 4: the KV cache and the bandwidth limit
+      Llama 3 8B on one 80 GB H100, bf16 weights, 2,048-token contexts
+      batch  tokens/s   per user
+          1       205      205.2
+          8     1,472      184.0
+         64     6,450      100.8
+        227     9,877       43.5
+      the ridge batch is 316, but only 227 sequences fit, so memory capacity caps batching before compute does
+  ✔ Milestone 5: compute-optimal sizes
+      Besiroglu refit at Gopher's budget (5.76e23 FLOPs): N = 72 B, D = 1.33 T, tokens per parameter 18.4
+      at 1e22 FLOPs a model half or twice the optimal size costs about 0.01 nats; four times, about 0.04
+  ✔ Milestone 6: lifetime cost and over-training
+      target loss 1.974 (the fit's value for Chinchilla); with no serving the cheapest model is 73 B parameters on 1.34 T tokens
+      serving 1e13 tokens: 34 B parameters on 3.75 T tokens (109 tokens per parameter) saves 28% of lifetime FLOPs
+
+6/6 milestones passing  (0.0 s)</span></code></pre><p>Then run the demo for the one-page report:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 demo.py solution</span>
+<span class="out">model             params   active  train states  KV/token  bf16 weights  tok/s on H100
+GPT-2 small         0.1B     0.1B          2 GB     36 KiB        0.2 GB       13,460
+GPT-3 175B        174.6B   174.6B      2,794 GB  4,608 KiB      349.2 GB           10
+Llama 2 7B          6.7B     6.7B        108 GB    512 KiB       13.5 GB          249
+Llama 3 8B          8.0B     8.0B        128 GB    128 KiB       16.1 GB          209
+Llama 3 70B        70.6B    70.6B      1,129 GB    320 KiB      141.1 GB           24
+Llama 3 405B      405.9B   405.9B      6,494 GB    504 KiB      811.7 GB            4
+Mixtral 8x7B       46.7B    12.9B        747 GB    128 KiB       93.4 GB           36
+Chinchilla 70B     65.0B    65.0B      1,039 GB  2,560 KiB      129.9 GB           26
+
+Llama 3 8B, training on a single 80 GB card, sequence length 4,096, microbatch 1
+  full       states  128.5 GB + activations   104.2 GB =   232.6 GB  fits: False
+  flash      states  128.5 GB + activations    18.3 GB =   146.7 GB  fits: False
+  recompute  states  128.5 GB + activations     1.1 GB =   129.6 GB  fits: False
+
+Llama 3 8B decoding on one 80 GB H100 (bf16), 2,048-token contexts
+  batch  tokens/s  tokens/s per user
+      1       205           205.2
+      8     1,472           184.0
+     64     6,450           100.8
+    227     9,877            43.5
+
+How big should the model be? Target: the loss the Besiroglu fit gives for Chinchilla (70B, 1.4T tokens)
+  target loss 1.974
+   tokens served    params  train tokens  tokens/param  lifetime FLOPs
+           0e+00     73.0B        1.34 T            18        5.88e+23
+           1e+12     57.7B        1.73 T            30        7.16e+23
+           1e+13     34.5B        3.75 T           109        1.47e+24
+           1e+14     21.2B       13.12 T           619        5.90e+24
+           1e+15     15.6B       57.74 T          3703        3.66e+25</span></code></pre><p>The model table is worth a slow read. Llama 3 8B trains in 128 GB of states but serves in 16 GB. GPT-3 175B needs 2.8 TB to train and 349 GB to serve, and a single H100 reading its weights would decode 10 tokens a second at best, which is why serving large models means splitting them across GPUs. Mixtral stores 46.7 billion parameters but multiplies by 12.9 billion per token: its training FLOPs per token are those of a 13-billion-parameter dense model, while its memory is that of a 47-billion one (and its batch-1 decode speed in this table is a lower bound, since the lab's <code>decode_step_seconds</code> reads all experts where a single sequence would touch only two per layer). The KV cache column shows GQA at work: Llama 3 70B has a cache of 320 KiB per token, only 2.5 times the 8B's: both have 8 key/value heads of width 128, so only the number of layers differs, and the 70B's doubled width costs nothing. And Chinchilla's "70 billion" is counted here as 65.0, the unresolved gap of milestone 1.</p>
+
+<h2>Going further</h2>
+
+<ul>
+  <li><strong>Add your own model.</strong> Add a <code>Config</code> for a model you use (its Hugging Face <code>config.json</code> lists hidden size, layers, heads, key/value heads, intermediate size and vocabulary) and compare your count with the model card. If it is off by more than 1%, find the missing term: biases, tied embeddings, a different MLP, or extra matrices such as relative positions.</li>
+  <li><strong>Chinchilla's missing 5 billion.</strong> Read the Gopher and Chinchilla papers and find where the extra weights are. Add a field to <code>Config</code> for them and make the 70B count land within 1%.</li>
+  <li><strong>Tensor and pipeline parallelism.</strong> Divide the states, activations and KV cache over g GPUs (ZeRO stage 1, 2 and 3 shard the optimiser state, gradients and weights in turn; <a href="../../llm-training/chapters/03-parallelism.html">A3 chapter 03</a>). For Llama 3 8B, what is the smallest g for which a microbatch of 1 at 8,192 tokens with fused attention fits an 80 GB card?</li>
+  <li><strong>Prefill versus decode.</strong> Processing a prompt of T tokens costs 2 &times; weights &times; T FLOPs but reads the weights once, so it is compute-bound for any T above a few hundred. Write <code>prefill_seconds</code> and compare it with the time to decode 500 tokens, for T = 1,000 and T = 32,000.</li>
+  <li><strong>A mixture of experts decodes differently.</strong> With batch 1 only top_k experts per layer are read; with a large batch nearly all of them are. Model the expected number of distinct experts touched by a batch of b tokens (assume a uniform router) and fix the decode speed of the Mixtral row.</li>
+  <li><strong>Fit your own law.</strong> Take the 24 runs of chapter 18's tiny experiment (or train your own small grid), fit E, A, B, &alpha;, &beta; by least squares, and feed the fit to <code>best_size_for_loss</code>. How different is the answer from the Besiroglu constants, and what does that say about trusting published ones?</li>
+  <li><strong>Price it.</strong> Take the 405B plan, add an assumed price per GPU-hour, and compute the cost of a 10-point drop in MFU. Then compare with the cost of an engineer-month spent finding it.</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>Parameters are counted by listing matrices: attention (narrower keys and values under GQA), MLP (three matrices for SwiGLU), norms, embeddings and an optional separate head. A count from a configuration reproduces published sizes to the last weight for most models, and a mismatch (Chinchilla's 70B) is a finding to investigate.</li>
+    <li>A matrix product costs 2mkn FLOPs, which gives 6 FLOPs per weight per token for training and 2 for inference. 6ND ignores the attention scores, whose 12LCT FLOPs per token dominate at very long context. Time is FLOPs over peak times MFU, and MFU is the largest uncertainty.</li>
+    <li>Training state is 16 bytes per parameter with mixed-precision AdamW, so an 80 GB card holds the states of about 4.8 billion parameters. Activations scale with microbatch, sequence and depth, with a quadratic term that fused kernels remove and recomputation trades for compute.</li>
+    <li>Serving needs the weights plus a KV cache of 2LKV&middot;d<sub>k</sub> numbers per token. Decoding one sequence is limited by memory bandwidth, batching shares the weight reads up to the ridge, and memory capacity usually caps the batch before compute does.</li>
+    <li>The loss law L(N, D) = E + A/N<sup>&alpha;</sup> + B/D<sup>&beta;</sup> has a closed-form optimum under C = 6ND, about 20 tokens per parameter for the refit constants. The optimum is flat: half or twice the size costs about 0.01 nats.</li>
+    <li>Add the cost of serving and the best model for a given quality gets smaller and is trained far longer. The method (target loss, D from the law, minimise training plus serving FLOPs) is robust; the constants are not.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">Kaplan et al., "Scaling Laws for Neural Language Models" (2020)</a>. The power laws in parameters, data and compute, and the C &asymp; 6N estimate with non-embedding parameters.</li>
+  <li><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener">Hoffmann et al., "Training Compute-Optimal Large Language Models" (2022)</a>. The Chinchilla paper; Table 4 gives the architecture used in this lab's zoo and Table A4 compares its exact FLOP count with 6ND.</li>
+  <li><a href="https://arxiv.org/abs/2404.10102" target="_blank" rel="noopener">Besiroglu et al., "Chinchilla Scaling: A replication attempt" (2024)</a>. The refit whose constants are in <code>FITS</code>.</li>
+  <li><a href="https://arxiv.org/abs/2401.00448" target="_blank" rel="noopener">Sardana et al., "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws" (2023)</a>. The inference-aware analysis behind milestone 6.</li>
+  <li><a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Korthikanti et al., "Reducing Activation Recomputation in Large Transformer Models" (2022)</a>. Derives the s&middot;b&middot;h&middot;(34 + 5as/h) activation formula tensor by tensor.</li>
+  <li><a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (2020)</a>. The clearest accounting of the 16 bytes per parameter and how to shard it.</li>
+  <li><a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">Chowdhery et al., "PaLM: Scaling Language Modeling with Pathways" (2022)</a>. Defines model FLOPs utilisation and the per-token count with the attention term.</li>
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Llama Team, "The Llama 3 Herd of Models" (2024)</a>. Table 3 (shapes) and the 3.8 &times; 10<sup>25</sup> FLOP budget used throughout this lab.</li>
+  <li><a href="https://mistral.ai/news/mixtral-of-experts" target="_blank" rel="noopener">Mistral AI, "Mixtral of experts" (2023)</a>. States 46.7 billion total and 12.9 billion active parameters for Mixtral 8x7B.</li>
+</ul>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A dense model has C = 4,096, L = 32, full multi-head attention (KV = H), a GELU MLP with F = 4C, no biases, and V = 50,000 with a tied head. Roughly how many parameters does it have?</p>
+    <ol class="q-options">
+      <li>About 0.4 billion, since only the MLP matters</li>
+      <li>About 13 billion, because every layer has 12C<sup>2</sup> weights per head</li>
+      <li>About 6.6 billion: 32 &times; 12 &times; 4,096<sup>2</sup> is 6.4 billion, plus a 0.2 billion embedding table</li>
+      <li>About 3.2 billion, since a tied head halves the model</li>
+    </ol>
+    <div class="q-explain">A block has 4C<sup>2</sup> attention weights and 8C<sup>2</sup> MLP weights, 12C<sup>2</sup> = 201 million; times 32 layers is 6.44 billion. The tied embedding adds V &times; C = 0.2 billion. Tying removes a second table (0.2 billion), not half the model, and the 12C<sup>2</sup> is per layer, not per head.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">An H100 delivers 400 TFLOP/s of model FLOPs while training, against a datasheet peak of 989 TFLOP/s. A colleague proposes buying 20% more GPUs to finish 20% sooner. What does the number suggest?</p>
+    <ol class="q-options">
+      <li>Check why utilisation is only 40% first (communication, memory-bound kernels, the input pipeline); extra GPUs often lower MFU further</li>
+      <li>Buy the GPUs: time is inversely proportional to the number of GPUs</li>
+      <li>The run is memory-bound, so add memory instead</li>
+      <li>MFU of 40% is a bug; it must be 100% for a correct run</li>
+    </ol>
+    <div class="q-explain">MFU is the fraction of peak arithmetic turned into model FLOPs, and 30% to 50% is normal for large runs. Where the rest goes decides whether more GPUs help; adding GPUs usually adds communication. Time is not simply inverse to GPU count when utilisation falls with scale, memory capacity is a separate constraint, and 100% is unreachable.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Llama 3 8B uses 8 key/value heads against 32 query heads. Compared with the same model with 32 key/value heads, what changes?</p>
+    <ol class="q-options">
+      <li>Parameters are cut by three quarters</li>
+      <li>Training FLOPs per token fall by three quarters</li>
+      <li>Nothing about memory; only speed changes</li>
+      <li>The KV cache shrinks by 4 times and the attention block loses about 37% of its weights; the MLP is unchanged</li>
+    </ol>
+    <div class="q-explain">The cache stores KV &times; d<sub>k</sub> numbers per layer per token, so 8 instead of 32 is a quarter. W<sub>k</sub> and W<sub>v</sub> shrink to a quarter, taking attention from 4C<sup>2</sup> to 2.5C<sup>2</sup>, a 37.5% cut, but attention is under a fifth of the model, so total parameters fall by about 9% (0.8 of 8.8 billion), not 75%. The MLP and the query and output matrices are untouched.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Decoding one sequence with an 8B bf16 model on a GPU with 2 TB/s of memory bandwidth and 500 TFLOP/s of peak speed. Which estimate of tokens per second is closest?</p>
+    <ol class="q-options">
+      <li>About 31,000, from 500 TFLOP/s divided by 16 GFLOPs per token</li>
+      <li>About 125, from 2 TB/s divided by the 16 GB of weights read for every token</li>
+      <li>About 2,000, from the bandwidth in GB/s</li>
+      <li>About 500, from the peak in TFLOP/s</li>
+    </ol>
+    <div class="q-explain">Each token must read every weight once: 2,000 GB/s over 16 GB is 125 tokens a second, and the arithmetic (about 16 GFLOPs per token) is a small fraction of the available FLOP/s. The first option divides by the arithmetic alone, which is the training-style bound that decoding does not hit; the other two mix up units.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">At a budget of 10<sup>22</sup> FLOPs the compute-optimal model has 9 billion parameters. A team picks 4.5 billion parameters, trained on twice as many tokens, because it is cheaper to serve. According to this lab's calculation, what does that cost in training loss?</p>
+    <ol class="q-options">
+      <li>About 0.5 nats, since the model is half as large</li>
+      <li>About 0.04 nats, as for a model four times too small</li>
+      <li>About 0.01 nats, because the bottom of the IsoFLOP curve is flat</li>
+      <li>Nothing: for the same budget the loss is identical</li>
+    </ol>
+    <div class="q-explain">Milestone 5's table gives 0.0099 nats for half the optimal size (and 0.0100 for twice). A factor of four costs about 0.04, so the second option is for a different choice; the loss is not identical, only close; and 0.5 nats would be far outside the shape of the curve.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">You expect your model to generate ten trillion tokens over its lifetime. How should that change the choice of model size and training tokens for a fixed target loss, compared with the compute-optimal (Chinchilla) choice?</p>
+    <ol class="q-options">
+      <li>Make the model larger and train on fewer tokens, to get more capability per token</li>
+      <li>Make the model smaller and train on more tokens: training cost is paid once but serving cost scales with parameters</li>
+      <li>No change: compute-optimal training already includes serving</li>
+      <li>Train the same model for fewer tokens and rely on a larger batch</li>
+    </ol>
+    <div class="q-explain">Serving costs about 2N FLOPs per generated token, so with heavy use each saved parameter pays back many times. In this lab, serving 10<sup>13</sup> tokens moves the best plan from 73 billion parameters on 1.3 trillion tokens to 34 billion on 3.7 trillion, saving 28% of lifetime FLOPs. Compute-optimal training ignores inference by definition.</div>
+  </div>
+</section>
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

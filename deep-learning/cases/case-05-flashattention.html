@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlashAttention &middot; Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dl" data-case="C5">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>FlashAttention</h1>
+  <p class="lede">Attention was already known to cost time and memory that grow with the square of the sequence length. In 2022 Tri Dao, Daniel Fu, Stefano Ermon, Atri Rudra and Christopher R&eacute; argued in "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" that the cost people were fighting was the wrong one. The arithmetic was not the bottleneck; the trips to the GPU's main memory were. Their kernel computes the same numbers as before, moves far fewer bytes, and made longer training contexts affordable.</p>
+</header>
+
+<div class="callout note">
+  <p class="callout-title">What I could and could not read</p>
+  <p>I fetched and read the full text of the original FlashAttention paper (arXiv 2205.14135, v2) including its tables, algorithms and limitations section. I fetched and read the abstract, introduction and training tables of the FlashAttention-2 paper (arXiv 2307.08691), the abstract and headline results of the FlashAttention-3 paper (arXiv 2407.08608), the abstract and introduction of the FlashAttention-4 paper (arXiv 2603.05451, March 2026), the abstract and introduction of Milakov and Gimelshein's "Online normalizer calculation for softmax", and the current PyTorch documentation page for <code>scaled_dot_product_attention</code>. I did not read the bodies of the FlashAttention-3 and FlashAttention-4 papers closely, I did not re-run any of the authors' benchmarks, and I have no GPU here: every speed figure below is the authors' own report, and the toy later on counts memory traffic in a model, it does not time hardware.</p>
+</div>
+
+<div class="callout why">
+  <p class="callout-title">The pattern in one sentence</p>
+  <p><strong>When an operation spends its time waiting for memory rather than computing, count the reads and writes between fast and slow memory, and restructure the algorithm (tile it, fuse it, recompute instead of storing) so that the big intermediate result never leaves the fast memory, even if that means doing more arithmetic.</strong></p>
+</div>
+
+<h2>Context: attention was slow for a reason nobody was measuring</h2>
+<p>By 2022 the attention layer from <a href="../chapters/09-attention.html">chapter 9</a> sat inside nearly every large model, and its cost was well known. For a sequence of N tokens, the score matrix S = QK<sup>T</sup> has N &times; N entries, so both the arithmetic and the memory grow with N<sup>2</sup>. The paper's introduction says this is why equipping Transformers with longer context "remains difficult". Many research groups had proposed <span class="term">approximate attention</span> (sparse patterns, low-rank projections, kernel tricks) that cut the arithmetic to nearly linear in N, at some cost in quality. The FlashAttention authors point out that many of these did not run faster on real hardware, and that "one main reason is that they focus on FLOP reduction (which may not correlate with wall-clock speed) and tend to ignore overheads from memory access (IO)".</p>
+<p>To see why, you need two facts about a GPU, both reviewed in <a href="../../systems/chapters/21-parallelism-gpus.html">Zero to Systems chapter 21</a>. First, a GPU has a large, slow main memory and a tiny, fast one. The paper's example is the A100: <span class="term">HBM</span> (high-bandwidth memory, the main memory) of 40 to 80 GB with bandwidth of 1.5 to 2.0 TB/s, and <span class="term">SRAM</span> (the on-chip memory next to the arithmetic units) of 192 KB per streaming multiprocessor, with 108 of them, at a bandwidth the authors estimate near 19 TB/s. The fast memory is an order of magnitude faster and many orders of magnitude smaller. Second, each GPU function, called a <span class="term">kernel</span>, loads its inputs from HBM, computes, and writes its outputs back to HBM. Whatever one kernel hands to the next must make a round trip.</p>
+<p>An operation is <span class="term">memory-bound</span> when its time is set by bytes moved rather than arithmetic done, and <span class="term">compute-bound</span> in the opposite case. The ratio that decides it is the <span class="term">arithmetic intensity</span>: arithmetic operations per byte of memory traffic. The paper lists large matrix multiplies as compute-bound and elementwise operations and reductions, including softmax, as memory-bound. A standard attention implementation is a matrix multiply, then a softmax, then another matrix multiply, with the N &times; N matrices S and P (the softmax output) written to HBM and read back between them. The paper's central claim is that this traffic, not the multiplication, sets the run time.</p>
+
+<dl class="terms">
+  <dt>HBM and SRAM</dt><dd>The GPU's large slow main memory and its tiny fast on-chip memory.</dd>
+  <dt>Kernel</dt><dd>One function launched on the GPU. Its inputs come from HBM and its outputs go back to HBM.</dd>
+  <dt>IO-aware</dt><dd>Designed by counting reads and writes between levels of memory, not only arithmetic.</dd>
+  <dt>Tiling</dt><dd>Splitting matrices into blocks small enough to fit in SRAM and processing them one block at a time.</dd>
+  <dt>Online softmax</dt><dd>A way to compute a softmax over a row that arrives in pieces, by keeping a running maximum and running sum.</dd>
+  <dt>Recomputation</dt><dd>Recalculating a value when it is needed again instead of storing it. Here it replaces storing the N &times; N matrices for the backward pass.</dd>
+</dl>
+
+<h2>The mechanism, part one: what the standard implementation moves</h2>
+<p>The paper writes attention as S = QK<sup>T</sup>, P = softmax(S), O = PV, with Q, K, V and O of shape (N, d) and S and P of shape (N, N). Its Algorithm 0 is the standard recipe: load Q and K, compute S and write it to HBM; read S, compute P and write it to HBM; load P and V, compute O and write it to HBM. Counting elements moved gives roughly 4N<sup>2</sup> + 4Nd, and since the head dimension d is 64 for GPT-2 while N is 1,024 or more, the N<sup>2</sup> terms dominate. The memory needed to hold S and P is quadratic in N too. The paper's own Theorem 2 states the standard cost as &Theta;(Nd + N<sup>2</sup>) HBM accesses.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Two rows. Top row: standard attention as three kernels, with the N by N matrices S and P written to and read from main memory between them. Bottom row: FlashAttention as one fused kernel that keeps those matrices on chip.">
+    <defs><marker id="ahDLC5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="28" class="t-sm t-bold">Standard: three kernels, two N &times; N matrices make a round trip to HBM</text>
+    <rect x="20" y="42" width="80" height="52" rx="8" class="fs-green s-green sw-2"/>
+    <text x="60" y="65" text-anchor="middle" class="t-sm t-bold">Q, K, V</text>
+    <text x="60" y="82" text-anchor="middle" class="t-xs t-muted">in HBM</text>
+    <rect x="120" y="42" width="90" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="165" y="65" text-anchor="middle" class="t-sm t-bold">scores</text>
+    <text x="165" y="82" text-anchor="middle" class="t-xs t-muted">kernel 1</text>
+    <rect x="235" y="42" width="80" height="52" rx="8" class="fs-red s-red sw-2"/>
+    <text x="275" y="65" text-anchor="middle" class="t-sm t-bold">S: N&times;N</text>
+    <text x="275" y="82" text-anchor="middle" class="t-xs t-muted">in HBM</text>
+    <rect x="340" y="42" width="80" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="65" text-anchor="middle" class="t-sm t-bold">softmax</text>
+    <text x="380" y="82" text-anchor="middle" class="t-xs t-muted">kernel 2</text>
+    <rect x="445" y="42" width="80" height="52" rx="8" class="fs-red s-red sw-2"/>
+    <text x="485" y="65" text-anchor="middle" class="t-sm t-bold">P: N&times;N</text>
+    <text x="485" y="82" text-anchor="middle" class="t-xs t-muted">in HBM</text>
+    <rect x="550" y="42" width="90" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="595" y="65" text-anchor="middle" class="t-sm t-bold">P times V</text>
+    <text x="595" y="82" text-anchor="middle" class="t-xs t-muted">kernel 3</text>
+    <rect x="665" y="42" width="75" height="52" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="702" y="65" text-anchor="middle" class="t-sm t-bold">O: N&times;d</text>
+    <text x="702" y="82" text-anchor="middle" class="t-xs t-muted">in HBM</text>
+    <line x1="100" y1="68" x2="118" y2="68" class="line" marker-end="url(#ahDLC5a)"/>
+    <line x1="210" y1="68" x2="233" y2="68" class="line" marker-end="url(#ahDLC5a)"/>
+    <line x1="315" y1="68" x2="338" y2="68" class="line" marker-end="url(#ahDLC5a)"/>
+    <line x1="420" y1="68" x2="443" y2="68" class="line" marker-end="url(#ahDLC5a)"/>
+    <line x1="525" y1="68" x2="548" y2="68" class="line" marker-end="url(#ahDLC5a)"/>
+    <line x1="640" y1="68" x2="663" y2="68" class="line" marker-end="url(#ahDLC5a)"/>
+    <text x="275" y="116" text-anchor="middle" class="t-xs tc-red">written, then read back</text>
+    <text x="485" y="116" text-anchor="middle" class="t-xs tc-red">written, then read back</text>
+    <text x="20" y="168" class="t-sm t-bold">FlashAttention: one fused kernel, S and P exist only in SRAM, one tile at a time</text>
+    <rect x="20" y="182" width="80" height="52" rx="8" class="fs-green s-green sw-2"/>
+    <text x="60" y="205" text-anchor="middle" class="t-sm t-bold">Q, K, V</text>
+    <text x="60" y="222" text-anchor="middle" class="t-xs t-muted">in HBM</text>
+    <rect x="120" y="182" width="520" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="205" text-anchor="middle" class="t-sm t-bold">scores, running softmax and P times V, tile by tile in SRAM</text>
+    <text x="380" y="222" text-anchor="middle" class="t-xs t-muted">no N &times; N matrix is ever written to HBM</text>
+    <rect x="665" y="182" width="75" height="52" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="702" y="205" text-anchor="middle" class="t-sm t-bold">O: N&times;d</text>
+    <text x="702" y="222" text-anchor="middle" class="t-xs t-muted">in HBM</text>
+    <line x1="100" y1="208" x2="118" y2="208" class="line" marker-end="url(#ahDLC5a)"/>
+    <line x1="640" y1="208" x2="663" y2="208" class="line" marker-end="url(#ahDLC5a)"/>
+    <text x="20" y="266" class="t-xs t-muted">Red boxes are the large intermediates. Names follow the paper's Algorithm 0 and Algorithm 1; the layout is mine.</text>
+  </svg>
+  <figcaption><strong>The same function, two memory plans.</strong> Attention itself is unchanged. What changes is where the N &times; N intermediates live while they exist.</figcaption>
+</figure>
+
+<h2>The mechanism, part two: tiles, a running softmax, and recomputation</h2>
+<p>The obstacle to keeping S and P on chip is that they are too big: for N = 1,024 and 16-bit numbers one head's S is already 2 MiB, and SRAM is measured in hundreds of kilobytes shared by many things. So the paper splits the work into tiles. The matrix products are easy to tile. The <a href="../chapters/09-attention.html">softmax</a> is not, because each weight is divided by a sum over the whole row, and for numerical stability (<a href="../../ml-foundations/chapters/11-numerics.html">A0 chapter 11</a>) the row maximum is subtracted first. If the row arrives in blocks, neither the final maximum nor the final sum is known when the first block is processed.</p>
+<p>The fix is a trick that predates the paper. Milakov and Gimelshein (2018, "Online normalizer calculation for softmax"), working at NVIDIA, showed how to compute the maximum and the sum in a single pass by keeping them as running values and rescaling the running sum whenever a new maximum appears. The FlashAttention paper keeps two statistics per row, the running maximum m and the running sum &ell; of exponentials, and extends the idea to the whole output: after each key/value block, the partly accumulated output is rescaled by the same correction factor before the new block's contribution is added. At the end the result is exactly softmax(QK<sup>T</sup>)V. Chapter 19's <a href="../chapters/19-efficient-attention.html">stepper on FlashAttention</a> walks through the arithmetic for one row of six scores; here the interest is the loop structure. The paper's Algorithm 1 sets block sizes B<sub>c</sub> = &lceil;M / 4d&rceil; and B<sub>r</sub> = min(&lceil;M / 4d&rceil;, d), where M is the SRAM size in elements.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 340" role="img" aria-label="A four by four grid of tiles of the score matrix. Column blocks are labelled K1 V1 to K4 V4 and row blocks Q1 to Q4. The first column and two tiles of the second column are marked finished, the third tile of the second column is the tile in SRAM now, the rest are not yet visited. On the right, the four steps of the loop are listed.">
+    <defs><marker id="ahDLC5b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="190" y="22" text-anchor="middle" class="t-sm t-bold">The N &times; N score matrix, cut into tiles</text>
+    <text x="100" y="58" text-anchor="middle" class="t-xs">K1, V1</text>
+    <text x="160" y="58" text-anchor="middle" class="t-xs">K2, V2</text>
+    <text x="220" y="58" text-anchor="middle" class="t-xs">K3, V3</text>
+    <text x="280" y="58" text-anchor="middle" class="t-xs">K4, V4</text>
+    <text x="62" y="104" text-anchor="end" class="t-xs">Q1</text>
+    <text x="62" y="164" text-anchor="end" class="t-xs">Q2</text>
+    <text x="62" y="224" text-anchor="end" class="t-xs">Q3</text>
+    <text x="62" y="284" text-anchor="end" class="t-xs">Q4</text>
+    <rect x="70" y="70" width="60" height="60" class="fs-blue s-blue"/>
+    <rect x="70" y="130" width="60" height="60" class="fs-blue s-blue"/>
+    <rect x="70" y="190" width="60" height="60" class="fs-blue s-blue"/>
+    <rect x="70" y="250" width="60" height="60" class="fs-blue s-blue"/>
+    <rect x="130" y="70" width="60" height="60" class="fs-blue s-blue"/>
+    <rect x="130" y="130" width="60" height="60" class="fs-blue s-blue"/>
+    <rect x="130" y="190" width="60" height="60" class="fs-yellow s-yellow sw-2"/>
+    <rect x="130" y="250" width="60" height="60" class="box"/>
+    <rect x="190" y="70" width="60" height="60" class="box"/>
+    <rect x="190" y="130" width="60" height="60" class="box"/>
+    <rect x="190" y="190" width="60" height="60" class="box"/>
+    <rect x="190" y="250" width="60" height="60" class="box"/>
+    <rect x="250" y="70" width="60" height="60" class="box"/>
+    <rect x="250" y="130" width="60" height="60" class="box"/>
+    <rect x="250" y="190" width="60" height="60" class="box"/>
+    <rect x="250" y="250" width="60" height="60" class="box"/>
+    <text x="160" y="224" text-anchor="middle" class="t-xs t-bold t-dark">S<tspan dy="3" font-size="8">32</tspan></text>
+    <rect x="350" y="48" width="14" height="14" class="fs-blue s-blue"/>
+    <text x="372" y="60" class="t-xs">tile finished (folded into the running softmax)</text>
+    <rect x="350" y="70" width="14" height="14" class="fs-yellow s-yellow"/>
+    <text x="372" y="82" class="t-xs">tile in SRAM now (exists only on chip)</text>
+    <rect x="350" y="92" width="14" height="14" class="box"/>
+    <text x="372" y="104" class="t-xs">not yet visited</text>
+    <rect x="350" y="124" width="390" height="40" rx="8" class="fs-green s-green sw-2"/>
+    <text x="545" y="148" text-anchor="middle" class="t-sm">Outer loop over j: copy K_j and V_j into SRAM</text>
+    <rect x="350" y="180" width="390" height="40" rx="8" class="fs-green s-green sw-2"/>
+    <text x="545" y="204" text-anchor="middle" class="t-sm">Inner loop over i: copy Q_i, O_i, m_i, l_i in</text>
+    <rect x="350" y="236" width="390" height="40" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="545" y="260" text-anchor="middle" class="t-sm">On chip: S_ij = Q_i K_j^T, update m, l and O_i</text>
+    <rect x="350" y="292" width="390" height="40" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="545" y="316" text-anchor="middle" class="t-sm">Write O_i, m_i, l_i back: only N &times; d values</text>
+    <line x1="545" y1="164" x2="545" y2="178" class="line" marker-end="url(#ahDLC5b)"/>
+    <line x1="545" y1="220" x2="545" y2="234" class="line" marker-end="url(#ahDLC5b)"/>
+    <line x1="545" y1="276" x2="545" y2="290" class="line" marker-end="url(#ahDLC5b)"/>
+  </svg>
+  <figcaption><strong>Column by column.</strong> The loop order is the paper's Algorithm 1: keys and values in the outer loop, queries in the inner loop. The running statistics m and l (and the partly finished output O) are what let a tile be forgotten once it has been folded in.</figcaption>
+</figure>
+<p>The second idea concerns training. The backward pass normally needs S and P to compute gradients, which would force the N &times; N matrices to be stored after all. The paper stores only the output O and the softmax statistics (m, &ell;), and recomputes the tiles of S and P on chip when the backward pass needs them. The authors describe this as a form of selective gradient checkpointing (<a href="../../ml-foundations/chapters/09-autodiff.html">A0 chapter 9</a>), with an important difference: ordinary checkpointing trades speed for memory, whereas here "even with more FLOPs, our recomputation speeds up the backward pass due to reduced HBM accesses". Together the whole computation fits in one fused kernel.</p>
+
+<h3>The theory behind the speed-up</h3>
+<p>The paper analyses <span class="term">IO complexity</span>, the number of HBM accesses, as a function of the sequence length N, head dimension d and SRAM size M. Its Theorem 1 says Algorithm 1 returns the exact attention output with O(N<sup>2</sup>d) FLOPs and needs O(N) extra memory beyond inputs and output. Theorem 2 says standard attention needs &Theta;(Nd + N<sup>2</sup>) HBM accesses while FlashAttention needs &Theta;(N<sup>2</sup>d<sup>2</sup>M<sup>-1</sup>). For typical values (d of 64 to 128, M around 100 KB) the paper notes that d<sup>2</sup> is many times smaller than M, so the second count is much smaller. Proposition 3 adds a lower bound: no exact attention algorithm can beat N<sup>2</sup>d<sup>2</sup>M<sup>-1</sup> HBM accesses for every M in the range from d to Nd. The proof idea is easy to follow: for each block of K and V of size about M, one pass over all of Q (Nd elements) is needed, and there are about Nd/M such blocks.</p>
+<details class="deeper"><summary>Go deeper <span class="hint">optional: where the d<sup>2</sup>/M comes from</span></summary>
+<p>Fix the SRAM size M. Each outer iteration loads a block of K and V holding about M elements, so there are about Nd / M outer iterations. Each inner loop streams through all of Q, O, m and &ell;, which is on the order of Nd elements. Multiplying gives (Nd / M) &times; Nd = N<sup>2</sup>d<sup>2</sup> / M accesses, which is the theorem's count. The standard algorithm's N<sup>2</sup> comes from writing and reading the score matrix once each. The two are equal when M is about d<sup>2</sup>, which is why a very small SRAM would erase the benefit, and why the toy below shows the ratio growing as M grows.</p>
+</details>
+
+<h2>What the authors reported</h2>
+<p>All figures here are the paper's own measurements on A100 GPUs unless stated. The first is the mechanism check (the paper's Figure 2, left): forward plus backward attention for GPT-2 medium (sequence length 1,024, head dimension 64, 16 heads, batch size 64). Standard attention took 66.6 GFLOPs, moved 40.3 GB to and from HBM and ran in 41.7 ms. FlashAttention took more arithmetic, 75.2 GFLOPs because of recomputation, but moved 4.4 GB and ran in 7.3 ms. The authors conclude that "HBM access is the primary factor affecting runtime".</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Three pairs of bars comparing standard attention and FlashAttention: GFLOPs 66.6 against 75.2, HBM traffic 40.3 against 4.4 gigabytes, runtime 41.7 against 7.3 milliseconds. FlashAttention has slightly more arithmetic but much less traffic and runtime.">
+    <line x1="40" y1="250" x2="250" y2="250" class="line"/>
+    <line x1="280" y1="250" x2="490" y2="250" class="line"/>
+    <line x1="520" y1="250" x2="730" y2="250" class="line"/>
+    <rect x="65" y="117.2" width="70" height="132.8" class="f-blue"/>
+    <rect x="155" y="100" width="70" height="150" class="f-orange"/>
+    <text x="100" y="110" text-anchor="middle" class="t-xs t-bold">66.6</text>
+    <text x="190" y="93" text-anchor="middle" class="t-xs t-bold">75.2</text>
+    <rect x="305" y="100" width="70" height="150" class="f-blue"/>
+    <rect x="395" y="233.6" width="70" height="16.4" class="f-orange"/>
+    <text x="340" y="93" text-anchor="middle" class="t-xs t-bold">40.3</text>
+    <text x="430" y="227" text-anchor="middle" class="t-xs t-bold">4.4</text>
+    <rect x="545" y="100" width="70" height="150" class="f-blue"/>
+    <rect x="635" y="223.7" width="70" height="26.3" class="f-orange"/>
+    <text x="580" y="93" text-anchor="middle" class="t-xs t-bold">41.7</text>
+    <text x="670" y="217" text-anchor="middle" class="t-xs t-bold">7.3</text>
+    <text x="100" y="268" text-anchor="middle" class="t-xs">standard</text>
+    <text x="190" y="268" text-anchor="middle" class="t-xs">Flash</text>
+    <text x="340" y="268" text-anchor="middle" class="t-xs">standard</text>
+    <text x="430" y="268" text-anchor="middle" class="t-xs">Flash</text>
+    <text x="580" y="268" text-anchor="middle" class="t-xs">standard</text>
+    <text x="670" y="268" text-anchor="middle" class="t-xs">Flash</text>
+    <text x="145" y="300" text-anchor="middle" class="t-sm t-bold">Arithmetic (GFLOPs)</text>
+    <text x="385" y="300" text-anchor="middle" class="t-sm t-bold">HBM traffic (GB)</text>
+    <text x="625" y="300" text-anchor="middle" class="t-sm t-bold">Runtime (ms)</text>
+    <text x="385" y="30" text-anchor="middle" class="t-sm t-bold">GPT-2 medium attention, forward + backward, A100</text>
+    <text x="385" y="50" text-anchor="middle" class="t-xs t-muted">Numbers from Figure 2 (left) of Dao et al. (2022). Each chart has its own scale starting at zero.</text>
+  </svg>
+  <figcaption><strong>More arithmetic, much less traffic, much less time.</strong> Blue is standard attention, orange is FlashAttention. Bar heights are drawn from the paper's reported values; each panel is scaled to its own largest bar.</figcaption>
+</figure>
+<p>The end-to-end results follow. The paper reports that its BERT-large (sequence length 512) trained to the MLPerf 1.1 target accuracy in 17.4 minutes against NVIDIA's record-holding 20.0 minutes, a 15% speed-up, on 8 A100s. For GPT-2 on OpenWebText, also on 8 A100s, it reports these training times with identical validation perplexity, since the model definition did not change:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Model</th><th>HuggingFace</th><th>Megatron-LM</th><th>FlashAttention</th></tr></thead>
+  <tbody>
+    <tr><td>GPT-2 small</td><td>9.5 days</td><td>4.7 days</td><td>2.7 days (3.5&times; over HuggingFace)</td></tr>
+    <tr><td>GPT-2 medium</td><td>21.0 days</td><td>11.5 days</td><td>6.9 days (3.0&times; over HuggingFace)</td></tr>
+  </tbody>
+</table></div>
+<p>The long-context result is the one that gave the paper its reach. Because the kernel is faster and its memory use is linear in N, the authors trained GPT-2 small with a context of 4,000 tokens ("4K") and report that it was still about 30% faster than Megatron-LM with a 1K context (3.6 days against 4.7), while reaching a perplexity 0.7 lower (17.5 against 18.2). On two long-document classification tasks, longer sequences gave gains over a 512-token baseline of 4.3 points (MIMIC-III at 16K) and 8.5 points (ECtHR at 8K). And on the Path-X task of the Long Range Arena (sequence length 16K) it produced "the first Transformer" with better-than-chance accuracy (61.4%), and with a block-sparse variant did the same on Path-256 (sequence length 64K, 63.1%). In the memory benchmark the paper reports a footprint growing linearly with N and up to 20 times lower than exact-attention baselines.</p>
+
+<h2>A toy you can run</h2>
+<p>The script below is my own NumPy sketch of Algorithm 1, not the authors' CUDA code. It does two jobs. First, it checks the claim that tiling with a running softmax is exact: it computes attention both ways and compares. Second, it keeps a ledger of how many elements each plan would move between a notional HBM and SRAM, using the paper's block sizes B<sub>c</sub> = M/4d and B<sub>r</sub> = min(B<sub>c</sub>, d). I assume an SRAM budget of M = 98,304 elements, which is the 192 KB per streaming multiprocessor quoted above at two bytes per element; real kernels do not get to use all of it for tiles, so treat the ratios as an idealisation. The last lines ask a roofline question for the paper's GPT-2 medium benchmark: how long would the reported HBM traffic, and the arithmetic, each take on an A100 if they ran at peak? The traffic and the measured times are the paper's; the arithmetic is my own count of matrix products (six for the standard forward and backward pass, seven for FlashAttention, which recomputes the scores).</p>
+<pre class="terminal" data-title="flash_toy.py"><code>"""Toy: exact tiled attention with an online softmax, plus an HBM-traffic ledger.
+My NumPy sketch of the idea in Dao et al. (2022), Algorithm 1. It counts elements moved
+between a notional HBM and SRAM; it does not time a GPU."""
+import numpy as np
+from math import ceil
+
+def standard(Q, K, V):
+    S = Q @ K.T / np.sqrt(Q.shape[1])
+    P = np.exp(S - S.max(1, keepdims=True)); P /= P.sum(1, keepdims=True)
+    return P @ V
+
+def flash(Q, K, V, Br, Bc):
+    N, d = Q.shape
+    O = np.zeros((N, d)); l = np.zeros(N); m = np.full(N, -np.inf)
+    traffic = 0                                        # elements read from or written to "HBM"
+    for j in range(0, N, Bc):                          # outer loop: K, V tiles
+        Kj, Vj = K[j:j+Bc], V[j:j+Bc]; traffic += 2 * Kj.size
+        for i in range(0, N, Br):                      # inner loop: Q tiles
+            Qi = Q[i:i+Br]; traffic += Qi.size + O[i:i+Br].size + 2 * Qi.shape[0]
+            S = Qi @ Kj.T / np.sqrt(d)                 # lives in SRAM only
+            m_new = np.maximum(m[i:i+Br], S.max(1))
+            P = np.exp(S - m_new[:, None])
+            scale = np.exp(m[i:i+Br] - m_new)          # rescale what we had accumulated
+            l_new = scale * l[i:i+Br] + P.sum(1)
+            O[i:i+Br] = (scale * l[i:i+Br])[:, None] * O[i:i+Br] / l_new[:, None] + P @ Vj / l_new[:, None]
+            l[i:i+Br], m[i:i+Br] = l_new, m_new
+            traffic += O[i:i+Br].size + 2 * Qi.shape[0]
+    return O, traffic
+
+def standard_traffic(N, d):                            # Algorithm 0: S and P go through HBM
+    return (2*N*d + N*N) + (2*N*N) + (N*N + 2*N*d)
+
+rng = np.random.default_rng(0)
+N, d = 1024, 64
+Q, K, V = (rng.normal(size=(N, d)) * 2 for _ in range(3))
+M = 98304                                              # assumed SRAM budget: 192 KB of fp16 = 98,304 elements
+Bc = ceil(M / (4*d)); Br = min(Bc, d)
+O1 = standard(Q, K, V); O2, t = flash(Q, K, V, Br, Bc)
+print(f"N={N} d={d} M={M}  Bc={Bc} Br={Br}  tiles: {ceil(N/Bc)} x {ceil(N/Br)}")
+print("max |standard - flash| =", np.abs(O1 - O2).max())
+print(f"HBM elements, standard: {standard_traffic(N, d):,}   flash: {t:,}   ratio {standard_traffic(N, d)/t:.1f}x")
+print("\n      N  S, one head  standard traffic   flash traffic   ratio   (M = %d)" % M)
+for n in (512, 1024, 2048, 4096, 8192):
+    q, k, v = (rng.normal(size=(n, d)) for _ in range(3))
+    _, ft = flash(q, k, v, Br, Bc); st = standard_traffic(n, d)
+    print(f"{n:7d} {n*n*2/2**20:9.1f} MiB {st:17,} {ft:15,} {st/ft:7.1f}x")
+print("\nSweep the SRAM budget at N=4096 (Bc = M/4d, Br = min(Bc, d)):")
+for M2 in (12288, 24576, 49152, 98304, 196608, 393216):
+    bc = ceil(M2 / (4*d)); br = min(bc, d)
+    q, k, v = (rng.normal(size=(4096, d)) for _ in range(3))
+    _, ft = flash(q, k, v, br, bc)
+    print(f"  M={M2:7d} elements  Bc={bc:4d} Br={br:3d}  flash traffic {ft:12,}  ratio {standard_traffic(4096, d)/ft:5.1f}x")
+
+# Roofline check for GPT-2 medium (batch 64, 16 heads, N=1024, d=64), forward + backward, on an A100.
+hbm_bw, peak = 1.5e12, 312e12                          # bytes/s (paper: 1.5-2.0 TB/s), FLOP/s (FlashAttention-2 paper, 16-bit matmul)
+mm = 2 * 1024**2 * 64 * (64 * 16)                      # FLOPs of one N x N x d matrix product over all heads
+print("\nFloors for GPT-2 medium attention, fwd+bwd, one A100 (HBM GB and measured ms are the paper's):")
+for name, n_mm, gb, ms in (("standard", 6, 40.3, 41.7), ("flash", 7, 4.4, 7.3)):   # 6 products; flash recomputes S: 7
+    print(f"  {name:9s} memory floor {gb*1e9/hbm_bw*1e3:5.1f} ms | compute floor {n_mm*mm/peak*1e3:4.2f} ms ({n_mm*mm/1e9:.0f} GFLOPs by my count) | measured {ms} ms")</code></pre>
+<p>Output when run:</p>
+<pre class="terminal" data-title="output"><code>N=1024 d=64 M=98304  Bc=384 Br=64  tiles: 3 x 16
+max |standard - flash| = 1.9539925233402755e-14
+HBM elements, standard: 4,456,448   flash: 733,184   ratio 6.1x
+
+      N  S, one head  standard traffic   flash traffic   ratio   (M = 98304)
+    512       0.5 MiB         1,179,648         266,240     4.4x
+   1024       2.0 MiB         4,456,448         733,184     6.1x
+   2048       8.0 MiB        17,301,504       2,670,592     6.5x
+   4096      32.0 MiB        68,157,440       9,355,264     7.3x
+   8192     128.0 MiB       270,532,608      36,372,480     7.4x
+
+Sweep the SRAM budget at N=4096 (Bc = M/4d, Br = min(Bc, d)):
+  M=  12288 elements  Bc=  48 Br= 48  flash traffic   69,566,464  ratio   1.0x
+  M=  24576 elements  Bc=  96 Br= 64  flash traffic   35,045,376  ratio   1.9x
+  M=  49152 elements  Bc= 192 Br= 64  flash traffic   18,186,240  ratio   3.7x
+  M=  98304 elements  Bc= 384 Br= 64  flash traffic    9,355,264  ratio   7.3x
+  M= 196608 elements  Bc= 768 Br= 64  flash traffic    5,341,184  ratio  12.8x
+  M= 393216 elements  Bc=1536 Br= 64  flash traffic    2,932,736  ratio  23.2x
+
+Floors for GPT-2 medium attention, fwd+bwd, one A100 (HBM GB and measured ms are the paper's):
+  standard  memory floor  26.9 ms | compute floor 2.64 ms (825 GFLOPs by my count) | measured 41.7 ms
+  flash     memory floor   2.9 ms | compute floor 3.08 ms (962 GFLOPs by my count) | measured 7.3 ms</code></pre>
+<p>Reading the output. The two methods agree to about 10<sup>-14</sup>, which is floating-point rounding: the algorithm is exact, not an approximation. At N = 1,024 the tiled plan moves 6.1 times fewer elements in this ledger, and the ratio grows slowly with N because both plans are quadratic and only the constants differ. The sweep shows the part of Theorem 2 that is easy to miss: the saving depends on M. With a quarter of the assumed SRAM the ratio is 1.9 times; with eight times as much it is 23. That is the reason the same algorithm is re-tuned for each GPU generation, as the next section shows. The last three lines use 1.5 TB/s of bandwidth (the low end of the paper's range) and 312 TFLOPs/s of 16-bit matrix-multiply throughput (from the FlashAttention-2 paper). For standard attention the memory floor of 26.9 ms is within a factor of 1.6 of the measured 41.7 ms, while the compute floor is about 2.6 ms: the traffic is the cost. After the change, the two floors are close (2.9 ms and 3.1 ms) and the measured 7.3 ms is about 42% of the compute floor's speed, which is close to the 25 to 40% of peak that the FlashAttention-2 abstract gives for the first version. The kernel has stopped waiting mainly for memory, and the remaining slack is the arithmetic efficiency that FlashAttention-2 went after. One caution: the GFLOPs printed in the paper's Figure 2 (66.6 and 75.2) are about twelve times smaller than my count of 825 and 962. I could not reconcile this (the paper's units or per-layer convention may differ), so I use the paper's figure only for the ratio between the two bars, and do not rely on it for the floors.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Save the script and run it, then change one thing at a time.</p>
+<pre class="terminal"><code><span class="prompt">$</span> <span class="cmd">python3 flash_toy.py</span>
+<span class="prompt">$</span> <span class="cmd">sed -i.bak 's/^M = 98304/M = 24576/' flash_toy.py &amp;&amp; python3 flash_toy.py | head -3</span></code></pre>
+  <p>Questions: (1) What happens to the first ratio when M drops to 24,576? Which line of the sweep predicts it? (2) Set d to 128 in the script. The theorem says the count scales with d<sup>2</sup>/M, so predict whether the ratio rises or falls, then check (I got 1.8 times at M = 98,304). (3) Multiply the random inputs by 30 instead of 2, so that the raw scores are huge. Does the difference between the two methods stay near 10<sup>-14</sup>, and which two lines of <code>flash</code> make that true?</p>
+</div>
+
+<h2>What came after, and the state of play</h2>
+<p>The first kernel was not the end. Each later paper keeps the same mathematical function and reworks how the kernel uses the hardware, which is a direct consequence of the IO-aware idea: the best tiling depends on the machine.</p>
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>These are the authors' own reports, taken from the abstracts and introductions I read; I have not reproduced them. <strong>FlashAttention-2</strong> (Dao, July 2023) says the first version reached only 25 to 40% of the A100's theoretical peak, attributes this to poor work partitioning across thread blocks and warps, and reports about 2&times; speed-up from three changes: fewer non-matrix-multiply operations (on an A100, 312 TFLOPs/s for 16-bit matrix multiply against 19.5 TFLOPs/s for other 32-bit arithmetic, so each non-matmul operation costs about 16 times more), parallelism over the sequence length for each head, and better division of work between warps. It reports up to 225 TFLOPs/s per A100 in end-to-end GPT-style training (72% model FLOPs utilisation). <strong>FlashAttention-3</strong> (Shah et al., July 2024) targets the H100 with asynchronous execution, warp specialisation and low-precision FP8, and reports 1.5 to 2.0&times; over its predecessor, up to 740 TFLOPs/s in FP16 (75% utilisation) and close to 1.2 PFLOPs/s in FP8. <strong>FlashAttention-4</strong> (Zadouri et al., March 2026) targets Blackwell GPUs, where the tensor cores doubled in speed while shared memory bandwidth and exponential units did not; it reports up to 1,613 TFLOPs/s (71% utilisation) on a B200 in BF16, 1.3&times; over cuDNN 9.13 and 2.7&times; over a Triton implementation. In PyTorch, <code>torch.nn.functional.scaled_dot_product_attention</code> documents three implementations (FlashAttention-2, memory-efficient attention, and a plain C++ version) and says it "attempts to automatically select the most optimal implementation based on the inputs", with the fused kernels each carrying input limitations. Kernel names, versions and hardware move fast; check the repository and your framework version before relying on any of this.</p>
+</div>
+<p>One adoption claim deserves its source. The FlashAttention-2 paper states that the first version "has seen wide adoption in large-scale training and inference of Transformers". That is the author's own assessment in a follow-up paper, not an independent survey, though the PyTorch documentation above is independent evidence that the idea is in the standard library.</p>
+
+<h2>What it did not change, and what critics and later work point out</h2>
+<ul>
+  <li><strong>The arithmetic is still quadratic.</strong> Theorem 1 gives O(N<sup>2</sup>d) FLOPs. FlashAttention removes the quadratic memory and a large constant in the time, not the quadratic growth of compute. At very long sequences the compute term dominates again, which is why the authors also built block-sparse FlashAttention (an approximation the paper reports as 2 to 4 times faster than the dense kernel, scaling to 64K tokens). In the paper's own benchmark, FlashAttention beats every other method up to a sequence length of 512, but beyond 1K some approximate methods such as Linformer become faster.</li>
+  <li><strong>It is an engineering burden.</strong> The paper's limitations section says each new attention variant needs a new CUDA kernel, "a considerably lower-level language than PyTorch", which may not transfer across GPU architectures. The authors call for a compiler from high-level code to IO-aware kernels. The FlashAttention-2 to -4 papers show the burden recurring with every hardware generation; FlashAttention-4's abstract reports writing the kernel in a Python-embedded DSL with 20 to 30 times faster compile times as one response.</li>
+  <li><strong>Results are not bit-identical across kernels.</strong> The PyTorch documentation warns that, "due to the nature of fusing floating point operations", the output may differ depending on which backend kernel is chosen. Exact here means the same mathematical function with floating-point rounding differences, which matters when you compare outputs across versions (<a href="../../ml-foundations/chapters/11-numerics.html">A0 chapter 11</a>).</li>
+  <li><strong>Inference has a different bottleneck.</strong> Training and prompt processing handle many query tokens at once. Generating one token at a time is dominated by reading the weights and the <a href="../../llm-training/chapters/18-kv-cache.html">KV cache</a>, which this kernel does not shrink. Multi-query and grouped-query attention (<a href="../chapters/19-efficient-attention.html">chapter 19</a>) address that cost.</li>
+  <li><strong>The headline speed-up depends on the baseline.</strong> "3&times; faster" is against a particular HuggingFace implementation, about 1.7 to 1.8&times; against Megatron-LM, and the paper's attention-only microbenchmark says "up to 3&times; faster than the standard attention implementation" across common lengths. Always ask what the comparison was.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"FlashAttention makes attention linear in the sequence length." It makes the <em>memory</em> linear and the <em>memory traffic</em> far smaller, with the exact same output. The number of multiply-adds still grows with N<sup>2</sup>. A 1-million-token context is cheaper than before, but it is not cheap, which is why long-context work continues with sparse, windowed and state-space designs (<a href="../chapters/22-beyond-attention.html">chapter 22</a>).</p>
+</div>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a cook with a small counter</p>
+  <p>A cook prepares a large banquet with a small counter and a distant pantry. The slow way is to carry every ingredient to the counter, do one step, carry the half-finished trays back to the pantry, then fetch them again for the next step. The fast way is to bring a few trays at a time, do every step on the trays while they are on the counter, and carry only the finished dishes back. The recipe is unchanged; the walking is what shrank. Doing a little extra chopping to avoid a trip, which is what recomputation does, is a good trade when the pantry is far away.</p>
+  <p><em>Where it breaks down:</em> a cook can see the whole counter at once, whereas a GPU's tiles must be arranged so that thousands of threads read and write fast memory without colliding, and that arrangement is what the later FlashAttention papers keep re-engineering.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>This is the memory hierarchy of <a href="../../systems/chapters/21-parallelism-gpus.html">Zero to Systems chapter 21</a> applied to one operator, and the method is that of <a href="../../systems/chapters/22-performance-engineering.html">chapter 22</a>: measure where time goes before optimising what you assumed was the cost. The paper's Figure 2 is a profile reduced to one picture. For what else lives in GPU memory during training, see <a href="../../llm-training/chapters/02-gpu-memory.html">GPU memory and why training runs out of it</a>, and for fused kernels in general see <a href="../../llm-training/chapters/04-kernels.html">kernels and performance</a>. Your own resource accounting in <a href="../chapters/16-resource-accounting.html">chapter 16</a> gets an extra column: bytes moved, not only parameters and FLOPs.</p>
+</div>
+
+<h2>Lessons</h2>
+<ul>
+  <li><strong>Profile before you approximate.</strong> Years of attention research reduced FLOPs while the real cost was HBM traffic. Chapter 19 lists the alternatives that change the function; this case shows the one that does not.</li>
+  <li><strong>Exact beats approximate when it is also fast.</strong> A drop-in kernel with identical maths needs no retraining, no quality evaluation and no change to the model, which is a large part of why it spread.</li>
+  <li><strong>Trade arithmetic for traffic.</strong> Recomputing the score tiles in the backward pass cost extra FLOPs and saved time, because arithmetic is cheap and memory trips are not.</li>
+  <li><strong>Optimal tiling is hardware-specific.</strong> The d<sup>2</sup>/M dependence is a reminder that the answer changes with the SRAM size and the relative speed of units, as the move from A100 to H100 to B200 shows.</li>
+  <li><strong>Memory limits are context limits.</strong> Memory that grows as N<sup>2</sup> caps the training context long before the compute budget does; removing it moved the cap, as the 4K-versus-1K GPT-2 result shows.</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Standard attention is memory-bound: it writes the N &times; N matrices S and P to HBM and reads them back.</li>
+    <li>FlashAttention tiles the computation, keeps a running softmax (m and &ell;), fuses everything into one kernel, and recomputes S and P in the backward pass.</li>
+    <li>It is exact, uses O(N) extra memory, and needs more FLOPs yet moves far fewer bytes: in the paper, 4.4 GB instead of 40.3 GB and 7.3 ms instead of 41.7 ms for GPT-2 medium.</li>
+    <li>Its HBM traffic scales as N<sup>2</sup>d<sup>2</sup>/M; arithmetic is still quadratic in N.</li>
+    <li>Later versions retune the same idea for A100, H100 and Blackwell; the kernel is rewritten for each, and numbers belong in a dated box.</li>
+  </ul>
+</div>
+
+<h2>Sources</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">Dao, Fu, Ermon, Rudra and R&eacute;, "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (arXiv 2205.14135, v2 June 2022)</a>. Fetched and read in full. Source of the memory hierarchy figures, Algorithms 0 and 1, Theorems 1 and 2, Proposition 3, Figure 2, Tables 1 to 4, the 20&times; memory claim and the limitations.</li>
+  <li><a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">Dao, "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (arXiv 2307.08691, July 2023)</a>. Fetched; abstract, introduction and training table read. Source of the 25 to 40% utilisation, 312 versus 19.5 TFLOPs/s, 225 TFLOPs/s and 72% figures and the adoption statement.</li>
+  <li><a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">Shah, Bikshandi, Zhang, Thakkar, Ramani and Dao, "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision" (arXiv 2407.08608, July 2024)</a>. Fetched; abstract and headline results read, body not read closely. Source of the H100 figures.</li>
+  <li><a href="https://arxiv.org/abs/2603.05451" target="_blank" rel="noopener">Zadouri, Hoehnerbach, Shah, Liu, Thakkar and Dao, "FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling" (arXiv 2603.05451, March 2026)</a>. Fetched; abstract and introduction read, body not read closely. Source of the Blackwell figures. Search-engine summaries of this paper disagreed on small numbers (1,605 against 1,613 TFLOPs/s); I used the abstract.</li>
+  <li><a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">Milakov and Gimelshein, "Online normalizer calculation for softmax" (arXiv 1805.02867, 2018)</a>. Fetched; abstract and introduction read. Source of the single-pass softmax idea.</li>
+  <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch documentation, "torch.nn.functional.scaled_dot_product_attention"</a>. Fetched and read (2.14 documentation, October 2026). Source of the backend list, automatic selection and numerical-difference warning.</li>
+  <li>The toy code, diagrams, analogy and the roofline arithmetic are my own. Rabe and Staats (2021), "Self-attention does not need O(n<sup>2</sup>) memory", is cited in the FlashAttention paper and in <a href="../chapters/19-efficient-attention.html">chapter 19</a>; I did not fetch it.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why was standard attention slow on an A100 even though its arithmetic was a small fraction of the GPU's peak?</p>
+    <ol class="q-options">
+      <li>The softmax needs more multiplications than the matrix products</li>
+      <li>The GPU cannot run matrix multiplies in 16-bit arithmetic</li>
+      <li>It writes the N &times; N matrices S and P to HBM and reads them back, so time is set by memory traffic</li>
+      <li>Its memory use is linear, which leaves SRAM idle</li>
+    </ol>
+    <div class="q-explain">The paper's Figure 2 shows 40.3 GB of HBM traffic against 4.4 GB, and runtime tracking traffic. The softmax is memory-bound rather than arithmetic-heavy (first option), and standard attention's memory use is quadratic, not linear (last option).</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">FlashAttention's backward pass recomputes the score tiles and so does more FLOPs, yet runs faster. What explains this?</p>
+    <ol class="q-options">
+      <li>The saved HBM reads and writes cost more time than the extra arithmetic</li>
+      <li>Recomputation is approximate, so it needs less precision</li>
+      <li>The extra FLOPs run on a separate, free unit</li>
+      <li>The backward pass is skipped for tokens that do not matter</li>
+    </ol>
+    <div class="q-explain">The paper reports 75.2 against 66.6 GFLOPs but 4.4 against 40.3 GB of traffic. Recomputation is exact, and nothing is skipped.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Which property of attention does FlashAttention NOT change?</p>
+    <ol class="q-options">
+      <li>The numerical result, up to rounding</li>
+      <li>The amount of extra memory needed for the N &times; N matrices</li>
+      <li>The number of kernels launched</li>
+      <li>The number of arithmetic operations, which still grows with N<sup>2</sup></li>
+    </ol>
+    <div class="q-explain">Theorem 1 gives O(N<sup>2</sup>d) FLOPs. The result is exact, the N &times; N memory goes away, and three kernels become one. Compute still grows quadratically.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">In the toy, raising the SRAM budget M from 49,152 to 196,608 elements raised the traffic ratio from 3.7&times; to 12.8&times;. Which statement from the paper does this match?</p>
+    <ol class="q-options">
+      <li>FlashAttention's HBM accesses do not depend on M</li>
+      <li>FlashAttention needs &Theta;(N<sup>2</sup>d<sup>2</sup>/M) HBM accesses, so a larger M means fewer passes over Q</li>
+      <li>Standard attention's HBM accesses fall as M grows</li>
+      <li>The ratio is fixed by the head dimension alone</li>
+    </ol>
+    <div class="q-explain">Bigger tiles mean fewer outer iterations and fewer passes over Q. Standard attention's count (Nd + N<sup>2</sup>) has no M in it. d matters, but not alone.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

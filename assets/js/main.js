@@ -239,20 +239,29 @@
 
   /* Hub and glossary: the sidebar lists the courses instead of chapters. */
   function buildHubNav(side) {
-    var list = el("ul", { class: "nav-list" });
-    COURSES.forEach(function (co, i) {
-      var planned = co.status === "planned";
-      var n = planned ? 0 : doneFor(co).size;
-      var total = planned ? 0 : co.chapters.length + co.labs.length + co.cases.length + (co.studios || []).length;
-      var a = el(planned ? "span" : "a", planned ? { class: "planned", title: "Coming soon: " + co.tagline } : { href: courseHome(co), title: co.tagline }, [
-        el("span", { class: "nav-num", html: "<span>" + i + "</span>" }),
-        el("span", { class: "nav-title", text: co.title }),
-        el("span", { class: "nav-count", text: planned ? "soon" : n + "/" + total })
-      ]);
-      list.appendChild(el("li", null, [a]));
+    [["The path", COURSES.filter(function (co) { return !co.track; })],
+     ["Zero to AI Systems", COURSES.filter(function (co) { return co.track === "ai"; })]].forEach(function (grp) {
+      if (!grp[1].length) return;
+      var list = el("ul", { class: "nav-list" });
+      grp[1].forEach(function (co) {
+        var planned = co.status === "planned";
+        var n = planned ? 0 : doneFor(co).size;
+        var total = planned ? 0 : co.chapters.length + co.labs.length + co.cases.length + (co.studios || []).length;
+        var a = el(planned ? "span" : "a", planned ? { class: "planned", title: "Coming soon: " + co.tagline } : { href: courseHome(co), title: co.tagline }, [
+          el("span", { class: "nav-num", html: "<span>" + courseNum(co) + "</span>" }),
+          el("span", { class: "nav-title", text: co.title }),
+          el("span", { class: "nav-count", text: planned ? "soon" : n + "/" + total })
+        ]);
+        list.appendChild(el("li", null, [a]));
+      });
+      side.appendChild(el("nav", { class: "nav-part", "aria-label": grp[0] }, [el("p", { class: "nav-part-title", text: grp[0] }), list]));
     });
-    side.appendChild(el("nav", { class: "nav-part", "aria-label": "Courses" }, [el("p", { class: "nav-part-title", text: "The path" }), list]));
     side.appendChild(sidebarFoot());
+  }
+
+  /* Track-1 courses are numbered 0..7 by position; track-2 courses carry their own label ("A0"). */
+  function courseNum(co) {
+    return co.num || String(COURSES.filter(function (c) { return !c.track; }).indexOf(co));
   }
 
   function refreshProgress() {
@@ -499,13 +508,16 @@
   /* ---------- site hub: one card per course ---------- */
 
   function buildHub() {
-    var host = document.getElementById("hub");
-    if (!host) return;
-    COURSES.forEach(function (co, i) {
+    var mainHost = document.getElementById("hub");
+    var aiHost = document.getElementById("hub-ai");
+    if (!mainHost && !aiHost) return;
+    COURSES.forEach(function (co) {
+      var host = co.track === "ai" ? aiHost : mainHost;
+      if (!host) return;
       var planned = co.status === "planned";
       var top = el("div", { class: "top" }, [
         el("span", { class: "hub-mark", text: co.mark }),
-        el("span", { class: "num", text: "Course " + i }),
+        el("span", { class: "num", text: "Course " + courseNum(co) }),
         el("span", { class: "badge " + co.status, text: { done: "Ready", building: "New", planned: "Coming soon" }[co.status] })
       ]);
       var kids = [top, el("div", { class: "title", text: co.title }), el("div", { class: "sub", text: co.subtitle }), el("div", { class: "blurb", text: co.tagline })];

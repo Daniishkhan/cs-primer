@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Llama 3 at Scale &middot; Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-case="C3">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Training Llama 3 at Scale</h1>
+  <p class="lede">Meta's "The Llama 3 Herd of Models" (Llama Team, AI @ Meta, 2024) devotes a few pages to a question most model papers skip: what happens to a training job when it runs on up to 16 thousand GPUs for weeks. Its answer is a table of 419 unexpected interruptions in 54 days, a claim of more than 90% effective training time, and a list of the tools that made that possible. This case study reads those pages as reliability engineering and checks the arithmetic.</p>
+</header>
+
+<div class="callout note">
+  <p class="callout-title">What I could and could not read</p>
+  <p>I fetched and read the full arXiv paper (2407.21783), concentrating on section 3 (pre-training infrastructure, parallelism, reliability and training recipe). Everything is Meta's own report about its own system: I have not seen the cluster, the logs or independent measurements of this run, and the paper gives a 54-day snapshot, not the whole run. As a second source I fetched the PDF of Kokolis et al. (2024/2025), "Revisiting Reliability in Large-Scale Machine Learning Research Clusters", a Meta paper about other (A100) clusters; I read its abstract and the passages on mean time to failure. I did not read Meta's engineering blog posts on the cluster build. <strong>One internal inconsistency in the paper's failure table is discussed below</strong>; I recomputed the table from its counts and the discrepancy is mine to report, not a finding about Meta's operations.</p>
+</div>
+
+<div class="callout why">
+  <p class="callout-title">The pattern in one sentence</p>
+  <p><strong>At large enough scale, failure is the normal state of a synchronous job, so reliability comes from making each interruption cheap (fast detection, automatic restart from a recent checkpoint) rather than from making interruptions rare.</strong></p>
+</div>
+
+<h2>Context: the biggest run, and why it is fragile</h2>
+<p>The paper says the flagship Llama 3 model has 405 billion parameters, was pre-trained on 15.6 trillion text tokens, and used 3.8 &times; 10<sup>25</sup> floating-point operations, "almost 50&times;" more than the largest Llama 2. Section 3.3.1 says it was trained on up to 16 thousand H100 GPUs, each with 80 GB of HBM3 memory and a 700 W power rating, on Meta's Grand Teton servers, eight GPUs per server connected by NVLink. As a sanity check (my arithmetic, not the paper's): at the roughly 400 teraflops per GPU of Table 4, 16,384 GPUs deliver about 6.6 &times; 10<sup>18</sup> operations a second, so 3.8 &times; 10<sup>25</sup> operations take about 5.8 million seconds, roughly 67 days if every GPU were busy all the time. That is the right order for "weeks to months", and it is why a 54-day window is a meaningful sample.</p>
+<p>The reason this is hard is stated in section 3.3.4: "the synchronous nature of training makes it less fault-tolerant", because "a single GPU failure may require a restart of the entire job"; it adds that the paper says that the complexity and failure scenarios of 16K-GPU training "surpass those of much larger CPU clusters that we have operated". If you have read <a href="../chapters/05-long-runs.html">chapter 5 (checkpoints, failures and long runs)</a>, this is that chapter's argument with real numbers.</p>
+
+<dl class="terms">
+  <dt>Interruption</dt><dd>Any event that stops the training job and forces a restart, whether planned (maintenance) or unexpected (a fault).</dd>
+  <dt>Effective training time</dt><dd>The paper's measure: time spent on useful training divided by elapsed time. Restart delays and re-done work both lower it.</dd>
+  <dt>Checkpoint</dt><dd>A saved copy of the model and optimiser state, from which a job can resume after an interruption.</dd>
+  <dt>Straggler</dt><dd>A device that still works but runs slowly, holding up every device that waits for it.</dd>
+  <dt>Silent data corruption</dt><dd>A hardware fault that produces wrong results without raising an error.</dd>
+  <dt>MFU</dt><dd>Model FLOPs utilisation: the fraction of a GPU's peak arithmetic rate that goes into useful model computation.</dd>
+</dl>
+
+<h2>The system: topology and parallelism</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 760 258" role="img" aria-label="Cluster hierarchy: server of 8 GPUs, rack of 16 GPUs, pod of 3,072 GPUs with full bisection bandwidth, and a cluster of 8 pods with 24 thousand GPUs and a 1 to 7 oversubscription at the top layer, with the four parallelism dimensions aligned underneath from innermost to outermost.">
+<defs><marker id="ahLT-C3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs><text x="380" y="20" text-anchor="middle" class="t-sm t-bold">The 24K-GPU RoCE cluster, bottom to top (Llama 3 405B used up to 16K of these GPUs)</text>
+<rect x="20" y="44" width="150" height="78" rx="8" class="fs-green s-green sw-2"/>
+<text x="95" y="71" text-anchor="middle" class="t-sm t-bold">Server</text>
+<text x="95" y="87" text-anchor="middle" class="t-xs">8 GPUs on NVLink</text>
+<text x="95" y="103" text-anchor="middle" class="t-xs">H100 80GB, 700W</text>
+<rect x="215" y="44" width="150" height="78" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="290" y="71" text-anchor="middle" class="t-sm t-bold">Rack</text>
+<text x="290" y="87" text-anchor="middle" class="t-xs">2 servers, 16 GPUs</text>
+<text x="290" y="103" text-anchor="middle" class="t-xs">one ToR switch</text>
+<rect x="410" y="44" width="150" height="78" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="485" y="71" text-anchor="middle" class="t-sm t-bold">Pod</text>
+<text x="485" y="87" text-anchor="middle" class="t-xs">192 racks, 3,072 GPUs</text>
+<text x="485" y="103" text-anchor="middle" class="t-xs">full bisection</text>
+<rect x="605" y="44" width="135" height="78" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="672.5" y="71" text-anchor="middle" class="t-sm t-bold">Cluster</text>
+<text x="672.5" y="87" text-anchor="middle" class="t-xs">8 pods, 24K GPUs</text>
+<text x="672.5" y="103" text-anchor="middle" class="t-xs">oversubscribed 1:7</text>
+<line x1="170" y1="83" x2="215" y2="83" class="line" marker-end="url(#ahLT-C3a)"/>
+<line x1="365" y1="83" x2="410" y2="83" class="line" marker-end="url(#ahLT-C3a)"/>
+<line x1="560" y1="83" x2="605" y2="83" class="line" marker-end="url(#ahLT-C3a)"/>
+<text x="380" y="156" text-anchor="middle" class="t-xs t-muted">Parallelism order [TP, CP, PP, DP]: the chattiest dimension stays inside a server</text>
+<rect x="20" y="174" width="150" height="44" rx="8" class="box"/>
+<text x="95" y="192" text-anchor="middle" class="t-xs t-bold">TP, in a server</text>
+<text x="95" y="208" text-anchor="middle" class="t-xs">highest bandwidth</text>
+<rect x="215" y="174" width="150" height="44" rx="8" class="box"/>
+<text x="290" y="192" text-anchor="middle" class="t-xs t-bold">CP</text>
+<text x="290" y="208" text-anchor="middle" class="t-xs">long sequences</text>
+<rect x="410" y="174" width="150" height="44" rx="8" class="box"/>
+<text x="485" y="192" text-anchor="middle" class="t-xs t-bold">PP</text>
+<text x="485" y="208" text-anchor="middle" class="t-xs">across racks</text>
+<rect x="605" y="174" width="135" height="44" rx="8" class="box"/>
+<text x="672.5" y="192" text-anchor="middle" class="t-xs t-bold">DP (FSDP)</text>
+<text x="672.5" y="208" text-anchor="middle" class="t-xs">outermost level</text>
+<text x="380" y="246" text-anchor="middle" class="t-xs t-faint">Counts: section 3.3.1 of the paper. Parallelism order: section 3.3.2.</text>
+
+  </svg>
+  <figcaption><strong>Network shape drives the parallelism plan.</strong> Tensor parallelism needs the most bandwidth, so it stays on NVLink inside a server; data parallelism tolerates the multi-hop network at the top. The drawing is mine.</figcaption>
+</figure>
+<p>Section 3.3.1 describes the 24K-GPU RoCE cluster that hosted the run (the 405B model used up to 16K of its GPUs). A rack holds 16 GPUs across two servers and one top-of-rack switch; 192 racks form a pod of 3,072 GPUs with full bisection bandwidth; eight pods in a building make the 24K cluster, whose aggregation layer is oversubscribed 1:7. Storage is Meta's Tectonic file system, 240 PB across 7,500 SSD servers, with a sustained throughput of 2 TB/s and a peak of 7 TB/s; the paper names "highly bursty checkpoint writes that saturate the storage fabric" as the major challenge, with checkpoints holding 1 MB to 4 GB of model state per GPU. Models were scheduled by Meta's MAST scheduler. The paper says its parallelism methods and its job scheduler are topology-aware, aiming to minimise communication across pods.</p>
+<p>Section 3.3.2 combines four forms of parallelism (<a href="../chapters/03-parallelism.html">chapter 3</a>): tensor (TP), context (CP), pipeline (PP) and data (DP, implemented as FSDP), ordered [TP, CP, PP, DP] from innermost to outermost. Table 4 gives the configurations: 8,192 GPUs with TP = 8, PP = 16, DP = 64 at 430 TFLOPs per GPU (43% BF16 MFU); 16,384 GPUs with DP = 128 at 400 TFLOPs (41%); and the long-context stage with CP = 16 at 380 TFLOPs (38%). The global batch is 16M tokens in each. The paper attributes the small MFU drop at 16K GPUs to keeping the global batch constant, so each data-parallel group gets less work. An early-training schedule is described too: a batch of 4M tokens of length 4,096, doubled to 8M tokens of 8,192 after 252M tokens, and again to 16M after 2.87T tokens. The authors say this recipe was stable, with "few loss spikes" and no interventions to correct divergence, so the reliability work below concerns hardware and systems, not optimisation.</p>
+
+<h2>The data: 466 interruptions in 54 days</h2>
+<p>From section 3.3.4: during a 54-day snapshot of pre-training there were 466 job interruptions. 47 were planned (automated maintenance such as firmware upgrades, or operator actions such as configuration and dataset updates). The other 419 were unexpected, and Table 5 classifies them. About 78% were attributed to confirmed or suspected hardware issues, and "significant manual intervention was required only three times", with automation handling the rest. Despite at least one maintenance-driven interruption daily, the team reports "higher than 90% effective training time".</p>
+<figure class="diagram">
+  <svg viewBox="0 0 760 336" role="img" aria-label="Horizontal bars of unexpected interruption counts: faulty GPU 148, GPU HBM3 memory 72, software bug 54, network switch or cable 35, host maintenance 32, GPU SRAM 19, GPU system processor 17, NIC 7, NCCL watchdog timeouts 7, silent data corruption 6, GPU thermal interface 6, all other causes 16.">
+<defs><marker id="ahLT-C3b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs><text x="380" y="20" text-anchor="middle" class="t-sm t-bold">Unexpected interruptions by root cause, 54 days (count of 419)</text>
+<line x1="240" y1="32" x2="240" y2="300" class="line-thin"/>
+<text x="240" y="316" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="345" y1="32" x2="345" y2="300" class="line-thin"/>
+<text x="345" y="316" text-anchor="middle" class="t-xs t-muted">40</text>
+<line x1="450" y1="32" x2="450" y2="300" class="line-thin"/>
+<text x="450" y="316" text-anchor="middle" class="t-xs t-muted">80</text>
+<line x1="555" y1="32" x2="555" y2="300" class="line-thin"/>
+<text x="555" y="316" text-anchor="middle" class="t-xs t-muted">120</text>
+<line x1="660" y1="32" x2="660" y2="300" class="line-thin"/>
+<text x="660" y="316" text-anchor="middle" class="t-xs t-muted">160</text>
+<text x="232" y="51" text-anchor="end" class="t-xs">Faulty GPU</text>
+<rect x="240" y="38" width="388.5" height="16" rx="3" class="f-red"/>
+<text x="634.5" y="51" text-anchor="start" class="t-xs t-bold">148</text>
+<text x="232" y="73" text-anchor="end" class="t-xs">GPU HBM3 memory</text>
+<rect x="240" y="60" width="189" height="16" rx="3" class="f-red"/>
+<text x="435" y="73" text-anchor="start" class="t-xs t-bold">72</text>
+<text x="232" y="95" text-anchor="end" class="t-xs">Software bug</text>
+<rect x="240" y="82" width="141.75" height="16" rx="3" class="f-blue"/>
+<text x="387.75" y="95" text-anchor="start" class="t-xs t-bold">54</text>
+<text x="232" y="117" text-anchor="end" class="t-xs">Network switch/cable</text>
+<rect x="240" y="104" width="91.875" height="16" rx="3" class="f-orange"/>
+<text x="337.875" y="117" text-anchor="start" class="t-xs t-bold">35</text>
+<text x="232" y="139" text-anchor="end" class="t-xs">Host maintenance</text>
+<rect x="240" y="126" width="84" height="16" rx="3" class="f-orange"/>
+<text x="330" y="139" text-anchor="start" class="t-xs t-bold">32</text>
+<text x="232" y="161" text-anchor="end" class="t-xs">GPU SRAM memory</text>
+<rect x="240" y="148" width="49.875" height="16" rx="3" class="f-red"/>
+<text x="295.875" y="161" text-anchor="start" class="t-xs t-bold">19</text>
+<text x="232" y="183" text-anchor="end" class="t-xs">GPU system processor</text>
+<rect x="240" y="170" width="44.625" height="16" rx="3" class="f-red"/>
+<text x="290.625" y="183" text-anchor="start" class="t-xs t-bold">17</text>
+<text x="232" y="205" text-anchor="end" class="t-xs">NIC</text>
+<rect x="240" y="192" width="18.375" height="16" rx="3" class="f-orange"/>
+<text x="264.375" y="205" text-anchor="start" class="t-xs t-bold">7</text>
+<text x="232" y="227" text-anchor="end" class="t-xs">NCCL watchdog timeouts</text>
+<rect x="240" y="214" width="18.375" height="16" rx="3" class="f-orange"/>
+<text x="264.375" y="227" text-anchor="start" class="t-xs t-bold">7</text>
+<text x="232" y="249" text-anchor="end" class="t-xs">Silent data corruption</text>
+<rect x="240" y="236" width="15.75" height="16" rx="3" class="f-red"/>
+<text x="261.75" y="249" text-anchor="start" class="t-xs t-bold">6</text>
+<text x="232" y="271" text-anchor="end" class="t-xs">GPU thermal interface</text>
+<rect x="240" y="258" width="15.75" height="16" rx="3" class="f-red"/>
+<text x="261.75" y="271" text-anchor="start" class="t-xs t-bold">6</text>
+<text x="232" y="293" text-anchor="end" class="t-xs">All other (SSD, power, chassis, ...)</text>
+<rect x="240" y="280" width="42" height="16" rx="3" class="f-orange"/>
+<text x="288" y="293" text-anchor="start" class="t-xs t-bold">16</text>
+
+  </svg>
+  <figcaption><strong>Most interruptions are hardware.</strong> Counts from Table 5 of the paper (red: GPU components; blue: software; orange: other). The 16 in the last bar is my sum of the seven rarest rows (SSD, power supply, chassis, IO board, dependency, CPU, memory: 3, 3, 2, 2, 2, 2, 2).</figcaption>
+</figure>
+<h3>A table that does not add up</h3>
+<p>Because every number in a case study should be checkable, I recomputed Table 5. The counts sum to 419, as they should. But the percentage printed for "Faulty GPU" is 30.1%, whereas 148/419 is 35.3%, and the printed percentages sum to 94.9%, not 100%. The paper's text says GPU issues were 58.7% of unexpected issues, which matches the sum of the <em>printed</em> GPU percentages, not the sum of the GPU <em>counts</em> (268 of 419, or 64.0%). One of the two numbers in that row has a slip. The counts sum exactly to 419, and with 35.3% in that row the percentages would sum to 100%, which suggests the printed 30.1% (and the 58.7% that follows from it) is the slip; but I cannot confirm that from the paper alone. Nothing in the argument depends on it: on either reading, GPU faults are by far the largest category, and hardware dominates. But it is a good reminder to compute totals when you copy numbers from a paper into a design.</p>
+
+<h2>What kept the run on track</h2>
+<ul>
+  <li><strong>Automation first.</strong> Only three of the interruptions needed significant manual intervention. At one interruption every 3 hours or so, nobody can be paged for each.</li>
+  <li><strong>Shorter startup and checkpointing.</strong> The paper says the team "reduced job startup and checkpointing time" and increased checkpoint frequency to reduce lost work after a recovery, which is the storage fabric's job to support.</li>
+  <li><strong>Fast diagnosis.</strong> The team uses PyTorch's NCCL flight recorder, which records collective-communication metadata and stack traces in a ring buffer and dumps them automatically on a watchdog or heartbeat timeout. Heavier tracing can be switched on live without a code release or restart.</li>
+  <li><strong>Co-designed communication library.</strong> The team's NCCL fork, NCCLX, exposes its internal state to PyTorch to detect and localise failures faster and to time out automatically when an NVLink stall leaves a kernel hanging without an error code.</li>
+  <li><strong>Straggler hunting.</strong> "Even a single straggler can slow down thousands of other GPUs", often looking like a working but slow collective. Tools rank suspicious communications from selected process groups, and investigating a few top suspects usually finds the culprit.</li>
+  <li><strong>Environmental effects.</strong> The paper reports a 1 to 2% diurnal throughput variation, which it attributes to higher mid-day temperatures affecting GPU voltage and frequency scaling, and power swings of tens of megawatts when tens of thousands of GPUs start or stop together, which it calls an ongoing challenge.</li>
+</ul>
+
+<h2>Checking the arithmetic: what does "more than 90%" demand?</h2>
+<p>Meta publishes the failure rate and the efficiency target but not the restart or checkpoint costs, so a back-of-envelope model shows what must be true. The script below (mine) does three things. It recomputes Table 5. It derives how long each interruption may cost on average if the run is to stay above 90% effective time. And it simulates a 54-day run with failures arriving at random at the paper's observed rate, comparing checkpoint intervals under two assumed sets of costs. The first assumes a 10-minute restart and a 30-second checkpoint pause; the second a 3-minute restart and a 5-second pause. Both are my assumptions, not Meta's.</p>
+<pre class="terminal" data-title="reliability_model.py"><code>"""Llama 3 405B interruption statistics (Table 5 and section 3.3.4 of the paper), recomputed, plus a simple restart model."""
+import math, random
+T5 = [("Faulty GPU",148,30.1),("GPU HBM3 Memory",72,17.2),("Software Bug",54,12.9),("Network Switch/Cable",35,8.4),
+      ("Host Maintenance",32,7.6),("GPU SRAM Memory",19,4.5),("GPU System Processor",17,4.1),("NIC",7,1.7),
+      ("NCCL Watchdog Timeouts",7,1.7),("Silent Data Corruption",6,1.4),("GPU Thermal Interface + Sensor",6,1.4),
+      ("SSD",3,0.7),("Power Supply",3,0.7),("Server Chassis",2,0.5),("IO Expansion Board",2,0.5),("Dependency",2,0.5),
+      ("CPU",2,0.5),("System Memory",2,0.5)]
+total = sum(c for _, c, _ in T5)
+print("sum of counts:", total, "| sum of printed percentages:", round(sum(p for *_, p in T5), 1))
+print("rows where count/419 differs from the printed % by more than 0.3 points:")
+for n, c, p in T5:
+    if abs(100 * c / 419 - p) &gt; 0.3: print(f"  {n}: {c}/419 = {100*c/419:.1f}% but table prints {p}%")
+gpu = [r for r in T5 if r[0] in ("Faulty GPU","GPU HBM3 Memory","GPU SRAM Memory","GPU System Processor","Silent Data Corruption","GPU Thermal Interface + Sensor")]
+print(f"GPU rows by counts: {sum(c for _,c,_ in gpu)}/419 = {100*sum(c for _,c,_ in gpu)/419:.1f}%  | by printed %: {sum(p for *_,p in gpu):.1f}%  (text says 58.7%)")
+
+days, total_int, planned = 54, 466, 47
+print(f"\n{total_int} interruptions in {days} days = {total_int/days:.1f} a day = one every {24*days/total_int:.1f} hours")
+print(f"unexpected only: {419/days:.1f} a day, one every {24*days/419:.1f} hours")
+budget_h = 0.10 * days * 24
+print(f"10% of {days} days = {budget_h:.0f} hours, so for &gt;90% effective time each interruption may cost {60*budget_h/total_int:.1f} minutes on average")
+per_gpu_day = 419 / (16384 * days)
+print(f"as a per-GPU rate: {per_gpu_day:.2e} unexpected interruptions per GPU-day (all causes, assuming 16,384 GPUs were in use throughout)")
+for n in (1024, 16384):
+    print(f"  a {n:5d}-GPU job at that rate: one unexpected interruption every {24/(per_gpu_day*n):.1f} hours")
+
+# Simple model: failures arrive at random (Poisson) at the observed total rate; each costs restart R plus work since last checkpoint.
+def effective(T_min, C_s=30, R_min=10, seed=0, horizon_days=54):
+    rng = random.Random(seed); rate = total_int / (days * 24 * 60)          # per minute
+    t, work, lost = 0.0, 0.0, 0.0; H = horizon_days * 24 * 60
+    since_ckpt = 0.0; next_fail = rng.expovariate(rate)
+    while t &lt; H:
+        step = min(T_min - since_ckpt, next_fail - t, H - t)
+        t += step; work += step; since_ckpt += step
+        if t &gt;= H: break
+        if abs(t - next_fail) &lt; 1e-9:                                        # failure: lose un-checkpointed work, pay restart
+            work -= since_ckpt; lost += since_ckpt + R_min; t += R_min; since_ckpt = 0.0
+            next_fail = t + rng.expovariate(rate)
+        else:                                                                  # checkpoint: pay pause C
+            t += C_s / 60; since_ckpt = 0.0
+    return work / H
+print("\nmodel (assumptions: restart 10 min, checkpoint pause 30 s, failures at the observed rate):")
+for T in (5, 10, 15, 30, 60, 180):
+    print(f"  checkpoint every {T:3d} min -&gt; useful fraction {effective(T):.3f}")
+print("\nwhat it takes to pass 90% (assumed: restart 3 min, checkpoint pause 5 s):")
+for T in (5, 10, 15, 30, 60, 180):
+    print(f"  checkpoint every {T:3d} min -&gt; useful fraction {effective(T, C_s=5, R_min=3):.3f}")</code></pre>
+<p>Output when run:</p>
+<pre class="terminal" data-title="output"><code>sum of counts: 419 | sum of printed percentages: 94.9
+rows where count/419 differs from the printed % by more than 0.3 points:
+  Faulty GPU: 148/419 = 35.3% but table prints 30.1%
+GPU rows by counts: 268/419 = 64.0%  | by printed %: 58.7%  (text says 58.7%)
+
+466 interruptions in 54 days = 8.6 a day = one every 2.8 hours
+unexpected only: 7.8 a day, one every 3.1 hours
+10% of 54 days = 130 hours, so for &gt;90% effective time each interruption may cost 16.7 minutes on average
+as a per-GPU rate: 4.74e-04 unexpected interruptions per GPU-day (all causes, assuming 16,384 GPUs were in use throughout)
+  a  1024-GPU job at that rate: one unexpected interruption every 49.5 hours
+  a 16384-GPU job at that rate: one unexpected interruption every 3.1 hours
+
+model (assumptions: restart 10 min, checkpoint pause 30 s, failures at the observed rate):
+  checkpoint every   5 min -&gt; useful fraction 0.848
+  checkpoint every  10 min -&gt; useful fraction 0.877
+  checkpoint every  15 min -&gt; useful fraction 0.878
+  checkpoint every  30 min -&gt; useful fraction 0.851
+  checkpoint every  60 min -&gt; useful fraction 0.786
+  checkpoint every 180 min -&gt; useful fraction 0.536
+
+what it takes to pass 90% (assumed: restart 3 min, checkpoint pause 5 s):
+  checkpoint every   5 min -&gt; useful fraction 0.953
+  checkpoint every  10 min -&gt; useful fraction 0.945
+  checkpoint every  15 min -&gt; useful fraction 0.935
+  checkpoint every  30 min -&gt; useful fraction 0.895
+  checkpoint every  60 min -&gt; useful fraction 0.819
+  checkpoint every 180 min -&gt; useful fraction 0.549</code></pre>
+<figure class="diagram">
+  <svg viewBox="0 0 760 318" role="img" aria-label="Line chart with two series of useful-time fraction against checkpoint interval from 5 to 180 minutes. With a 10 minute restart and 30 second checkpoint pause the best value is about 0.88; with a 3 minute restart and 5 second pause it peaks near 0.95 and falls to about 0.82 at a 60 minute interval.">
+<defs><marker id="ahLT-C3c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs><text x="395" y="20" text-anchor="middle" class="t-sm t-bold">Useful fraction of time vs checkpoint interval (my simulation)</text>
+<line x1="90" y1="190" x2="700" y2="190" class="line-thin"/>
+<text x="82" y="194" text-anchor="end" class="t-xs t-muted">0.5</text>
+<line x1="90" y1="160" x2="700" y2="160" class="line-thin"/>
+<text x="82" y="164" text-anchor="end" class="t-xs t-muted">0.6</text>
+<line x1="90" y1="130" x2="700" y2="130" class="line-thin"/>
+<text x="82" y="134" text-anchor="end" class="t-xs t-muted">0.7</text>
+<line x1="90" y1="100" x2="700" y2="100" class="line-thin"/>
+<text x="82" y="104" text-anchor="end" class="t-xs t-muted">0.8</text>
+<line x1="90" y1="70" x2="700" y2="70" class="line-dash"/>
+<text x="82" y="74" text-anchor="end" class="t-xs t-muted">0.9</text>
+<line x1="90" y1="40" x2="700" y2="40" class="line-thin"/>
+<text x="82" y="44" text-anchor="end" class="t-xs t-muted">1.0</text>
+<text x="120" y="238" text-anchor="middle" class="t-xs t-muted">5</text>
+<text x="230" y="238" text-anchor="middle" class="t-xs t-muted">10</text>
+<text x="340" y="238" text-anchor="middle" class="t-xs t-muted">15</text>
+<text x="450" y="238" text-anchor="middle" class="t-xs t-muted">30</text>
+<text x="560" y="238" text-anchor="middle" class="t-xs t-muted">60</text>
+<text x="670" y="238" text-anchor="middle" class="t-xs t-muted">180</text>
+<text x="395" y="258" text-anchor="middle" class="t-xs">checkpoint every N minutes (categories, not to scale)</text>
+<path d="M120,85.6 L230,76.9 L340,76.6 L450,84.7 L560,104.2 L670,179.2" fill="none" class="s-red sw-2"/>
+<circle cx="120" cy="85.6" r="4" class="f-red"/>
+<circle cx="230" cy="76.9" r="4" class="f-red"/>
+<circle cx="340" cy="76.6" r="4" class="f-red"/>
+<circle cx="450" cy="84.7" r="4" class="f-red"/>
+<circle cx="560" cy="104.2" r="4" class="f-red"/>
+<circle cx="670" cy="179.2" r="4" class="f-red"/>
+<path d="M120,54.1 L230,56.5 L340,59.5 L450,71.5 L560,94.3 L670,175.3" fill="none" class="s-green sw-2"/>
+<circle cx="120" cy="54.1" r="4" class="f-green"/>
+<circle cx="230" cy="56.5" r="4" class="f-green"/>
+<circle cx="340" cy="59.5" r="4" class="f-green"/>
+<circle cx="450" cy="71.5" r="4" class="f-green"/>
+<circle cx="560" cy="94.3" r="4" class="f-green"/>
+<circle cx="670" cy="175.3" r="4" class="f-green"/>
+<text x="696" y="64" text-anchor="end" class="t-xs t-faint">90 percent (paper: more than 90)</text>
+<rect x="110" y="270" width="230" height="38" rx="8" class="fs-red s-red sw-2"/>
+<text x="225" y="285" text-anchor="middle" class="t-xs t-bold">restart 10 min, pause 30 s</text>
+<text x="225" y="301" text-anchor="middle" class="t-xs">never reaches 90 percent</text>
+<rect x="380" y="270" width="230" height="38" rx="8" class="fs-green s-green sw-2"/>
+<text x="495" y="285" text-anchor="middle" class="t-xs t-bold">restart 3 min, pause 5 s</text>
+<text x="495" y="301" text-anchor="middle" class="t-xs">peaks near 95 percent</text>
+
+  </svg>
+  <figcaption><strong>Cheap restarts and cheap checkpoints are what buy the last ten points.</strong> This is my own simulation (assumed restart and pause costs, failures at the paper's observed rate of 466 interruptions in 54 days, one seeded run); Meta does not publish these parameters.</figcaption>
+</figure>
+<p>Reading the output. (1) At 466 interruptions in 54 days, interruptions arrive about every 2.8 hours; to stay above 90%, each can cost only about 16.7 minutes on average, covering detection, scheduling, restart, reloading the checkpoint and re-doing the work since the last save. (2) With a slow recovery path (10-minute restart, 30-second pause) no checkpoint interval reaches 90%; the best is about 0.88 at a 10 to 15 minute interval. Only when restarts and checkpoint pauses are cheap does the curve rise above 0.9, peaking near 0.95 with checkpoints every 5 minutes. That is consistent with the paper's emphasis on shortening startup and checkpoint time rather than on preventing faults, though it does not show what Meta's actual costs were. (3) The last few lines scale the observed failure rate with job size: about one unexpected interruption every 3.1 hours at 16,384 GPUs, but only every 49.5 hours at 1,024 GPUs, which is why a failure feels rare in a small lab and routine in a big one.</p>
+<p>How does that compare with independent numbers? Kokolis et al. (2025) studied two Meta research clusters of A100 GPUs over 11 months (about 4 million jobs and over 150 million GPU-hours). They report a mean time to failure of 7.9 hours for 1,024-GPU jobs, and project 1.8 hours for 16,384-GPU jobs. Their projection is close to the 3.1 hours I derived from Llama 3's table; their 1,024-GPU figure is much lower than my 49.5 hours. The two differ in hardware generation, workload (a shared research cluster with many users, where user-program errors count as failures) and definition of failure, so the comparison supports only "the same order of magnitude, shrinking as one over the number of GPUs" and not precise agreement.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Checkpoint-and-resume is the idea behind replaying a log from the last committed offset (<a href="../../distributed/chapters/17-logs-exactly-once.html">logs and exactly-once processing</a>), and the arithmetic is that of <a href="../../reliability/chapters/01-availability-math.html">availability maths</a>: when a component fails every few hours, recovery speed (the MTTR term) matters more than prevention. Watchdog timeouts and the flight recorder are the observability side (<a href="../../reliability/chapters/06-tracing.html">tracing</a>); stragglers are the tail-latency problem of <a href="../../reliability/chapters/09-tail-latency.html">tail latency at scale</a>, with a synchronous all-reduce as the fan-out that makes the slowest worker the one that counts. The power-grid effect is a reminder that a data centre is a shared dependency.</p>
+</div>
+
+<h2>What the paper does not say, and what to be careful about</h2>
+<ul>
+  <li><strong>It is a snapshot.</strong> The statistics cover 54 days. The paper does not say how the rest of the run compared, and the 78% hardware share and the single GPU table row mentioned above come from one window on one cluster.</li>
+  <li><strong>Definitions matter.</strong> "Effective training time" counts time spent on useful training. The paper does not publish the breakdown between restarts, lost work and slow periods, so I cannot say how much of the remaining 10% each takes.</li>
+  <li><strong>Suspected, not confirmed.</strong> The 78% is "confirmed or suspected" hardware; silent data corruption and unplanned host maintenance are counted as suspected hardware issues.</li>
+  <li><strong>No cost figure.</strong> The paper reports GPUs, FLOPs and tokens, not dollars or GPU-hours spent, so I do not give one.</li>
+</ul>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a relay team that must all start together</p>
+  <p>Imagine sixteen thousand runners tied together so that nobody can move until everybody has taken the same step. If one stumbles, the team stops. You cannot stop runners stumbling, but you can make stumbling cheap: mark the course with frequent save points, keep a medic at every stretch who can name the runner who tripped within a minute, and have the team restart automatically from the last mark.</p>
+  <p><em>Where it breaks down:</em> real runners do not usually fail in ways that look like a slow jog instead of a fall. A straggler or a silently wrong result is harder to see than a stop, which is why the paper spends time on detection tools rather than only on restarts.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>These numbers describe a specific run on H100 hardware in 2024, as reported in a paper last revised in 2024. Failure rates depend on hardware generation, cooling, software versions and what counts as an interruption. Use the structure (planned versus unplanned interruptions, a root-cause table, effective-training-time as the headline metric) in your own work, but do not transfer the percentages to a different cluster. I have not checked what later Llama releases or other labs have reported about their own runs.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Llama 3 405B (15.6T tokens, 3.8 &times; 10<sup>25</sup> FLOPs) trained on up to 16K H100 GPUs; the paper's 54-day snapshot has 466 interruptions, 419 of them unexpected, and "higher than 90%" effective training time.</li>
+    <li>About 78% of unexpected interruptions were confirmed or suspected hardware faults, GPUs being the largest group; only three needed significant manual intervention.</li>
+    <li>At about one interruption every 2.8 hours, each one may cost only about 16.7 minutes on average if you want to stay above 90%: reliability comes from cheap recovery.</li>
+    <li>The tools named: automated recovery, faster startup and checkpoints, the NCCL flight recorder, NCCLX failure detection, and straggler tracing.</li>
+    <li>Recompute tables you quote: Table 5's printed percentages and counts disagree in the Faulty GPU row.</li>
+    <li>Independent Meta data on A100 clusters (Kokolis et al.) shows MTTF falling roughly in proportion to GPU count: 7.9 hours at 1,024 GPUs, a projected 1.8 hours at 16,384.</li>
+  </ul>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In the script, change the restart cost to 5 minutes and the checkpoint pause to 20 seconds. Which checkpoint interval is best now, and does the run clear 90%? Then double the failure rate (as if running on 32K GPUs of the same quality) and find what restart cost keeps the useful fraction above 0.9. Compare the shape with the Young optimum in <a href="../chapters/05-long-runs.html">chapter 5</a>.</p>
+</div>
+
+<h2>Connect it</h2>
+<div class="callout ds">
+  <p class="callout-title">Connections</p>
+  <ul>
+    <li><a href="../chapters/05-long-runs.html">Checkpoints, failures and long runs</a>: the chapter this case grounds in numbers.</li>
+    <li><a href="../chapters/03-parallelism.html">Parallel training</a>: TP, PP, CP and DP, and why their order follows the network.</li>
+    <li><a href="../chapters/02-gpu-memory.html">GPU memory and why training runs out of it</a>: why checkpoints are gigabytes per GPU.</li>
+    <li><a href="../../systems/chapters/21-parallelism-gpus.html">Parallelism, SIMD and GPUs</a> and <a href="../../systems/chapters/22-performance-engineering.html">performance engineering</a>: where utilisation numbers like MFU come from.</li>
+    <li><a href="../../reliability/chapters/17-postmortems.html">Postmortems</a>: the habit of classifying every interruption by root cause.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">The paper reports 466 interruptions in 54 days. Roughly how much may each interruption cost, on average, if the run is to keep more than 90% effective training time?</p>
+    <ol class="q-options">
+      <li>About 2 minutes</li>
+      <li>About 17 minutes</li>
+      <li>About 2.8 hours</li>
+      <li>About 8 hours</li>
+    </ol>
+    <div class="q-explain">10% of 54 days is about 130 hours; divided over 466 interruptions that is about 16.7 minutes each, including detection, restart and re-done work. 2.8 hours is the average gap between interruptions, not the budget per interruption.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why does the paper order the parallelism dimensions [TP, CP, PP, DP] from innermost to outermost?</p>
+    <ol class="q-options">
+      <li>The innermost needs the highest bandwidth and lowest latency, so it stays within a server; the outermost tolerates a multi-hop network</li>
+      <li>Alphabetical order makes the code simpler</li>
+      <li>Data parallelism is the most memory-hungry, so it goes last</li>
+      <li>Tensor parallelism has the fewest messages, so it goes first</li>
+    </ol>
+    <div class="q-explain">Tensor parallelism exchanges activations inside every layer, so it needs NVLink-class bandwidth. FSDP data parallelism can prefetch and overlap communication, so it tolerates the slower top of the network.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">In the simulation, with a 10-minute restart and 30-second checkpoint pause, no checkpoint interval reaches 90% useful time, but with a 3-minute restart and 5-second pause some do. What does that suggest about how Meta reached "more than 90%"?</p>
+    <ol class="q-options">
+      <li>Meta must have prevented most hardware faults</li>
+      <li>Meta must have checkpointed once a day</li>
+      <li>The simulation proves Meta's restart takes exactly 3 minutes</li>
+      <li>Recovery had to be cheap (fast restart and checkpoints), consistent with the paper's emphasis; the costs themselves are my assumptions</li>
+    </ol>
+    <div class="q-explain">The failure rate is given by the paper, but restart and checkpoint costs are not. The model shows that high efficiency requires cheap recovery, and the paper states that the team reduced startup and checkpointing time. It does not show the actual costs.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">The failure table's counts sum to 419 but the printed percentages sum to 94.9% and the Faulty GPU row does not match 148/419. What is the right way to use the table?</p>
+    <ol class="q-options">
+      <li>Discard the whole paper as unreliable</li>
+      <li>Trust the percentages and ignore the counts</li>
+      <li>Report the discrepancy, note the conclusion (hardware, especially GPUs, dominates) holds on either reading, and avoid quoting the row's exact share</li>
+      <li>Silently correct the percentage to 35.3% and cite the paper</li>
+    </ol>
+    <div class="q-explain">The paper does not say which number is wrong, so quoting a corrected value as Meta's would misattribute. The broad finding is unaffected, so there is no reason to discard the paper, which is why the honest course is to flag the discrepancy.</div>
+  </div>
+</section>
+
+<h2>Sources</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Llama Team, AI @ Meta, "The Llama 3 Herd of Models" (arXiv 2407.21783, July 2024)</a>. Fetched and read, mainly section 3. Source of the hardware, topology, storage, Table 4 (parallelism and MFU), Table 5 (interruptions), section 3.3.4 (reliability), the batch-size schedule and the model size, token and FLOP figures.</li>
+  <li><a href="https://arxiv.org/abs/2410.21680" target="_blank" rel="noopener">Kokolis et al., "Revisiting Reliability in Large-Scale Machine Learning Research Clusters" (arXiv 2410.21680, October 2024, revised February 2025; HPCA 2025)</a>. Fetched; abstract and the mean-time-to-failure passages read, not the whole paper. Source of the 7.9-hour and 1.8-hour MTTF figures and the description of the A100 clusters.</li>
+  <li>The reliability script, the simulation, the figures and the analogy are my own. Restart and checkpoint costs in the simulation are assumptions, not Meta's figures.</li>
+</ul>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,917 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attention from First Principles · Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/dl09-attention.css">
+</head>
+<body data-root="../.." data-course="dl" data-chapter="09">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Attention from First Principles</h1>
+  <p class="lede">Every large language model is, at its core, a stack of one idea: let each position in a sequence look at the other positions and take a weighted average of what it finds there. This chapter builds that operation from a dictionary lookup, derives each factor in the formula softmax(QK<sup>T</sup>/&radic;d<sub>k</sub>)V, adds the mask that makes it usable for generation, and then multiplies it into several heads. Everything is run in NumPy, shape by shape.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Attention is the mechanism that lets a model use context. When a chat model resolves "it" to the right noun three paragraphs back, copies an identifier from your prompt into its answer, or follows a format you showed it once, attention heads are moving information between positions. It is also the part of a Transformer whose cost grows with the square of the sequence length, so it decides context-window limits, memory use and a large share of serving cost (chapters 16 and 19, and the KV cache in <a href="../../llm-training/chapters/18-kv-cache.html">A3 chapter 18</a>). After this chapter you can write scaled dot-product attention with a causal mask and multiple heads from memory, say what every tensor shape means, explain why the &radic;d<sub>k</sub> is there, and spot the common bugs: a mask applied after the softmax, a mask that leaks the future, a row that is masked entirely and returns NaN. Chapter 10 puts this operation into a full Transformer block, and chapter 12 trains a small GPT built from it.</p>
+</div>
+
+<h2>The problem attention solves</h2>
+
+<p>A language model must predict a token from the tokens before it, and the useful evidence can be anywhere. In "The trophy did not fit in the suitcase because <em>it</em> was too big", what "it" refers to depends on a word eight positions back. In a Python file, the right closing bracket depends on an opening bracket that may be hundreds of tokens earlier. Whatever the architecture, it needs a way to <em>route</em> information from the position that has it to the position that needs it.</p>
+
+<p>Chapter 08 showed the recurrent answer: read the tokens one at a time and squeeze everything seen so far into a single hidden state vector. That state is a bottleneck. Information from early tokens must survive many updates, gradients must travel back through every step, and the computation is sequential, so a GPU cannot process the tokens of a sequence in parallel during training. Bahdanau, Cho and Bengio ("Neural Machine Translation by Jointly Learning to Align and Translate", 2014) made the first big change inside a recurrent translator: instead of forcing the decoder to rely on one summary vector of the source sentence, let it <em>look back</em> at all the encoder's states and take a weighted average, with weights it computes itself at each output step. They called this soft alignment, and it is the origin of the word attention in deep learning.</p>
+
+<p>Vaswani et al. ("Attention Is All You Need", 2017) then asked whether the recurrence was needed at all. Their answer was an architecture that uses only attention (plus position-wise networks, chapter 10) to route information, which removes the sequential dependency: every position can compute its attention output at the same time. The case study <a href="../cases/case-02-transformer.html">Attention Is All You Need</a> reads that paper closely. Here we build the operation itself.</p>
+
+<h2>A soft dictionary</h2>
+
+<p>Start with something familiar. A Python dictionary maps keys to values: <code>d["currency"]</code> finds the entry whose key equals the query and returns its value. It is a <em>hard</em> lookup: exactly one entry matches, or none does. Attention generalises this in two ways. The match is graded rather than exact, so every key receives a <span class="term">score</span> saying how well it fits the query. And the answer is a blend: the scores become weights that sum to one, and the result is the weighted average of all the values.</p>
+
+<p>The three roles get names. The <span class="term">query</span> is the vector that asks the question. A <span class="term">key</span> is a vector attached to each item that advertises what the item is about. A <span class="term">value</span> is the vector attached to each item that is handed over if the item is selected. The score of a key for a query is their dot product, the similarity measure of <a href="../../ml-foundations/chapters/05-vectors-similarity.html">A0 chapter 05</a>: large and positive when the vectors point the same way. The weights come from a <span class="term">softmax</span>, which turns any list of real numbers into positive weights summing to one (and which must be computed stably, as <a href="../../ml-foundations/chapters/11-numerics.html">A0 chapter 11</a> explains):</p>
+<p style="text-align:center">weights<sub>j</sub> = exp(s<sub>j</sub>) / &sum;<sub>m</sub> exp(s<sub>m</sub>), &nbsp;&nbsp; output = &sum;<sub>j</sub> weights<sub>j</sub> &middot; value<sub>j</sub>.</p>
+
+<p>The script below stores three items under unit-vector keys and queries it with a vector that matches the second key exactly. A multiplier &beta; applied to the scores (think of it as 1 over a temperature) controls how sharp the lookup is.</p>
+
+<pre class="terminal" data-title="lookup.py"><code>import numpy as np
+np.set_printoptions(precision=3, suppress=True)
+
+# a tiny table: three keys (unit vectors) and the value stored under each
+keys   = np.eye(3)                           # "capital", "currency", "language"
+values = np.array([[10., 0.], [0., 10.], [5., 5.]])
+q = np.array([0.0, 1.0, 0.0])                # a query that matches the second key exactly
+
+def softmax(a):
+    e = np.exp(a - a.max()); return e / e.sum()
+
+print("hard lookup (argmax):", values[np.argmax(keys @ q)])
+for beta in (0.5, 2, 8):                     # beta plays the role of 1/temperature
+    w = softmax(beta * keys @ q)
+    print(f"beta={beta:&lt;3} weights={w}  result={w @ values}")
+
+# a query halfway between two keys
+q2 = np.array([0.7, 0.7, 0.0])
+w = softmax(8 * keys @ q2)
+print("blended query, beta=8:", w, "-&gt;", w @ values)</code></pre>
+<pre class="terminal" data-title="output"><code>hard lookup (argmax): [ 0. 10.]
+beta=0.5 weights=[0.274 0.452 0.274]  result=[4.111 5.889]
+beta=2   weights=[0.107 0.787 0.107]  result=[1.598 8.402]
+beta=8   weights=[0.    0.999 0.   ]  result=[0.005 9.995]
+blended query, beta=8: [0.499 0.499 0.002] -&gt; [5. 5.]</code></pre>
+
+<p>With &beta; = 0.5 the result is a vague mixture of everything; with &beta; = 8 it is almost exactly the stored value of the best match, (0, 10), so the soft lookup has become the hard one. A query halfway between two keys returns the average of their two values, (5, 5). This is the whole behaviour of attention: <strong>a lookup whose sharpness and target are both learned</strong>, differentiable everywhere, so that gradient descent can tune what is asked, what is advertised and what is handed over.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: asking a room of experts</p>
+  <p>Picture a meeting where each person wears a badge listing their specialities (the key) and has notes prepared (the value). You stand up with a question (the query). People whose badges fit your question wave their notes the hardest; you listen to everyone at once, weighting each by how hard they wave, and walk away with a blend of what they said. Different questions make different people wave.</p>
+  <p><em>Where it breaks down:</em> real keys and queries are learned vectors of dozens or hundreds of numbers with no human-readable meaning, and the badge and the notes are produced from the same underlying person by two different learned maps. Also, in a Transformer everyone in the room asks a question at the same moment, and the room has many parallel meetings (the heads) at once.</p>
+</div>
+
+<div class="widget" id="dl09-attention">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Steer a soft lookup</h4></div>
+  <p class="widget-help">Six tokens have keys placed in the plane (blue dots, bigger when they receive more weight); the value of each token is its own position. The orange arrow is the query. Rotate it, then raise "sharpness" to turn the soft lookup into a hard one. Tick the causal mask to hide every token after the chosen position, as in a language model.</p>
+  <div class="dl09-ctl">
+    <div><label for="dl09-angle">Query direction: <output data-act="angle-out">60&deg;</output></label><input id="dl09-angle" data-act="angle" type="range" min="0" max="359" step="1" value="60"></div>
+    <div><label for="dl09-beta">Sharpness &beta;: <output data-act="beta-out">1.00</output></label><input id="dl09-beta" data-act="beta" type="range" min="-1" max="1.6" step="0.02" value="0"></div>
+    <div><label for="dl09-pos">Query is at position</label>
+      <select id="dl09-pos" data-act="pos"><option value="0">1 (the)</option><option value="1">2 (cat)</option><option value="2">3 (sat)</option><option value="3">4 (on)</option><option value="4">5 (the)</option><option value="5" selected>6 (mat)</option></select></div>
+  </div>
+  <div class="dl09-checks"><label><input type="checkbox" data-act="mask"> Causal mask (hide tokens after the query's position)</label></div>
+  <svg class="dl09-chart" viewBox="0 0 700 270" role="img" aria-label="Left: six key points in a plane with an orange query arrow and a yellow output point. Right: bars showing the attention weight of the query on each of the six tokens."></svg>
+  <div class="widget-out dl09-summary" aria-live="polite"></div>
+</div>
+
+<h2>Queries, keys and values from the same tokens</h2>
+
+<p>In a Transformer the queries, keys and values are not given: they are computed from the sequence itself. This is called <span class="term">self-attention</span>. The input is the matrix <b>x</b> of shape (T, C) for one sequence, where T is the number of tokens and C (also written d<sub>model</sub>) is the width of each token's vector, the notation of this course. Three learned weight matrices project it:</p>
+<p style="text-align:center">Q = x W<sub>Q</sub>, &nbsp; K = x W<sub>K</sub>, &nbsp; V = x W<sub>V</sub>, &nbsp;&nbsp; with W<sub>Q</sub>, W<sub>K</sub> of shape (C, d<sub>k</sub>) and W<sub>V</sub> of shape (C, d<sub>v</sub>).</p>
+<p>Row i of Q is the query of token i, row j of K is the key of token j, and row j of V is its value. With a batch dimension everything gains a leading B: x is (B, T, C) and Q, K, V are (B, T, d<sub>k</sub>). The core is then two matrix products and a softmax:</p>
+<p style="text-align:center">Attention(Q, K, V) = softmax( Q K<sup>T</sup> / &radic;d<sub>k</sub> ) V.</p>
+<p>Q K<sup>T</sup> has shape (T, d<sub>k</sub>) &times; (d<sub>k</sub>, T) = (T, T). Entry (i, j) is the dot product of query i with key j: how strongly token i wants to read from token j. The softmax is taken <em>along each row</em>, so row i becomes a probability distribution over the T positions that token i may read. Multiplying by V, shape (T, d<sub>v</sub>), forms for every token a weighted average of all value vectors, giving an output of shape (T, d<sub>v</sub>). One matrix product scores all T&sup2; pairs at once; this is why attention maps so well onto GPUs.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 900 250" role="img" aria-label="Data flow of scaled dot-product attention. The input x of shape B,T,C is multiplied by three weight matrices to give Q, K and V. Q and K produce the score matrix of shape B,T,T after dividing by root d_k. A mask and softmax turn it into weights P. P multiplied by V gives the output of shape B,T,d_k.">
+    <defs><marker id="ahDL09a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="10" y="95" width="90" height="56" rx="8" class="fs-green s-green sw-2"/>
+    <text x="55" y="120" text-anchor="middle" class="t-sm t-bold">x</text>
+    <text x="55" y="138" text-anchor="middle" class="t-xs">(B, T, C)</text>
+    <rect x="130" y="20" width="90" height="40" rx="8" class="fs-blue s-blue sw-2"/><text x="175" y="45" text-anchor="middle" class="t-sm t-bold">W_Q</text>
+    <rect x="130" y="100" width="90" height="40" rx="8" class="fs-blue s-blue sw-2"/><text x="175" y="125" text-anchor="middle" class="t-sm t-bold">W_K</text>
+    <rect x="130" y="180" width="90" height="40" rx="8" class="fs-blue s-blue sw-2"/><text x="175" y="205" text-anchor="middle" class="t-sm t-bold">W_V</text>
+    <line x1="100" y1="115" x2="128" y2="42" class="line" marker-end="url(#ahDL09a)"/>
+    <line x1="100" y1="123" x2="128" y2="120" class="line" marker-end="url(#ahDL09a)"/>
+    <line x1="100" y1="131" x2="128" y2="200" class="line" marker-end="url(#ahDL09a)"/>
+    <rect x="250" y="20" width="100" height="40" rx="8" class="box"/><text x="300" y="38" text-anchor="middle" class="t-sm t-bold">Q</text><text x="300" y="53" text-anchor="middle" class="t-xs">(B, T, d_k)</text>
+    <rect x="250" y="100" width="100" height="40" rx="8" class="box"/><text x="300" y="118" text-anchor="middle" class="t-sm t-bold">K</text><text x="300" y="133" text-anchor="middle" class="t-xs">(B, T, d_k)</text>
+    <rect x="250" y="180" width="100" height="40" rx="8" class="box"/><text x="300" y="198" text-anchor="middle" class="t-sm t-bold">V</text><text x="300" y="213" text-anchor="middle" class="t-xs">(B, T, d_v)</text>
+    <line x1="220" y1="40" x2="248" y2="40" class="line" marker-end="url(#ahDL09a)"/>
+    <line x1="220" y1="120" x2="248" y2="120" class="line" marker-end="url(#ahDL09a)"/>
+    <line x1="220" y1="200" x2="248" y2="200" class="line" marker-end="url(#ahDL09a)"/>
+    <rect x="385" y="55" width="125" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="447" y="80" text-anchor="middle" class="t-sm t-bold">scores</text>
+    <text x="447" y="98" text-anchor="middle" class="t-xs">QK^T / &radic;d_k</text>
+    <line x1="350" y1="45" x2="383" y2="72" class="line" marker-end="url(#ahDL09a)"/>
+    <line x1="350" y1="115" x2="383" y2="98" class="line" marker-end="url(#ahDL09a)"/>
+    <rect x="545" y="55" width="125" height="60" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="607" y="80" text-anchor="middle" class="t-sm t-bold">mask, softmax</text>
+    <text x="607" y="98" text-anchor="middle" class="t-xs">P: (B, T, T)</text>
+    <line x1="510" y1="85" x2="543" y2="85" class="line" marker-end="url(#ahDL09a)"/>
+    <rect x="705" y="55" width="150" height="60" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="780" y="80" text-anchor="middle" class="t-sm t-bold">P V</text>
+    <text x="780" y="98" text-anchor="middle" class="t-xs">output: (B, T, d_v)</text>
+    <line x1="670" y1="85" x2="703" y2="85" class="line" marker-end="url(#ahDL09a)"/>
+    <path d="M350,200 H780 V117" fill="none" class="line" marker-end="url(#ahDL09a)"/>
+  </svg>
+  <figcaption><strong>Scaled dot-product attention as a data flow.</strong> Three learned projections make Q, K and V from the same input. Q and K meet in the (T, T) score matrix; a row-wise softmax turns it into weights; the weights mix the rows of V. The only parameters are the three projections.</figcaption>
+</figure>
+
+<h3>Why three separate projections?</h3>
+<p>One could imagine using x directly for all three roles. Separate maps are worth their parameters for two reasons. First, they decouple what a token <em>asks</em> from what it <em>advertises</em>. A verb might ask for "my subject" while advertising "I am a verb in the past tense"; with a single map the same vector would have to do both jobs. Second, with Q = K the score matrix would be symmetric (token i's interest in j equal to j's interest in i), and every token's strongest match would be itself, since a vector has its largest dot product with itself among equal-length vectors. Separate W<sub>Q</sub> and W<sub>K</sub> break that symmetry. Finally, V is separate from K because the thing that makes a token findable is not necessarily the thing you want to read from it.</p>
+
+<h2>A worked example with numbers</h2>
+
+<p>Here is the whole operation on three tokens, small enough to check by hand. Each token is a vector of C = 4 numbers, the projections map to d<sub>k</sub> = 2, and the matrices were chosen to give readable values. The final lines add a causal mask, which we derive properly below.</p>
+
+<pre class="terminal" data-title="tiny.py"><code>import numpy as np
+np.set_printoptions(precision=2, suppress=True)
+
+x = np.array([[1., 0., 1., 0.],    # token 0: "the"
+              [0., 1., 0., 1.],    # token 1: "cat"
+              [1., 1., 0., 0.]])   # token 2: "sat"      x is (T, C) = (3, 4)
+Wq = np.array([[1, 0], [0, 1], [0, 0], [0, 0]], float)   # (C, d_k) = (4, 2)
+Wk = np.array([[1, 0], [0, 1], [1, 0], [0, 1]], float)
+Wv = np.array([[1, 0], [0, 1], [1, 0], [0, 0]], float)
+
+Q, K, V = x @ Wq, x @ Wk, x @ Wv         # each (3, 2)
+print("Q", Q.tolist(), "\nK", K.tolist(), "\nV", V.tolist())
+
+S = Q @ K.T / np.sqrt(2)                 # (3, 3): score of query i against key j
+print("scores\n", S)
+
+def softmax(a):
+    e = np.exp(a - a.max(-1, keepdims=True))
+    return e / e.sum(-1, keepdims=True)
+
+P = softmax(S)
+print("weights\n", P, "\nrow sums", P.sum(1))
+print("output = P @ V\n", P @ V)
+
+mask = np.triu(np.ones((3, 3), bool), k=1)       # True above the diagonal = future
+Pc = softmax(np.where(mask, -np.inf, S))
+print("causal weights\n", Pc)
+print("causal output\n", Pc @ V)</code></pre>
+<pre class="terminal" data-title="output"><code>Q [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] 
+K [[2.0, 0.0], [0.0, 2.0], [1.0, 1.0]] 
+V [[2.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+scores
+ [[1.41 0.   0.71]
+ [0.   1.41 0.71]
+ [1.41 1.41 1.41]]
+weights
+ [[0.58 0.14 0.28]
+ [0.14 0.58 0.28]
+ [0.33 0.33 0.33]] 
+row sums [1. 1. 1.]
+output = P @ V
+ [[1.44 0.42]
+ [0.56 0.86]
+ [1.   0.67]]
+causal weights
+ [[1.   0.   0.  ]
+ [0.2  0.8  0.  ]
+ [0.33 0.33 0.33]]
+causal output
+ [[2.   0.  ]
+ [0.39 0.8 ]
+ [1.   0.67]]</code></pre>
+
+<p>Check row 0 of the weights by hand. Query 0 is (1, 0); the keys are (2, 0), (0, 2) and (1, 1), so the dot products are 2, 0 and 1. Dividing by &radic;2 = 1.414 gives the scores 1.41, 0 and 0.71. Their exponentials are 4.11, 1.00 and 2.03, which sum to 7.14, so the weights are 0.58, 0.14 and 0.28, as printed. The output is 0.58 (2, 0) + 0.14 (0, 1) + 0.28 (1, 1) = (1.44, 0.42). Row 2 has equal scores, so its weights are all 1/3 and it simply averages the three values. With the causal mask, row 0 can see only itself and is forced to weight (1, 0, 0), so token 0's output is exactly its own value, (2, 0). Step through the same computation below.</p>
+
+<div class="widget stepper" data-autoplay-ms="4500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">Causal self-attention on three tokens</h4></div>
+  <svg viewBox="0 0 760 230" role="img" aria-label="Six stages of causal attention on three tokens: the embedded input, the projections Q, K and V, the score matrix, the causal mask, the row-wise softmax and the weighted sum of values.">
+<defs><marker id="ahDL09s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<g>
+<text x="100" y="76" text-anchor="end" class="t-sm t-bold">the</text>
+<text x="100" y="91" text-anchor="end" class="t-xs t-faint">token 0</text>
+<text x="100" y="116" text-anchor="end" class="t-sm t-bold">cat</text>
+<text x="100" y="131" text-anchor="end" class="t-xs t-faint">token 1</text>
+<text x="100" y="156" text-anchor="end" class="t-sm t-bold">sat</text>
+<text x="100" y="171" text-anchor="end" class="t-xs t-faint">token 2</text>
+</g>
+<g data-steps="1" data-active="1"><text x="120" y="40" class="t-sm t-bold">x, the embedded tokens: (T, C) = (3, 4)</text><rect x="120" y="60" width="56" height="40" class="fs-green s-green"/>
+<text x="148.0" y="84.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="176" y="60" width="56" height="40" class="fs-green s-green"/>
+<text x="204.0" y="84.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="232" y="60" width="56" height="40" class="fs-green s-green"/>
+<text x="260.0" y="84.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="288" y="60" width="56" height="40" class="fs-green s-green"/>
+<text x="316.0" y="84.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="120" y="100" width="56" height="40" class="fs-green s-green"/>
+<text x="148.0" y="124.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="176" y="100" width="56" height="40" class="fs-green s-green"/>
+<text x="204.0" y="124.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="232" y="100" width="56" height="40" class="fs-green s-green"/>
+<text x="260.0" y="124.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="288" y="100" width="56" height="40" class="fs-green s-green"/>
+<text x="316.0" y="124.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="120" y="140" width="56" height="40" class="fs-green s-green"/>
+<text x="148.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="176" y="140" width="56" height="40" class="fs-green s-green"/>
+<text x="204.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="232" y="140" width="56" height="40" class="fs-green s-green"/>
+<text x="260.0" y="164.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="288" y="140" width="56" height="40" class="fs-green s-green"/>
+<text x="316.0" y="164.0" text-anchor="middle" class="t-xs mono">0</text></g>
+<g data-steps="2" data-active="2"><text x="120" y="40" class="t-sm t-bold">Q = xW_Q</text><text x="320" y="40" class="t-sm t-bold">K = xW_K</text><text x="520" y="40" class="t-sm t-bold">V = xW_V</text><rect x="120" y="60" width="60" height="40" class="fs-blue s-blue"/>
+<text x="150.0" y="84.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="180" y="60" width="60" height="40" class="fs-blue s-blue"/>
+<text x="210.0" y="84.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="120" y="100" width="60" height="40" class="fs-blue s-blue"/>
+<text x="150.0" y="124.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="180" y="100" width="60" height="40" class="fs-blue s-blue"/>
+<text x="210.0" y="124.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="120" y="140" width="60" height="40" class="fs-blue s-blue"/>
+<text x="150.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="180" y="140" width="60" height="40" class="fs-blue s-blue"/>
+<text x="210.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text><rect x="320" y="60" width="60" height="40" class="fs-orange s-orange"/>
+<text x="350.0" y="84.0" text-anchor="middle" class="t-xs mono">2</text>
+<rect x="380" y="60" width="60" height="40" class="fs-orange s-orange"/>
+<text x="410.0" y="84.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="320" y="100" width="60" height="40" class="fs-orange s-orange"/>
+<text x="350.0" y="124.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="380" y="100" width="60" height="40" class="fs-orange s-orange"/>
+<text x="410.0" y="124.0" text-anchor="middle" class="t-xs mono">2</text>
+<rect x="320" y="140" width="60" height="40" class="fs-orange s-orange"/>
+<text x="350.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="380" y="140" width="60" height="40" class="fs-orange s-orange"/>
+<text x="410.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text><rect x="520" y="60" width="60" height="40" class="fs-purple s-purple"/>
+<text x="550.0" y="84.0" text-anchor="middle" class="t-xs mono">2</text>
+<rect x="580" y="60" width="60" height="40" class="fs-purple s-purple"/>
+<text x="610.0" y="84.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="520" y="100" width="60" height="40" class="fs-purple s-purple"/>
+<text x="550.0" y="124.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="580" y="100" width="60" height="40" class="fs-purple s-purple"/>
+<text x="610.0" y="124.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="520" y="140" width="60" height="40" class="fs-purple s-purple"/>
+<text x="550.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="580" y="140" width="60" height="40" class="fs-purple s-purple"/>
+<text x="610.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text><text x="120" y="212" class="t-xs t-muted">Each is (T, d_k) = (3, 2): row i of Q asks, row j of K advertises, row j of V is handed over.</text></g>
+<g data-steps="3" data-active="3"><text x="120" y="40" class="t-sm t-bold">S = QK^T / &radic;d_k: (T, T) = (3, 3)</text><rect x="120" y="60" width="70" height="40" class="fs-yellow s-yellow"/>
+<text x="155.0" y="84.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="190" y="60" width="70" height="40" class="fs-yellow s-yellow"/>
+<text x="225.0" y="84.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="260" y="60" width="70" height="40" class="fs-yellow s-yellow"/>
+<text x="295.0" y="84.0" text-anchor="middle" class="t-xs mono">0.71</text>
+<rect x="120" y="100" width="70" height="40" class="box"/>
+<text x="155.0" y="124.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="190" y="100" width="70" height="40" class="box"/>
+<text x="225.0" y="124.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="260" y="100" width="70" height="40" class="box"/>
+<text x="295.0" y="124.0" text-anchor="middle" class="t-xs mono">0.71</text>
+<rect x="120" y="140" width="70" height="40" class="box"/>
+<text x="155.0" y="164.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="190" y="140" width="70" height="40" class="box"/>
+<text x="225.0" y="164.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="260" y="140" width="70" height="40" class="box"/>
+<text x="295.0" y="164.0" text-anchor="middle" class="t-xs mono">1.41</text><text x="350" y="86" class="t-xs">row 0: q&#8320; = (1, 0)</text><text x="350" y="104" class="t-xs">q&#8320;&middot;k&#8320; = 2,  q&#8320;&middot;k&#8321; = 0,  q&#8320;&middot;k&#8322; = 1</text><text x="350" y="122" class="t-xs">each divided by &radic;2 = 1.41</text><text x="120" y="212" class="t-xs t-muted">Entry (i, j): how well query i matches key j. Every token is scored against every token.</text></g>
+<g data-steps="4" data-active="4"><text x="120" y="40" class="t-sm t-bold">Causal mask: future positions set to &minus;&infin;</text><rect x="120" y="60" width="70" height="40" class="fs-green s-green"/>
+<text x="155.0" y="84.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="190" y="60" width="70" height="40" class="fs-red s-red"/>
+<text x="225.0" y="84.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="260" y="60" width="70" height="40" class="fs-red s-red"/>
+<text x="295.0" y="84.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="120" y="100" width="70" height="40" class="fs-green s-green"/>
+<text x="155.0" y="124.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="190" y="100" width="70" height="40" class="fs-green s-green"/>
+<text x="225.0" y="124.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="260" y="100" width="70" height="40" class="fs-red s-red"/>
+<text x="295.0" y="124.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="120" y="140" width="70" height="40" class="fs-green s-green"/>
+<text x="155.0" y="164.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="190" y="140" width="70" height="40" class="fs-green s-green"/>
+<text x="225.0" y="164.0" text-anchor="middle" class="t-xs mono">1.41</text>
+<rect x="260" y="140" width="70" height="40" class="fs-green s-green"/>
+<text x="295.0" y="164.0" text-anchor="middle" class="t-xs mono">1.41</text><text x="350" y="86" class="t-xs">token 0 may only look at itself,</text><text x="350" y="104" class="t-xs">token 1 at tokens 0 and 1,</text><text x="350" y="122" class="t-xs">token 2 at all three.</text><text x="120" y="212" class="t-xs t-muted">The mask goes on the scores, before the softmax, so hidden entries take no share of the weight.</text></g>
+<g data-steps="5" data-active="5"><text x="120" y="40" class="t-sm t-bold">P = softmax(rows): each row sums to 1</text><rect x="120" y="60" width="70" height="40" class="fs-blue s-blue"/>
+<text x="155.0" y="84.0" text-anchor="middle" class="t-xs mono">1.00</text>
+<rect x="190" y="60" width="70" height="40" class="box"/>
+<text x="225.0" y="84.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="260" y="60" width="70" height="40" class="box"/>
+<text x="295.0" y="84.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="120" y="100" width="70" height="40" class="fs-blue s-blue"/>
+<text x="155.0" y="124.0" text-anchor="middle" class="t-xs mono">0.20</text>
+<rect x="190" y="100" width="70" height="40" class="fs-blue s-blue"/>
+<text x="225.0" y="124.0" text-anchor="middle" class="t-xs mono">0.80</text>
+<rect x="260" y="100" width="70" height="40" class="box"/>
+<text x="295.0" y="124.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="120" y="140" width="70" height="40" class="fs-blue s-blue"/>
+<text x="155.0" y="164.0" text-anchor="middle" class="t-xs mono">0.33</text>
+<rect x="190" y="140" width="70" height="40" class="fs-blue s-blue"/>
+<text x="225.0" y="164.0" text-anchor="middle" class="t-xs mono">0.33</text>
+<rect x="260" y="140" width="70" height="40" class="fs-blue s-blue"/>
+<text x="295.0" y="164.0" text-anchor="middle" class="t-xs mono">0.33</text><text x="350" y="86" class="t-xs">row 1: exp(0) = 1, exp(1.41) = 4.11,</text><text x="350" y="104" class="t-xs">so weights = 1/5.11 = 0.20</text><text x="350" y="122" class="t-xs">and 4.11/5.11 = 0.80.</text><text x="120" y="212" class="t-xs t-muted">Masked entries get weight exactly 0. Row 2 is even because its three scores are equal.</text></g>
+<g data-steps="6" data-active="6"><text x="120" y="40" class="t-sm t-bold">O = PV: (T, d_k) = (3, 2)</text><rect x="120" y="60" width="50" height="40" class="box"/>
+<text x="145.0" y="84.0" text-anchor="middle" class="t-xs mono">1.00</text>
+<rect x="170" y="60" width="50" height="40" class="box"/>
+<text x="195.0" y="84.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="220" y="60" width="50" height="40" class="box"/>
+<text x="245.0" y="84.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="120" y="100" width="50" height="40" class="fs-yellow s-yellow"/>
+<text x="145.0" y="124.0" text-anchor="middle" class="t-xs mono">0.20</text>
+<rect x="170" y="100" width="50" height="40" class="fs-yellow s-yellow"/>
+<text x="195.0" y="124.0" text-anchor="middle" class="t-xs mono">0.80</text>
+<rect x="220" y="100" width="50" height="40" class="fs-yellow s-yellow"/>
+<text x="245.0" y="124.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="120" y="140" width="50" height="40" class="box"/>
+<text x="145.0" y="164.0" text-anchor="middle" class="t-xs mono">0.33</text>
+<rect x="170" y="140" width="50" height="40" class="box"/>
+<text x="195.0" y="164.0" text-anchor="middle" class="t-xs mono">0.33</text>
+<rect x="220" y="140" width="50" height="40" class="box"/>
+<text x="245.0" y="164.0" text-anchor="middle" class="t-xs mono">0.33</text><text x="285" y="85" text-anchor="middle" class="t-sm t-bold">&times;</text><text x="300" y="52" class="t-xs t-muted">V</text><rect x="300" y="60" width="50" height="40" class="fs-purple s-purple"/>
+<text x="325.0" y="84.0" text-anchor="middle" class="t-xs mono">2</text>
+<rect x="350" y="60" width="50" height="40" class="fs-purple s-purple"/>
+<text x="375.0" y="84.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="300" y="100" width="50" height="40" class="fs-purple s-purple"/>
+<text x="325.0" y="124.0" text-anchor="middle" class="t-xs mono">0</text>
+<rect x="350" y="100" width="50" height="40" class="fs-purple s-purple"/>
+<text x="375.0" y="124.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="300" y="140" width="50" height="40" class="fs-purple s-purple"/>
+<text x="325.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text>
+<rect x="350" y="140" width="50" height="40" class="fs-purple s-purple"/>
+<text x="375.0" y="164.0" text-anchor="middle" class="t-xs mono">1</text><text x="415" y="85" text-anchor="middle" class="t-sm t-bold">=</text><text x="430" y="52" class="t-xs t-muted">O</text><rect x="430" y="60" width="56" height="40" class="box"/>
+<text x="458.0" y="84.0" text-anchor="middle" class="t-xs mono">2.00</text>
+<rect x="486" y="60" width="56" height="40" class="box"/>
+<text x="514.0" y="84.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="430" y="100" width="56" height="40" class="fs-yellow s-yellow"/>
+<text x="458.0" y="124.0" text-anchor="middle" class="t-xs mono">0.39</text>
+<rect x="486" y="100" width="56" height="40" class="fs-yellow s-yellow"/>
+<text x="514.0" y="124.0" text-anchor="middle" class="t-xs mono">0.80</text>
+<rect x="430" y="140" width="56" height="40" class="box"/>
+<text x="458.0" y="164.0" text-anchor="middle" class="t-xs mono">1.00</text>
+<rect x="486" y="140" width="56" height="40" class="box"/>
+<text x="514.0" y="164.0" text-anchor="middle" class="t-xs mono">0.67</text><text x="560" y="80" class="t-xs">row 1 = 0.20 &middot; (2, 0)</text><text x="574" y="98" class="t-xs">+ 0.80 &middot; (0, 1)</text><text x="574" y="116" class="t-xs">= (0.39, 0.80)</text><text x="120" y="212" class="t-xs t-muted">Each output row is a weighted average of value rows: token 1 reads mostly from itself.</text></g>
+
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Start with embedded tokens.</strong> Three tokens, each a vector of C = 4 numbers, form x with shape (T, C) = (3, 4). Attention will let each of them read from the others.</li>
+    <li><strong>Project to Q, K and V.</strong> Three matrix products give three (3, 2) matrices from the same x. Nothing has been mixed between tokens yet: row i depends only on token i.</li>
+    <li><strong>Score every pair.</strong> Q K<sup>T</sup> / &radic;2 is a 3 &times; 3 table. Row 0 (yellow) holds token 0's scores against all three keys. This is the first place information from different tokens meets.</li>
+    <li><strong>Apply the causal mask.</strong> Entries above the diagonal are the future. They are replaced by &minus;&infin; so that the softmax will give them weight exactly zero.</li>
+    <li><strong>Softmax along each row.</strong> Each row becomes a distribution over the positions it may read. Row 0 is (1, 0, 0), row 1 is (0.20, 0.80, 0), row 2 is uniform.</li>
+    <li><strong>Mix the values.</strong> Output row i is the weighted average of the rows of V with the weights in row i of P. The result has shape (T, d<sub>v</sub>) = (3, 2), ready for the next stage of the network.</li>
+  </ol>
+</div>
+
+<h2>Why divide by &radic;d<sub>k</sub></h2>
+
+<p>The factor 1/&radic;d<sub>k</sub> looks like a detail but it is what makes the softmax trainable at realistic widths. Vaswani et al. (2017) gave the reason in a footnote; here it is in full.</p>
+
+<p>Suppose a query q and a key k each have d<sub>k</sub> components that are independent, with mean 0 and variance 1. This is roughly true at initialisation if the inputs are normalised and the projection weights follow the scaling rules of <a href="03-training-dynamics.html">chapter 03</a>. The score is q&middot;k = &sum;<sub>i</sub> q<sub>i</sub>k<sub>i</sub>. Each product q<sub>i</sub>k<sub>i</sub> has mean 0 and variance E[q<sub>i</sub><sup>2</sup>]E[k<sub>i</sub><sup>2</sup>] = 1. A sum of d<sub>k</sub> independent terms has variance equal to the sum of the variances, so</p>
+<p style="text-align:center">Var(q&middot;k) = d<sub>k</sub>, &nbsp;&nbsp; standard deviation &radic;d<sub>k</sub>. &nbsp;&nbsp; Dividing by &radic;d<sub>k</sub> restores a standard deviation of 1.</p>
+
+<p>It is the same variance rule as the initialisation derivation of chapter 03, applied to a dot product instead of a neuron. Why does a large score spread matter? The softmax turns scores into weights with exp. If the scores have a standard deviation of 30, the largest of them beats the second largest by many units, and exp(10) is about 22,000 times exp(0). The softmax output is then almost exactly one-hot. A one-hot softmax has an almost zero derivative: its Jacobian is &part;p<sub>i</sub>/&part;s<sub>j</sub> = p<sub>i</sub>(&delta;<sub>ij</sub> &minus; p<sub>j</sub>), and when one p is near 1 and the rest near 0 every entry is near 0. The gradient to the query and key projections vanishes, and the head is stuck attending to whichever key it happened to prefer at initialisation. Measure it:</p>
+
+<pre class="terminal" data-title="scale.py"><code>import numpy as np
+rng = np.random.default_rng(0)
+
+def softmax(a):
+    e = np.exp(a - a.max(-1, keepdims=True))
+    return e / e.sum(-1, keepdims=True)
+
+print(f"{'d_k':&gt;5} {'std(q.k)':&gt;9} {'std(q.k/sqrt d)':&gt;16} {'max weight raw':&gt;15} {'max weight scaled':&gt;18}")
+for d_k in (4, 16, 64, 256, 1024):
+    q = rng.normal(size=(2000, d_k))           # 2000 queries
+    k = rng.normal(size=(2000, 10, d_k))       # 10 keys each
+    s = np.einsum("nd,nkd-&gt;nk", q, k)          # raw scores, (2000, 10)
+    raw = softmax(s).max(-1).mean()
+    sca = softmax(s / np.sqrt(d_k)).max(-1).mean()
+    print(f"{d_k:&gt;5} {s.std():&gt;9.2f} {(s/np.sqrt(d_k)).std():&gt;16.2f} {raw:&gt;15.3f} {sca:&gt;18.3f}")
+
+# how much gradient flows back through the softmax? mean Frobenius norm of its Jacobian
+print()
+for d_k in (4, 64, 1024):
+    q = rng.normal(size=(2000, d_k)); k = rng.normal(size=(2000, 10, d_k))
+    s = np.einsum("nd,nkd-&gt;nk", q, k)
+    out = []
+    for name, sc in (("raw", s), ("scaled", s / np.sqrt(d_k))):
+        p = softmax(sc)
+        J = np.einsum("nk,kj-&gt;nkj", p, np.eye(10)) - np.einsum("nk,nj-&gt;nkj", p, p)
+        out.append(f"{name} {np.linalg.norm(J, axis=(1, 2)).mean():.3f}")
+    print(f"d_k={d_k:&gt;5}: mean Jacobian norm  " + "   ".join(out))</code></pre>
+<pre class="terminal" data-title="output"><code>  d_k  std(q.k)  std(q.k/sqrt d)  max weight raw  max weight scaled
+    4      2.01             1.00           0.496              0.304
+   16      4.03             1.01           0.726              0.319
+   64      7.86             0.98           0.856              0.315
+  256     15.91             0.99           0.931              0.318
+ 1024     32.02             1.00           0.968              0.319
+
+d_k=    4: mean Jacobian norm  raw 0.336   scaled 0.340
+d_k=   64: mean Jacobian norm  raw 0.160   scaled 0.347
+d_k= 1024: mean Jacobian norm  raw 0.045   scaled 0.347</code></pre>
+
+<p>The standard deviation of the raw score is almost exactly &radic;d<sub>k</sub> (2, 4, 7.9, 16, 32), and the scaled score stays at 1.0 for every width. With ten random keys a uniform softmax would give each key 0.10 of the weight. The raw dot products at d<sub>k</sub> = 1024 put 0.97 of the weight on one key on average; the scaled ones put about 0.32, whatever d<sub>k</sub> is. The Jacobian norm tells the same story: with raw scores it drops from 0.34 to 0.045 as d<sub>k</sub> grows from 4 to 1024, while with scaling it stays near 0.35. The original paper reports that for large d<sub>k</sub> additive attention (a small network scoring each pair) outperformed unscaled dot-product attention, and that scaling closes the gap while keeping the speed of a matrix product.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Line chart of the average largest attention weight over ten keys against key width d_k from 4 to 1024. Without scaling the line rises from 0.50 to 0.97. With scaling by root d_k it stays flat near 0.31 to 0.32. The uniform value 0.10 is a dashed line.">
+<rect x="70" y="20" width="450" height="200" class="box" rx="4"/>
+<line x1="70" y1="220.0" x2="520" y2="220.0" class="line-thin"/>
+<text x="64" y="224.0" text-anchor="end" class="t-xs t-faint">0.00</text>
+<line x1="70" y1="170.0" x2="520" y2="170.0" class="line-thin"/>
+<text x="64" y="174.0" text-anchor="end" class="t-xs t-faint">0.25</text>
+<line x1="70" y1="120.0" x2="520" y2="120.0" class="line-thin"/>
+<text x="64" y="124.0" text-anchor="end" class="t-xs t-faint">0.50</text>
+<line x1="70" y1="70.0" x2="520" y2="70.0" class="line-thin"/>
+<text x="64" y="74.0" text-anchor="end" class="t-xs t-faint">0.75</text>
+<line x1="70" y1="20.0" x2="520" y2="20.0" class="line-thin"/>
+<text x="64" y="24.0" text-anchor="end" class="t-xs t-faint">1.00</text>
+<text x="70.0" y="238" text-anchor="middle" class="t-xs t-faint">4</text>
+<text x="182.5" y="238" text-anchor="middle" class="t-xs t-faint">16</text>
+<text x="295.0" y="238" text-anchor="middle" class="t-xs t-faint">64</text>
+<text x="407.5" y="238" text-anchor="middle" class="t-xs t-faint">256</text>
+<text x="520.0" y="238" text-anchor="middle" class="t-xs t-faint">1024</text>
+<line x1="70" y1="200.0" x2="520" y2="200.0" class="line-dash s-green"/>
+<text x="516" y="214.0" text-anchor="end" class="t-xs tc-green">uniform: 0.10</text>
+<path d="M70.0,120.8 L182.5,74.9 L295.0,48.8 L407.5,33.7 L520.0,26.5" fill="none" class="s-orange sw-2"/>
+<circle cx="70.0" cy="120.8" r="3.5" class="f-orange"/>
+<circle cx="182.5" cy="74.9" r="3.5" class="f-orange"/>
+<circle cx="295.0" cy="48.8" r="3.5" class="f-orange"/>
+<circle cx="407.5" cy="33.7" r="3.5" class="f-orange"/>
+<circle cx="520.0" cy="26.5" r="3.5" class="f-orange"/>
+<path d="M70.0,159.1 L182.5,156.2 L295.0,157.0 L407.5,156.5 L520.0,156.3" fill="none" class="s-blue sw-2"/>
+<circle cx="70.0" cy="159.1" r="3.5" class="f-blue"/>
+<circle cx="182.5" cy="156.2" r="3.5" class="f-blue"/>
+<circle cx="295.0" cy="157.0" r="3.5" class="f-blue"/>
+<circle cx="407.5" cy="156.5" r="3.5" class="f-blue"/>
+<circle cx="520.0" cy="156.3" r="3.5" class="f-blue"/>
+<line x1="560" y1="60" x2="586" y2="60" class="s-orange sw-2"/><text x="594" y="64" class="t-xs">raw q&middot;k</text>
+<line x1="560" y1="84" x2="586" y2="84" class="s-blue sw-2"/><text x="594" y="88" class="t-xs">divided by &radic;d_k</text>
+<text x="295.0" y="258" text-anchor="middle" class="t-xs t-muted">key/query width d_k (log scale)</text>
+<text x="16" y="120.0" transform="rotate(-90 16 120.0)" text-anchor="middle" class="t-xs t-muted">average largest weight (10 keys)</text>
+  </svg>
+  <figcaption><strong>Without scaling, wide heads become one-hot.</strong> Each point averages 2,000 random queries against 10 random keys (data from <code>scale.py</code>). The orange line climbs towards 1: one key takes nearly all the weight and the gradient to the rest vanishes. Dividing by &radic;d<sub>k</sub> (blue) holds the softmax at the same sharpness at any width.</figcaption>
+</figure>
+
+<div class="widget" id="dl09-scale">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Raw scores versus scaled scores</h4></div>
+  <p class="widget-help">One random query is scored against 10 random keys; the bars show the resulting weights. Switch the width d_k up from 4 to 1024 with scaling off, then turn scaling on. The summary averages 300 such queries.</p>
+  <div class="dl09-ctl">
+    <div><label for="dl09-dk">Width d_k</label>
+      <select id="dl09-dk" data-act="dk"><option value="4">4</option><option value="16">16</option><option value="64" selected>64</option><option value="256">256</option><option value="1024">1024</option></select></div>
+  </div>
+  <div class="dl09-checks"><label><input type="checkbox" data-act="scale"> Divide scores by &radic;d_k</label></div>
+  <svg class="dl09-chart" viewBox="0 0 700 240" role="img" aria-label="Ten horizontal bars showing the attention weights of one random query over ten random keys."></svg>
+  <div class="widget-out dl09-summary" aria-live="polite"></div>
+</div>
+
+<details class="deeper">
+  <summary>Go deeper <span class="hint">optional: when the unit-variance assumption fails</span></summary>
+  <p>The derivation assumes that the components of q and k are independent with unit variance. Trained queries and keys are not like that: the model can learn to make some components large and correlated, and then the real score spread differs from &radic;d<sub>k</sub>. That is allowed: the scaling fixes the starting point, and the model learns whatever sharpness it needs from there. Some recent models normalise the queries and keys themselves (often called QK-norm, a LayerNorm or RMSNorm on each head's Q and K before the dot product) because in large, long training runs the scores can still drift large enough to saturate the softmax and cause loss spikes (chapter 17). A related line of work (for example "Scalable-Softmax", 2025) argues that the right scaling should also depend on the sequence length T, since the softmax over more keys is flatter for the same scores. Treat these as active research; the &radic;d<sub>k</sub> rule remains the standard default.</p>
+</details>
+
+<h2>Masking: what a token may not read</h2>
+
+<p>The formula so far lets every token read every other token, which suits an encoder that processes a whole sentence at once. A language model that generates text cannot work that way. During training it sees a whole sequence of T tokens and predicts the next token at <em>every</em> position in one pass (chapter 14). If position 3 could read token 4 it could copy the answer, learn nothing, and fail at generation time when token 4 does not exist yet. The <span class="term">causal mask</span> forbids this: query i may attend only to keys j &le; i. The matrix of allowed pairs is lower-triangular.</p>
+
+<p>The mask has to act on the scores, <em>before</em> the softmax, by setting forbidden entries to &minus;&infin;. Since exp(&minus;&infin;) = 0, such entries get weight exactly zero and the remaining weights still sum to one. The tempting alternative, zeroing the weights <em>after</em> the softmax, is wrong: the softmax has already shared out probability to the forbidden positions, so after removing them the rows no longer sum to one and the output is shrunk by an amount that depends on how much of the weight was in the future. The script shows both, plus the second kind of mask and the classic failure.</p>
+
+<pre class="terminal" data-title="mask.py"><code>import numpy as np
+np.set_printoptions(precision=2, suppress=True)
+rng = np.random.default_rng(1)
+T = 5
+S = rng.normal(size=(T, T))               # raw scores for one head
+def softmax(a):
+    e = np.exp(a - a.max(-1, keepdims=True))
+    return e / e.sum(-1, keepdims=True)
+
+future = np.triu(np.ones((T, T), bool), k=1)
+good = softmax(np.where(future, -np.inf, S))               # mask BEFORE softmax
+bad = softmax(S) * ~future                                  # zero AFTER softmax
+print("masked before softmax: row sums", good.sum(1))
+print("zeroed after softmax:  row sums", bad.sum(1))
+print(good)
+
+# padding mask: sequence of length 3 padded to T=5 (keys 3 and 4 are padding)
+pad = np.array([False, False, False, True, True])
+Sp = np.where(pad[None, :], -np.inf, S)
+print("padding mask, query 0:", softmax(Sp)[0])
+
+# a fully masked row gives NaN: the classic bug
+print("all -inf row:", softmax(np.full((1, 3), -np.inf)))</code></pre>
+<pre class="terminal" data-title="output"><code>masked before softmax: row sums [1. 1. 1. 1. 1.]
+zeroed after softmax:  row sums [0.18 0.32 0.69 0.84 1.  ]
+[[1.   0.   0.   0.   0.  ]
+ [0.73 0.27 0.   0.   0.  ]
+ [0.32 0.53 0.15 0.   0.  ]
+ [0.45 0.26 0.18 0.11 0.  ]
+ [0.12 0.09 0.44 0.33 0.01]]
+padding mask, query 0: [0.28 0.45 0.27 0.   0.  ]
+all -inf row: [[nan nan nan]]</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two five by five grids. Left: attention scores with the upper triangle, the future positions, replaced by minus infinity and shown in red. Right: the weights after a row-wise softmax, where the upper triangle is exactly zero and each row sums to one.">
+<defs><marker id="ahDL09b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="195.0" y="22" text-anchor="middle" class="t-sm t-bold">scores S (T, T)</text>
+<text x="87.0" y="46" text-anchor="middle" class="t-xs t-faint">key 0</text>
+<text x="141.0" y="46" text-anchor="middle" class="t-xs t-faint">key 1</text>
+<text x="195.0" y="46" text-anchor="middle" class="t-xs t-faint">key 2</text>
+<text x="249.0" y="46" text-anchor="middle" class="t-xs t-faint">key 3</text>
+<text x="303.0" y="46" text-anchor="middle" class="t-xs t-faint">key 4</text>
+<text x="54" y="81.0" text-anchor="end" class="t-xs t-faint">query 0</text>
+<text x="54" y="119.0" text-anchor="end" class="t-xs t-faint">query 1</text>
+<text x="54" y="157.0" text-anchor="end" class="t-xs t-faint">query 2</text>
+<text x="54" y="195.0" text-anchor="end" class="t-xs t-faint">query 3</text>
+<text x="54" y="233.0" text-anchor="end" class="t-xs t-faint">query 4</text>
+<rect x="60" y="58" width="54" height="38" class="fs-green s-green"/>
+<text x="87.0" y="81.0" text-anchor="middle" class="t-xs mono">0.35</text>
+<rect x="114" y="58" width="54" height="38" class="fs-red s-red"/>
+<text x="141.0" y="81.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="168" y="58" width="54" height="38" class="fs-red s-red"/>
+<text x="195.0" y="81.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="222" y="58" width="54" height="38" class="fs-red s-red"/>
+<text x="249.0" y="81.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="276" y="58" width="54" height="38" class="fs-red s-red"/>
+<text x="303.0" y="81.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="60" y="96" width="54" height="38" class="fs-green s-green"/>
+<text x="87.0" y="119.0" text-anchor="middle" class="t-xs mono">0.45</text>
+<rect x="114" y="96" width="54" height="38" class="fs-green s-green"/>
+<text x="141.0" y="119.0" text-anchor="middle" class="t-xs mono">-0.54</text>
+<rect x="168" y="96" width="54" height="38" class="fs-red s-red"/>
+<text x="195.0" y="119.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="222" y="96" width="54" height="38" class="fs-red s-red"/>
+<text x="249.0" y="119.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="276" y="96" width="54" height="38" class="fs-red s-red"/>
+<text x="303.0" y="119.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="60" y="134" width="54" height="38" class="fs-green s-green"/>
+<text x="87.0" y="157.0" text-anchor="middle" class="t-xs mono">0.03</text>
+<rect x="114" y="134" width="54" height="38" class="fs-green s-green"/>
+<text x="141.0" y="157.0" text-anchor="middle" class="t-xs mono">0.55</text>
+<rect x="168" y="134" width="54" height="38" class="fs-green s-green"/>
+<text x="195.0" y="157.0" text-anchor="middle" class="t-xs mono">-0.74</text>
+<rect x="222" y="134" width="54" height="38" class="fs-red s-red"/>
+<text x="249.0" y="157.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="276" y="134" width="54" height="38" class="fs-red s-red"/>
+<text x="303.0" y="157.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="60" y="172" width="54" height="38" class="fs-green s-green"/>
+<text x="87.0" y="195.0" text-anchor="middle" class="t-xs mono">0.60</text>
+<rect x="114" y="172" width="54" height="38" class="fs-green s-green"/>
+<text x="141.0" y="195.0" text-anchor="middle" class="t-xs mono">0.04</text>
+<rect x="168" y="172" width="54" height="38" class="fs-green s-green"/>
+<text x="195.0" y="195.0" text-anchor="middle" class="t-xs mono">-0.29</text>
+<rect x="222" y="172" width="54" height="38" class="fs-green s-green"/>
+<text x="249.0" y="195.0" text-anchor="middle" class="t-xs mono">-0.78</text>
+<rect x="276" y="172" width="54" height="38" class="fs-red s-red"/>
+<text x="303.0" y="195.0" text-anchor="middle" class="t-xs mono">&minus;&infin;</text>
+<rect x="60" y="210" width="54" height="38" class="fs-green s-green"/>
+<text x="87.0" y="233.0" text-anchor="middle" class="t-xs mono">0.01</text>
+<rect x="114" y="210" width="54" height="38" class="fs-green s-green"/>
+<text x="141.0" y="233.0" text-anchor="middle" class="t-xs mono">-0.28</text>
+<rect x="168" y="210" width="54" height="38" class="fs-green s-green"/>
+<text x="195.0" y="233.0" text-anchor="middle" class="t-xs mono">1.29</text>
+<rect x="222" y="210" width="54" height="38" class="fs-green s-green"/>
+<text x="249.0" y="233.0" text-anchor="middle" class="t-xs mono">1.01</text>
+<rect x="276" y="210" width="54" height="38" class="fs-green s-green"/>
+<text x="303.0" y="233.0" text-anchor="middle" class="t-xs mono">-2.71</text>
+<text x="575.0" y="22" text-anchor="middle" class="t-sm t-bold">weights P after softmax</text>
+<text x="467.0" y="46" text-anchor="middle" class="t-xs t-faint">key 0</text>
+<text x="521.0" y="46" text-anchor="middle" class="t-xs t-faint">key 1</text>
+<text x="575.0" y="46" text-anchor="middle" class="t-xs t-faint">key 2</text>
+<text x="629.0" y="46" text-anchor="middle" class="t-xs t-faint">key 3</text>
+<text x="683.0" y="46" text-anchor="middle" class="t-xs t-faint">key 4</text>
+<text x="434" y="81.0" text-anchor="end" class="t-xs t-faint">query 0</text>
+<text x="434" y="119.0" text-anchor="end" class="t-xs t-faint">query 1</text>
+<text x="434" y="157.0" text-anchor="end" class="t-xs t-faint">query 2</text>
+<text x="434" y="195.0" text-anchor="end" class="t-xs t-faint">query 3</text>
+<text x="434" y="233.0" text-anchor="end" class="t-xs t-faint">query 4</text>
+<rect x="440" y="58" width="54" height="38" class="fs-blue s-blue"/>
+<text x="467.0" y="81.0" text-anchor="middle" class="t-xs mono">1.00</text>
+<rect x="494" y="58" width="54" height="38" class="box"/>
+<text x="521.0" y="81.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="548" y="58" width="54" height="38" class="box"/>
+<text x="575.0" y="81.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="602" y="58" width="54" height="38" class="box"/>
+<text x="629.0" y="81.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="656" y="58" width="54" height="38" class="box"/>
+<text x="683.0" y="81.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="440" y="96" width="54" height="38" class="fs-blue s-blue"/>
+<text x="467.0" y="119.0" text-anchor="middle" class="t-xs mono">0.73</text>
+<rect x="494" y="96" width="54" height="38" class="fs-blue s-blue"/>
+<text x="521.0" y="119.0" text-anchor="middle" class="t-xs mono">0.27</text>
+<rect x="548" y="96" width="54" height="38" class="box"/>
+<text x="575.0" y="119.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="602" y="96" width="54" height="38" class="box"/>
+<text x="629.0" y="119.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="656" y="96" width="54" height="38" class="box"/>
+<text x="683.0" y="119.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="440" y="134" width="54" height="38" class="fs-blue s-blue"/>
+<text x="467.0" y="157.0" text-anchor="middle" class="t-xs mono">0.32</text>
+<rect x="494" y="134" width="54" height="38" class="fs-blue s-blue"/>
+<text x="521.0" y="157.0" text-anchor="middle" class="t-xs mono">0.53</text>
+<rect x="548" y="134" width="54" height="38" class="fs-blue s-blue"/>
+<text x="575.0" y="157.0" text-anchor="middle" class="t-xs mono">0.15</text>
+<rect x="602" y="134" width="54" height="38" class="box"/>
+<text x="629.0" y="157.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="656" y="134" width="54" height="38" class="box"/>
+<text x="683.0" y="157.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="440" y="172" width="54" height="38" class="fs-blue s-blue"/>
+<text x="467.0" y="195.0" text-anchor="middle" class="t-xs mono">0.45</text>
+<rect x="494" y="172" width="54" height="38" class="fs-blue s-blue"/>
+<text x="521.0" y="195.0" text-anchor="middle" class="t-xs mono">0.26</text>
+<rect x="548" y="172" width="54" height="38" class="fs-blue s-blue"/>
+<text x="575.0" y="195.0" text-anchor="middle" class="t-xs mono">0.18</text>
+<rect x="602" y="172" width="54" height="38" class="fs-blue s-blue"/>
+<text x="629.0" y="195.0" text-anchor="middle" class="t-xs mono">0.11</text>
+<rect x="656" y="172" width="54" height="38" class="box"/>
+<text x="683.0" y="195.0" text-anchor="middle" class="t-xs mono">0.00</text>
+<rect x="440" y="210" width="54" height="38" class="fs-blue s-blue"/>
+<text x="467.0" y="233.0" text-anchor="middle" class="t-xs mono">0.12</text>
+<rect x="494" y="210" width="54" height="38" class="fs-blue s-blue"/>
+<text x="521.0" y="233.0" text-anchor="middle" class="t-xs mono">0.09</text>
+<rect x="548" y="210" width="54" height="38" class="fs-blue s-blue"/>
+<text x="575.0" y="233.0" text-anchor="middle" class="t-xs mono">0.44</text>
+<rect x="602" y="210" width="54" height="38" class="fs-blue s-blue"/>
+<text x="629.0" y="233.0" text-anchor="middle" class="t-xs mono">0.33</text>
+<rect x="656" y="210" width="54" height="38" class="fs-blue s-blue"/>
+<text x="683.0" y="233.0" text-anchor="middle" class="t-xs mono">0.01</text>
+<line x1="340" y1="153" x2="420" y2="153" class="line" marker-end="url(#ahDL09b)"/>
+<text x="380" y="140" text-anchor="middle" class="t-xs t-muted">softmax</text>
+<text x="380" y="172" text-anchor="middle" class="t-xs t-muted">by row</text>
+  </svg>
+  <figcaption><strong>The causal mask is a triangle.</strong> Green cells are allowed. Red cells are set to &minus;&infin; before the softmax, so on the right they carry weight exactly 0. Row 0 can only attend to itself; row 4 can see everything. Numbers are from <code>mask.py</code>.</figcaption>
+</figure>
+
+<p>A second kind is the <span class="term">padding mask</span>. To process several sequences of different lengths as one batch tensor, shorter ones are padded with dummy tokens up to the batch's length. Those positions hold no information, so every query must be forbidden from attending to them: the key positions that are padding get &minus;&infin;. In the output above, query 0 spreads its weight over the three real tokens and gives exactly 0 to the two padded ones. In a padded batch of a decoder the two masks are combined (a position is forbidden if it is in the future or is padding).</p>
+
+<p>Finally, the failure at the bottom of the output. If <em>every</em> entry of a row is &minus;&infin;, the stable softmax computes &minus;&infin; minus the row maximum (&minus;&infin;), which is not a number, and the whole row becomes NaN. With a causal mask this cannot happen because the diagonal is always allowed, but with a padding mask on a left-padded batch, or a sequence whose real length is zero, it can, and a single NaN in one row of one head spreads to the whole network within a layer or two. Real implementations either guarantee one allowed entry per row, use a large negative finite number such as &minus;10<sup>9</sup> instead of &minus;&infin; (then a fully masked row becomes uniform rather than NaN), or fix up the rows after the fact. nanoGPT fills with <code>float('-inf')</code> and relies on the diagonal.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Attention weights show why the model produced its answer." The weights are a real intermediate quantity, easy to plot as a heatmap, and they are tempting to read as an explanation. But they are one step of a deep computation: the values they mix pass through the output projection, the MLP and many more layers, and other heads and layers carry information too. Jain and Wallace ("Attention is not Explanation", 2019) showed in text classifiers that attention weights often correlate weakly with other measures of feature importance, and that very different weights could give the same prediction. Wiegreffe and Pinter ("Attention is not not Explanation", 2019) replied that the answer depends on what one means by explanation. The practical position: attention maps are a useful hint about where to look, never a proof of what the model relied on. Testing a claim means intervening (remove or change the token and watch the output), not just looking.</p>
+</div>
+
+<h2>Multiple heads</h2>
+
+<p>One attention operation computes one weighted average per token with one set of weights. But a token often needs several different kinds of information from its context at once: the subject of the verb, the previous token, the matching opening bracket, something quoted earlier. A single softmax has to put one probability distribution over the positions and cannot do all of these. The remedy is to run several attention operations side by side, each with its own projections, and combine them: <span class="term">multi-head attention</span>. Each parallel copy is a <span class="term">head</span>.</p>
+
+<p>The cheap way to do it divides the width. With h heads, give each a slice of size d<sub>k</sub> = C / h (Vaswani et al. used C = 512, h = 8, d<sub>k</sub> = 64). Head i has its own W<sub>Q</sub><sup>(i)</sup>, W<sub>K</sub><sup>(i)</sup>, W<sub>V</sub><sup>(i)</sup> of shape (C, d<sub>k</sub>) and computes its own (T, d<sub>k</sub>) output. The h outputs are concatenated along the feature axis, restoring width h &middot; d<sub>k</sub> = C, and a final learned matrix W<sub>O</sub> of shape (C, C) mixes the heads' results together:</p>
+<p style="text-align:center">MultiHead(x) = Concat(head<sub>1</sub>, &hellip;, head<sub>h</sub>) W<sub>O</sub>, &nbsp;&nbsp; head<sub>i</sub> = Attention(xW<sub>Q</sub><sup>(i)</sup>, xW<sub>K</sub><sup>(i)</sup>, xW<sub>V</sub><sup>(i)</sup>).</p>
+
+<p>In code the h separate small matrices are stored as one big (C, C) matrix for each of Q, K and V, and the heads are made by reshaping, so one large matrix product serves all heads. Column block i of W<sub>Q</sub> <em>is</em> head i's projection. The reshape takes (B, T, C) to (B, T, h, d<sub>k</sub>) and then swaps axes to (B, h, T, d<sub>k</sub>), so heads become an extra batch-like axis, and the attention code from before runs unchanged on the last two axes.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Multi-head attention with four heads. A column of C features is split into four slices of d_k features. Each slice goes to its own attention head. The four head outputs are stacked back into a column of C features, multiplied by W_O, and give an output of shape B,T,C.">
+    <defs><marker id="ahDL09c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="30" y="15" width="50" height="40" class="fs-blue s-blue"/><rect x="30" y="65" width="50" height="40" class="fs-green s-green"/><rect x="30" y="115" width="50" height="40" class="fs-orange s-orange"/><rect x="30" y="165" width="50" height="40" class="fs-purple s-purple"/>
+    <text x="55" y="226" text-anchor="middle" class="t-xs t-muted">Q, K, V</text>
+    <text x="55" y="241" text-anchor="middle" class="t-xs t-muted">(B, T, C)</text>
+    <text x="108" y="39" text-anchor="middle" class="t-xs t-faint">d_k</text><text x="108" y="89" text-anchor="middle" class="t-xs t-faint">d_k</text><text x="108" y="139" text-anchor="middle" class="t-xs t-faint">d_k</text><text x="108" y="189" text-anchor="middle" class="t-xs t-faint">d_k</text>
+    <rect x="140" y="15" width="220" height="40" rx="8" class="fs-blue s-blue sw-2"/><text x="250" y="31" text-anchor="middle" class="t-sm t-bold">head 1</text><text x="250" y="46" text-anchor="middle" class="t-xs">softmax(Q1 K1^T / &radic;d_k) V1</text>
+    <rect x="140" y="65" width="220" height="40" rx="8" class="fs-green s-green sw-2"/><text x="250" y="81" text-anchor="middle" class="t-sm t-bold">head 2</text><text x="250" y="96" text-anchor="middle" class="t-xs">softmax(Q2 K2^T / &radic;d_k) V2</text>
+    <rect x="140" y="115" width="220" height="40" rx="8" class="fs-orange s-orange sw-2"/><text x="250" y="131" text-anchor="middle" class="t-sm t-bold">head 3</text><text x="250" y="146" text-anchor="middle" class="t-xs">softmax(Q3 K3^T / &radic;d_k) V3</text>
+    <rect x="140" y="165" width="220" height="40" rx="8" class="fs-purple s-purple sw-2"/><text x="250" y="181" text-anchor="middle" class="t-sm t-bold">head 4</text><text x="250" y="196" text-anchor="middle" class="t-xs">softmax(Q4 K4^T / &radic;d_k) V4</text>
+    <line x1="82" y1="35" x2="138" y2="35" class="line" marker-end="url(#ahDL09c)"/><line x1="82" y1="85" x2="138" y2="85" class="line" marker-end="url(#ahDL09c)"/><line x1="82" y1="135" x2="138" y2="135" class="line" marker-end="url(#ahDL09c)"/><line x1="82" y1="185" x2="138" y2="185" class="line" marker-end="url(#ahDL09c)"/>
+    <rect x="410" y="15" width="50" height="40" class="fs-blue s-blue"/><rect x="410" y="65" width="50" height="40" class="fs-green s-green"/><rect x="410" y="115" width="50" height="40" class="fs-orange s-orange"/><rect x="410" y="165" width="50" height="40" class="fs-purple s-purple"/>
+    <line x1="362" y1="35" x2="408" y2="35" class="line" marker-end="url(#ahDL09c)"/><line x1="362" y1="85" x2="408" y2="85" class="line" marker-end="url(#ahDL09c)"/><line x1="362" y1="135" x2="408" y2="135" class="line" marker-end="url(#ahDL09c)"/><line x1="362" y1="185" x2="408" y2="185" class="line" marker-end="url(#ahDL09c)"/>
+    <text x="435" y="226" text-anchor="middle" class="t-xs t-muted">concatenated</text>
+    <text x="435" y="241" text-anchor="middle" class="t-xs t-muted">(B, T, C)</text>
+    <rect x="510" y="75" width="90" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="555" y="102" text-anchor="middle" class="t-sm t-bold">&times; W_O</text><text x="555" y="120" text-anchor="middle" class="t-xs">(C, C)</text>
+    <line x1="462" y1="105" x2="508" y2="105" class="line" marker-end="url(#ahDL09c)"/>
+    <rect x="650" y="15" width="60" height="190" class="fs-yellow s-yellow sw-2"/>
+    <line x1="602" y1="105" x2="648" y2="105" class="line" marker-end="url(#ahDL09c)"/>
+    <text x="680" y="226" text-anchor="middle" class="t-xs t-muted">output</text>
+    <text x="680" y="241" text-anchor="middle" class="t-xs t-muted">(B, T, C)</text>
+  </svg>
+  <figcaption><strong>Heads split the width, not the sequence.</strong> The feature axis is drawn vertically. Each head sees a d_k = C/h slice of Q, K and V, attends over all T positions with its own weight matrix, and writes a d_k slice of the result. W<sub>O</sub> lets the heads' outputs mix.</figcaption>
+</figure>
+
+<p>The script below builds this with B = 2, T = 6, C = 32 and h = 4 (so d<sub>k</sub> = 8), prints the shape after every stage, and checks the batched version against a plain loop over heads with ordinary 2-D matrices.</p>
+
+<pre class="terminal" data-title="mha.py"><code>import numpy as np
+rng = np.random.default_rng(0)
+B, T, C, h = 2, 6, 32, 4
+d_k = C // h
+
+def softmax(a):
+    e = np.exp(a - a.max(-1, keepdims=True))
+    return e / e.sum(-1, keepdims=True)
+
+x = rng.normal(size=(B, T, C))
+Wq, Wk, Wv, Wo = (rng.normal(size=(C, C)) / np.sqrt(C) for _ in range(4))
+
+def split(t):                       # (B, T, C) -&gt; (B, h, T, d_k)
+    return t.reshape(B, T, h, d_k).transpose(0, 2, 1, 3)
+
+def mha(x, causal=True):
+    q, k, v = split(x @ Wq), split(x @ Wk), split(x @ Wv)
+    print("q, k, v:", q.shape)
+    s = q @ k.transpose(0, 1, 3, 2) / np.sqrt(d_k)
+    print("scores :", s.shape)
+    if causal:
+        s = np.where(np.triu(np.ones((T, T), bool), 1), -np.inf, s)
+    p = softmax(s)
+    o = p @ v
+    print("per-head output:", o.shape)
+    o = o.transpose(0, 2, 1, 3).reshape(B, T, C)      # concatenate heads
+    print("concatenated:", o.shape)
+    return o @ Wo, p
+
+y, p = mha(x)
+print("output:", y.shape)
+
+# the same thing, one head at a time with plain 2-D matrices
+outs = []
+for i in range(h):
+    sl = slice(i * d_k, (i + 1) * d_k)
+    q, k, v = x[0] @ Wq[:, sl], x[0] @ Wk[:, sl], x[0] @ Wv[:, sl]
+    s = q @ k.T / np.sqrt(d_k)
+    s[np.triu_indices(T, 1)] = -np.inf
+    outs.append(softmax(s) @ v)
+y0 = np.concatenate(outs, axis=-1) @ Wo
+print("max |batched - loop over heads| =", np.abs(y[0] - y0).max())
+print("weights sum to 1:", np.allclose(p.sum(-1), 1), "| future weights:", p[0, 0][np.triu_indices(T, 1)].max())
+print("parameters in the four matrices:", 4 * C * C, "= 4 C^2")</code></pre>
+<pre class="terminal" data-title="output"><code>q, k, v: (2, 4, 6, 8)
+scores : (2, 4, 6, 6)
+per-head output: (2, 4, 6, 8)
+concatenated: (2, 6, 32)
+output: (2, 6, 32)
+max |batched - loop over heads| = 0.0
+weights sum to 1: True | future weights: 0.0
+parameters in the four matrices: 4096 = 4 C^2</code></pre>
+
+<p>Two things to notice. The scores have shape (B, h, T, T): every head has its own T &times; T table, so memory for the scores grows with the number of heads as well as with T&sup2;. And the parameter count, 4C&sup2;, does not depend on h at all. Splitting the width into more heads costs no extra parameters or arithmetic; it only changes how the same C columns are grouped. What more heads buy is diversity of attention patterns; what they cost is that each head works with fewer dimensions (d<sub>k</sub> shrinks), which limits how rich each head's matching can be.</p>
+
+<h3>What heads learn</h3>
+<p>Heads differ because they are initialised differently and trained to be useful together, not because anyone assigns them roles. Interpretability work has found recurring patterns anyway. Voita et al. ("Analyzing Multi-Head Self-Attention: Specialized Heads Do the Heavy Lifting, the Rest Can Be Pruned", 2019) found, in a translation model, a few heads that tracked adjacent positions, syntactic relations or rare words, and that many other heads could be removed with little loss. Michel, Levy and Neubig ("Are Sixteen Heads Really Better than One?", 2019) reached a similar conclusion for removing heads at test time. Olsson et al. ("In-context Learning and Induction Heads", 2022) identified <em>induction heads</em>: a pair of heads in two layers that, after seeing "A B" earlier in the context, notice a new "A" and predict "B". They linked the appearance of such heads during training to a sharp improvement in the model's ability to learn from examples given in the prompt. This is a research finding about particular models, not a law: do not assume each head in a model you load has a tidy job.</p>
+
+<h3>Self-attention, cross-attention, encoders and decoders</h3>
+<p>In <em>self</em>-attention Q, K and V all come from the same sequence. In <span class="term">cross-attention</span> the queries come from one sequence and the keys and values from another: the decoder of a translation model queries the encoder's output, and a vision-language model's text tokens can query image features (chapter 21). The computation is identical; only the source of K and V changes, and the score matrix becomes (T<sub>query</sub>, T<sub>key</sub>), no longer square. Models built from self-attention with a causal mask only, the GPT family and nearly every current chat model, are called <em>decoder-only</em>; those with no mask are <em>encoders</em> (BERT-style, used for classification and embedding models, <a href="../../retrieval/chapters/07-dense-retrieval.html">A5 chapter 07</a>).</p>
+
+<h2>Gradients through attention</h2>
+
+<p>Attention is built from matrix products and a softmax, so autodiff handles it, but it is worth knowing the backward pass once, both to check an implementation and to see where the softmax's near-zero gradient from the previous section enters. For one head with P = softmax(S) row-wise and O = PV, suppose the loss sends back dO of the same shape as O. The three steps are the reverse of the forward pass (chapter 02 and <a href="../../ml-foundations/chapters/09-autodiff.html">A0 chapter 09</a>):</p>
+<ol class="steps">
+  <li><b>Through O = PV.</b> dV = P<sup>T</sup> dO and dP = dO V<sup>T</sup>. The first is the gradient into the values: each value row receives the output gradients of the tokens that read it, weighted by how much they read it.</li>
+  <li><b>Through the row-wise softmax.</b> For each row, dS = P &odot; (dP &minus; rowsum(dP &odot; P)). This is the Jacobian p<sub>i</sub>(&delta;<sub>ij</sub> &minus; p<sub>j</sub>) applied without forming the matrix. If a row of P is one-hot, dS is zero for that row.</li>
+  <li><b>Through S = QK<sup>T</sup>/&radic;d<sub>k</sub>.</b> dQ = dS K / &radic;d<sub>k</sub> and dK = dS<sup>T</sup> Q / &radic;d<sub>k</sub>. Masked entries have P = 0, hence dS = 0, so no gradient flows through forbidden pairs.</li>
+</ol>
+<p>The script implements these three lines and compares them with central finite differences (the check from chapter 02) on a causal 5-token head.</p>
+
+<pre class="terminal" data-title="gradcheck.py"><code>import numpy as np
+rng = np.random.default_rng(0)
+T, d = 5, 4
+def softmax(a):
+    e = np.exp(a - a.max(-1, keepdims=True)); return e / e.sum(-1, keepdims=True)
+mask = np.triu(np.ones((T, T), bool), 1)
+
+def forward(Q, K, V):
+    S = np.where(mask, -np.inf, Q @ K.T / np.sqrt(d))
+    P = softmax(S)
+    return P @ V, P
+
+def backward(dO, Q, K, V, P):
+    dV = P.T @ dO
+    dP = dO @ V.T
+    dS = P * (dP - (dP * P).sum(-1, keepdims=True))   # softmax backward, row by row
+    dQ = dS @ K / np.sqrt(d)
+    dK = dS.T @ Q / np.sqrt(d)
+    return dQ, dK, dV
+
+Q, K, V = (rng.normal(size=(T, d)) for _ in range(3))
+W = rng.normal(size=(T, d))                  # loss = sum(W * output)
+O, P = forward(Q, K, V)
+dQ, dK, dV = backward(W, Q, K, V, P)
+
+def num_grad(f, A, eps=1e-6):
+    g = np.zeros_like(A)
+    for i in np.ndindex(*A.shape):
+        a = A[i]; A[i] = a + eps; hi = f(); A[i] = a - eps; lo = f(); A[i] = a
+        g[i] = (hi - lo) / (2 * eps)
+    return g
+loss = lambda: (W * forward(Q, K, V)[0]).sum()
+for name, A, g in (("Q", Q, dQ), ("K", K, dK), ("V", V, dV)):
+    print(f"d{name}: max |analytic - numeric| = {np.abs(g - num_grad(loss, A)).max():.1e}")</code></pre>
+<pre class="terminal" data-title="output"><code>dQ: max |analytic - numeric| = 8.0e-10
+dK: max |analytic - numeric| = 1.6e-09
+dV: max |analytic - numeric| = 7.8e-10</code></pre>
+
+<p>All three gradients agree with the numeric ones to about 10<sup>&minus;9</sup>, so the formulas are right. Fast attention kernels (<a href="19-efficient-attention.html">chapter 19</a>) recompute P in the backward pass instead of storing it, but the algebra is exactly this.</p>
+
+<h2>What attention costs</h2>
+
+<p>The score matrix has T&sup2; entries per head per sequence. Computing Q K<sup>T</sup> and then P V takes about 2 &middot; 2 &middot; T&sup2; &middot; d<sub>k</sub> floating-point operations per head (each of the two matrix products is T &times; T &times; d<sub>k</sub> multiply-adds, and a multiply-add counts as two operations). If the whole T &times; T matrix is stored it also takes T&sup2; numbers of memory. The next script tabulates both for one head with d<sub>k</sub> = 128 and 16-bit numbers.</p>
+
+<pre class="terminal" data-title="cost.py"><code># memory of the T x T score matrix for ONE head, ONE sequence, in 16-bit numbers, and the multiply-adds of QK^T and PV
+for T in (1_024, 8_192, 32_768, 131_072):
+    entries = T * T
+    mib = entries * 2 / 2**20
+    d_k = 128
+    flops = 2 * 2 * T * T * d_k          # two matmuls, 2 FLOPs per multiply-add
+    print(f"T={T:&gt;7,}  entries={entries:&gt;16,}  one head, fp16: {mib:&gt;10,.0f} MiB   QK^T + PV: {flops/1e9:&gt;10,.1f} GFLOPs")</code></pre>
+<pre class="terminal" data-title="output"><code>T=  1,024  entries=       1,048,576  one head, fp16:          2 MiB   QK^T + PV:        0.5 GFLOPs
+T=  8,192  entries=      67,108,864  one head, fp16:        128 MiB   QK^T + PV:       34.4 GFLOPs
+T= 32,768  entries=   1,073,741,824  one head, fp16:      2,048 MiB   QK^T + PV:      549.8 GFLOPs
+T=131,072  entries=  17,179,869,184  one head, fp16:     32,768 MiB   QK^T + PV:    8,796.1 GFLOPs</code></pre>
+
+<p>Going from 1,024 to 131,072 tokens multiplies the length by 128 and the cost by 128&sup2; = 16,384. A naive implementation holding the full score matrix would need 32 GiB for a <em>single</em> head at 131k tokens, more than a full model's worth of heads could fit on any GPU, so long-context models never materialise it. This is the motivation for the techniques of chapter 19: grouped-query attention shrinks what must be stored per token during generation, sliding windows restrict which pairs are scored, and FlashAttention computes exactly the same result in small tiles without ever writing the T &times; T matrix to GPU memory (<a href="../cases/case-05-flashattention.html">case study 5</a>). For generation, previous tokens' K and V are cached so each new token needs only one new row of scores (<a href="../../llm-training/chapters/18-kv-cache.html">A3 chapter 18</a>).</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Attention is two large matrix multiplications with a softmax between them, which is the workload GPUs were built for (<a href="../../systems/chapters/21-parallelism-gpus.html">Zero to Systems chapter 21</a>). The matrix products are limited by arithmetic throughput; the softmax and the masking are limited by memory bandwidth, because they do little arithmetic per element but touch the whole T &times; T matrix. That mismatch is why attention was memory-bound before fused kernels, and why measuring it needs the profiling habits of <a href="../../systems/chapters/22-performance-engineering.html">chapter 22</a> rather than counting FLOPs alone. The quadratic cost is also a capacity-planning fact: doubling the context a service accepts quadruples the attention work for a request of full length and raises the memory for caching, which is why providers price and limit long contexts as they do (<a href="../../design/chapters/20-ml-systems.html">Designing with ML &amp; LLMs</a>).</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>As far as published model reports show, the operation in this chapter, causal multi-head softmax attention, is still the core of nearly every frontier language model. The variants are in how keys and values are stored and which pairs are scored: grouped-query attention (several query heads share one key/value head) is widespread, compressing the key/value cache with a learned low-rank projection (as in DeepSeek's multi-head latent attention, 2024) is used in some models, and many models mix full-attention layers with sliding-window or other sparse layers. PyTorch has exposed fused attention kernels through <code>torch.nn.functional.scaled_dot_product_attention</code> since version 2.0 (2023), so most users never write the loop of this chapter outside teaching code. All of these change cost and memory, not the idea; chapters 19 to 22 cover them. Details of any given model change with each release, so check its current technical report.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>1. In the "Steer a soft lookup" widget set sharpness near 0.1 and note that the output sits near the centre of the six points; raise it to 40 and watch it jump to a single token. 2. Tick the causal mask, put the query at position 2, and rotate the arrow through a full circle: the output can never leave the span of the first two values. 3. In <code>tiny.py</code> change the mask line so the mask is applied <em>after</em> the softmax and compare the row sums to 1. 4. In <code>scale.py</code> replace <code>np.sqrt(d_k)</code> by <code>d_k</code> and re-run. What standard deviation do you get, and what happens to the weights? 5. In <code>mha.py</code> set h to 1, 2, 8 and 32 (C stays 32) and check that the parameter count printed does not change, then print how the shape of the score tensor does.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 tiny.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 scale.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 mha.py</span></code></pre>
+  <p>Lab 3 (<a href="../labs/lab-03-attention.html">Attention &amp; a Transformer Block</a>) has you implement these functions in pure Python and check them shape by shape.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Attention is a differentiable dictionary lookup: scores from query-key dot products, a softmax to make weights, and a weighted average of values. Q, K and V are three learned projections of the same tokens in self-attention.</li>
+    <li>Shapes: x is (B, T, C); Q, K are (B, T, d<sub>k</sub>); scores and weights are (B, T, T); the output is (B, T, d<sub>v</sub>). With h heads, insert an h axis: (B, h, T, d<sub>k</sub>) and (B, h, T, T).</li>
+    <li>Dividing by &radic;d<sub>k</sub> keeps the score variance at 1 whatever the width; without it the softmax saturates, becomes one-hot and passes almost no gradient.</li>
+    <li>The causal mask sets future scores to &minus;&infin; <em>before</em> the softmax. Masking after the softmax breaks the row sums; a fully masked row gives NaN.</li>
+    <li>Multi-head attention splits the width into h slices of d<sub>k</sub> = C/h, runs attention on each and mixes with W<sub>O</sub>. The four matrices cost 4C&sup2; parameters whatever h is.</li>
+    <li>Attention costs O(T&sup2;) time and, if materialised, memory per head. That drives context limits, the KV cache and fast kernels. Attention weights are a hint, not an explanation.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Vaswani et al., "Attention Is All You Need" (2017)</a>. The paper that defines scaled dot-product and multi-head attention; the footnote on the variance of dot products is the &radic;d<sub>k</sub> argument.</li>
+  <li><a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener">Bahdanau, Cho and Bengio, "Neural Machine Translation by Jointly Learning to Align and Translate" (2014)</a>. The first widely used soft attention, inside a recurrent translator.</li>
+  <li><a href="https://arxiv.org/abs/1905.09418" target="_blank" rel="noopener">Voita et al., "Analyzing Multi-Head Self-Attention: Specialized Heads Do the Heavy Lifting, the Rest Can Be Pruned" (2019)</a>. What individual heads do and how many are needed.</li>
+  <li><a href="https://arxiv.org/abs/2209.11895" target="_blank" rel="noopener">Olsson et al., "In-context Learning and Induction Heads" (2022)</a>. A circuit that completes patterns, and its link to in-context learning.</li>
+  <li><a href="https://arxiv.org/abs/1902.10186" target="_blank" rel="noopener">Jain and Wallace, "Attention is not Explanation" (2019)</a> and <a href="https://arxiv.org/abs/1908.04626" target="_blank" rel="noopener">Wiegreffe and Pinter, "Attention is not not Explanation" (2019)</a>. The two sides of the debate over reading attention maps.</li>
+  <li><a href="https://www.youtube.com/watch?v=kCc8FmEb1nY" target="_blank" rel="noopener">Karpathy, "Let's build GPT: from scratch, in code, spelled out" (2023)</a>. Builds masked self-attention step by step, in the spirit of this chapter; the matching code is the <a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">nanoGPT</a> repository.</li>
+  <li><a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">Alammar, "The Illustrated Transformer" (2018)</a>. A picture-led walk through the same computation.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A decoder layer has B = 4, T = 128, C = 768 and h = 12 heads. What is the shape of the attention-weight tensor P?</p>
+    <ol class="q-options"><li>(4, 128, 768)</li><li>(4, 12, 128, 64)</li><li>(4, 12, 128, 128)</li><li>(4, 128, 128)</li></ol>
+    <div class="q-explain">Each of the 12 heads has its own T &times; T table of weights for each sequence, so the shape is (B, h, T, T) = (4, 12, 128, 128). (4, 12, 128, 64) is the shape of one head's Q, K, V or output, with d<sub>k</sub> = 768/12 = 64. (4, 128, 128) would be a single head.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You change d<sub>k</sub> from 64 to 256 and forget the 1/&radic;d<sub>k</sub> factor. Compared with the d<sub>k</sub> = 64 model, roughly how does the standard deviation of the scores change at initialisation, and what is the effect?</p>
+    <ol class="q-options"><li>It is unchanged, because the softmax normalises it</li><li>It halves, so attention becomes too uniform</li><li>It grows by a factor of 4, so the weights become uniform</li><li>It doubles, so the softmax is sharper and the gradient to Q and K shrinks</li></ol>
+    <div class="q-explain">Var(q&middot;k) = d<sub>k</sub>, so the standard deviation goes from 8 to 16: a factor of &radic;4 = 2, not 4. Larger scores make the softmax closer to one-hot, which reduces its gradient. The softmax normalises the weights, not the scores that go into it, so the sharpness changes.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Which statement about the causal mask is correct?</p>
+    <ol class="q-options"><li>Future positions' scores are set to &minus;&infin; before the softmax, so their weights are exactly zero and each row still sums to one</li><li>Future positions' weights are set to zero after the softmax, which is equivalent</li><li>The mask is applied to V, so future values are zeroed</li><li>The mask is only needed at inference time</li></ol>
+    <div class="q-explain">Masking before the softmax lets the remaining weights renormalise. Zeroing after leaves rows summing to less than one, which is not equivalent. Masking V is not enough: the weights would still be shared out to future positions. The mask matters in <em>training</em> most, because there the whole sequence is present and an unmasked model could read the answer.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A model has C = 512. You go from h = 8 heads to h = 16 heads, keeping C. What happens to the number of parameters in the Q, K, V and output projections and to the size of the score tensor?</p>
+    <ol class="q-options"><li>Parameters double; score tensor is unchanged</li><li>Parameters are unchanged (4C&sup2;); the score tensor doubles because there are twice as many T &times; T tables</li><li>Parameters are unchanged; the score tensor is unchanged</li><li>Parameters double; the score tensor doubles</li></ol>
+    <div class="q-explain">The projections are (C, C) matrices however the columns are grouped, so 4C&sup2; = 1,048,576 in both cases. Each head has its own T &times; T scores, so h doubling doubles the score tensor, while d<sub>k</sub> halves from 64 to 32.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">While training a decoder you notice that changing token 9 of a sequence changes the model's output at position 5. Which is the most likely cause?</p>
+    <ol class="q-options"><li>The &radic;d<sub>k</sub> scaling is missing</li><li>There are too many heads</li><li>The causal mask is missing, wrong or applied after the softmax, so position 5 can read the future</li><li>The values V are too wide</li></ol>
+    <div class="q-explain">Output at position 5 should depend only on tokens 0 to 5. Any dependence on token 9 is leakage from the future, which a missing or misapplied mask produces (an off-by-one that lets the mask start on the diagonal rather than above it is another classic). Scaling, head count and value width affect quality and trainability, not causality. The test is cheap: change a late token and assert earlier outputs are identical.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A colleague shows a heatmap in which a head's attention from the word "bank" is concentrated on "river" and concludes "the model decided the meaning from 'river'". What is the soundest response?</p>
+    <ol class="q-options"><li>It is a useful hypothesis, but test it by intervening, for example replacing or removing "river" and checking whether the output changes</li><li>It is proven, because attention weights are probabilities of importance</li><li>It is meaningless, because attention weights carry no information</li><li>It is only valid for decoder-only models</li></ol>
+    <div class="q-explain">Weights are real quantities but one step among many; other heads, layers and the MLPs also carry information, so high weight does not establish reliance (Jain and Wallace, 2019). They are not meaningless either, which is why the debate is not settled in either direction. The cure is an intervention that measures the effect on the output.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/dl09-attention.js"></script>
+</body>
+</html>

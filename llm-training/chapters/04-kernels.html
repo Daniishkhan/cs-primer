@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernels &amp; Performance · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="04">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Kernels &amp; Performance</h1>
+  <p class="lede">A GPU is fast at arithmetic and slow at fetching the numbers to do arithmetic on. This chapter explains why most of a transformer's operations are limited by memory traffic rather than by maths, why combining several small operations into one fused kernel removes that traffic, and what a first Triton kernel looks like.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The previous chapters counted what a training run must store (<a href="02-gpu-memory.html">chapter 02</a>) and how it spreads over many GPUs (<a href="03-parallelism.html">chapter 03</a>). This chapter is about what happens inside one GPU: why a run reaches only 40 percent of the chip's advertised arithmetic speed even when everything is well parallelised. After it you will be able to tell a memory-bound operation from a compute-bound one with one division, explain why FlashAttention and <code>torch.compile</code> exist, and read a simple Triton kernel. You will not be expected to write production kernels; that is a specialist job, but knowing what the specialists are doing tells you where your own time goes.</p>
+</div>
+
+<h2>The cost that does not appear in the FLOP count</h2>
+
+<p><a href="../../deep-learning/chapters/16-resource-accounting.html">Chapter 16 of A2</a> counted a model's work in FLOPs (floating-point operations). That count answers "how much arithmetic?" but not "how long?". A chip finishes a job when both of two things are done: the arithmetic, and the movement of the data that the arithmetic reads and writes. Whichever takes longer sets the time.</p>
+
+<p>A GPU has two places to keep numbers. <span class="term">HBM</span> (high-bandwidth memory) is the large off-chip memory, 80 GB on an H100, where weights and activations live between operations. <span class="term">On-chip memory</span> (registers and shared memory, also called SRAM) sits inside each processor, is orders of magnitude smaller (hundreds of kilobytes per processor) and is far faster. Every operation must bring its inputs from HBM into the chip and, unless something else consumes them immediately, write its results back.</p>
+
+<p>NVIDIA's datasheet for the H100 SXM lists 80 GB of HBM3 at 3.35 TB/s and 989 TFLOPS of dense bf16 tensor-core arithmetic (the headline 1,979 figure assumes structured sparsity, which training rarely uses). Divide the two: <strong>989 trillion FLOP/s over 3.35 trillion bytes/s is about 295 FLOP per byte</strong>. To keep the arithmetic units busy, a program must do about 295 operations for every byte it fetches from HBM. This number is the chip's <span class="term">ridge point</span>.</p>
+
+<p>Most operations in a network do far fewer than 295. Take an elementwise operation such as adding a bias or applying a GELU. It reads each value (2 bytes in bf16), does a handful of operations, and writes the value back (2 bytes): one or two FLOP per four bytes, well under 1 FLOP per byte. The GPU spends nearly all its time waiting for memory and nearly none computing. The quantity that decides this, <span class="term">arithmetic intensity</span>, is simply FLOPs divided by bytes moved to and from HBM. An operation with intensity below the ridge point is <span class="term">memory-bound</span>; above it, <span class="term">compute-bound</span>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="A roofline plot on logarithmic axes. Performance rises along a slanted memory-bandwidth line until the ridge point at about 295 FLOP per byte, then stays flat at 989 teraflops. Three points are marked: an unfused elementwise chain far left on the slanted line, the same chain fused a little to the right, and a large matrix multiplication on the flat part.">
+    <defs><marker id="ahLT04a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="90" y1="250" x2="700" y2="250" class="line"/>
+    <line x1="90" y1="40" x2="90" y2="250" class="line"/>
+    <line x1="90" y1="250" x2="90" y2="254" class="line-thin"/><text x="90" y="268" text-anchor="middle" class="t-xs t-muted">0.1</text>
+    <line x1="212" y1="250" x2="212" y2="254" class="line-thin"/><text x="212" y="268" text-anchor="middle" class="t-xs t-muted">1</text>
+    <line x1="334" y1="250" x2="334" y2="254" class="line-thin"/><text x="334" y="268" text-anchor="middle" class="t-xs t-muted">10</text>
+    <line x1="456" y1="250" x2="456" y2="254" class="line-thin"/><text x="456" y="268" text-anchor="middle" class="t-xs t-muted">100</text>
+    <line x1="578" y1="250" x2="578" y2="254" class="line-thin"/><text x="578" y="268" text-anchor="middle" class="t-xs t-muted">1,000</text>
+    <line x1="700" y1="250" x2="700" y2="254" class="line-thin"/><text x="700" y="268" text-anchor="middle" class="t-xs t-muted">10,000</text>
+    <text x="395" y="292" text-anchor="middle" class="t-sm">Arithmetic intensity (FLOP per byte of HBM traffic)</text>
+    <text x="84" y="254" text-anchor="end" class="t-xs t-muted">0.1T</text>
+    <text x="84" y="201" text-anchor="end" class="t-xs t-muted">1T</text>
+    <text x="84" y="149" text-anchor="end" class="t-xs t-muted">10T</text>
+    <text x="84" y="96" text-anchor="end" class="t-xs t-muted">100T</text>
+    <text x="84" y="44" text-anchor="end" class="t-xs t-muted">1,000T</text>
+    <text x="16" y="150" class="t-xs t-muted" transform="rotate(-90 16 150)" text-anchor="middle">Achievable FLOP/s</text>
+    <line x1="90" y1="222.4" x2="513.4" y2="40.3" class="line s-blue sw-2"/>
+    <line x1="513.4" y1="40.3" x2="700" y2="40.3" class="line s-blue sw-2"/>
+    <line x1="513.4" y1="40.3" x2="513.4" y2="250" class="line-dash"/>
+    <text x="508" y="236" text-anchor="end" class="t-xs t-muted">ridge point, about 295</text>
+    <text x="600" y="32" text-anchor="middle" class="t-xs tc-blue">compute roof: 989 TFLOPS</text>
+    <text x="300" y="118" class="t-xs tc-blue" transform="rotate(-23 300 118)">memory roof: 3.35 TB/s</text>
+    <circle cx="97.6" cy="219.2" r="6" class="f-red"/>
+    <text x="108" y="238" class="t-xs">unfused chain</text>
+    <circle cx="196.8" cy="176.5" r="6" class="f-green"/>
+    <text x="206" y="196" class="t-xs">same chain, fused</text>
+    <circle cx="631.2" cy="40.3" r="6" class="f-yellow"/>
+    <text x="631" y="66" text-anchor="middle" class="t-xs">large matmul</text>
+  </svg>
+  <figcaption><strong>The roofline.</strong> Under the slanted line an operation is limited by bandwidth: doubling its intensity doubles its speed. Fusion moves a point to the right (same FLOPs, fewer bytes) and so up the slope. A large matrix multiplication is already past the ridge point, so only more arithmetic would help it. Both axes are logarithmic; points use the six-operation chain computed below in float32 and a bf16 8192 by 8192 matmul.</figcaption>
+</figure>
+
+<p>This explains a fact that surprises newcomers: the large matrix multiplications of a transformer are compute-bound and run near peak, but the layers around them (normalisation, softmax, activation functions, residual adds, dropout, the cast between precisions) are memory-bound, and added together they can take a large share of the step time. In <a href="../../deep-learning/chapters/17-training-stability.html">A2's training chapters</a> and in <a href="../../deep-learning/chapters/19-efficient-attention.html">efficient attention</a> the same split appears: FlashAttention's gain is not fewer FLOPs but less HBM traffic.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>This is the memory hierarchy argument from <a href="../../systems/chapters/21-parallelism-gpus.html">Parallelism, SIMD and GPUs</a> applied to one chip, and the method is the one from <a href="../../systems/chapters/22-performance-engineering.html">Performance Engineering</a>: find out whether you are limited by compute or by memory before you try to improve either.</p>
+</div>
+
+<h2>Why one kernel beats three</h2>
+
+<p>A <span class="term">kernel</span> is a function that runs on the GPU, launched from the CPU, across thousands of threads. In plain PyTorch each operation you write is, by default, its own kernel. The expression <code>y = relu(x * 1.5 + 0.5)</code> launches three kernels. Each one reads its input array from HBM and writes a whole new array back. The intermediate arrays exist only so that the next kernel can read them again.</p>
+
+<p>A <span class="term">fused kernel</span> does all three steps while the value is still in a register: read <code>x</code> once, multiply, add, apply ReLU, write <code>y</code> once. The arithmetic is identical; the memory traffic drops from six passes (three reads, three writes) to two. For an operation limited by bandwidth, time is proportional to bytes, so the saving is close to proportional to the passes removed. Fusion also removes the cost of launching kernels (a few microseconds each, which matters when the kernel itself runs in tens of microseconds) and the memory for the intermediate arrays.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Two panels. Left: three separate kernels, each reading from and writing to HBM, giving six trips across the memory bus. Right: one fused kernel reading once from HBM, doing three steps on chip and writing once, giving two trips.">
+    <defs><marker id="ahLT04b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="180" y="24" text-anchor="middle" class="t-sm t-bold">Unfused: three kernels</text>
+    <rect x="20" y="40" width="320" height="44" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="180" y="67" text-anchor="middle" class="t-sm t-bold">HBM (x, t1, t2, y)</text>
+    <rect x="30" y="170" width="86" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="73" y="200" text-anchor="middle" class="t-sm">x * 1.5</text>
+    <rect x="137" y="170" width="86" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="180" y="200" text-anchor="middle" class="t-sm">+ 0.5</text>
+    <rect x="244" y="170" width="86" height="50" rx="8" class="fs-blue s-blue sw-2"/><text x="287" y="200" text-anchor="middle" class="t-sm">relu</text>
+    <line x1="60" y1="86" x2="60" y2="168" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <line x1="86" y1="168" x2="86" y2="86" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <line x1="167" y1="86" x2="167" y2="168" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <line x1="193" y1="168" x2="193" y2="86" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <line x1="274" y1="86" x2="274" y2="168" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <line x1="300" y1="168" x2="300" y2="86" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <text x="180" y="256" text-anchor="middle" class="t-sm">6 trips over the memory bus</text>
+    <text x="180" y="276" text-anchor="middle" class="t-xs t-muted">3 launches, 2 temporary arrays</text>
+    <line x1="380" y1="30" x2="380" y2="285" class="line-dash"/>
+    <text x="570" y="24" text-anchor="middle" class="t-sm t-bold">Fused: one kernel</text>
+    <rect x="420" y="40" width="320" height="44" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="580" y="67" text-anchor="middle" class="t-sm t-bold">HBM (x, y)</text>
+    <rect x="440" y="150" width="280" height="86" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="580" y="176" text-anchor="middle" class="t-sm t-bold">one kernel, on chip</text>
+    <text x="580" y="200" text-anchor="middle" class="t-xs t-muted">x * 1.5, then + 0.5, then relu</text>
+    <text x="580" y="218" text-anchor="middle" class="t-xs t-muted">values stay in registers</text>
+    <line x1="510" y1="86" x2="510" y2="148" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <line x1="650" y1="148" x2="650" y2="86" class="line s-orange" marker-end="url(#ahLT04b)"/>
+    <text x="570" y="256" text-anchor="middle" class="t-sm">2 trips over the memory bus</text>
+    <text x="570" y="276" text-anchor="middle" class="t-xs t-muted">1 launch, no temporary arrays</text>
+  </svg>
+  <figcaption><strong>Same arithmetic, a third of the traffic.</strong> Orange arrows are reads and writes between HBM and the processors. In the left panel the arrays t1 and t2 are written only to be read straight back.</figcaption>
+</figure>
+
+<h3>Measuring it</h3>
+
+<p>You do not need a GPU to see the effect, because every modern CPU has the same two-level structure: a large, slow main memory and a small, fast cache. The script below applies a chain of six cheap operations to 134 million float32 values (512 MiB). The unfused version is ordinary NumPy, which makes a full-size temporary array at each step. The fused version processes the array in blocks of 512 KiB so that the temporaries stay in cache, which is the same idea as keeping values on chip. Both produce identical results (the script asserts it).</p>
+
+<pre class="terminal" data-title="fuse.py"><code>import time
+import numpy as np
+
+N = 1 &lt;&lt; 27                       # 134 million float32 values = 512 MiB
+x = np.random.default_rng(0).standard_normal(N, dtype=np.float32)
+f = np.float32
+
+def unfused(x):                   # six separate passes over memory
+    t = x * f(1.5)                # read x, write t
+    t = t + f(0.5)                # read t, write t
+    t = t * t
+    t = t - f(1)
+    t = t + x                     # reads two arrays
+    return np.maximum(t, 0)
+
+def fused(x, block=1 &lt;&lt; 17):      # 131,072 floats = 512 KiB, small enough for cache
+    y = np.empty_like(x)
+    buf = np.empty(block, dtype=np.float32)
+    for i in range(0, len(x), block):
+        xs = x[i:i + block]
+        t = buf[:len(xs)]
+        np.multiply(xs, f(1.5), out=t)
+        t += f(0.5); t *= t; t -= f(1); t += xs
+        np.maximum(t, 0, out=y[i:i + block])
+    return y
+
+def best(g, reps=5):
+    times = []
+    for _ in range(reps):
+        t0 = time.perf_counter(); g(x); times.append(time.perf_counter() - t0)
+    return min(times)
+
+assert np.array_equal(unfused(x), fused(x))
+tu, tf = best(unfused), best(fused)
+gib = lambda n: n * 4 / 2**30
+print(f"unfused: {gib(13*N):.1f} GiB moved, best of 5 = {tu*1e3:.0f} ms")
+print(f"fused:   {gib(2*N):.1f} GiB moved, best of 5 = {tf*1e3:.0f} ms")
+print(f"traffic ratio {13/2:.1f}x, measured time ratio {tu/tf:.2f}x")
+
+# The same chain on an H100 SXM, using NVIDIA's datasheet figures.
+peak, bw = 989e12, 3.35e12        # dense bf16 FLOP/s, HBM3 bytes/s
+print(f"\nH100 ridge point: {peak/bw:.0f} FLOP per byte")
+print(f"chain intensity, fused: 6 FLOP / 8 bytes = {6/8:.2f} FLOP per byte")
+print(f"1 Gi values, bandwidth floor: unfused {13*2**30*4/bw*1e3:.1f} ms, fused {2*2**30*4/bw*1e3:.1f} ms")
+print(f"1 Gi values, compute floor: {6*2**30/peak*1e3:.4f} ms")
+</code></pre>
+<pre class="terminal" data-title="output"><code>unfused: 6.5 GiB moved, best of 5 = 92 ms
+fused:   1.0 GiB moved, best of 5 = 78 ms
+traffic ratio 6.5x, measured time ratio 1.17x
+
+H100 ridge point: 295 FLOP per byte
+chain intensity, fused: 6 FLOP / 8 bytes = 0.75 FLOP per byte
+1 Gi values, bandwidth floor: unfused 16.7 ms, fused 2.6 ms
+1 Gi values, compute floor: 0.0065 ms
+</code></pre>
+
+<p>The output below came from a laptop with an Apple-silicon chip and NumPy 2.x. Read it carefully, because it contains a lesson. The fused version moves 6.5 times less data by the count in the script, but ran only about 1.2 times faster here. Two reasons. First, this laptop has a large cache and very fast unified memory, so its ridge point is low and the unfused version was not as starved as a GPU would be. Second, the fused loop runs in Python and pays interpreter overhead per block, and NumPy still makes a separate pass for each step inside a block. Real fusion happens in the compiler, per element, in registers. The traffic ratio is a ceiling on the gain for a bandwidth-bound operation, not a prediction of it. Your numbers will differ; run the script yourself.</p>
+
+<p>The last four lines apply the roofline to an H100. For a billion values the unfused chain needs at least 16.7 ms just to move bytes at 3.35 TB/s, the fused one 2.6 ms, and the arithmetic itself would take 0.0065 ms. The arithmetic is irrelevant; the whole cost is traffic. These are floors from the datasheet bandwidth: real kernels reach perhaps 70 to 90 percent of peak bandwidth (an assumption that depends on the kernel and the chip, so measure it).</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A faster GPU, or fewer FLOPs, makes every layer faster." Only compute-bound operations get faster with more arithmetic throughput. A memory-bound layer on a chip with twice the FLOPs and the same bandwidth takes exactly as long. This is why model FLOPs utilisation (MFU), the fraction of peak arithmetic achieved, stays well below 100 percent even in excellent runs: Llama 3 405B reported 38 to 43 percent of peak bf16 on up to 16,384 H100 GPUs (Dubey et al., 2024), and the shortfall comes from memory-bound operations, communication and waiting (the paper does not give a breakdown).</p>
+</div>
+
+<h2>Getting fusion without writing it</h2>
+
+<p>Most engineers get fused kernels from tools, in rising order of effort.</p>
+
+<ul>
+  <li><strong>Library kernels.</strong> Frameworks ship fused versions of the common patterns: fused optimiser steps (AdamW updates all parameters in a few kernels instead of one per tensor), fused layer normalisation, and fused attention (FlashAttention, Dao et al., 2022, "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"). Turning these on is often a configuration flag, and it is the cheapest win in this chapter.</li>
+  <li><strong><code>torch.compile</code>.</strong> PyTorch 2 captures a model's operations as a graph and generates fused kernels for the memory-bound stretches automatically, using Triton as its GPU code generator (Ansel et al., 2024, "PyTorch 2"). You wrap a function or module and keep writing ordinary PyTorch. The costs are compile time at the start, occasional recompilation when shapes change, and harder debugging.</li>
+  <li><strong>A custom kernel in Triton or CUDA.</strong> Worth it when profiling shows one operation dominating and no library covers it. This is where the remainder of this chapter points.</li>
+</ul>
+
+<h2>A first look at Triton</h2>
+
+<p><span class="term">CUDA</span> is NVIDIA's programming model: you write what one thread does, and manage groups of threads, shared memory and synchronisation by hand. <span class="term">Triton</span> (Tillet, Kung and Cox, 2019, "Triton: an intermediate language and compiler for tiled neural network computations") raises the level. You write Python-syntax code for a <strong>block</strong> of values at once, and the compiler decides how threads, registers and shared memory implement it. Each running copy of the kernel is a <span class="term">program</span>, identified by <code>tl.program_id</code>; it handles a block of <code>BLOCK_SIZE</code> consecutive elements.</p>
+
+<p>Below is the fused chain from the benchmark, as a Triton kernel with its launch. It is a listing, not output from this machine: Triton needs a supported GPU, which the machine used for this chapter does not have.</p>
+
+<pre class="terminal" data-title="fused_chain.py (Triton, not run here)"><code>import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def chain_kernel(x_ptr, y_ptr, n, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)                  # which block am I?
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets &lt; n                           # last block may be partial
+    x = tl.load(x_ptr + offsets, mask=mask)      # one read from HBM
+    t = x * 1.5 + 0.5                            # all of this stays in registers
+    t = t * t - 1.0 + x
+    y = tl.maximum(t, 0.0)
+    tl.store(y_ptr + offsets, y, mask=mask)      # one write to HBM
+
+def chain(x):
+    y = torch.empty_like(x)
+    n = x.numel()
+    grid = (triton.cdiv(n, 1024),)               # number of programs
+    chain_kernel[grid](x, y, n, BLOCK_SIZE=1024)
+    return y</code></pre>
+
+<p>Three ideas carry over to every Triton kernel. The <strong>grid</strong> says how many programs to launch (here one per 1,024 values). Each program computes its slice of indices from its id and uses a <strong>mask</strong> so it never touches memory past the end of the array. And memory is touched only by explicit <code>tl.load</code> and <code>tl.store</code> calls: everything between them is on chip. The official fused-softmax tutorial counts the saving for a row-wise softmax over an M by N matrix: the unfused PyTorch version moves about 8MN + 4M elements and the fused kernel 2MN, a ratio approaching 4 for large N (Triton documentation, "Fused Softmax"). Softmax needs a reduction (a row maximum and a row sum), which is why it is a better second kernel to study than an elementwise one.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Triton is open source and developed in the open (triton-lang.org); kernels written for it are portable across NVIDIA and, with backend work, AMD GPUs, though tuning is per chip. Several newer kernel languages and tile-based programming models exist, and NVIDIA ships its own Python kernel tooling; which will matter in three years is unsettled, so treat Triton as the clearest way to learn the ideas rather than the final word. GPU numbers above are from the NVIDIA H100 datasheet; newer chips have higher bandwidth and different ridge points, and you should recompute the ridge point (FLOP/s divided by bytes/s) for whatever hardware you use.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Run <code>fuse.py</code>, then change the block size from 131,072 to 4,096 and to 4,194,304 and observe the time. Very small blocks lose to interpreter overhead; very large ones no longer fit in cache and the fused version converges to the unfused one. Then compute the ridge point for a chip you can look up (for example an A100 80 GB: 312 TFLOPS dense bf16 and about 2 TB/s) and decide whether a LayerNorm over 4,096 values, which does roughly 10 FLOP per element on 2-byte inputs, is memory-bound there.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 fuse.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 -c "print(312e12 / 2.0e12)"</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Time is set by the slower of arithmetic and memory traffic. Arithmetic intensity (FLOP per byte of HBM traffic) against the chip's ridge point (about 295 for an H100 in bf16) says which.</li>
+    <li>Large matrix multiplications are compute-bound; normalisation, activations, softmax, residual adds and casts are memory-bound.</li>
+    <li>Fusion keeps intermediate values on chip, cutting HBM traffic and kernel launches without changing the maths.</li>
+    <li>Use library fused kernels and <code>torch.compile</code> first; write a Triton kernel when profiling points at one operation.</li>
+    <li>Traffic ratios are ceilings, not predictions: measure on your hardware.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://www.eecs.harvard.edu/~htk/publication/2019-mapl-tillet-kung-cox.pdf" target="_blank" rel="noopener">Tillet, Kung and Cox, "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations" (2019)</a>. The original paper behind the language.</li>
+  <li><a href="https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html" target="_blank" rel="noopener">Triton documentation, "Fused Softmax" tutorial</a>. The traffic count and a complete kernel you can run on a GPU.</li>
+  <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022)</a>. Fusion applied to attention, argued from memory traffic.</li>
+  <li><a href="https://pytorch.org/assets/pytorch2-2.pdf" target="_blank" rel="noopener">Ansel et al., "PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation" (2024)</a>. How <code>torch.compile</code> works.</li>
+  <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA, H100 Tensor Core GPU datasheet</a>. The bandwidth and FLOP figures used here.</li>
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Dubey et al., "The Llama 3 Herd of Models" (2024)</a>. Section 3 reports the MFU figures quoted above.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">An H100 has about 989 TFLOPS of dense bf16 arithmetic and 3.35 TB/s of memory bandwidth. An elementwise operation reads and writes bf16 values and does 2 FLOP per element. Which statement is correct?</p>
+    <ol class="q-options"><li>It is compute-bound, because the GPU has far more arithmetic throughput than the operation needs</li><li>It is memory-bound: it does 2 FLOP per 4 bytes, far below the ridge point of about 295 FLOP per byte</li><li>It is balanced, because 2 FLOP is close to the ridge point</li><li>It cannot be classified without knowing the batch size</li></ol>
+    <div class="q-explain">Intensity is 0.5 FLOP per byte against a ridge point near 295, so the memory system is the limit. The first option reads the same fact backwards: spare arithmetic throughput is exactly what idles when memory is the bottleneck.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You fuse five elementwise operations into one kernel. Which effect should you expect?</p>
+    <ol class="q-options"><li>The FLOP count falls to a fifth</li><li>The results change slightly because the order of operations changes</li><li>The speed is unchanged, because the same arithmetic is done</li><li>HBM traffic and kernel launches fall, while the arithmetic stays the same</li></ol>
+    <div class="q-explain">Fusion removes the writes and re-reads of intermediate arrays and the extra launches. FLOPs are unchanged (the third option mistakes FLOPs for time), and for the simple operations here the numbers are the same.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">The fused NumPy version moved 6.5 times less data than the unfused one but ran only about 1.2 times faster. What is the best reading?</p>
+    <ol class="q-options"><li>The traffic ratio is a ceiling for a bandwidth-bound operation; caches, interpreter overhead and passes inside each block keep the real gain lower</li><li>Fusion does not work on CPUs</li><li>The unfused version must have been buggy</li><li>The benchmark proves fusion is rarely worth it on GPUs either</li></ol>
+    <div class="q-explain">The script asserts that results match, so the unfused version is correct. The effect is real but smaller than the ideal ratio on this machine; a GPU, whose ridge point is far higher, is much more sensitive to traffic.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In the Triton kernel, why does it compute <code>mask = offsets &lt; n</code> and pass it to <code>tl.load</code> and <code>tl.store</code>?</p>
+    <ol class="q-options"><li>To skip elements that are zero and save arithmetic</li><li>To make the kernel deterministic</li><li>Because the last block may extend past the end of the array and must not read or write out of bounds</li><li>To tell the compiler which values to keep in registers</li></ol>
+    <div class="q-explain">The grid is rounded up to whole blocks, so when n is not a multiple of BLOCK_SIZE the final program has indices beyond the array. The mask stops those accesses. It does not test values for zero and has nothing to do with register allocation.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

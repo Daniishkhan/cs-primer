@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mixed Precision &amp; Training Stability · Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dl" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Mixed Precision &amp; Training Stability</h1>
+  <p class="lede">Large models are trained in 16-bit arithmetic because it is faster and half the size, and they are trained for weeks, so small numerical problems have time to become large ones. This chapter explains what the 16-bit formats lose, what must stay in 32 bits, why loss suddenly spikes, and the four habits (warmup, clipping, careful optimiser settings and the right logs) that keep a long run alive.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapter 16 priced a training run in FLOPs and bytes. A run that fits and is affordable can still fail in a way no arithmetic predicts: the loss climbs for no visible reason on day nine, or turns into NaN (the floating-point value "not a number", which poisons everything it touches) and the last good checkpoint is six hours old. The public logbooks of large runs, which this chapter draws on, read mostly as lists of such events and the decisions made about them. After this chapter you will know why bf16 is the default format, which parts of a step must stay in fp32, how Adam turns one bad batch into an oversized step, what clipping and warmup do about it, and which curves to put on the dashboard so that you notice trouble before the loss does. Chapter 18 then asks what size of model and dataset to run in the first place, and the studio at the end of Part 5 gives you a broken run to diagnose.</p>
+</div>
+
+<h2>Why not simply use 32-bit numbers?</h2>
+
+<p>Everything in chapters 01 to 15 ran in 32-bit floating point (fp32, "single precision", 4 bytes per number), or in NumPy's 64-bit default. That is safe and slow. A modern GPU's matrix-multiplication units (tensor cores) run 16-bit inputs several times faster than 32-bit ones, and 16-bit numbers occupy half the memory and move through the memory system twice as fast. Because training is dominated by large matrix products (chapter 16), switching them to 16 bits changes the cost of a run by a large factor. The question is what such a switch does to the numbers. For a refresher on how floats work, see <a href="../../ml-foundations/chapters/11-numerics.html">A0 chapter 11</a>; the essentials follow.</p>
+
+<h2>Three formats and what each gives up</h2>
+
+<p>A floating-point number is stored as a sign, an <span class="term">exponent</span> and a <span class="term">mantissa</span> (also called the significand). The exponent sets the <b>range</b>: how large or small a number can be. The mantissa sets the <b>precision</b>: how many significant digits it has, and so how close together representable numbers are. Three formats matter for training.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 252" role="img" aria-label="Bit layouts of three formats. fp32 has 1 sign bit, 8 exponent bits and 23 mantissa bits. fp16 has 1 sign, 5 exponent and 10 mantissa bits. bf16 has 1 sign, 8 exponent and 7 mantissa bits, so it has the same range as fp32 with less precision than fp16.">
+    <text x="20" y="65" class="t-sm t-bold">fp32</text>
+    <rect x="70.0" y="40" width="17.0" height="36" class="f-yellow" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="78.5" y="63" text-anchor="middle" class="t-xs t-bold t-dark">s</text>
+    <rect x="87.0" y="40" width="136.0" height="36" class="f-blue" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="155.0" y="63" text-anchor="middle" class="t-xs t-bold t-dark">8 exponent bits</text>
+    <rect x="223.0" y="40" width="391.0" height="36" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="418.5" y="63" text-anchor="middle" class="t-xs t-bold t-dark">23 mantissa bits</text>
+    <text x="624.0" y="63" class="t-xs t-muted">max 3.4e38</text>
+    <text x="20" y="127" class="t-sm t-bold">fp16</text>
+    <rect x="70.0" y="102" width="17.0" height="36" class="f-yellow" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="78.5" y="125" text-anchor="middle" class="t-xs t-bold t-dark">s</text>
+    <rect x="87.0" y="102" width="85.0" height="36" class="f-blue" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="129.5" y="125" text-anchor="middle" class="t-xs t-bold t-dark">5 exp</text>
+    <rect x="172.0" y="102" width="170.0" height="36" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="257.0" y="125" text-anchor="middle" class="t-xs t-bold t-dark">10 mantissa</text>
+    <text x="352.0" y="125" class="t-xs t-muted">max 65,504</text>
+    <text x="20" y="189" class="t-sm t-bold">bf16</text>
+    <rect x="70.0" y="164" width="17.0" height="36" class="f-yellow" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="78.5" y="187" text-anchor="middle" class="t-xs t-bold t-dark">s</text>
+    <rect x="87.0" y="164" width="136.0" height="36" class="f-blue" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="155.0" y="187" text-anchor="middle" class="t-xs t-bold t-dark">8 exponent bits</text>
+    <rect x="223.0" y="164" width="119.0" height="36" class="f-orange" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="282.5" y="187" text-anchor="middle" class="t-xs t-bold t-dark">7 mantissa</text>
+    <text x="352.0" y="187" class="t-xs t-muted">max 3.4e38</text>
+    <rect x="70" y="226" width="12" height="12" class="f-yellow"/><text x="88" y="237" class="t-xs">sign</text>
+    <rect x="140" y="226" width="12" height="12" class="f-blue"/><text x="158" y="237" class="t-xs">exponent: sets the range</text>
+    <rect x="330" y="226" width="12" height="12" class="f-orange"/><text x="348" y="237" class="t-xs">mantissa: sets the precision</text>
+  </svg>
+  <figcaption><strong>Same width, different bargain.</strong> fp16 and bf16 both use 16 bits. fp16 spends them on precision (10 mantissa bits) and gets a narrow range; bf16 keeps fp32's 8 exponent bits, and therefore its range, and has only 7 bits of precision. Bars are drawn to scale in bits.</figcaption>
+</figure>
+
+<ul>
+  <li><b>fp32</b>: 8 exponent bits, 23 mantissa bits. Range up to 3.4 &times; 10<sup>38</sup>; about seven significant decimal digits.</li>
+  <li><b>fp16</b> (IEEE half precision): 5 exponent bits, 10 mantissa bits. More precise than bf16, but its range ends at 65,504 and its smallest normal number is about 6 &times; 10<sup>-5</sup> (smaller values survive as "subnormal" numbers down to about 6 &times; 10<sup>-8</sup>, with less and less precision).</li>
+  <li><b>bf16</b> ("brain floating point", introduced by Google Brain): the top 16 bits of an fp32 number. The same 8 exponent bits as fp32, hence the same range, but only 7 mantissa bits, about two to three significant decimal digits.</li>
+</ul>
+
+<p>The script below prints the limits and then converts a few values through each format. bf16 is not built into NumPy, so the function <code>to_bf16</code> emulates it by rounding an fp32 number to its top 16 bits (round to nearest, ties to even), which is exactly what the hardware does.</p>
+
+<pre class="terminal" data-title="formats.py"><code># Three floating-point formats: range and precision. bf16 is emulated by rounding float32 to its top 16 bits.
+import numpy as np
+
+def to_bf16(x):
+    """Round float32 values to the nearest bfloat16 (ties to even) and return them as float32."""
+    u = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    u = (u + 0x7FFF + ((u &gt;&gt; 16) &amp; 1)) &amp; 0xFFFF0000
+    return u.astype(np.uint32).view(np.float32)
+
+def to_fp16(x):
+    with np.errstate(over="ignore"):
+        return np.asarray(x, dtype=np.float32).astype(np.float16).astype(np.float32)
+
+if __name__ == "__main__":
+    f16, f32 = np.finfo(np.float16), np.finfo(np.float32)
+    print(f"{'format':&lt;6}{'bits (s/e/m)':&gt;14}{'largest':&gt;13}{'smallest normal':&gt;17}{'epsilon (1+eps&gt;1)':&gt;19}")
+    print(f"{'fp32':&lt;6}{'1/8/23':&gt;14}{float(f32.max):&gt;13.3e}{float(f32.tiny):&gt;17.3e}{float(f32.eps):&gt;19.3e}")
+    print(f"{'fp16':&lt;6}{'1/5/10':&gt;14}{float(f16.max):&gt;13.3e}{float(f16.tiny):&gt;17.3e}{float(f16.eps):&gt;19.3e}")
+    print(f"{'bf16':&lt;6}{'1/8/7':&gt;14}{(2 - 2.0**-7) * 2.0**127:&gt;13.3e}{2.0**-126:&gt;17.3e}{2.0**-7:&gt;19.3e}")
+    
+    print("\nvalue            fp16            bf16")
+    for v in (257.0, 1 + 2**-9, 70000.0, 1e-8, 3e38):
+        print(f"{v:&lt;14.8g}{float(to_fp16(v)):&gt;14.8g}{float(to_bf16(v)):&gt;16.8g}")</code></pre>
+<pre class="terminal" data-title="output"><code>format  bits (s/e/m)      largest  smallest normal  epsilon (1+eps&gt;1)
+fp32          1/8/23    3.403e+38        1.175e-38          1.192e-07
+fp16          1/5/10    6.550e+04        6.104e-05          9.766e-04
+bf16           1/8/7    3.390e+38        1.175e-38          7.812e-03
+
+value            fp16            bf16
+257                      257             256
+1.0019531          1.0019531               1
+70000                    inf           70144
+1e-08                      0   1.0011718e-08
+3e+38                    inf   3.0040553e+38</code></pre>
+
+<p>The second table shows the bargain. The integer 257 survives in fp16 but rounds to 256 in bf16, because 7 mantissa bits cannot tell 256 from 257. Adding 2<sup>-9</sup> to 1 is visible in fp16 and lost in bf16. In the other direction, 70,000 overflows to infinity in fp16 but is representable in bf16, and 10<sup>-8</sup> underflows to zero in fp16 but survives in bf16. Neural-network values are noisy and tolerate low precision well; they do not tolerate silently becoming zero or infinity. That is the reason bf16 won.</p>
+
+<h2>fp16 needs loss scaling; bf16 does not</h2>
+
+<p>Gradients are often tiny. In a deep network the gradient of the loss with respect to an early weight can be 10<sup>-8</sup> or smaller, below the smallest fp16 number. If the backward pass runs in fp16, those gradients become exactly zero and the corresponding weights stop learning. Micikevicius et al. (2017, "Mixed Precision Training") fixed this with <span class="term">loss scaling</span>: multiply the loss by a constant S (say 1,024) before the backward pass. By the chain rule every gradient is then multiplied by S, which lifts small values into fp16's range. Before the optimiser update the gradients are divided by S in fp32, so the learning step is unchanged.</p>
+
+<p>The constant has to be chosen well. Too small and gradients still underflow; too large and the largest gradients overflow to infinity. Practical systems use <b>dynamic loss scaling</b>: start high, and if any gradient contains an infinity or NaN, skip that optimiser step and halve the scale; after a run of clean steps, double it again. The scale hovers just below the largest value that does not overflow. The script applies a plain fp16 conversion to a synthetic gradient distribution (log-normal magnitudes with a median of 3 &times; 10<sup>-8</sup>, chosen to be small; real distributions differ) and then runs the dynamic-scaling rule on a toy sequence.</p>
+
+<pre class="terminal" data-title="lossscale.py"><code># fp16 gradients underflow; scaling the loss moves them into range. Gradients here are synthetic (log-normal magnitudes).
+import numpy as np
+from formats import to_fp16
+
+rng = np.random.default_rng(0)
+grads = np.exp(rng.normal(np.log(3e-8), 2.0, 100_000)) * rng.choice([-1, 1], 100_000)   # median 3e-8, wide spread
+print(f"gradient magnitudes: median {np.median(abs(grads)):.1e}, 1st pct {np.percentile(abs(grads), 1):.1e}, 99th pct {np.percentile(abs(grads), 99):.1e}")
+print(f"{'loss scale':&gt;10} {'flushed to zero':&gt;16} {'overflowed to inf':&gt;18}")
+for scale in (1, 2**10, 2**15, 2**20):
+    h = to_fp16(grads * scale)
+    print(f"{scale:&gt;10} {np.mean(h == 0):&gt;15.1%} {np.mean(np.isinf(h)):&gt;17.2%}")
+
+# Dynamic loss scaling: double the scale after 4 clean steps (real systems wait about 2000); on overflow, skip the step and halve.
+scale, clean, true_max = 2.0**14, 0, 0.4            # largest true gradient entry 0.4, so the scale must stay below 65504/0.4 = 163,760
+for step in range(20):
+    if true_max * scale &gt; 65504:
+        scale, clean = scale / 2, 0
+        print(f"step {step:&gt;2}: gradient overflowed to inf, update skipped, scale halved to {scale:.0f}")
+    else:
+        clean += 1
+        if clean == 4: scale, clean = scale * 2, 0; print(f"step {step:&gt;2}: 4 clean steps, scale doubled to {scale:.0f}")</code></pre>
+<pre class="terminal" data-title="output"><code>gradient magnitudes: median 3.0e-08, 1st pct 2.8e-10, 99th pct 3.2e-06
+loss scale  flushed to zero  overflowed to inf
+         1           50.0%             0.00%
+      1024            0.0%             0.00%
+     32768            0.0%             0.00%
+   1048576            0.0%             0.00%
+step  3: 4 clean steps, scale doubled to 32768
+step  7: 4 clean steps, scale doubled to 65536
+step 11: 4 clean steps, scale doubled to 131072
+step 15: 4 clean steps, scale doubled to 262144
+step 16: gradient overflowed to inf, update skipped, scale halved to 131072</code></pre>
+
+<p>Half of these synthetic gradients vanish without scaling and none do with a scale of 1,024. In the dynamic part, the scale doubles every four clean steps (a real system waits on the order of two thousand), reaches a value at which the largest gradient no longer fits, loses a step to an overflow, and halves. Loss scaling is not free: the check for infinities adds work, and skipped steps are skipped learning. It also leaves a trace in the logs, as the OPT-175B team found (below).</p>
+
+<p>bf16 sidesteps all of this. Its range matches fp32's, so gradients that fp32 can hold, bf16 can hold, and no scaling is needed. Kalamkar et al. (2019, "A Study of BFLOAT16 for Deep Learning Training") showed that bf16 training with no changes to hyperparameters matched fp32 across many models. The price is precision, and that is where the next section goes.</p>
+
+<h2>What must stay in 32 bits</h2>
+
+<p>"Mixed precision" means exactly that: not everything is in 16 bits. The rule of thumb is to use 16 bits for bulky tensors that are only multiplied and summed, and fp32 for quantities that accumulate small contributions over time.</p>
+
+<p>The most important example is the <span class="term">master weights</span>. A typical optimiser update is a tiny fraction of the weight: with a learning rate of 3 &times; 10<sup>-4</sup> a weight of size about 1 changes by roughly 10<sup>-4</sup> per step. In bf16, representable numbers near 1.0 are 2<sup>-7</sup> = 0.0078 apart, so adding 10<sup>-4</sup> to 1.0 and rounding gives 1.0 again: the update disappears. Even fp16, with a spacing of 0.00098 near 1.0, rounds it away. The script accumulates 8,192 updates of 2<sup>-13</sup> (about 1.2 &times; 10<sup>-4</sup>) onto a weight of 1.0 in each format, rounding after each addition.</p>
+
+<pre class="terminal" data-title="master.py"><code># Why the optimiser keeps fp32 master weights: small updates vanish when added to a 16-bit weight.
+import numpy as np
+from formats import to_bf16, to_fp16
+
+lr_times_grad = np.float32(2.0**-13)              # one typical update, about 1.2e-4 of a weight of size 1 (exact in binary)
+w32, w16, wbf = np.float32(1.0), np.float32(1.0), np.float32(1.0)
+for step in range(8192):
+    w32 = w32 + lr_times_grad                     # fp32 master weight accumulates every update
+    w16 = to_fp16(w16 + lr_times_grad)            # weight stored in fp16: rounded after each update
+    wbf = to_bf16(wbf + lr_times_grad)            # weight stored in bf16: rounded after each update
+print(f"after 8,192 updates of +2^-13 (exact answer 2.0):")
+print(f"  fp32 weight: {float(w32):.4f}\n  fp16 weight: {float(w16):.4f}\n  bf16 weight: {float(wbf):.4f}")
+print(f"spacing of representable numbers near 1.0: fp16 {2.0**-10:.5f}, bf16 {2.0**-7:.5f}, update {float(lr_times_grad):.5f}")</code></pre>
+<pre class="terminal" data-title="output"><code>after 8,192 updates of +2^-13 (exact answer 2.0):
+  fp32 weight: 2.0000
+  fp16 weight: 1.0000
+  bf16 weight: 1.0000
+spacing of representable numbers near 1.0: fp16 0.00098, bf16 0.00781, update 0.00012</code></pre>
+
+<p>The fp32 weight reaches the exact answer, 2.0. The 16-bit weights never move: the learning rate was small enough that every single step was a rounding error that rounded to nothing. This is why the optimiser holds a separate fp32 copy of every weight (the 4-byte "master" entry of chapter 16's 16 bytes per parameter), updates that, and then casts a bf16 copy for the forward and backward passes. It is also why training in "pure" bf16 can quietly stall at small learning rates late in a run, when updates are smallest. (Stochastic rounding, which rounds up or down at random in proportion to the remainder, is one way to avoid the loss; it is used in some systems, and the master copy remains the standard.)</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="One mixed-precision training step. Top row, left to right: fp32 master weights are cast to bf16 weights, which are used in the forward and backward pass with bf16 matrix products, producing bf16 gradients. Bottom row, right to left: the gradients are cast to fp32 and clipped, then AdamW updates the fp32 master weights using fp32 moments. An arrow returns to the master weights.">
+    <defs><marker id="ahDL17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="30" width="150" height="62" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="95" y="56" text-anchor="middle" class="t-sm t-bold">Master weights</text><text x="95" y="75" text-anchor="middle" class="t-xs">fp32, 4 bytes each</text>
+    <rect x="215" y="30" width="150" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="290" y="56" text-anchor="middle" class="t-sm t-bold">Weights for compute</text><text x="290" y="75" text-anchor="middle" class="t-xs">bf16 copy</text>
+    <rect x="410" y="30" width="170" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="495" y="56" text-anchor="middle" class="t-sm t-bold">Forward and backward</text><text x="495" y="75" text-anchor="middle" class="t-xs">bf16 matmuls, fp32 sums</text>
+    <rect x="620" y="30" width="120" height="62" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="680" y="56" text-anchor="middle" class="t-sm t-bold">Gradients</text><text x="680" y="75" text-anchor="middle" class="t-xs">bf16</text>
+    <line x1="170" y1="61" x2="213" y2="61" class="line" marker-end="url(#ahDL17a)"/>
+    <line x1="365" y1="61" x2="408" y2="61" class="line" marker-end="url(#ahDL17a)"/>
+    <line x1="580" y1="61" x2="618" y2="61" class="line" marker-end="url(#ahDL17a)"/>
+    <text x="192" y="52" text-anchor="middle" class="t-xs t-muted">cast</text>
+    <path d="M680,92 V168 H582" class="line" fill="none" marker-end="url(#ahDL17a)"/>
+    <rect x="410" y="140" width="170" height="62" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="495" y="166" text-anchor="middle" class="t-sm t-bold">Cast, check, clip</text><text x="495" y="185" text-anchor="middle" class="t-xs">fp32 gradient norm, clip to 1.0</text>
+    <line x1="410" y1="171" x2="367" y2="171" class="line" marker-end="url(#ahDL17a)"/>
+    <rect x="215" y="140" width="150" height="62" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="290" y="166" text-anchor="middle" class="t-sm t-bold">AdamW update</text><text x="290" y="185" text-anchor="middle" class="t-xs">fp32 moments m and v</text>
+    <path d="M215,171 H95 V94" class="line" fill="none" marker-end="url(#ahDL17a)"/>
+    <text x="20" y="236" class="t-xs t-muted">Kept in fp32 throughout: the master weights, the optimiser moments, the loss and softmax, normalisation statistics, and the</text>
+    <text x="20" y="254" class="t-xs t-muted">running sums inside matrix multiplications. Only the bulky matrix products and stored activations drop to 16 bits.</text>
+  </svg>
+  <figcaption><strong>Precision is spent where it pays.</strong> The loop is the same as chapter 16's memory picture: 16 bytes per parameter in all. A fp16 recipe adds one box, the loss scale, between the loss and the backward pass.</figcaption>
+</figure>
+
+<p>The other fp32 items follow the same logic. The softmax and the cross-entropy loss involve exponentials and sums over a large vocabulary, where range and accumulation errors matter (<a href="../../ml-foundations/chapters/11-numerics.html">A0 chapter 11</a> showed why a softmax needs the max subtracted). Normalisation layers compute means and variances, which are sums over many elements. And inside a matrix multiplication the hardware multiplies 16-bit inputs but accumulates the sums in fp32, so errors do not pile up across the thousands of terms in a dot product. Frameworks apply these rules automatically in their mixed-precision modes (PyTorch's autocast chooses the dtype per operation, and the optimiser keeps fp32 state); you rarely write them by hand, but you should know them to read a stack trace or a precision bug.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>bf16 with fp32 master weights and optimiser state is the common baseline for pre-training, and the Llama 3 report quotes the MFU of its 405B run against the BF16 peak. The frontier of the field is lower precision. The DeepSeek-V3 technical report (December 2024) describes training a large mixture-of-experts model with 8-bit floating-point (FP8) matrix products, with fine-grained scaling factors and higher-precision accumulation, and reports a relative loss error below 0.25% against a bf16 baseline; the same report stores Adam's two moments in bf16 rather than fp32, while keeping master weights and accumulated gradients in fp32. Other labs and library vendors have since added FP8 and narrower 4-bit options, but I have not verified the details or the benefits at frontier scale, so treat claims about 4-bit pre-training as evidence still being gathered. What is stable is the pattern: narrower formats for the bulky multiplications, wider ones for accumulation, and a scaling scheme to keep values in range.</p>
+</div>
+
+<h2>Loss spikes: what they are and why they happen</h2>
+
+<p>A <span class="term">loss spike</span> is a sudden, large rise in training loss, often followed by a partial or complete recovery over hundreds or thousands of steps; sometimes the run never recovers (a <span class="term">divergence</span>). Spikes are not rare at scale. The PaLM authors (Chowdhery et al., 2022) report that the 540B model spiked about 20 times during training, "despite the fact that gradient clipping was enabled", at irregular intervals, and that they could not find a principled fix. Their remedy was operational: restart from a checkpoint roughly 100 steps before the spike and skip about 200 to 500 batches of data. Re-running the same batches from an earlier checkpoint did not reproduce the spike, which led them to conclude that spikes arise from a specific combination of a batch and a particular parameter state, not from "bad data" alone. The OPT-175B team (Zhang et al., 2022) saw loss divergences too, and found that lowering the learning rate and restarting from an earlier checkpoint let the run continue; they also observed that divergences correlated with their dynamic loss scale collapsing towards zero and the norm of the final-layer activations spiking. The Llama 3 team, by contrast, reported that their 405B run was "very stable", with few loss spikes and no interventions needed to correct divergence, and the DeepSeek-V3 report says its run had no irrecoverable loss spikes and no rollbacks. Stability is a property of the recipe, and it can be engineered.</p>
+
+<p>Known mechanisms, from the literature and the logbooks, are these.</p>
+<ul>
+  <li><b>An update that is too large.</b> The learning rate is too high for the current state of the model: the step overshoots and the loss rises. This is the main reason for warmup, covered below.</li>
+  <li><b>Adam turns one outlier into a big step.</b> The next section shows this in numbers.</li>
+  <li><b>Attention logits that grow without bound.</b> The pre-softmax scores QK<sup>T</sup>/&radic;d<sub>k</sub> can grow during training until the softmax becomes nearly one-hot and its gradients vanish or explode. Wortsman et al. (2023, "Small-scale proxies for large-scale Transformer training instabilities") reproduced this instability in small models at high learning rates, and showed that <b>QK-normalisation</b> (applying a LayerNorm to queries and keys before the dot product, proposed for ViT-22B by Dehghani et al., 2023) removes it.</li>
+  <li><b>Output logits that drift.</b> The final logits can move away from log-probabilities so that the softmax normaliser grows. PaLM added an auxiliary <b>z-loss</b>, 10<sup>-4</sup> &times; (log Z)<sup>2</sup> with Z the softmax denominator, to keep it close to 1, and Wortsman et al. showed that it is an effective mitigation at small scale as well.</li>
+  <li><b>Numerical range problems.</b> In fp16, overflow in an activation produces infinities. In any format, an extreme activation can push a normalisation or softmax outside its comfortable range. These are the cases mixed-precision recipes are designed to avoid.</li>
+  <li><b>Data.</b> A corrupted or extreme batch can trigger an event the model is fragile to, even if the batch is harmless after a restart, as PaLM's experiment suggests.</li>
+</ul>
+
+<h3>How Adam amplifies a bad batch</h3>
+
+<p>Chapter 03 and <a href="../../ml-foundations/chapters/10-optimisers.html">A0 chapter 10</a> introduced Adam: it keeps a running average of the gradient (m, with decay &beta;<sub>1</sub> = 0.9) and of the squared gradient (v, with decay &beta;<sub>2</sub>), and steps by m/&radic;v. Normally the gradient is of similar size from step to step, so m/&radic;v is of order one per weight whatever the raw gradient scale. When one batch produces a gradient 100 times larger than usual, the average m jumps by 10% of it at once, while v, which averages squares over about 1/(1 &minus; &beta;<sub>2</sub>) = 1,000 steps, rises slowly: the numerator has reacted and the denominator has not, so the step is large. The script feeds 3,000 steps of noise-like gradients of norm 0.3 into AdamW's update rule, then one gradient of norm 30, and measures the update.</p>
+
+<pre class="terminal" data-title="spike.py"><code># What one bad batch does to AdamW, with and without gradient clipping. Gradients are synthetic: noise with norm about 0.3,
+# then a single batch whose gradient has norm 30 (100 times larger) at step 3000.
+import numpy as np
+
+def run(beta2, clip, spike_norm=30.0, d=2000, seed=0):
+    rng = np.random.default_rng(seed)
+    m = np.zeros(d); v = np.zeros(d); ups = []
+    for t in range(1, 3031):
+        g = rng.normal(size=d); g *= (spike_norm if t == 3000 else 0.3) / np.linalg.norm(g)
+        if clip and np.linalg.norm(g) &gt; clip: g *= clip / np.linalg.norm(g)
+        m = 0.9 * m + 0.1 * g; v = beta2 * v + (1 - beta2) * g * g
+        u = (m / (1 - 0.9 ** t)) / (np.sqrt(v / (1 - beta2 ** t)) + 1e-8)
+        ups.append(np.sqrt((u * u).mean()))          # RMS of the update per coordinate, in units of the learning rate
+    ups = np.array(ups); typical = np.median(ups[2000:2999])
+    return typical, ups[2999] / typical, ups[3000:3030].mean() / typical
+
+print(f"{'beta2':&gt;6} {'clip':&gt;6} | {'typical update':&gt;15} {'at the spike':&gt;13} {'next 30 steps (mean)':&gt;21}   (updates are RMS per weight, in units of the learning rate)")
+for b2 in (0.999, 0.95):
+    for clip in (None, 1.0):
+        typ, at, after = run(b2, clip)
+        print(f"{b2:&gt;6} {str(clip):&gt;6} | {typ:&gt;15.3f} {at * typ:&gt;13.3f} {after * typ:&gt;21.3f}   ({at:.1f}x and {after:.1f}x typical)")
+print(f"\nno step can exceed about (1-b1)/sqrt(1-b2) = {0.1/np.sqrt(1-0.999):.2f} per weight for b2=0.999 after a quiet period, {0.1/np.sqrt(1-0.95):.2f} for b2=0.95")</code></pre>
+<pre class="terminal" data-title="output"><code> beta2   clip |  typical update  at the spike  next 30 steps (mean)   (updates are RMS per weight, in units of the learning rate)
+ 0.999   None |           0.229         2.579                 0.764   (11.3x and 3.3x typical)
+ 0.999    1.0 |           0.229         0.388                 0.256   (1.7x and 1.1x typical)
+  0.95   None |           0.226         0.439                 0.177   (1.9x and 0.8x typical)
+  0.95    1.0 |           0.226         0.295                 0.227   (1.3x and 1.0x typical)
+
+no step can exceed about (1-b1)/sqrt(1-b2) = 3.16 per weight for b2=0.999 after a quiet period, 0.45 for b2=0.95</code></pre>
+
+<p>With &beta;<sub>2</sub> = 0.999 and no clipping, the one bad batch produces an update 11 times the typical size, and the following 30 steps still average 3.3 times typical, because m remembers the outlier for about ten steps and the inflated v then shrinks later updates for a thousand. With clipping at a gradient norm of 1.0 the spike step is 1.7 times typical: still larger than normal, but bounded. Lowering &beta;<sub>2</sub> to 0.95 makes v respond within about 20 steps and shrinks the effect on its own, which is one reason several recent large-model recipes (the DeepSeek-V3 report lists &beta;<sub>2</sub> = 0.95, and the original LLaMA recipe used the same value) choose it over the default 0.999. These are measurements on a synthetic gradient stream, not on a Transformer, but the algebra is the same one that real runs face.</p>
+
+<h2>Gradient clipping</h2>
+
+<p>The <span class="term">gradient norm</span> is the length of the whole gradient vector, ||g|| = &radic;(&sum; g<sub>i</sub>&sup2;), taken over all parameters at once. <span class="term">Gradient clipping</span> (Pascanu et al., 2013) rescales the gradient when this norm exceeds a threshold c: if ||g|| &gt; c, replace g by g &middot; c/||g||. The direction is kept and the length is capped. The standard setting for Transformer pre-training is c = 1.0 (PaLM and DeepSeek-V3 both state it). OPT lowered it to 0.3 early in training when they saw instability.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a speed limiter</p>
+  <p>A governor on a lorry caps its speed however hard the driver presses the pedal. Gradient clipping does the same to the optimiser's step: on a steep, jagged stretch of the loss landscape, where the raw gradient says "move far", the clip says "move at most this far, in the same direction". On ordinary stretches the governor never engages.</p>
+  <p><em>Where it breaks down:</em> a governor is a safety device on the vehicle, whereas the clip is applied to the gradient and interacts with Adam's running averages, which are updated with the clipped values; it does not undo damage already stored in m and v, and it cannot repair a model that is already in a bad region. It also hides information: if you clip every step, the threshold has become your learning-rate schedule.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Gradient clipping prevents loss spikes." It limits one cause, an oversized gradient, but PaLM's 540B model spiked about twenty times with clipping on, and a clip that engages on every step is a symptom (a learning rate too high or a bad initialisation), not a cure. Use the <b>fraction of steps that are clipped</b> as a diagnostic: in a healthy run it is near zero, with occasional clipped steps during spikes. The cure for a persistent problem is usually a lower learning rate, a better-conditioned architecture (QK-norm, pre-normalisation, chapter 03) or a data fix.</p>
+</div>
+
+<h2>Learning-rate warmup</h2>
+
+<p><span class="term">Warmup</span> starts the learning rate near zero and raises it linearly to its peak over the first few hundred to few thousand steps, then follows a decay schedule (usually cosine; see <a href="../../ml-foundations/chapters/10-optimisers.html">A0 chapter 10</a>). The Llama 3 405B run warms up for 8,000 steps to a peak of 8 &times; 10<sup>-5</sup>, and the scaling-law experiments of the same report used 2,000 warmup steps; DeepSeek-V3 warms up over the first 2,000 steps to 2.2 &times; 10<sup>-4</sup>.</p>
+
+<p>Why does it help? At step one the weights are random and the loss landscape around them is at its roughest: the loss is large and the gradients are large and erratic (the step-0 gradient norm below is about 60). Adam's second-moment estimate has seen one or two gradients, so it is a poor guide to the right step size (Liu et al., 2020, "On the Variance of the Adaptive Learning Rate and Beyond", analyse this and propose a corrected optimiser). Taking a full-size step in that state can throw the weights into a region from which recovery is slow or impossible. Pre-norm Transformers (chapter 03; Xiong et al., 2020) need less warmup than post-norm ones but are still run with it at scale. The script trains the same eight-layer ReLU network on a small regression task three times at each peak learning rate: once with no warmup and once with 100 steps of linear warmup.</p>
+
+<pre class="terminal" data-title="warm.py"><code># Does warmup matter? Train the same deep MLP with Adam, with and without a linear learning-rate warmup.
+import numpy as np
+
+def train(peak_lr, warmup, steps=400, depth=8, width=64, seed=0, clip=None):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(512, 16)); w_true = rng.normal(size=(16, 1)); y = np.tanh(X @ w_true) + 0.05 * rng.normal(size=(512, 1))
+    dims = [16] + [width] * depth + [1]
+    Ws = [rng.normal(0, np.sqrt(2 / a), (a, b)) for a, b in zip(dims[:-1], dims[1:])]   # He initialisation
+    m = [np.zeros_like(w) for w in Ws]; v = [np.zeros_like(w) for w in Ws]
+    losses, gnorms = [], []
+    for t in range(1, steps + 1):
+        lr = peak_lr * min(1.0, t / warmup) if warmup else peak_lr
+        hs = [X]
+        for i, W in enumerate(Ws):
+            z = hs[-1] @ W; hs.append(np.maximum(z, 0) if i &lt; len(Ws) - 1 else z)
+        err = hs[-1] - y; loss = float((err ** 2).mean()); losses.append(loss)
+        if not np.isfinite(loss) or loss &gt; 1e12: losses += [float("inf")] * (steps - t); gnorms += [float("nan")] * (steps - t + 1); break
+        g = 2 * err / len(X); grads = [None] * len(Ws)
+        for i in reversed(range(len(Ws))):
+            grads[i] = hs[i].T @ g
+            if i: g = (g @ Ws[i].T) * (hs[i] &gt; 0)
+        gn = float(np.sqrt(sum((q ** 2).sum() for q in grads))); gnorms.append(gn)
+        if clip and gn &gt; clip: grads = [q * clip / gn for q in grads]
+        for i in range(len(Ws)):
+            m[i] = 0.9 * m[i] + 0.1 * grads[i]; v[i] = 0.999 * v[i] + 0.001 * grads[i] ** 2
+            Ws[i] -= lr * (m[i] / (1 - 0.9 ** t)) / (np.sqrt(v[i] / (1 - 0.999 ** t)) + 1e-8)
+    return losses, gnorms
+
+if __name__ == "__main__":
+    print(f"{'peak lr':&gt;8} {'warmup':&gt;7} {'loss@10':&gt;9} {'loss@50':&gt;9} {'loss@100':&gt;9} {'loss@400':&gt;9} {'max loss':&gt;9}")
+    for lr in (3e-3, 3e-2, 1e-1):
+        for wu in (0, 100):
+            l, _ = train(lr, wu)
+            print(f"{lr:&gt;8g} {wu:&gt;7} {l[9]:&gt;9.3f} {l[49]:&gt;9.3f} {l[99]:&gt;9.3f} {l[399]:&gt;9.3f} {max(l):&gt;9.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code> peak lr  warmup   loss@10   loss@50  loss@100  loss@400  max loss
+   0.003       0     0.553     0.031     0.001     0.000     5.450
+   0.003     100     2.167     0.354     0.017     0.000     5.450
+    0.03       0     0.656     0.060     0.028     0.005   144.130
+    0.03     100     1.019     0.034     0.004     0.004     5.450
+     0.1       0     0.771     0.821     0.821     0.821 4491007.240
+     0.1     100     0.571     0.031     7.780     0.821  1833.752</code></pre>
+
+<p>Read the <b>max loss</b> column: with the peak rate of 0.03, training with no warmup jumps to a loss of 144 in the second step, while the warmed-up run never exceeds its starting loss of 5.45. In this small problem both recover and end at about the same loss, so warmup bought safety, not accuracy. At the largest rate, 0.1, neither version survives: both end at 0.821, the variance of the targets, which is the loss of a network that has died and predicts a constant. Warmup widens the range of learning rates that work; it does not make every rate work. The plot shows the first 60 steps for the middle row.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 275" role="img" aria-label="Two log-scale line charts over the first 60 steps of training the same network with Adam and peak learning rate 0.03. Without warmup the loss jumps from 5 to about 144 at step 2 and the gradient norm reaches about 880 at step 2; with a 100-step linear warmup the loss falls from 5 and the gradient norm never exceeds its initial value of about 60.">
+    <line x1="70" y1="200.0" x2="340" y2="200.0" class="line-thin"/>
+    <text x="64" y="204.0" text-anchor="end" class="t-xs t-muted">0.1</text>
+    <line x1="70" y1="162.5" x2="340" y2="162.5" class="line-thin"/>
+    <text x="64" y="166.5" text-anchor="end" class="t-xs t-muted">1</text>
+    <line x1="70" y1="125.0" x2="340" y2="125.0" class="line-thin"/>
+    <text x="64" y="129.0" text-anchor="end" class="t-xs t-muted">10</text>
+    <line x1="70" y1="87.5" x2="340" y2="87.5" class="line-thin"/>
+    <text x="64" y="91.5" text-anchor="end" class="t-xs t-muted">100</text>
+    <line x1="70" y1="50.0" x2="340" y2="50.0" class="line-thin"/>
+    <text x="64" y="54.0" text-anchor="end" class="t-xs t-muted">1000</text>
+    <text x="70" y="38" class="t-sm t-bold">Loss (log scale)</text>
+    <text x="70.0" y="216" text-anchor="middle" class="t-xs t-muted">0</text>
+    <text x="160.0" y="216" text-anchor="middle" class="t-xs t-muted">20</text>
+    <text x="250.0" y="216" text-anchor="middle" class="t-xs t-muted">40</text>
+    <text x="340.0" y="216" text-anchor="middle" class="t-xs t-muted">60</text>
+    <text x="205.0" y="234" text-anchor="middle" class="t-xs">training step</text>
+    <polyline points="70.0,134.9 74.5,81.5 79.0,163.9 83.5,163.0 88.0,165.8 92.5,164.2 97.0,164.9 101.5,166.8 106.0,165.3 110.5,169.4 115.0,167.2 119.5,164.6 124.0,172.0 128.5,167.0 133.0,174.6 137.5,170.7 142.0,181.0 146.5,171.9 151.0,185.1 155.5,177.0 160.0,185.2 164.5,187.3 169.0,182.2 173.5,191.4 178.0,188.2 182.5,187.3 187.0,193.8 191.5,190.6 196.0,190.5 200.5,196.5 205.0,193.2 209.5,193.5 214.0,198.1 218.5,196.6 223.0,196.4 227.5,200.0 232.0,199.1 236.5,199.2 241.0,200.0 245.5,200.0 250.0,200.0 254.5,200.0 259.0,200.0 263.5,200.0 268.0,200.0 272.5,200.0 277.0,200.0 281.5,200.0 286.0,200.0 290.5,200.0 295.0,200.0 299.5,200.0 304.0,200.0 308.5,200.0 313.0,200.0 317.5,200.0 322.0,200.0 326.5,200.0 331.0,200.0 335.5,200.0 340.0,200.0" fill="none" class="s-red sw-2"/>
+    <polyline points="70.0,134.9 74.5,138.2 79.0,145.0 83.5,155.1 88.0,164.3 92.5,165.1 97.0,160.6 101.5,158.1 106.0,159.0 110.5,162.2 115.0,165.3 119.5,166.8 124.0,168.1 128.5,170.3 133.0,171.7 137.5,172.3 142.0,173.1 146.5,174.7 151.0,175.6 155.5,176.1 160.0,178.1 164.5,179.1 169.0,181.4 173.5,183.4 178.0,185.5 182.5,186.6 187.0,189.5 191.5,190.2 196.0,192.9 200.5,194.0 205.0,196.6 209.5,198.9 214.0,199.4 218.5,200.0 223.0,200.0 227.5,200.0 232.0,200.0 236.5,200.0 241.0,200.0 245.5,200.0 250.0,200.0 254.5,200.0 259.0,200.0 263.5,200.0 268.0,200.0 272.5,200.0 277.0,200.0 281.5,200.0 286.0,200.0 290.5,200.0 295.0,200.0 299.5,200.0 304.0,200.0 308.5,200.0 313.0,200.0 317.5,200.0 322.0,200.0 326.5,200.0 331.0,200.0 335.5,200.0 340.0,200.0" fill="none" class="s-blue sw-2"/>
+    <line x1="450" y1="186.3" x2="720" y2="186.3" class="line-thin"/>
+    <text x="444" y="190.3" text-anchor="end" class="t-xs t-muted">1</text>
+    <line x1="450" y1="140.9" x2="720" y2="140.9" class="line-thin"/>
+    <text x="444" y="144.9" text-anchor="end" class="t-xs t-muted">10</text>
+    <line x1="450" y1="95.4" x2="720" y2="95.4" class="line-thin"/>
+    <text x="444" y="99.4" text-anchor="end" class="t-xs t-muted">100</text>
+    <line x1="450" y1="50.0" x2="720" y2="50.0" class="line-thin"/>
+    <text x="444" y="54.0" text-anchor="end" class="t-xs t-muted">1000</text>
+    <text x="450" y="38" class="t-sm t-bold">Gradient norm (log scale)</text>
+    <text x="450.0" y="216" text-anchor="middle" class="t-xs t-muted">0</text>
+    <text x="540.0" y="216" text-anchor="middle" class="t-xs t-muted">20</text>
+    <text x="630.0" y="216" text-anchor="middle" class="t-xs t-muted">40</text>
+    <text x="720.0" y="216" text-anchor="middle" class="t-xs t-muted">60</text>
+    <text x="585.0" y="234" text-anchor="middle" class="t-xs">training step</text>
+    <polyline points="450.0,105.6 454.5,52.5 459.0,173.4 463.5,165.6 468.0,176.8 472.5,158.7 477.0,160.1 481.5,167.0 486.0,153.9 490.5,180.3 495.0,146.8 499.5,140.8 504.0,165.6 508.5,140.9 513.0,164.7 517.5,145.6 522.0,175.1 526.5,141.0 531.0,177.3 535.5,150.2 540.0,165.8 544.5,168.0 549.0,154.0 553.5,185.8 558.0,166.8 562.5,163.7 567.0,190.6 571.5,167.9 576.0,165.8 580.5,200.0 585.0,171.7 589.5,171.8 594.0,195.0 598.5,176.8 603.0,173.4 607.5,200.0 612.0,179.9 616.5,180.6 621.0,192.5 625.5,188.2 630.0,181.8 634.5,191.7 639.0,188.4 643.5,186.8 648.0,193.4 652.5,191.0 657.0,189.0 661.5,197.1 666.0,189.6 670.5,194.7 675.0,198.6 679.5,192.4 684.0,199.8 688.5,198.1 693.0,194.9 697.5,200.0 702.0,199.6 706.5,199.7 711.0,200.0 715.5,198.9 720.0,200.0" fill="none" class="s-red sw-2"/>
+    <polyline points="450.0,105.6 454.5,108.9 459.0,116.4 463.5,129.5 468.0,155.2 472.5,158.4 477.0,144.7 481.5,142.3 486.0,145.4 490.5,154.5 495.0,169.2 499.5,166.2 504.0,164.1 508.5,173.3 513.0,184.4 517.5,176.3 522.0,173.4 526.5,183.7 531.0,183.4 535.5,172.0 540.0,189.9 544.5,173.4 549.0,179.2 553.5,177.4 558.0,182.6 562.5,176.0 567.0,197.6 571.5,175.8 576.0,199.0 580.5,178.2 585.0,185.3 589.5,195.9 594.0,179.0 598.5,187.0 603.0,199.1 607.5,183.5 612.0,195.5 616.5,200.0 621.0,183.4 625.5,184.0 630.0,198.9 634.5,200.0 639.0,191.3 643.5,180.6 648.0,175.8 652.5,173.5 657.0,177.7 661.5,199.9 666.0,193.8 670.5,181.0 675.0,178.9 679.5,184.6 684.0,199.6 688.5,200.0 693.0,200.0 697.5,191.7 702.0,187.2 706.5,185.6 711.0,183.0 715.5,180.4 720.0,180.9" fill="none" class="s-blue sw-2"/>
+    <polyline points="70,12 94,12" fill="none" class="s-red sw-2"/><text x="100" y="16" class="t-xs">no warmup</text>
+    <polyline points="200,12 224,12" fill="none" class="s-blue sw-2"/><text x="230" y="16" class="t-xs">100-step linear warmup</text>
+  </svg>
+  <figcaption><strong>The same network, the same peak learning rate.</strong> Measured by <code>warm.py</code>. Without warmup the first full-size Adam steps throw the weights far from the starting point: the loss jumps to 144 and the gradient norm to about 880 within two steps. With warmup the first steps are tiny and both curves fall smoothly. The gradient norm moves before, or with, the loss: it is the earliest warning signal.</figcaption>
+</figure>
+
+<h2>What to log, and what the curves mean</h2>
+
+<p>Chapter 16's accounting predicts how the run should behave; the logs tell you whether it does. A training dashboard for a long run should plot, at every step or every few steps:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Signal</th><th>Healthy looks like</th><th>If it goes wrong</th></tr></thead>
+  <tbody>
+    <tr><td><b>Training loss</b> (raw and smoothed)</td><td>Falls quickly, then slowly; noise around a smooth trend</td><td>Sharp jump up: a spike. Flat from the start: learning rate, data or a bug (studio 1 practises this)</td></tr>
+    <tr><td><b>Gradient norm</b> (before clipping)</td><td>Settles to a steady level after warmup; rare isolated peaks</td><td>Rising trend or growing peaks usually precede a loss spike; a sudden drop to near zero can mean dead units or a frozen graph</td></tr>
+    <tr><td><b>Fraction of steps clipped</b></td><td>Near 0%</td><td>High and persistent: the learning rate or the architecture is wrong, and the clip is hiding it</td></tr>
+    <tr><td><b>Learning rate</b></td><td>The planned schedule</td><td>Not matching the plan: a restart that reset the schedule is a classic bug</td></tr>
+    <tr><td><b>Loss scale</b> (fp16 only)</td><td>Hovers at a high value, rare halvings</td><td>Repeated halvings or a collapse towards 1: overflowing activations, often just before divergence (the OPT-175B pattern)</td></tr>
+    <tr><td><b>Largest attention logit, output logit and activation norms</b></td><td>Stable or slowly changing</td><td>Steady growth is the signature of the attention-logit and output-logit instabilities above</td></tr>
+    <tr><td><b>Update-to-weight ratio</b> (||&Delta;w|| / ||w||, per layer)</td><td>Roughly 10<sup>-3</sup> as a rule of thumb for many setups (an empirical heuristic, not a law)</td><td>Layers far from the rest: a mis-scaled layer or a frozen one</td></tr>
+    <tr><td><b>NaN and infinity counts</b> (loss, gradients, activations)</td><td>Zero</td><td>Any non-zero: stop, find the first layer and step where it appears (fp32 rerun, anomaly detection)</td></tr>
+    <tr><td><b>Evaluation loss</b> on held-out data</td><td>Tracks the training loss closely</td><td>Diverging from it: overfitting or a train/eval data leak (<a href="../../ml/chapters/14-leakage.html">A1 chapter 14</a>)</td></tr>
+    <tr><td><b>Throughput</b>: tokens per second per GPU, and MFU</td><td>Constant, matching the plan of chapter 16</td><td>Drops: a slow or failing GPU, a data-loader stall, network trouble</td></tr>
+    <tr><td><b>Data position</b>: shard id, sample counter, RNG seed</td><td>Recorded with every checkpoint</td><td>Without it you cannot skip the batches around a spike, which PaLM's remedy requires</td></tr>
+  </tbody>
+</table></div>
+
+<p>Two habits make these logs useful. <b>Alert on the gradient norm and the loss against a running baseline</b>, not an absolute value, as you would alert on a latency percentile rather than an average (<a href="../../reliability/chapters/04-metrics.html">Zero to Systems reliability, chapter 4</a>). And <b>log enough to replay</b>: the seed and the data position at every checkpoint, the exact configuration, and the code version. The OPT-175B team published their daily logbook as a primary record of this kind of operating work; <a href="../cases/case-07-opt-logbook.html">case study 7</a> reads it.</p>
+
+<h2>A runbook for a spike</h2>
+
+<ol class="steps">
+  <li><b>Look before you act.</b> Is the gradient norm elevated? Did the loss scale (if any) collapse? Did anything else change at that step: a new data shard, a resumed checkpoint, a node swap, a learning-rate phase?</li>
+  <li><b>Let it ride, briefly.</b> Some spikes recover on their own, and the dashboard will show whether the loss is returning to its earlier trend. Decide a threshold in advance (for example, "not back to the previous trend after N steps") so the decision does not depend on how anxious you feel.</li>
+  <li><b>If it does not recover, roll back.</b> Restart from the last checkpoint before the spike. PaLM went back about 100 steps and skipped 200 to 500 batches; OPT lowered the learning rate on restart. Keep checkpoints frequent enough for this (<a href="../../llm-training/chapters/05-long-runs.html">A3 chapter 05</a>).</li>
+  <li><b>Fix the cause, if you can find one.</b> Lower the peak learning rate, add warmup, lower &beta;<sub>2</sub> towards 0.95, tighten the clip, add QK-normalisation or a z-loss, remove a bad shard. Change one thing at a time and write it down.</li>
+  <li><b>Write it up.</b> Record the step, the signals, the action and the outcome. The next engineer, or you in a month, will need it.</li>
+</ol>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>A long training run is a production service with a very expensive failure mode, and the same reliability ideas apply. The dashboard above is the metrics layer (<a href="../../reliability/chapters/04-metrics.html">metrics</a>, <a href="../../reliability/chapters/05-logs-events.html">structured events</a>); the runbook is an incident procedure; checkpoints are the recovery point objective; and the decision to roll back is the same trade as rolling back a deployment, made with the same discipline of deciding the threshold before the incident. Silent numerical errors are the training analogue of <a href="../../networking/chapters/16-failure.html">partial failures</a>: nothing crashes, the output is merely wrong, and the monitoring has to be designed to notice.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>1. In <code>formats.py</code> add a value of your own that fp16 handles and bf16 does not, and the reverse. 2. In <code>master.py</code> change the update to 2<sup>-9</sup> and find which formats now move, then find the smallest update that bf16 can accumulate onto 1.0. 3. In <code>spike.py</code> try clip thresholds of 0.5, 3 and 10 and find where clipping stops mattering for the spike step. Then set &beta;<sub>2</sub> to 0.99. 4. In <code>warm.py</code> change the warmup to 20 and to 400 steps and note both the max loss and the final loss; then try a learning rate between 0.03 and 0.1 to find where the run dies. 5. Add a gradient-norm clip of 1.0 (the <code>clip</code> argument of <code>train</code>) to the no-warmup run at 0.03 and compare the max loss. Studio 1 (<a href="../studios/studio-01-debug-training.html">Debug a Training Run That Will Not Learn</a>) gives you a broken run to diagnose from logs like these.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 formats.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 master.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 spike.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 warm.py</span></code></pre>
+</div>
+
+<p>In PyTorch the whole recipe is a few lines. This listing is not run here; with bf16 autocast it needs no loss scaler, and the comments say what each line corresponds to above.</p>
+<pre class="terminal" data-title="train_step.py (PyTorch, not run here)"><code>for step, (x, y) in enumerate(loader):
+    lr = schedule(step)                               # linear warmup, then cosine decay
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    with torch.autocast("cuda", dtype=torch.bfloat16):  # bf16 matmuls, fp32 where needed
+        loss = model(x, y)
+    loss.backward()                                   # parameters (and so gradients) are fp32 here
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # returns the norm BEFORE clipping
+    if not torch.isfinite(gnorm):                     # NaN or inf: skip the step and log it
+        optimizer.zero_grad(set_to_none=True)
+        continue
+    optimizer.step()                                  # AdamW(betas=(0.9, 0.95), weight_decay=0.1)
+    optimizer.zero_grad(set_to_none=True)
+    log(step, loss.item(), gnorm.item(), lr, clipped=bool(gnorm &gt; 1.0))</code></pre>
+<p>In this form the model's parameters stay in fp32 and autocast casts them to bf16 for each matrix product, which is the simplest way to get an fp32 master copy; larger systems that shard the model keep separate bf16 and fp32 copies, as chapter 16's byte count assumes. If you switched to fp16 you would add a <code>GradScaler</code> that implements the dynamic loss scaling shown earlier.</p>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>16-bit matrix products are several times faster and half the size. fp16 has more precision but a narrow range (largest value 65,504) and needs loss scaling; bf16 has fp32's range with 7 mantissa bits and needs none, which is why it is the default.</li>
+    <li>Keep in fp32: the master weights, the optimiser moments, the loss and softmax, normalisation statistics and the sums inside matrix products. A bf16 weight cannot accumulate small updates (spacing 0.0078 near 1.0).</li>
+    <li>Loss spikes are normal at scale: PaLM 540B saw about 20 with clipping on. The usual remedy is to roll back to a checkpoint before the spike, skipping the batches around it, often with a lower learning rate.</li>
+    <li>Adam turns one extreme gradient into a large step because m reacts at once while v, averaged over about 1,000 steps, does not. Clipping the gradient norm (c = 1.0 is standard) and a lower &beta;<sub>2</sub> (0.95) both limit this.</li>
+    <li>Warmup raises the learning rate over the first thousands of steps because the start is the roughest stretch of the landscape. It widens the range of working learning rates; it does not make every rate work.</li>
+    <li>Log the gradient norm (before clipping), the fraction of clipped steps, the loss scale, activation and logit maxima, throughput and the data position. Alert against a running baseline, and keep enough information to replay the run.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Micikevicius et al., "Mixed Precision Training" (2017)</a>. The fp32 master copy and loss scaling; short and readable.</li>
+  <li><a href="https://arxiv.org/abs/1905.12322" target="_blank" rel="noopener">Kalamkar et al., "A Study of BFLOAT16 for Deep Learning Training" (2019)</a>. Why bf16 works without loss scaling.</li>
+  <li><a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">Chowdhery et al., "PaLM: Scaling Language Modeling with Pathways" (2022)</a>. Section 5.1 describes the loss spikes and the restart-and-skip remedy; also the z-loss and the clip value.</li>
+  <li><a href="https://arxiv.org/abs/2205.01068" target="_blank" rel="noopener">Zhang et al., "OPT: Open Pre-trained Transformer Language Models" (2022)</a>. Section 2.5 on hardware failures and loss divergences, with the released logbook.</li>
+  <li><a href="https://arxiv.org/abs/2309.14322" target="_blank" rel="noopener">Wortsman et al., "Small-scale proxies for large-scale Transformer training instabilities" (2023)</a>. Reproduces attention-logit growth and output-logit divergence in small models, and shows QK-norm and z-loss fixing them.</li>
+  <li><a href="https://arxiv.org/abs/1908.03265" target="_blank" rel="noopener">Liu et al., "On the Variance of the Adaptive Learning Rate and Beyond" (2020)</a>. An analysis of why Adam needs warmup.</li>
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Llama Team, "The Llama 3 Herd of Models" (2024)</a>. Section 3.4 gives the warmup, learning-rate and batch-size recipe of a run with few spikes; the infrastructure section reports interruptions.</li>
+  <li><a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-AI, "DeepSeek-V3 Technical Report" (2024)</a>. FP8 mixed-precision training, bf16 optimiser moments and the optimiser settings quoted here.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A colleague moves a training run from bf16 to fp16 for higher precision and the loss becomes NaN within a few hundred steps, with the gradient norm reported as inf. Which is the most likely explanation?</p>
+    <ol class="q-options"><li>fp16 has fewer mantissa bits than bf16, so rounding errors cancel out</li><li>fp16 cannot represent the learning rate</li><li>fp16's range ends at 65,504, so an activation or scaled gradient overflowed to infinity, and without dynamic loss scaling or clipping the infinity spread</li><li>fp16 is not supported by tensor cores</li></ol>
+    <div class="q-explain">fp16 has more mantissa bits (10) than bf16 (7), so the first option is backwards; what fp16 lacks is range. Overflow to infinity and then NaN is its signature failure, and why fp16 recipes use loss scaling with skipped steps. fp16 can represent typical learning rates, and tensor cores support it.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">You train a model with the weights themselves stored in bf16 and no fp32 copy. Late in the run the learning rate has decayed to 10<sup>-6</sup> and the loss stops improving, although gradients are healthy. What is the best explanation?</p>
+    <ol class="q-options"><li>Updates of about 10<sup>-6</sup> times the gradient are smaller than half the spacing between bf16 numbers near the weight, so they round away and the weights stop changing</li><li>The model has reached the irreducible loss of the data</li><li>bf16 gradients underflow to zero</li><li>The warmup was too short</li></ol>
+    <div class="q-explain">With 7 mantissa bits, the spacing near a weight of size 1 is about 0.008, so tiny updates are rounded to no change; an fp32 master copy accumulates them. bf16 has fp32's range, so gradients do not underflow (the third option describes fp16). The data floor is possible but not implied by healthy gradients, and warmup concerns the start of training.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">In the Adam experiment, one gradient 100 times larger than usual produced an update about 11 times typical with &beta;<sub>2</sub> = 0.999 and no clipping. Why is the step so large when Adam is supposed to normalise by the gradient size?</p>
+    <ol class="q-options"><li>Adam divides by the gradient of the current step, so large gradients produce larger steps</li><li>The learning rate is automatically increased after a large gradient</li><li>Weight decay amplifies the outlier</li><li>The first moment m jumps immediately to a tenth of the outlier, while the second moment v averages over about a thousand steps and has barely moved, so m/&radic;v is far above normal</li></ol>
+    <div class="q-explain">Adam's normalisation uses a long-run average of squared gradients, not the current gradient. The numerator reacts at once; the denominator lags. Adam does not divide by the current gradient, the learning rate has not changed, and weight decay is a separate small term unrelated to the outlier.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A dashboard shows that gradient clipping is active on 70% of steps in a run that has just passed warmup. What should you conclude?</p>
+    <ol class="q-options"><li>Clipping is working well, because it is engaging often</li><li>The typical gradient norm is above the threshold, so the learning rate, initialisation or architecture likely needs attention, because the clip has become part of the optimiser rather than a safety net</li><li>The threshold is too low and should be removed</li><li>The loss scale has collapsed</li></ol>
+    <div class="q-explain">A healthy run clips rarely; frequent clipping means the gradient is routinely larger than the design assumed and the clip is compensating for something else. Removing the clip would remove protection without removing the cause. The loss scale applies only to fp16 runs and is a separate signal.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">The PaLM team replayed the batches around a loss spike from an earlier checkpoint and the spike did not recur. What did they conclude, and what remedy follows?</p>
+    <ol class="q-options"><li>The spike depended on the combination of those batches and the parameter state at that time; restarting from before the spike and skipping a few hundred batches avoids it</li><li>The data were corrupted, so the shard should be deleted from the corpus</li><li>The hardware was faulty, so the nodes should be replaced</li><li>The learning rate was too low, so it should be raised</li></ol>
+    <div class="q-explain">The replay from an earlier state did not spike, which rules out "bad data" as a complete explanation; it was the particular pairing of data and parameters. Hence the remedy of rolling back and skipping data. A hardware fault would not be fixed by changing the starting checkpoint, and raising the learning rate would make spikes more likely.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">You plan to log a training run. Which set of signals is most useful for detecting an impending loss spike before the loss moves?</p>
+    <ol class="q-options"><li>Wall-clock time per step and GPU temperature</li><li>Training loss averaged over 1,000 steps and the final evaluation score</li><li>Pre-clip gradient norm, fraction of steps clipped, and the maxima of attention logits, output logits and activations</li><li>The learning rate and the batch size</li></ol>
+    <div class="q-explain">The gradient norm, the clip rate and the growth of logits and activations are leading indicators: instabilities build in them before the loss reacts, as in the OPT and Wortsman et al. observations. A heavily smoothed loss reacts late by construction. Learning rate and batch size are plan values you already know, and hardware metrics diagnose throughput problems, not numerical ones.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

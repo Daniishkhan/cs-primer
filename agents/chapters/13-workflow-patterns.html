@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workflow Patterns · Agents, Tools &amp; Protocols</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/agt13-patterns.css">
+</head>
+<body data-root="../.." data-course="agt" data-chapter="13">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Workflow Patterns</h1>
+  <p class="lede">Before an agent decides its own next step, most useful LLM systems are programs where you decide the steps and the model fills them in. This chapter writes the five patterns that cover most of those programs (chaining, routing, parallelising, orchestrator-workers and evaluator-optimiser loops) as plain code, counts what each costs, and explains the way each one fails.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Teams reach for a free-running agent when a six-line workflow would be cheaper, faster, easier to test and easier to explain to an auditor. Knowing the patterns lets you choose the least autonomous design that works, and lets you recognise when a task really does need the loop of <a href="02-tool-loop.html">chapter 2</a>. The same patterns are the vocabulary for the multi-agent designs of <a href="14-multi-agent.html">chapter 14</a>, the durable runs of <a href="15-durable-execution.html">chapter 15</a> and the workflow lab, so they are worth getting precise.</p>
+</div>
+
+<h2>A workflow is a program with model calls in it</h2>
+
+<p>Anthropic's December 2024 essay "Building effective agents" draws a line that this course keeps using. A <span class="term">workflow</span> is a system where LLMs and tools are orchestrated through <em>predefined code paths</em>. An <span class="term">agent</span> is a system where the LLM dynamically directs its own process and tool use. <a href="00-start-here.html">Chapter 0</a> introduced the distinction; the point here is what follows from it. In a workflow, your code owns the control flow: the order of steps, the branches, the loops and the stopping rule are ordinary Python (or TypeScript, or Go), and the model supplies judgement or language at fixed points.</p>
+
+<p>That ownership buys four things an open-ended agent cannot easily give you.</p>
+
+<ul>
+  <li><strong>Predictable cost and latency.</strong> The number of model calls is bounded by the program, not by the model's mood. You can write the worst case on a whiteboard.</li>
+  <li><strong>Testability.</strong> Each step takes input and returns output, so you can test it in isolation, replace the model with a scripted stand-in (as the examples below do), and put an evaluation on each step rather than on a whole opaque run.</li>
+  <li><strong>Inspectability.</strong> A reviewer can read the program and see every place a model can influence an outcome. That matters for regulated work such as claims triage, loan documents and medical coding.</li>
+  <li><strong>Containment.</strong> A step that can only classify cannot also send an email. Permissions can be narrow because the steps are narrow (<a href="19-agent-security.html">chapter 19</a>).</li>
+</ul>
+
+<p>The essay's advice is to find the simplest solution possible and add complexity only when it demonstrably improves outcomes, and to begin with the model APIs directly because many patterns take only a few lines. The rest of this chapter takes that advice literally. Every pattern is shown as code you could paste into a project, with no framework underneath it (<a href="21-frameworks.html">chapter 21</a> covers what frameworks add and hide).</p>
+
+<h3>The shared helper</h3>
+
+<p>One small class is used by every example. It wraps a model so that each call is logged with its step name and token counts. Token counts here come from the stand-in tokeniser in <code>lab-support/llm.py</code>, which counts roughly four characters per token, so treat them as consistent units rather than real billing numbers. The stand-in model itself (in the optional box) is a single deterministic function that behaves differently depending on the system prompt, which is enough to make every example reproducible.</p>
+
+<pre class="terminal" data-title="flow.py"><code># flow.py: the one helper every pattern in this chapter shares
+import threading, time
+from llm import ScriptedModel, text_of
+
+class Flow:
+    """Wraps a model so every call is recorded: which step, tokens in, tokens out."""
+    def __init__(self, model, latency=0.0):
+        self.model, self.latency, self.calls, self.lock = model, latency, [], threading.Lock()
+
+    def ask(self, step, system, user):
+        time.sleep(self.latency)                       # stands in for network + generation time
+        r = self.model.complete([{"role": "user", "content": user}], system=system)
+        with self.lock:
+            self.calls.append((step, r.usage["input_tokens"], r.usage["output_tokens"]))
+        return text_of(r)
+
+    def report(self, label):
+        tin = sum(c[1] for c in self.calls); tout = sum(c[2] for c in self.calls)
+        print(f"{label}: {len(self.calls)} model calls, {tin} tokens in, {tout} tokens out")</code></pre>
+
+<details class="deeper"><summary>Go deeper <span class="hint">the stand-in model used by the first two examples</span></summary>
+<pre class="terminal" data-title="fakes.py"><code># fakes.py: ONE deterministic stand-in "model" that behaves differently per system prompt
+import json, re
+from llm import ScriptedModel
+
+def fake(messages, tools, system):
+    u = messages[-1]["content"]
+    if system.startswith("EXTRACT"):
+        m = re.search(r"\b([A-Z]-\d{4})\b", u)
+        return json.dumps({"order_id": m.group(1) if m else None,
+                           "issue": "late" if "late" in u or "not arrived" in u else "other"})
+    if system.startswith("DRAFT"):
+        d = json.loads(u.split("FACTS:")[1].split("\n")[0])
+        return (f"Sorry about the wait with order {d['order_id']}. It is {d['status']} and should arrive "
+                f"on {d['eta']}. Reply here if it does not.")
+    if system.startswith("CLASSIFY"):
+        low = u.lower()
+        if "refund" in low or "money back" in low: return "refund|0.93"
+        if "password" in low or "log in" in low: return "account|0.90"
+        if "where" in low or "arrived" in low: return "tracking|0.88"
+        return "other|0.41"
+    if system.startswith("HANDLE-"):
+        return f"[{system[7:]}] handled: " + u[:40]
+    return "?"</code></pre>
+<p>It is a function from <code>(messages, tools, system)</code> to a reply, wrapped by <code>ScriptedModel</code>, which also records every request and counts tokens. Swap it for <code>get_model(...)</code> from <code>llm.py</code> and the same workflow code talks to a real model.</p>
+</details>
+
+<figure class="diagram">
+  <svg viewBox="0 0 900 420" role="img" aria-label="Six panels. Panel 1, prompt chaining: input, model call, a gate, a second model call, output, with a failed gate leading to a stop. Panel 2, routing: input to a router which picks one of three handlers. Panel 3, parallelisation: input fans out to three model calls whose results are combined. Panel 4, orchestrator-workers: input to an orchestrator, a dynamic set of workers, then a synthesiser. Panel 5, evaluator-optimiser: a generator and an evaluator in a loop with feedback, exiting when the check passes. Panel 6, a short guide to choosing between them.">
+    <defs><marker id="ahAG13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+
+    <rect x="10" y="10" width="280" height="190" rx="10" class="box"/>
+    <text x="24" y="34" class="t-sm t-bold">1 Prompt chaining</text>
+    <rect x="22" y="64" width="36" height="32" rx="6" class="fs-green s-green sw-2"/><text x="40" y="84" text-anchor="middle" class="t-xs">In</text>
+    <rect x="70" y="64" width="50" height="32" rx="6" class="fs-blue s-blue sw-2"/><text x="95" y="84" text-anchor="middle" class="t-xs">LLM</text>
+    <rect x="132" y="64" width="44" height="32" rx="6" class="fs-yellow s-yellow sw-2"/><text x="154" y="84" text-anchor="middle" class="t-xs t-bold">gate</text>
+    <rect x="188" y="64" width="50" height="32" rx="6" class="fs-blue s-blue sw-2"/><text x="213" y="84" text-anchor="middle" class="t-xs">LLM</text>
+    <rect x="250" y="64" width="32" height="32" rx="6" class="fs-green s-green sw-2"/><text x="266" y="84" text-anchor="middle" class="t-xs">Out</text>
+    <line x1="58" y1="80" x2="68" y2="80" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="120" y1="80" x2="130" y2="80" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="176" y1="80" x2="186" y2="80" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="238" y1="80" x2="248" y2="80" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="154" y1="96" x2="154" y2="116" class="line s-red" marker-end="url(#ahAG13a)"/>
+    <rect x="130" y="118" width="48" height="26" rx="6" class="fs-red s-red sw-2"/><text x="154" y="135" text-anchor="middle" class="t-xs">stop</text>
+    <text x="24" y="174" class="t-xs t-muted">Fixed steps in order. A gate stops</text>
+    <text x="24" y="190" class="t-xs t-muted">bad output before it is passed on.</text>
+
+    <rect x="310" y="10" width="280" height="190" rx="10" class="box"/>
+    <text x="324" y="34" class="t-sm t-bold">2 Routing</text>
+    <rect x="322" y="100" width="36" height="32" rx="6" class="fs-green s-green sw-2"/><text x="340" y="120" text-anchor="middle" class="t-xs">In</text>
+    <rect x="372" y="100" width="62" height="32" rx="6" class="fs-blue s-blue sw-2"/><text x="403" y="120" text-anchor="middle" class="t-xs">Router</text>
+    <rect x="480" y="50" width="96" height="28" rx="6" class="box"/><text x="528" y="68" text-anchor="middle" class="t-xs">refund path</text>
+    <rect x="480" y="92" width="96" height="28" rx="6" class="box"/><text x="528" y="110" text-anchor="middle" class="t-xs">account path</text>
+    <rect x="480" y="134" width="96" height="28" rx="6" class="box"/><text x="528" y="152" text-anchor="middle" class="t-xs">human queue</text>
+    <line x1="358" y1="116" x2="370" y2="116" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="434" y1="110" x2="478" y2="68" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="434" y1="116" x2="478" y2="106" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="434" y1="124" x2="478" y2="146" class="line" marker-end="url(#ahAG13a)"/>
+    <text x="324" y="178" class="t-xs t-muted">One label picks one path. Low</text>
+    <text x="324" y="194" class="t-xs t-muted">confidence goes to a person.</text>
+
+    <rect x="610" y="10" width="280" height="190" rx="10" class="box"/>
+    <text x="624" y="34" class="t-sm t-bold">3 Parallelisation</text>
+    <rect x="622" y="100" width="36" height="32" rx="6" class="fs-green s-green sw-2"/><text x="640" y="120" text-anchor="middle" class="t-xs">In</text>
+    <rect x="690" y="50" width="60" height="28" rx="6" class="fs-blue s-blue sw-2"/><text x="720" y="68" text-anchor="middle" class="t-xs">LLM</text>
+    <rect x="690" y="102" width="60" height="28" rx="6" class="fs-blue s-blue sw-2"/><text x="720" y="120" text-anchor="middle" class="t-xs">LLM</text>
+    <rect x="690" y="154" width="60" height="28" rx="6" class="fs-blue s-blue sw-2"/><text x="720" y="172" text-anchor="middle" class="t-xs">LLM</text>
+    <rect x="796" y="100" width="82" height="32" rx="6" class="box"/><text x="837" y="120" text-anchor="middle" class="t-xs">combine</text>
+    <line x1="658" y1="110" x2="688" y2="68" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="658" y1="116" x2="688" y2="116" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="658" y1="122" x2="688" y2="168" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="750" y1="64" x2="794" y2="108" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="750" y1="116" x2="794" y2="116" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="750" y1="168" x2="794" y2="124" class="line" marker-end="url(#ahAG13a)"/>
+    <text x="624" y="190" class="t-xs t-muted">Sections, or repeated votes.</text>
+
+    <rect x="10" y="215" width="280" height="190" rx="10" class="box"/>
+    <text x="24" y="239" class="t-sm t-bold">4 Orchestrator-workers</text>
+    <rect x="16" y="300" width="30" height="32" rx="6" class="fs-green s-green sw-2"/><text x="31" y="320" text-anchor="middle" class="t-xs">In</text>
+    <rect x="54" y="298" width="86" height="36" rx="6" class="fs-blue s-blue sw-2"/><text x="97" y="320" text-anchor="middle" class="t-xs">Orchestrator</text>
+    <rect x="156" y="262" width="56" height="26" rx="6" class="box" stroke-dasharray="4 3"/><text x="184" y="279" text-anchor="middle" class="t-xs">worker</text>
+    <rect x="156" y="303" width="56" height="26" rx="6" class="box" stroke-dasharray="4 3"/><text x="184" y="320" text-anchor="middle" class="t-xs">worker</text>
+    <rect x="156" y="344" width="56" height="26" rx="6" class="box" stroke-dasharray="4 3"/><text x="184" y="361" text-anchor="middle" class="t-xs">worker</text>
+    <rect x="234" y="300" width="48" height="32" rx="6" class="fs-blue s-blue sw-2"/><text x="258" y="320" text-anchor="middle" class="t-xs">Synth</text>
+    <line x1="46" y1="316" x2="52" y2="316" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="140" y1="310" x2="154" y2="278" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="140" y1="316" x2="154" y2="316" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="140" y1="324" x2="154" y2="354" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="212" y1="276" x2="232" y2="308" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="212" y1="316" x2="232" y2="316" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="212" y1="356" x2="232" y2="326" class="line" marker-end="url(#ahAG13a)"/>
+    <text x="24" y="388" class="t-xs t-muted">The orchestrator chooses the workers</text>
+    <text x="24" y="402" class="t-xs t-muted">from the input, then results merge.</text>
+
+    <rect x="310" y="215" width="280" height="190" rx="10" class="box"/>
+    <text x="324" y="239" class="t-sm t-bold">5 Evaluator-optimiser</text>
+    <rect x="326" y="268" width="96" height="40" rx="6" class="fs-blue s-blue sw-2"/><text x="374" y="293" text-anchor="middle" class="t-xs">Generator</text>
+    <rect x="474" y="268" width="100" height="40" rx="6" class="fs-teal s-teal sw-2"/><text x="524" y="293" text-anchor="middle" class="t-xs">Evaluator</text>
+    <line x1="422" y1="280" x2="472" y2="280" class="line" marker-end="url(#ahAG13a)"/>
+    <line x1="474" y1="298" x2="424" y2="298" class="line" marker-end="url(#ahAG13a)"/>
+    <text x="448" y="322" text-anchor="middle" class="t-xs t-muted">feedback</text>
+    <line x1="524" y1="308" x2="524" y2="340" class="line s-green" marker-end="url(#ahAG13a)"/>
+    <text x="534" y="330" class="t-xs tc-green t-bold">pass</text>
+    <rect x="496" y="342" width="56" height="26" rx="6" class="fs-green s-green sw-2"/><text x="524" y="359" text-anchor="middle" class="t-xs">Out</text>
+    <text x="324" y="388" class="t-xs t-muted">Loop until the check passes or</text>
+    <text x="324" y="402" class="t-xs t-muted">the round limit is reached.</text>
+
+    <rect x="610" y="215" width="280" height="190" rx="10" class="box"/>
+    <text x="624" y="239" class="t-sm t-bold">6 Which one?</text>
+    <text x="624" y="266" class="t-xs"><tspan class="t-bold">Known steps:</tspan> chain</text>
+    <text x="624" y="290" class="t-xs"><tspan class="t-bold">Known categories:</tspan> route</text>
+    <text x="624" y="314" class="t-xs"><tspan class="t-bold">Independent parts:</tspan> parallelise</text>
+    <text x="624" y="338" class="t-xs"><tspan class="t-bold">Unknown parts:</tspan> orchestrator</text>
+    <text x="624" y="362" class="t-xs"><tspan class="t-bold">Clear quality test:</tspan> evaluator loop</text>
+    <text x="624" y="388" class="t-xs"><tspan class="t-bold">None fit:</tspan> an agent (chapter 2)</text>
+  </svg>
+  <figcaption><strong>Five shapes of control flow.</strong> In every panel the arrows are written by you, in ordinary code. The model sits inside the blue boxes; yellow and teal boxes are checks, which can be plain code or another model call.</figcaption>
+</figure>
+
+<h2>Prompt chaining: steps in a fixed order, with gates</h2>
+
+<p><span class="term">Prompt chaining</span> splits a task into sequential steps in which each model call processes the output of the previous one. The reason to split is that a model does better on a narrow job with a short prompt than on a wide job with a long one, and a chain turns one hard call into several easy ones. The cost is latency: the steps run one after another. Anthropic's essay describes the trade as exchanging latency for higher accuracy.</p>
+
+<p>The best feature of a chain is the <span class="term">gate</span>: a programmatic check between two steps that decides whether to continue. A gate is ordinary code, so it is cheap, deterministic and testable. It is also where you should put anything you can verify without a model: whether the JSON parses, whether an id exists, whether a number is in range, whether the output names the order it is about.</p>
+
+<p>Here is a support chain. Step 1 (a model call) extracts the order id from a free-text ticket. Gate 1 checks the id exists. Step 2 is a plain database lookup, because fetching a record is not a language task. Step 3 (a model call) writes a reply from the facts only. Gate 2 checks the reply mentions the order and is short.</p>
+
+<pre class="terminal" data-title="d1_chain.py"><code>import json, re
+from flow import Flow
+from llm import ScriptedModel
+from fakes import fake
+
+ORDERS = {"A-1001": {"status": "shipped", "eta": "Friday"}, "A-1002": {"status": "processing", "eta": "Monday"}}
+
+def chain(flow, ticket):
+    # step 1 (LLM): extract structured fields from free text
+    raw = flow.ask("extract", "EXTRACT order id and issue as JSON", ticket)
+    fields = json.loads(raw)
+    # GATE 1 (code): stop early if the output is unusable; no later LLM call is spent
+    if not fields["order_id"] or fields["order_id"] not in ORDERS:
+        return None, "gate 1: no valid order id, ask the customer"
+    # step 2 (plain code): a database lookup is not an LLM job
+    facts = dict(ORDERS[fields["order_id"]], order_id=fields["order_id"])
+    # step 3 (LLM): write the reply from facts only
+    reply = flow.ask("draft", "DRAFT a short reply using only the facts", "FACTS:" + json.dumps(facts) + "\n")
+    # GATE 2 (code): the reply must mention the order id and stay short
+    if facts["order_id"] not in reply or len(reply.split()) &gt; 40:
+        return None, "gate 2: draft rejected"
+    return reply, "ok"
+
+for ticket in ["My parcel A-1001 has not arrived and it is late.", "Where is my stuff? It is late!"]:
+    flow = Flow(ScriptedModel(fake))
+    reply, status = chain(flow, ticket)
+    print(status, "|", reply)
+    flow.report("  cost")</code></pre>
+<pre class="terminal" data-title="output"><code>ok | Sorry about the wait with order A-1001. It is shipped and should arrive on Friday. Reply here if it does not.
+  cost: 2 model calls, 48 tokens in, 38 tokens out
+gate 1: no valid order id, ask the customer | None
+  cost: 1 model calls, 17 tokens in, 9 tokens out</code></pre>
+
+<p>The second ticket never names an order, so gate 1 stops the chain after one model call and returns a message asking the customer for the id. Without the gate, step 3 would have been asked to write a reply about <code>None</code>, and a model asked to be helpful about <code>None</code> will often invent an order. <strong>A gate converts a silent wrong answer into a loud, cheap, handled one.</strong></p>
+
+<p>That matters because errors compound. If each step is right 90% of the time and steps are independent, a five-step chain is right 0.9<sup>5</sup>, about 59%, of the time (<a href="02-tool-loop.html">chapter 2</a> made the same point about agent loops). Gates do not raise the 59%, but they turn many of the 41% from undetected failures into detected ones that you can retry, route to a person or report. Two design rules follow. Keep each step's output in a form a gate can check (structured output, a fixed vocabulary, a short list), as <a href="01-model-apis.html">chapter 1</a> described. And do not chain what one call does well: every added step is another place to fail and another delay.</p>
+
+<h2>Routing: choose the path, then follow it</h2>
+
+<p><span class="term">Routing</span> classifies an input and sends it down a specialised path. It works when a task has distinct categories that are better handled separately, because each path can have its own prompt, examples, tools and even model. Two common uses are different handling for different request types (refunds, account problems, tracking) and different cost tiers (easy questions to a small, cheap model, hard ones to a large one).</p>
+
+<pre class="terminal" data-title="d2_route.py"><code>from flow import Flow
+from llm import ScriptedModel
+from fakes import fake
+
+# each route = (system prompt for the handler, a made-up cost tier shown in the log)
+ROUTES = {"refund": ("HANDLE-refund-careful", "large"), "account": ("HANDLE-account", "small"),
+          "tracking": ("HANDLE-tracking", "small")}
+THRESHOLD = 0.7
+
+def route(flow, ticket):
+    label, conf = flow.ask("classify", "CLASSIFY into refund|account|tracking|other", ticket).split("|")
+    if label not in ROUTES or float(conf) &lt; THRESHOLD:       # unknown or unsure: do not guess
+        return "human-queue", f"{label} ({conf}) below {THRESHOLD}"
+    system, tier = ROUTES[label]
+    return flow.ask("handle", system, ticket), f"{label} ({conf}) -&gt; {tier} model"
+
+tickets = ["I want my money back for A-1001", "I cannot log in", "Where is my parcel?",
+           "Your driver was lovely", "Refund please, and reset my password"]
+flow = Flow(ScriptedModel(fake))
+for t in tickets:
+    out, why = route(flow, t)
+    print(f"{t[:38]:&lt;40} {why:&lt;34} {str(out)[:28]}")
+flow.report("total")</code></pre>
+<pre class="terminal" data-title="output"><code>I want my money back for A-1001          refund (0.93) -&gt; large model       [refund-careful] handled: I 
+I cannot log in                          account (0.90) -&gt; small model      [account] handled: I cannot 
+Where is my parcel?                      tracking (0.88) -&gt; small model     [tracking] handled: Where is
+Your driver was lovely                   other (0.41) below 0.7             human-queue
+Refund please, and reset my password     refund (0.93) -&gt; large model       [refund-careful] handled: Re
+total: 9 model calls, 133 tokens in, 66 tokens out</code></pre>
+
+<p>Four details in this short program are the whole craft of routing.</p>
+
+<ol class="steps">
+  <li><strong>A fallback exists.</strong> A label outside the table, or a confidence below the threshold, goes to a human queue instead of a guessed handler. "Your driver was lovely" is not a support request, and a router with no <code>other</code> exit would push it into the nearest wrong category.</li>
+  <li><strong>The threshold is a dial, not a constant.</strong> Lower it and fewer tickets reach people but more are misrouted; raise it and the reverse. Choose it from an evaluation, not a feeling (<a href="../../evals/chapters/02-eval-harnesses.html">A6 chapter 2</a>).</li>
+  <li><strong>The labels must be mutually exclusive, and real inputs are not.</strong> The last ticket asks for a refund and a password reset. The router picked <code>refund</code> with 0.93 confidence and the password request is silently dropped. Fixes include multi-label routing (run both paths), splitting the input first, or having each handler report what it did not cover.</li>
+  <li><strong>The router is a model, so it has an error rate.</strong> Measure it on labelled examples and look at the confusion between categories, not only overall accuracy. A router that is 95% accurate and wrong mostly on refunds is worse than the number suggests.</li>
+</ol>
+
+<p>Routing by model tier deserves one more sentence. Because the routing call is itself a model call, it must cost much less than the saving it creates. A tiny classifier (even a regular expression or a small trained model, as in <a href="../../ml/chapters/00-start-here.html">course A1</a>) often beats an LLM at this, and the cost-quality curve you can reach this way is the subject of <a href="../../evals/chapters/19-cost-latency-quality.html">A6 chapter 19</a>.</p>
+
+<h2>Parallelisation: sectioning and voting</h2>
+
+<p>When the work divides into pieces that do not depend on each other, run them at once and combine the results in code. Anthropic's essay names two variants.</p>
+
+<dl class="terms">
+  <dt>Sectioning</dt>
+  <dd>Different independent subtasks run in parallel: one model checks a draft for personal data, another for tone, a third for policy compliance. Each call is narrow and the wall-clock time is that of the slowest.</dd>
+  <dt>Voting</dt>
+  <dd>The <em>same</em> task runs several times and the answers are combined, usually by majority. It trades tokens for confidence on decisions where a single run is noisy, such as flagging a vulnerability or moderating content.</dd>
+</dl>
+
+<h3>Sectioning</h3>
+
+<p>Model calls spend almost all their time waiting on the network and the generation, so threads are enough to overlap them. (Why that works is the subject of <a href="../../systems/chapters/17-async-await.html">systems chapter 17</a> and <a href="../../systems/chapters/15-blocking-io.html">chapter 15</a>.) The first half of the script below runs three checks one after another and then at once, with an artificial 0.2-second delay per call standing in for network time.</p>
+
+<h3>Voting, and the trap in it</h3>
+
+<p>If a single judge is right 70% of the time and judges err independently, a majority of three is right 78.4% of the time, five 83.7% and nine 90.1%, from the binomial formula in the script. That is the argument for voting and it is correct <em>if</em> the independence holds. The second half of the script tests what happens when it does not: suppose 20% of items are hard in a way that fools every judge together (the same ambiguity, the same missing context). Each judge is still right 70% of the time overall, but now a majority can never exceed the 80% of items that are not hard.</p>
+
+<pre class="terminal" data-title="d3_parallel.py"><code>import random, time
+from concurrent.futures import ThreadPoolExecutor
+from math import comb
+from flow import Flow
+from llm import ScriptedModel
+from fakes import fake
+
+# Sectioning: three independent checks of the same text, run at once
+def check(flow, name, text): return name, flow.ask("check-" + name, "HANDLE-" + name, text)
+flow = Flow(ScriptedModel(fake), latency=0.2)
+text = "Customer asks for a refund and shares a password."
+t0 = time.time()
+for name in ("pii", "tone", "policy"): check(flow, name, text)
+seq = time.time() - t0
+flow.calls.clear(); t0 = time.time()
+with ThreadPoolExecutor(3) as pool:
+    list(pool.map(lambda n: check(flow, n, text), ("pii", "tone", "policy")))
+par = time.time() - t0
+print(f"sectioning: sequential {seq:.1f}s, parallel {par:.1f}s, same {len(flow.calls)} calls and tokens")
+
+# Voting: n noisy judges, majority wins. A single judge is right 70% of the time (a simulation).
+# Independent case: errors are random. Correlated case: 20% of items are "hard" and fool every
+# judge together; on the other 80% each judge is right with q = 0.7 / 0.8 = 0.875, so one judge is still 70%.
+def vote_accuracy(n, hard=0.0, trials=20000, seed=3):
+    rnd, right = random.Random(seed), 0
+    q = 0.7 / (1 - hard)
+    for _ in range(trials):
+        if rnd.random() &lt; hard: continue                     # every judge wrong together
+        right += sum(rnd.random() &lt; q for _ in range(n)) &gt; n / 2
+    return right / trials
+exact = lambda p, n: sum(comb(n, k) * p**k * (1-p)**(n-k) for k in range(n // 2 + 1, n + 1))
+print("\njudges  independent errors   exact   20% shared-hard items")
+for n in (1, 3, 5, 9):
+    print(f"{n:&gt;6}  {vote_accuracy(n):&gt;16.3f} {exact(0.7, n):&gt;8.3f}   {vote_accuracy(n, 0.2):&gt;18.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>sectioning: sequential 0.6s, parallel 0.2s, same 3 calls and tokens
+
+judges  independent errors   exact   20% shared-hard items
+     1             0.700    0.700                0.701
+     3             0.784    0.784                0.770
+     5             0.839    0.837                0.786
+     9             0.902    0.901                0.800</code></pre>
+
+<p>The wall-clock gain from sectioning is real (0.6 s to 0.2 s) and the token bill is unchanged, since the same three calls are made. The voting rows show the difference between independent and shared errors. The "independent" column matches the exact binomial values (the small differences are sampling noise from 20,000 simulated trials); the "shared-hard" column flattens at 0.80 however many judges you add. Real LLM judges that share a prompt, a model and a training distribution are more like the second column than the first.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Grouped bar chart of majority-vote accuracy against number of judges, 1, 3, 5 and 9. Independent errors: 0.70, 0.78, 0.84, 0.90. With 20 percent shared-hard items: 0.70, 0.77, 0.79, 0.80. A dashed line marks the 0.80 ceiling.">
+    <line x1="70" y1="230" x2="730" y2="230" class="line-thin"/>
+    <line x1="70" y1="30" x2="70" y2="230" class="line-thin"/>
+    <line x1="70" y1="130" x2="730" y2="130" class="line-thin t-faint" stroke-dasharray="2 4"/>
+    <line x1="70" y1="30" x2="730" y2="30" class="line-thin t-faint" stroke-dasharray="2 4"/>
+    <text x="62" y="234" text-anchor="end" class="t-xs t-muted">0</text>
+    <text x="62" y="134" text-anchor="end" class="t-xs t-muted">0.5</text>
+    <text x="62" y="34" text-anchor="end" class="t-xs t-muted">1.0</text>
+    <line x1="70" y1="70" x2="730" y2="70" class="line-dash s-red"/>
+    
+
+    <rect x="95" y="90" width="50" height="140" class="f-blue"/><text x="120" y="84" text-anchor="middle" class="t-xs">0.700</text>
+    <rect x="150" y="89.8" width="50" height="140.2" class="f-red"/><text x="175" y="104" text-anchor="middle" class="t-xs t-dark">0.701</text>
+    <rect x="255" y="73.2" width="50" height="156.8" class="f-blue"/><text x="280" y="67" text-anchor="middle" class="t-xs">0.784</text>
+    <rect x="310" y="76" width="50" height="154" class="f-red"/><text x="335" y="90" text-anchor="middle" class="t-xs t-dark">0.770</text>
+    <rect x="415" y="62.2" width="50" height="167.8" class="f-blue"/><text x="440" y="56" text-anchor="middle" class="t-xs">0.839</text>
+    <rect x="470" y="72.8" width="50" height="157.2" class="f-red"/><text x="495" y="87" text-anchor="middle" class="t-xs t-dark">0.786</text>
+    <rect x="575" y="49.6" width="50" height="180.4" class="f-blue"/><text x="600" y="43" text-anchor="middle" class="t-xs">0.902</text>
+    <rect x="630" y="70" width="50" height="160" class="f-red"/><text x="655" y="84" text-anchor="middle" class="t-xs t-dark">0.800</text>
+
+    <text x="148" y="250" text-anchor="middle" class="t-xs t-muted">1 judge</text>
+    <text x="308" y="250" text-anchor="middle" class="t-xs t-muted">3 judges</text>
+    <text x="468" y="250" text-anchor="middle" class="t-xs t-muted">5 judges</text>
+    <text x="628" y="250" text-anchor="middle" class="t-xs t-muted">9 judges</text>
+    <rect x="260" y="266" width="12" height="12" class="f-blue"/><text x="278" y="276" class="t-xs">independent errors</text>
+    <rect x="420" y="266" width="12" height="12" class="f-red"/><text x="438" y="276" class="t-xs">20% of items fool every judge</text>
+    <line x1="640" y1="272" x2="664" y2="272" class="line-dash s-red"/><text x="670" y="276" class="t-xs">ceiling 0.80</text>
+  </svg>
+  <figcaption><strong>Votes help only as much as errors are independent.</strong> Both series have the same single-judge accuracy of 0.70 and come from d3_parallel.py. Correlated mistakes cap the improvement however many judges you pay for.</figcaption>
+</figure>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Five votes are better than one, so nine are better than five." Only if the votes disagree for independent reasons. If the judges share a prompt and a model, they usually share blind spots, and the extra calls buy cost without accuracy. The remedy is diversity you can measure: different prompts, different models or different evidence, then check on a labelled set whether agreement actually predicts correctness.</p>
+</div>
+
+<p>Parallel fan-out brings the failure modes of any distributed call (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>). The slowest branch sets the latency, so one slow call stretches every request, the effect described in <a href="../../reliability/chapters/09-tail-latency.html">reliability chapter 9</a>. Rate limits can reject a burst of simultaneous calls. And you need a rule for partial failure: wait for all, accept a majority, or return what arrived by a deadline. Write that rule down in the code instead of leaving it to whatever the thread pool does.</p>
+
+<h2>Orchestrator-workers: when the pieces are not known in advance</h2>
+
+<p>Parallelisation needs you to know the parts when you write the program. Often you do not. "Compare the refund policies of the branches in this email" has two subtasks if the email names two branches and nine if it names nine. In the <span class="term">orchestrator-workers</span> pattern a central model call reads the input, decides the subtasks, hands each to a worker call, and a final call synthesises the results. The essay's key distinction from plain parallelisation is that the subtasks are not pre-defined but determined by the orchestrator from the specific input.</p>
+
+<pre class="terminal" data-title="d4_orch.py"><code>import json, re
+from concurrent.futures import ThreadPoolExecutor
+from flow import Flow
+from llm import ScriptedModel
+
+POLICY = {"Leeds": 30, "Derby": 14, "York": 45, "Hull": 28, "Bath": 60}
+
+def model(messages, tools, system):             # stand-in: orchestrator, workers and synthesiser
+    u = messages[-1]["content"]
+    if system.startswith("PLAN"):                # the plan depends on the INPUT: one subtask per city named
+        return json.dumps([{"task": f"Find the refund window for {c}", "city": c}
+                           for c in re.findall(r"\b(Leeds|Derby|York|Hull|Bath)\b", u)])
+    if system.startswith("WORK"):
+        c = re.search(r"for (\w+)", u).group(1)
+        return f"{c}: {POLICY[c]} days"
+    if system.startswith("SYNTH"):
+        facts = sorted(u.splitlines(), key=lambda s: int(re.search(r"(\d+) days", s).group(1)))
+        return f"Shortest window: {facts[0]}. Longest: {facts[-1]}."
+
+def orchestrate(flow, request, max_subtasks=6):
+    plan = json.loads(flow.ask("plan", "PLAN split the request into independent subtasks as JSON", request))
+    if len(plan) &gt; max_subtasks:                 # a budget the orchestrator cannot talk its way past
+        plan = plan[:max_subtasks]
+    with ThreadPoolExecutor(len(plan) or 1) as pool:
+        results = list(pool.map(lambda t: flow.ask("worker", "WORK answer one subtask", t["task"]), plan))
+    return flow.ask("synth", "SYNTH combine the findings", "\n".join(results)), len(plan)
+
+for req in ["Compare refund windows in Leeds and Derby.", "Compare refund windows in Leeds, Derby, York, Hull and Bath."]:
+    flow = Flow(ScriptedModel(model))
+    answer, n = orchestrate(flow, req)
+    print(f"{n} subtasks -&gt; {answer}")
+    flow.report("  cost")</code></pre>
+<pre class="terminal" data-title="output"><code>2 subtasks -&gt; Shortest window: Derby: 14 days. Longest: Leeds: 30 days.
+  cost: 4 model calls, 68 tokens in, 55 tokens out
+5 subtasks -&gt; Shortest window: Derby: 14 days. Longest: Bath: 60 days.
+  cost: 7 model calls, 124 tokens in, 112 tokens out</code></pre>
+
+<p>The same program handled two cities with four calls and five cities with seven calls: planner, one worker per subtask, synthesiser. The line <code>plan[:max_subtasks]</code> deserves attention. The number of workers is chosen by a model, so cost is now partly model-controlled, and the cap is a limit that lives in code where the model cannot argue with it. Without it, an over-eager plan multiplies spend; Anthropic's multi-agent research write-up reports that early versions of their system spawned dozens of sub-agents for simple queries before the prompts taught the lead how much effort a query deserved.</p>
+
+<div class="widget stepper" data-autoplay-ms="3500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One orchestrator run, over time</h4></div>
+  <svg viewBox="0 0 760 300" role="img" aria-label="A timeline with an orchestrator lane and three worker lanes. The orchestrator plans three subtasks, three workers of different durations run in parallel, the slowest one sets the wait, the orchestrator synthesises the results and returns an answer. Five model calls are made but only three sit on the critical path.">
+    <defs><marker id="ahAG13b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="14" y="57" class="t-xs t-muted">Orchestrator</text>
+    <text x="14" y="112" class="t-xs t-muted">Worker 1</text>
+    <text x="14" y="154" class="t-xs t-muted">Worker 2</text>
+    <text x="14" y="196" class="t-xs t-muted">Worker 3</text>
+    <line x1="110" y1="82" x2="750" y2="82" class="line-thin"/>
+    <line x1="110" y1="30" x2="110" y2="214" class="line-thin"/>
+    <text x="750" y="226" text-anchor="end" class="t-xs t-faint">time goes left to right</text>
+
+    <rect x="120" y="34" width="150" height="36" rx="6" class="fs-blue s-blue sw-2"/>
+    <g data-steps="1" data-active="1"><text x="195" y="57" text-anchor="middle" class="t-xs t-bold">planning ...</text></g>
+    <g data-steps="2-" data-active="2"><text x="195" y="57" text-anchor="middle" class="t-xs t-bold">plan: 3 subtasks</text></g>
+
+    <g data-steps="3-" data-active="3">
+      <line x1="270" y1="62" x2="298" y2="104" class="line-dash" marker-end="url(#ahAG13b)"/>
+      <line x1="270" y1="64" x2="298" y2="146" class="line-dash" marker-end="url(#ahAG13b)"/>
+      <line x1="270" y1="66" x2="298" y2="188" class="line-dash" marker-end="url(#ahAG13b)"/>
+      <rect x="300" y="92" width="150" height="30" rx="6" class="fs-cyan s-cyan sw-2"/><text x="375" y="112" text-anchor="middle" class="t-xs">Leeds policy</text>
+      <rect x="300" y="134" width="110" height="30" rx="6" class="fs-cyan s-cyan sw-2"/><text x="355" y="154" text-anchor="middle" class="t-xs">Derby policy</text>
+      <rect x="300" y="176" width="210" height="30" rx="6" class="fs-cyan s-cyan sw-2"/><text x="405" y="196" text-anchor="middle" class="t-xs">York policy (slow page)</text>
+    </g>
+
+    <g data-steps="4-" data-active="4">
+      <text x="458" y="112" class="t-xs tc-green t-bold">done</text>
+      <text x="418" y="154" class="t-xs tc-green t-bold">done</text>
+      <rect x="298" y="174" width="214" height="34" rx="7" fill="none" class="s-yellow sw-3"/>
+      <line x1="516" y1="88" x2="516" y2="212" class="line-dash s-orange"/>
+      <text x="522" y="150" class="t-xs tc-orange t-bold">wait for</text>
+      <text x="522" y="166" class="t-xs tc-orange t-bold">the slowest</text>
+    </g>
+
+    <g data-steps="5-" data-active="5">
+      <line x1="516" y1="176" x2="548" y2="70" class="line-dash" marker-end="url(#ahAG13b)"/>
+      <rect x="550" y="34" width="130" height="36" rx="6" class="fs-blue s-blue sw-2"/><text x="615" y="57" text-anchor="middle" class="t-xs t-bold">synthesise</text>
+    </g>
+
+    <g data-steps="6" data-active="6">
+      <line x1="680" y1="52" x2="696" y2="52" class="line" marker-end="url(#ahAG13b)"/>
+      <rect x="698" y="34" width="52" height="36" rx="6" class="fs-green s-green sw-2"/><text x="724" y="57" text-anchor="middle" class="t-xs">answer</text>
+      <rect x="120" y="238" width="560" height="50" rx="8" class="box"/>
+      <text x="400" y="258" text-anchor="middle" class="t-xs t-bold">5 model calls, 3 on the critical path (plan, slowest worker, synthesise).</text>
+      <text x="400" y="276" text-anchor="middle" class="t-xs">Tokens are paid for all five; waiting time is paid for only the path.</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>The request arrives.</strong> The orchestrator reads the input and decides how to split it. Its one job at this point is planning; it does not do the work.</li>
+    <li><strong>The plan names three subtasks.</strong> The count came from the input (three cities), not from the program. Had the request named five, the plan would hold five, up to the cap your code enforces.</li>
+    <li><strong>Workers start in parallel.</strong> Each gets one subtask and its own short prompt. They differ in duration because their tools differ in speed: here the third has a slow page to read.</li>
+    <li><strong>The slowest worker sets the wait.</strong> Two workers are finished but their results cannot be combined until the third returns. This is the tail-latency effect of any fan-out, and the place to put a timeout and a rule for what to do without a result.</li>
+    <li><strong>The synthesiser merges.</strong> One model call receives the worker outputs (not their working) and writes the combined answer. It is the single point where all results meet, so it is also where a missing or contradictory result must be handled.</li>
+    <li><strong>Answer returned.</strong> Five calls were paid for, three were on the path the user waited for. Orchestration costs tokens to buy flexibility and parallel speed.</li>
+  </ol>
+</div>
+
+<p>Two weaknesses follow from the shape. The plan is a single point of failure: a subtask that the orchestrator forgets, or two that overlap, is a flaw no later step can repair, because the workers faithfully do what they are told. And the quality of each worker depends on the brief the orchestrator writes, which is why <a href="14-multi-agent.html">chapter 14</a> spends a section on briefs. When workers need to loop, call tools and decide for themselves how long to run, this pattern becomes a multi-agent system, and that chapter picks it up.</p>
+
+<h2>Evaluator-optimiser: draft, check, revise</h2>
+
+<p>In the <span class="term">evaluator-optimiser</span> pattern one call produces a draft and another judges it against criteria and returns feedback, and the producer revises, repeating until the check passes or a limit is reached. It is the workflow form of a human editor. It earns its cost only under two conditions, both stated in the essay: the criteria are clear enough to check, and feedback demonstrably improves the next draft. If the evaluator cannot tell good from bad, or the producer cannot act on its notes, the loop spends tokens and produces churn.</p>
+
+<pre class="terminal" data-title="d5_eval.py"><code>import re
+from flow import Flow
+from llm import ScriptedModel
+
+def writer(messages, tools, system):             # stand-in writer: obeys feedback if it gets any
+    u = messages[-1]["content"]
+    text = "Your order is late."
+    if "apologise" in u: text = "Sorry, your order is late."
+    if "order id" in u:  text += " Order A-1001 is on its way."
+    return text
+
+def rubric(draft):                               # evaluator: here plain code; it could be an LLM judge
+    issues = []
+    if "sorry" not in draft.lower(): issues.append("apologise")
+    if not re.search(r"[A-Z]-\d{4}", draft): issues.append("order id")
+    return issues
+
+def refine(flow, task, max_rounds=3):
+    prompt, best = task, (99, "")
+    for r in range(1, max_rounds + 1):
+        draft = flow.ask(f"draft{r}", "DRAFT", prompt)
+        issues = rubric(draft)
+        print(f"  round {r}: {draft!r} issues={issues}")
+        best = min(best, (len(issues), draft))
+        if not issues: return draft, "passed"
+        prompt = task + " Fix: " + ", ".join(issues)      # feedback goes back to the writer
+    return best[1], "gave up: returning the best draft"
+
+flow = Flow(ScriptedModel(writer))
+print(refine(flow, "Reply to a late order.")); flow.report("cost")
+print(); flow = Flow(ScriptedModel(writer))
+print(refine(flow, "Reply to a late order.", max_rounds=1)); flow.report("cost")</code></pre>
+<pre class="terminal" data-title="output"><code>  round 1: 'Your order is late.' issues=['apologise', 'order id']
+  round 2: 'Sorry, your order is late. Order A-1001 is on its way.' issues=[]
+('Sorry, your order is late. Order A-1001 is on its way.', 'passed')
+cost: 2 model calls, 22 tokens in, 19 tokens out
+
+  round 1: 'Your order is late.' issues=['apologise', 'order id']
+('Your order is late.', 'gave up: returning the best draft')
+cost: 1 model calls, 8 tokens in, 5 tokens out</code></pre>
+
+<p>The first run passes on the second draft because the feedback names two concrete defects and the writer can fix both. The second run, limited to one round, shows the exit nobody should forget: when the budget ends before the check passes, the function returns the best draft it has <em>and says so</em>, instead of looping or pretending success.</p>
+
+<div class="widget stepper" data-autoplay-ms="3500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">A two-round revision loop</h4></div>
+  <svg viewBox="0 0 760 330" role="img" aria-label="Two columns, writer on the left and evaluator on the right. Round 1: the writer drafts 'Your order is late.'; the evaluator finds two issues, apologise and order id. The feedback returns to the writer. Round 2: the writer drafts a corrected reply; the evaluator finds no issues and the loop stops with the draft.">
+    <defs><marker id="ahAG13c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="40" y="24" class="t-sm t-bold">Writer (model call)</text>
+    <text x="440" y="24" class="t-sm t-bold">Evaluator (here: plain code)</text>
+    <line x1="380" y1="34" x2="380" y2="236" class="line-thin"/>
+
+    <g data-steps="1-" data-active="1">
+      <rect x="30" y="44" width="320" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+      <text x="44" y="64" class="t-xs t-bold">round 1: draft</text>
+      <text x="44" y="84" class="t-xs mono">"Your order is late."</text>
+    </g>
+    <g data-steps="2-" data-active="2">
+      <line x1="350" y1="72" x2="428" y2="72" class="line" marker-end="url(#ahAG13c)"/>
+      <rect x="430" y="44" width="300" height="56" rx="8" class="fs-red s-red sw-2"/>
+      <text x="444" y="64" class="t-xs t-bold">issues found</text>
+      <text x="444" y="84" class="t-xs mono">['apologise', 'order id']</text>
+    </g>
+    <g data-steps="3-" data-active="3">
+      <path d="M580,102 V122 H190 V148" class="line-dash" marker-end="url(#ahAG13c)"/>
+      <text x="385" y="116" text-anchor="middle" class="t-xs t-muted">feedback: "Fix: apologise, order id"</text>
+    </g>
+    <g data-steps="4-" data-active="4">
+      <rect x="30" y="150" width="320" height="64" rx="8" class="fs-blue s-blue sw-2"/>
+      <text x="44" y="168" class="t-xs t-bold">round 2: draft</text>
+      <text x="44" y="186" class="t-xs mono">"Sorry, your order is late.</text>
+      <text x="44" y="202" class="t-xs mono"> Order A-1001 is on its way."</text>
+    </g>
+    <g data-steps="5-" data-active="5">
+      <line x1="350" y1="182" x2="428" y2="182" class="line" marker-end="url(#ahAG13c)"/>
+      <rect x="430" y="150" width="300" height="64" rx="8" class="fs-green s-green sw-2"/>
+      <text x="444" y="172" class="t-xs t-bold">issues found</text>
+      <text x="444" y="192" class="t-xs mono">[]   pass</text>
+    </g>
+    <g data-steps="6" data-active="6">
+      <rect x="130" y="250" width="500" height="64" rx="8" class="box"/>
+      <text x="380" y="274" text-anchor="middle" class="t-xs t-bold">Stop: returned the round-2 draft. Cost: 2 model calls.</text>
+      <text x="380" y="294" text-anchor="middle" class="t-xs">With max_rounds=1 the loop returns the round-1 draft and reports that it gave up.</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>Round 1: a first draft.</strong> The writer produces something short and incomplete, as first drafts often are.</li>
+    <li><strong>The evaluator checks the rubric.</strong> The rubric is code here, so it is free, exact and repeatable. It returns a list of named defects, not just "fail".</li>
+    <li><strong>Feedback goes back.</strong> The defects are added to the next prompt. Feedback that is specific is what makes a second draft better than a second random sample.</li>
+    <li><strong>Round 2: a revised draft.</strong> The writer fixes both named issues.</li>
+    <li><strong>The check passes.</strong> No issues remain, so the loop has a reason to stop other than running out of rounds.</li>
+    <li><strong>The loop ends, and records how.</strong> Always keep the stopping reason (passed, out of rounds, no improvement) in the result so downstream code and humans can tell a verified answer from a best effort.</li>
+  </ol>
+</div>
+
+<p>Three cautions apply. First, <strong>prefer a programmatic evaluator wherever one exists</strong>: tests that run, schemas that validate, totals that reconcile, a link that resolves. A model judge can be wrong and is biased toward longer answers and toward its own style (<a href="../../evals/chapters/03-llm-judges.html">A6 chapter 3</a>); when you must use one, give it a binary rubric. Second, a loop can <em>optimise the evaluator instead of the goal</em>: a writer that learns to include the string "Order A-1001" whether or not it is true passes the rubric above while saying something false. Make the evaluator check what matters and keep a held-out check the loop cannot see (<a href="../../open-ended/chapters/15-evaluator-hacking.html">A7 chapter 15</a> takes this much further). Third, set two limits, a maximum number of rounds and a minimum improvement per round, because a loop with a noisy judge will otherwise wander.</p>
+
+<h2>Choosing, combining and costing</h2>
+
+<p>The patterns compose, and real systems do. A router sends a ticket to one of three chains; one chain contains an orchestrator-workers step; the final draft goes through an evaluator loop. Each composition multiplies the number of ways to fail, so compose only when each added pattern earns something measurable. The table summarises what each pattern buys and where it hurts.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Pattern</th><th>Use it when</th><th>Cost shape</th><th>Main risk</th></tr></thead>
+  <tbody>
+    <tr><td>Chain</td><td>The task splits cleanly into fixed steps</td><td>n calls in series; latency grows with n</td><td>Compounding errors; mitigate with gates</td></tr>
+    <tr><td>Route</td><td>Distinct categories need distinct handling</td><td>One cheap call, then one path</td><td>Misrouting; multi-intent inputs</td></tr>
+    <tr><td>Parallelise (sections)</td><td>Independent subtasks; latency matters</td><td>Same tokens as serial, less waiting</td><td>Slowest branch; rate limits; partial failure</td></tr>
+    <tr><td>Parallelise (votes)</td><td>A noisy decision needs more confidence</td><td>k times the tokens</td><td>Correlated errors cap the gain</td></tr>
+    <tr><td>Orchestrator-workers</td><td>Subtasks depend on the input and cannot be listed in advance</td><td>n + 2 calls; model-controlled n</td><td>Bad or overlapping plan; runaway fan-out</td></tr>
+    <tr><td>Evaluator-optimiser</td><td>Clear criteria, and feedback improves drafts</td><td>2 calls per round, up to a cap</td><td>Weak evaluator; gaming the check; endless loops</td></tr>
+  </tbody>
+</table></div>
+
+<p>The explorer below puts all six on one set of assumptions. Change how reliable one call is and how wide each pattern is, and compare calls, tokens, waiting time and the chance of a correct result. Treat every output as illustrative: the model of "chance correct" is deliberately simple (independent calls, a fixed misrouting success rate, an evaluator that never rejects a good draft), and your own evaluation replaces it.</p>
+
+<div class="widget" id="agt13-patterns"></div>
+
+<p>Two readings are worth making before moving on. At 90% per-call reliability a chain of five falls to 59%, while a loop with an evaluator that catches 80% of bad drafts rises above the single call; the price is about twice the calls. And voting at five judges only looks good when the hard-item share is low. Push the slider up and the voting row stops improving, which is the bar chart above in interactive form.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a recipe and a chef</p>
+  <p>A workflow is a recipe: the steps are written down, anyone can follow them, and you know before you start roughly what it will cost and how long it will take. An agent is a chef given a pantry and a dish to make, who decides what to do next from what they see. For a dinner you cook every Tuesday the recipe wins. For a pantry you have never seen and a guest with unusual allergies you want the chef.</p>
+  <p><em>Where it breaks down:</em> a recipe is followed by a person who understands the goal and notices when the oven is cold. The model inside a workflow step follows its instruction literally and cannot tell that the step before it produced nonsense, which is why gates exist.</p>
+</div>
+
+<h3>When to stop using a workflow</h3>
+
+<p>A workflow stops being the right shape when you cannot write the control flow down: the number of steps depends on what the earlier steps discover, the next action depends on environment feedback, or the branches are too many to enumerate. Debugging a failing build, researching an open question and driving a browser all have that character. That is where the loop of <a href="02-tool-loop.html">chapter 2</a> belongs. A useful discipline is to move in small steps: build the workflow first, find the places where it needs a decision you could not pre-program, and let only those places become agentic.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The five patterns come from a December 2024 essay and have proved stable: later vendor guidance and framework documentation still organise their examples around chaining, routing, parallelisation, orchestrators and evaluator loops. What changes quickly is the surrounding menu. Model tiers and their prices shift (the essay's own routing example names specific small and large models and has been revised since), providers add features such as structured outputs, parallel tool calls and server-side caching that make individual steps cheaper, and orchestration frameworks come and go. Keep the patterns in your head and the vendor details in a configuration file you can change.</p>
+</div>
+
+<h2>Running workflows in production</h2>
+
+<p>Because a workflow is a program, the habits of running programs apply, and several are easy to forget when the program contains a model.</p>
+
+<ul>
+  <li><strong>Timeouts and retries per step.</strong> Each model call can hang or fail. Give every call a timeout, retry only failures that are safe to repeat, and use backoff with jitter (<a href="../../networking/chapters/16-failure.html">networking chapter 16</a>). A retry of a step that has side effects needs an idempotency key (<a href="../../distributed/chapters/17-logs-exactly-once.html">distributed chapter 17</a>).</li>
+  <li><strong>Make state explicit.</strong> If a chain of eight steps fails at step six, you want to resume at step six rather than pay for one to five again. That means storing each step's output, which is the beginning of <a href="15-durable-execution.html">durable execution</a>, and the same reasoning as a saga's compensations (<a href="../../architecture/chapters/15-sagas.html">architecture chapter 15</a>).</li>
+  <li><strong>Trace every step.</strong> Record the step name, inputs, outputs, tokens and latency as spans (<a href="../../reliability/chapters/06-tracing.html">reliability chapter 6</a>, <a href="../../evals/chapters/17-observability.html">A6 chapter 17</a>). The Flow helper in this chapter is a ten-line version of that idea, and it is what let each example print its own cost.</li>
+  <li><strong>Evaluate per step as well as end to end.</strong> If the final answer is wrong, a per-step evaluation tells you whether extraction, routing or drafting failed. Without it you debug one opaque number (<a href="../../evals/chapters/01-error-analysis.html">A6 chapter 1</a>).</li>
+  <li><strong>Version the prompts with the code.</strong> A prompt is part of the program (<a href="04-prompting.html">chapter 4</a>); review it, test it and roll it out like any other change.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>These patterns are old ideas wearing new components. A chain with gates is a pipeline with validation between stages; sectioning is fork-join with all the tail-latency consequences of <a href="../../reliability/chapters/09-tail-latency.html">reliability chapter 9</a>; orchestrator-workers is the master-worker shape of batch systems (<a href="../../data/chapters/18-batch.html">data chapter 18</a>); and a durable multi-step workflow is a saga. What is new is only that a step is probabilistic, so every edge needs a check you would not bother with between two deterministic functions.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Run the five scripts after copying <code>llm.py</code> from <code>lab-support/</code> next to them, then change one thing each. In <code>d1_chain.py</code> add a third gate that rejects replies mentioning a refund (the draft step must never promise one) and design a ticket that triggers it. In <code>d2_route.py</code> lower <code>THRESHOLD</code> to 0.4 and see which ticket is now misrouted. In <code>d3_parallel.py</code> set the shared-hard share to 0.4: what is the ceiling now, and does the simulation agree? In <code>d4_orch.py</code> set <code>max_subtasks=3</code> and send the five-city request: what does the answer silently omit, and how would you make the omission visible? Then, in the explorer above, set the hard-item share to 0.2 and find the number of judges beyond which voting stops improving.</p>
+  <pre class="terminal"><span class="prompt">$</span> <span class="cmd">cp lab-support/llm.py . &amp;&amp; python3 d3_parallel.py</span></pre>
+</div>
+
+<p>The workflow lab (<a href="../labs/lab-04-workflows.html">Lab 4</a>) has you build chains, routers, fan-out and orchestrator-workers with token accounting for each, using exactly this style of code.</p>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A workflow keeps control flow in your code and uses the model at fixed points. It gives bounded cost, testable steps and a program a reviewer can read.</li>
+    <li>Chain when the steps are known; put gates between steps so a bad output stops cheaply. Errors compound, so five steps at 90% each are right about 59% of the time.</li>
+    <li>Route when categories are distinct. Always provide a low-confidence exit, expect multi-intent inputs, and measure the router.</li>
+    <li>Parallelise independent sections to cut waiting time at the same token cost; vote to buy confidence, but correlated errors cap the gain no matter how many judges you add.</li>
+    <li>Use orchestrator-workers when the subtasks depend on the input. Cap the fan-out in code, and treat the plan and the synthesis as the weak points.</li>
+    <li>Use evaluator loops only with clear criteria and useful feedback; prefer programmatic checks; limit rounds; return the stopping reason.</li>
+    <li>Workflows are programs: timeouts, idempotent retries, stored step outputs, tracing and per-step evaluation all apply.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic, "Building effective agents" (December 2024)</a>. The source of the workflow taxonomy used here, with the advice to start simple.</li>
+  <li><a href="https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf" target="_blank" rel="noopener">OpenAI, "A practical guide to building agents"</a>. A second vendor's view of when to move from deterministic flows to agents, and how to compose them.</li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Anthropic, "Writing effective tools for agents"</a>. How to design the tools and checks that workflow steps call.</li>
+  <li><a href="https://arxiv.org/abs/2203.11171" target="_blank" rel="noopener">Wang et al., "Self-Consistency Improves Chain of Thought Reasoning in Language Models" (2022)</a>. The research root of voting: sample several reasoning paths and take the majority answer.</li>
+  <li><a href="https://arxiv.org/abs/2303.17651" target="_blank" rel="noopener">Madaan et al., "Self-Refine: Iterative Refinement with Self-Feedback" (2023)</a>. An evaluator-optimiser loop in which one model critiques and revises its own output.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A five-step chain has independent steps that are each correct 90% of the time. Roughly how often is the final output correct, and what do gates change?</p>
+    <ol class="q-options">
+      <li>About 90%, because the weakest step sets the limit; gates make no difference</li>
+      <li>About 59%; gates do not raise it but can turn many undetected failures into detected, handled ones</li>
+      <li>About 41%; gates raise it to 90% by repeating the model call</li>
+      <li>About 99%, since five chances to be right compound in your favour</li>
+    </ol>
+    <div class="q-explain">0.9 to the fifth power is about 0.59: every step must be right. A gate does not make a step more accurate, but it stops the chain when an output is unusable, so the failure is caught early and handled. Errors do not average out, so the first and last options are wrong; repeating a call is voting, not gating.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A router is 95% accurate overall. A ticket reads "Refund my order and also change my password" and is sent to the refund handler, which ignores the password request. Which change addresses the cause?</p>
+    <ol class="q-options">
+      <li>Raise the confidence threshold to 0.99</li>
+      <li>Use a larger model for the router</li>
+      <li>Add more refund examples to the refund handler's prompt</li>
+      <li>Support multi-intent inputs: split the ticket or run both paths, and have handlers report what they did not cover</li>
+    </ol>
+    <div class="q-explain">The router returned a confident single label for an input that has two intents, so the problem is the design (mutually exclusive labels), not accuracy or confidence. A threshold may even leave this case alone because the router was confident. A larger router still picks one label. Refund examples improve the handler, not the dropped request.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">Five LLM judges using the same prompt and model each label items correctly 70% of the time. Majority voting gives only a small gain. What is the most likely reason?</p>
+    <ol class="q-options">
+      <li>Their errors are correlated: the same hard items fool all of them, so the vote cannot fix those</li>
+      <li>Five is an even number, so ties destroy the result</li>
+      <li>Majority voting never helps when the base accuracy is above 50%</li>
+      <li>The judges run in parallel, which reduces accuracy</li>
+    </ol>
+    <div class="q-explain">The binomial gain assumes independent errors. Judges sharing a prompt and model share blind spots, and the share of items that fool all of them is a ceiling on the vote. Five is odd, so ties are not the issue; voting does help above 50% when errors are independent; and running in parallel affects latency, not accuracy.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">What most clearly separates orchestrator-workers from plain parallelisation?</p>
+    <ol class="q-options">
+      <li>Orchestrator-workers uses more than one model call</li>
+      <li>Orchestrator-workers always runs its workers one after another</li>
+      <li>In orchestrator-workers a model decides the subtasks from the specific input at run time, rather than you fixing them in the program</li>
+      <li>Orchestrator-workers does not need a combining step</li>
+    </ol>
+    <div class="q-explain">Both use several calls, both can run workers in parallel, and both need a combining step. The difference is who determines the parts: the programmer (parallelisation) or a model reading the input (orchestrator-workers). That flexibility is why the fan-out needs a cap in code.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">An evaluator-optimiser loop drafts customer replies. Reviews show drafts barely change between rounds and the judge passes or fails almost at random. What does this suggest?</p>
+    <ol class="q-options">
+      <li>Add more rounds so the loop has time to converge</li>
+      <li>The conditions for the pattern are not met: the criteria are not checkable or the feedback is not actionable, so use a programmatic check or drop the loop</li>
+      <li>Switch the evaluator to the same model as the writer</li>
+      <li>Remove the round limit to stop the loop ending early</li>
+    </ol>
+    <div class="q-explain">The pattern pays off only when criteria are clear and feedback improves the next draft. A near-random judge and unchanging drafts show neither holds, so more rounds only add cost. Using the same model as writer and judge tends to add self-preference bias, and removing the limit invites endless loops.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">Three independent checks, each taking 4 seconds and 1,000 tokens, are changed from sequential to parallel. What happens?</p>
+    <ol class="q-options">
+      <li>Time drops to 4 seconds and tokens drop to about 333</li>
+      <li>Time stays at 12 seconds but tokens drop</li>
+      <li>Both time and tokens triple</li>
+      <li>Time drops to roughly 4 seconds (the slowest check) while tokens stay at 3,000; the cost moves to concurrency and rate limits</li>
+    </ol>
+    <div class="q-explain">The same three calls are made, so the token bill is unchanged. Waiting time becomes the slowest call plus small overheads. What gets worse is the burst: three simultaneous requests can hit rate limits, and one slow branch holds up the combined result.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/agt13-patterns.js"></script>
+</body>
+</html>

@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adapters on Demand · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Adapters on Demand</h1>
+  <p class="lede">LoRA needs a training run for every task. This chapter looks at two research directions that try to remove that run: models that adjust themselves to the task they see, and hypernetworks that write an adapter from a short description of the task. Both are young, so the aim is to understand the mechanism, the evidence and the limits.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Chapter 11 made adaptation cheap, and chapter 16 made combining adaptations cheap. A product with hundreds of tasks or customers still pays one data-collection and training cycle per adapter. If a network could produce a decent adapter in one forward pass, specialisation would become something a service does per request. These ideas are not yet standard practice, but they point at where the field is moving, and they are built from pieces you already know: singular values, low-rank updates and reinforcement learning. After this chapter you will be able to explain singular-value fine-tuning and two-pass inference, describe what a hypernetwork is and what Text-to-LoRA generates, and judge how much of the claimed benefit to trust.</p>
+</div>
+
+<h2>The problem: one training run per task</h2>
+
+<p>A LoRA adapter (<a href="11-lora.html">chapter 11</a>) is small, but making it is not free: you need task data, a training run, hyperparameters and an evaluation. A company with 300 customers, each wanting the model to follow their house style, faces 300 of those. A coding assistant that wants a specialist for each framework faces the same. Two questions follow. Can the base model itself notice what kind of task it has been given and reconfigure a little? And can we skip training and <em>compute</em> the adapter from a description of the task?</p>
+
+<h2>Self-adaptive models: Transformer-squared</h2>
+
+<p>Sun, Cetin and Tang (2025), in "Transformer-Squared: Self-adaptive LLMs" (Sakana AI), propose a model that adapts at inference time in two passes. The ingredient is a very small kind of fine-tuning.</p>
+
+<h3>Singular-value fine-tuning</h3>
+
+<p>Any weight matrix W has a singular value decomposition W = U &Sigma; V<sup>T</sup> (<a href="../../ml-foundations/chapters/07-decompositions.html">A0, eigenvectors, SVD and low rank</a>): U and V hold directions, and the diagonal of &Sigma; holds one strength per direction. <span class="term">Singular-value fine-tuning</span> (SVF) leaves U and V alone and learns only a vector z with one number per singular value, giving W&prime; = U (&Sigma; &otimes; diag(z)) V<sup>T</sup>. Each direction the layer already uses is amplified (z &gt; 1), damped (z &lt; 1) or flipped. A square 4,096 &times; 4,096 matrix has 4,096 singular values, so SVF trains 4,096 numbers for it, against 8 &times; (4,096 + 4,096) = 65,536 for a rank-8 LoRA. The authors report that SVF uses fewer than 10% of the trainable parameters of their LoRA baseline.</p>
+
+<p>Two properties make this convenient. The learned vectors are small enough to store hundreds of them. And because W&prime; is linear in z, mixing two vectors mixes the two modified matrices exactly. Here is a check, and a parameter count for the query and value projections of a 7B-class model (the shapes of Mistral-7B: 4,096-wide, 32 layers, key and value width 1,024), set beside the hypernetwork sizes reported later in this chapter.</p>
+
+<pre class="terminal" data-title="svf.py"><code>import numpy as np
+
+rng = np.random.default_rng(0)
+m = n = 256
+W = rng.normal(0, 0.05, (m, n))
+U, s, Vt = np.linalg.svd(W, full_matrices=False)
+
+def with_z(z):
+    """Singular-value fine-tuning: scale each singular value by z[i], keep U and V fixed."""
+    return (U * (s * z)) @ Vt
+
+assert np.allclose(with_z(np.ones(n)), W)                  # z = 1 leaves the layer unchanged
+z_math = 1 + 0.3 * rng.normal(size=n)                      # stand-ins for two trained "expert vectors"
+z_code = 1 + 0.3 * rng.normal(size=n)
+alpha = 0.7
+mixed_z = with_z(alpha * z_math + (1 - alpha) * z_code)
+mixed_W = alpha * with_z(z_math) + (1 - alpha) * with_z(z_code)
+print(f"mixing two expert vectors equals mixing the two weight matrices: max difference {np.abs(mixed_z - mixed_W).max():.1e}")
+
+# Parameter counts for the query and value projections of a 7B-class model (4096 wide, 32 layers,
+# key/value width 1024 from 8 key-value heads of 128): Mistral-7B-like shapes.
+shapes = [(4096, 4096), (1024, 4096)]                     # (out, in) for q_proj and v_proj
+L, r = 32, 8
+lora = L * sum(r * (o + i) for o, i in shapes)
+svf = L * sum(min(o, i) for o, i in shapes)
+print(f"one rank-{r} LoRA on q and v : {lora:&gt;10,} parameters")
+print(f"one SVF vector on q and v : {svf:&gt;10,} parameters ({100 * svf / lora:.1f}% of the LoRA)")
+for name, size in (("hypernetwork S", 4.9e6), ("hypernetwork M", 34.3e6), ("hypernetwork L", 55.3e6)):
+    print(f"{name}: {size / 1e6:5.1f} M parameters = {size / lora:4.1f} adapters' worth of storage")</code></pre>
+<pre class="terminal" data-title="output"><code>mixing two expert vectors equals mixing the two weight matrices: max difference 4.2e-16
+one rank-8 LoRA on q and v :  3,407,872 parameters
+one SVF vector on q and v :    163,840 parameters (4.8% of the LoRA)
+hypernetwork S:   4.9 M parameters =  1.4 adapters' worth of storage
+hypernetwork M:  34.3 M parameters = 10.1 adapters' worth of storage
+hypernetwork L:  55.3 M parameters = 16.2 adapters' worth of storage</code></pre>
+
+<p>The first line is the useful one: a weighted mix of two expert vectors gives the same weights as the weighted mix of the two adapted layers, to rounding error (4e-16). The 3,407,872 parameters of a rank-8 adapter on q and v matches the "about 3.4 million" per LoRA reported in the Text-to-LoRA paper, which gives some confidence that the shapes are right. SVF on the same two matrices would be 163,840 numbers; the paper applies SVF to more matrices than these two, so read the percentage as a shape comparison, not as the paper's own figure.</p>
+
+<p>SVF is trained with reinforcement learning, not next-token prediction. The paper uses REINFORCE (<a href="07-policy-gradients.html">chapter 7</a>) with a reward of &minus;1 or +1 for a wrong or right answer plus a KL penalty to the original model (<a href="08-ppo.html">chapter 8</a>). That lets it learn from datasets that have only final answers, such as GSM8K, and the authors report that SVF trained stably where LoRA trained with the same RL objective was unstable.</p>
+
+<h3>Two passes at inference</h3>
+
+<p>Training gives a set of <span class="term">expert vectors</span>, each specialised for a domain (the paper trains on maths, code and reasoning data, and a vision task for a vision-language model). At inference there are two passes, which is where the name comes from.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two-pass inference. A prompt enters the first pass, a dispatch step, which identifies the task using prompt-based classification, a classifier expert, or few-shot search. This produces a mixture of expert vectors z prime. The second pass runs the base model with its singular values scaled by z prime and generates the answer. A library of stored expert vectors for maths, code and reasoning feeds the mixture.">
+    <defs><marker id="ahLT17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="14" y="70" width="110" height="60" rx="8" class="fs-green s-green sw-2"/>
+    <text x="69" y="96" text-anchor="middle" class="t-sm t-bold">Prompt</text>
+    <text x="69" y="114" text-anchor="middle" class="t-xs">a new task</text>
+    <line x1="124" y1="100" x2="158" y2="100" class="line" marker-end="url(#ahLT17a)"/>
+    <rect x="160" y="60" width="180" height="80" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="250" y="86" text-anchor="middle" class="t-sm t-bold">Pass 1: dispatch</text>
+    <text x="250" y="106" text-anchor="middle" class="t-xs">what kind of task is this?</text>
+    <text x="250" y="122" text-anchor="middle" class="t-xs">classify or few-shot search</text>
+    <line x1="340" y1="100" x2="378" y2="100" class="line" marker-end="url(#ahLT17a)"/>
+    <rect x="380" y="60" width="150" height="80" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="455" y="86" text-anchor="middle" class="t-sm t-bold">Mix z&#8242;</text>
+    <text x="455" y="106" text-anchor="middle" class="t-xs">weights over the</text>
+    <text x="455" y="122" text-anchor="middle" class="t-xs">expert vectors</text>
+    <line x1="530" y1="100" x2="568" y2="100" class="line" marker-end="url(#ahLT17a)"/>
+    <rect x="570" y="60" width="176" height="80" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="658" y="86" text-anchor="middle" class="t-sm t-bold">Pass 2: answer</text>
+    <text x="658" y="106" text-anchor="middle" class="t-xs">base model with singular</text>
+    <text x="658" y="122" text-anchor="middle" class="t-xs">values scaled by z&#8242;</text>
+    <rect x="300" y="180" width="310" height="64" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="455" y="206" text-anchor="middle" class="t-sm t-bold">Library of expert vectors</text>
+    <text x="455" y="226" text-anchor="middle" class="t-xs">z maths, z code, z reasoning, ...</text>
+    <line x1="455" y1="180" x2="455" y2="142" class="line" marker-end="url(#ahLT17a)"/>
+    <text x="20" y="206" class="t-xs t-muted">Extra cost: one more pass,</text>
+    <text x="20" y="222" class="t-xs t-muted">and the vectors to store.</text>
+  </svg>
+  <figcaption><strong>Look first, then answer.</strong> The first pass only decides which experts to blend. The second pass is an ordinary generation with the blended weights. Three ways of doing the first pass are described in the paper.</figcaption>
+</figure>
+
+<p>The paper describes three strategies for the first pass: ask the model to classify the prompt into one of the known categories (prompt-based); use a separate SVF-trained classifier expert, which the authors report is more accurate; or, given about ten examples from the task, use a search method (the cross-entropy method) to find the mixing coefficients that do best on them. They report gains on held-out tasks over the base model: for example, on Llama3-8B-Instruct the few-shot version moved MATH from 24.54 to 25.47, HumanEval from 60.98 to 62.99 and ARC-Challenge from 80.63 to 82.61. These are real but modest improvements, and the paper itself notes that not every setting improved (prompt-based adaptation slightly lowered Llama3-70B's MATH score), that the search adds one-time overhead, and that SVF can only amplify or damp what the base model's weights already contain.</p>
+
+<h2>Hypernetworks: networks that write networks</h2>
+
+<p>A <span class="term">hypernetwork</span> is a network whose output is the weights of another network. Ha, Dai and Le (2016) introduced the term for generating the weights of recurrent networks. Used for adaptation, the idea is: train a network H that takes a description of a task and returns the LoRA matrices A and B for each layer. Then a new task costs one forward pass of H, not a training run.</p>
+
+<p>Charakorn et al. (2025), in "Text-to-LoRA: Instant Transformer Adaption" (ICML 2025), do this. As reported in the paper, H takes a text embedding of the task description (from a sentence-embedding model) together with learned embeddings that say which layer and which projection it is generating for, and outputs the rank-8 LoRA matrices for the query and value projections in every attention block of the base model. Three sizes are described: about 55.3 million parameters (the largest, which emits A and B together), about 34.3 million and about 4.9 million. Compare the output: one adapter is about 3.4 million parameters, so the large hypernetwork has the storage footprint of about sixteen adapters, as the last lines of the output above show.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Text-to-LoRA. A task description in words goes through a text encoder to an embedding. The embedding, together with a layer and module embedding, enters the hypernetwork. The hypernetwork outputs matrices A and B for each target layer. These are added in parallel with the frozen base model weights to give the adapted model, in one forward pass, with no task data and no training.">
+    <defs><marker id="ahLT17b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="14" y="40" width="160" height="70" rx="8" class="fs-green s-green sw-2"/>
+    <text x="94" y="66" text-anchor="middle" class="t-sm t-bold">Task description</text>
+    <text x="94" y="86" text-anchor="middle" class="t-xs">"solve grade-school</text>
+    <text x="94" y="100" text-anchor="middle" class="t-xs">maths word problems"</text>
+    <line x1="174" y1="75" x2="212" y2="75" class="line" marker-end="url(#ahLT17b)"/>
+    <rect x="214" y="40" width="130" height="70" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="279" y="70" text-anchor="middle" class="t-sm t-bold">Text encoder</text>
+    <text x="279" y="90" text-anchor="middle" class="t-xs">frozen embedding</text>
+    <line x1="344" y1="75" x2="382" y2="75" class="line" marker-end="url(#ahLT17b)"/>
+    <rect x="384" y="30" width="170" height="90" rx="8" class="fs-purple s-purple sw-3"/>
+    <text x="469" y="62" text-anchor="middle" class="t-sm t-bold">Hypernetwork H</text>
+    <text x="469" y="82" text-anchor="middle" class="t-xs">task embedding + layer</text>
+    <text x="469" y="98" text-anchor="middle" class="t-xs">and module embedding</text>
+    <line x1="554" y1="75" x2="592" y2="75" class="line" marker-end="url(#ahLT17b)"/>
+    <rect x="594" y="40" width="152" height="70" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="670" y="66" text-anchor="middle" class="t-sm t-bold">A and B</text>
+    <text x="670" y="86" text-anchor="middle" class="t-xs">rank-8 LoRA, per layer,</text>
+    <text x="670" y="100" text-anchor="middle" class="t-xs">query and value</text>
+    <path d="M670,110 V160" fill="none" class="line" marker-end="url(#ahLT17b)"/>
+    <rect x="440" y="162" width="306" height="64" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="593" y="188" text-anchor="middle" class="t-sm t-bold">Base model + adapter</text>
+    <text x="593" y="208" text-anchor="middle" class="t-xs">W0 x + (alpha / r) B A x, base frozen</text>
+    <rect x="14" y="162" width="400" height="64" rx="8" class="box"/>
+    <text x="214" y="188" text-anchor="middle" class="t-xs t-bold">One forward pass of H. No task data, no gradient steps.</text>
+    <text x="214" y="208" text-anchor="middle" class="t-xs">H itself was trained once, on many tasks.</text>
+  </svg>
+  <figcaption><strong>Compute the adapter.</strong> The expensive training happens once, for H. After that, a description of a new task yields an adapter in one pass. What you gain in speed you pay for in quality, as the numbers below show.</figcaption>
+</figure>
+
+<p>Two ways to train H are described. In <strong>reconstruction</strong>, H is trained to reproduce LoRAs that were already trained on known tasks, a form of distillation (<a href="15-distillation.html">chapter 15</a>) from adapters into a generator. The authors report that on nine benchmark tasks it matches the task-specific adapters (averages of about 73.0 to 73.5 against 73.3), but that it generalises poorly to tasks it was not trained on. In <strong>supervised fine-tuning</strong>, H is trained end to end across 479 training tasks, with several descriptions each, so that the generated adapters make the base model do well on each task's data. This version can produce adapters zero-shot for unseen tasks: on ten benchmarks the paper reports an average of 67.7 for the largest hypernetwork, against 66.3 for a multi-task LoRA and 55.8 for the base model (Mistral-7B-Instruct). The generated adapters beat the base model by a wide margin, and on some benchmarks even exceed a task-specific adapter, but the authors state that zero-shot generation does not fully close the gap to task-specific training.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The Text-to-LoRA, Transformer-squared and Drag-and-Drop LLMs results above come from papers by the method's own authors; I read the abstracts and the paper text through a summarising tool, and have not reproduced any of the numbers. Drag-and-Drop LLMs (Liang et al., 2025) generates LoRA weights from a batch of unlabelled prompts and claims up to 12,000 times lower overhead than full fine-tuning and gains of up to 30% over the strongest training LoRAs on unseen benchmarks; it is a single preprint at the time of writing. Sakana AI also released Doc-to-LoRA in February 2026, a hypernetwork that turns a document into an adapter so a model can answer questions about it without the document in context; I saw its project page and repository summary but did not read the paper, and I cite it only as a direction. Treat all of this as research results to test on your own tasks.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A hypernetwork makes fine-tuning obsolete." The evidence so far says it gives a fast, cheap starting point whose quality depends on how well the task description matches tasks seen in training. The Text-to-LoRA authors report large drops when descriptions are unaligned with the task (around 51 against 73 on average in one reconstruction test), and say its generalisation to task types far from the training distribution is not yet established. For a task that matters, a trained adapter still wins; a generated adapter is a quick draft to evaluate, or to continue training from.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Generated weights are build output made from an input you may not control. If a customer's text can shape the weights that serve that customer, then a poisoned or adversarial description is a weight-level <a href="../../security/chapters/09-injection.html">injection</a> problem: validate inputs, evaluate each generated adapter on a fixed suite before use, and cache by a hash of the description so repeated requests reuse a vetted adapter. Serving many adapters on one base model is an engine feature, covered in <a href="20-serving-engines.html">chapter 20</a>; the memory the extra adapters occupy competes with the KV cache of <a href="18-kv-cache.html">chapter 18</a>.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In <code>svf.py</code>, change the matrix size <code>n</code> to 64, then 1,024, and compare the SVF parameter count with a rank-8 LoRA on the same square matrix. Then change <code>alpha</code> from 0.7 to 0.0 and 1.0 and confirm that the mixed layer equals one of the two experts exactly. Finally, replace <code>1 + 0.3 * rng.normal</code> with a vector of ones except in the five largest singular values, and print the Frobenius norm of the difference from W.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 svf.py</span></code></pre>
+  <p>Question: which singular values would you expect a task-specific vector to move most, the largest or the smallest, and what would that imply about SVF's capacity?</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Singular-value fine-tuning learns one scale per singular value of a weight matrix, thousands of parameters per matrix instead of tens of thousands for LoRA. Because it is linear in the scales, vectors can be mixed exactly.</li>
+    <li>Transformer-squared uses two passes: dispatch to identify the task and blend expert vectors, then answer with the blended weights. Reported gains over the base model are real but modest.</li>
+    <li>A hypernetwork writes another network's weights. Text-to-LoRA writes a rank-8 adapter from a task description in one forward pass, trained by reconstructing adapters or by end-to-end supervised learning.</li>
+    <li>Zero-shot generated adapters beat the base model but still trail task-specific training, and they depend on how well the description matches the training tasks.</li>
+    <li>Generated adapters are untrusted build output: evaluate them, cache vetted ones, and check where the description came from.</li>
+  </ul>
+</div>
+
+<p>This closes Part 4. Part 5 turns from changing weights to running them: the next chapter explains why generating text is limited by memory traffic, and what the key-value cache costs.</p>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2501.06252" target="_blank" rel="noopener">Sun, Cetin and Tang, "Transformer-Squared: Self-adaptive LLMs" (2025)</a>. SVF, expert vectors, two-pass inference.</li>
+  <li><a href="https://arxiv.org/abs/2506.06105" target="_blank" rel="noopener">Charakorn, Cetin, Tang and Lange, "Text-to-LoRA: Instant Transformer Adaption" (2025)</a>. The hypernetwork, its sizes, reconstruction and SFT training, and limitations.</li>
+  <li><a href="https://arxiv.org/abs/2506.16406" target="_blank" rel="noopener">Liang et al., "Drag-and-Drop LLMs: Zero-Shot Prompt-to-Weights" (2025)</a>. Generating LoRA weights from unlabelled prompts.</li>
+  <li><a href="https://arxiv.org/abs/1609.09106" target="_blank" rel="noopener">Ha, Dai and Le, "HyperNetworks" (2016)</a>. The original idea of one network generating another's weights.</li>
+  <li><a href="https://sakana.ai/doc-to-lora/" target="_blank" rel="noopener">Sakana AI, "Instant LLM Updates with Doc-to-LoRA and Text-to-LoRA" (February 2026)</a>. The authors' project page, which I did not read in full.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A 4,096 &times; 4,096 weight matrix is adapted with SVF and, separately, with a rank-8 LoRA. How many trainable numbers does each need for this one matrix?</p>
+    <ol class="q-options">
+      <li>SVF: 65,536; LoRA: 4,096</li>
+      <li>SVF: 4,096; LoRA: 65,536</li>
+      <li>SVF: 4,096; LoRA: 4,096</li>
+      <li>SVF: 16.8 million; LoRA: 65,536</li>
+    </ol>
+    <div class="q-explain">SVF trains one scale per singular value, min(m, n) = 4,096 numbers. A rank-8 LoRA trains A (8 &times; 4,096) and B (4,096 &times; 8), which is 8 &times; (4,096 + 4,096) = 65,536. The 16.8 million figure is the size of the matrix itself, which neither method trains.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">What does the first pass of Transformer-squared produce?</p>
+    <ol class="q-options">
+      <li>The final answer, which the second pass only reformats</li>
+      <li>A new LoRA adapter trained on the user's prompt</li>
+      <li>A gradient update to the base model's weights</li>
+      <li>A choice or blend of stored expert vectors suited to the incoming task, used to scale the singular values in the second pass</li>
+    </ol>
+    <div class="q-explain">The first pass is a dispatch step (classification, a classifier expert, or a few-shot search for mixing coefficients). It does not train anything and does not answer. Its output, a blended vector z&prime;, configures the model for the second pass, which generates the answer.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">A Text-to-LoRA hypernetwork trained by supervised fine-tuning on many tasks is given a description of a task it never saw. What should you expect, based on the reported results?</p>
+    <ol class="q-options">
+      <li>An adapter that usually improves on the base model, but that may still fall short of a task-specific trained adapter, and that is sensitive to how well the description fits</li>
+      <li>An adapter equal to a trained one, because the hypernetwork has seen similar text</li>
+      <li>An adapter no better than the base model, since it saw no data for this task</li>
+      <li>An error, because hypernetworks only work on tasks seen in training</li>
+    </ol>
+    <div class="q-explain">The paper reports zero-shot generalisation above the base model but short of task-specific adapters, with drops when descriptions are unaligned. Equal quality would contradict the authors' own statement; no gain would contradict their averages; and the SFT variant does produce adapters for unseen tasks, which is its purpose.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">You adopt a service that generates an adapter from each customer's free-text task description. Which control matters most before an adapter goes into production?</p>
+    <ol class="q-options">
+      <li>Increase the rank so that the adapter is more expressive</li>
+      <li>Use a larger text encoder for the descriptions</li>
+      <li>Run each generated adapter against a fixed evaluation suite, including adversarial cases, and cache vetted adapters by a hash of the description</li>
+      <li>Merge every generated adapter into the base weights as soon as it is created</li>
+    </ol>
+    <div class="q-explain">Generated weights are the output of a model fed with uncontrolled text, so they need the same acceptance testing as any other artefact. A higher rank or bigger encoder says nothing about safety or quality, and merging unvetted adapters into the shared base would spread a bad one to every customer.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

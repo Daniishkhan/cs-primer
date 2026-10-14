@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 2: Policy Gradients &amp; PPO · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-lab="L2">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 2: Policy Gradients &amp; PPO</h1>
+  <p class="lede">Chapters <a href="../chapters/07-policy-gradients.html">7</a> and <a href="../chapters/08-ppo.html">8</a> derived two formulas: the REINFORCE gradient, which turns "make good samples more likely" into something you can compute, and PPO's clipped objective with a KL penalty, which stops that gradient from wrecking the policy it improves. Every RL method used to train language models is a refinement of those two. In this lab you implement them from the softmax up, in standard-library Python, on a bandit where you can check every number by hand and on a small gridworld where an agent has to find its way. You will watch a baseline remove a thirty-fold amount of noise, watch the clip stop a reused batch from running away, and turn the KL coefficient up and down to see exactly what the leash costs and what it buys.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>RLHF, RLVR and GRPO training runs are hard to debug because many things move at once: a generator, a reward, a baseline, a clip, a penalty and a few thousand GPU-hours. The formulas are short and the failure modes are quiet. A baseline that includes the sample's own reward shrinks the gradient by (B &minus; 1)/B and nothing crashes. A ratio computed against the wrong "old" policy makes the clip meaningless. A KL penalty with the wrong sign rewards drift. A tabular policy cannot tell you how a transformer behaves, but it makes every one of these mistakes visible: the policy is a handful of numbers, the expected reward and the exact KL divergence can be computed in closed form, and a gradient can be checked against finite differences. Once you have written each piece and seen the checker catch its classic wrong version, a training log from a real run (ratio statistics, clip fraction, KL, reward) stops being a list of mysterious dials and becomes a set of quantities you know how to compute.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Deterministic, small, standard library only</p>
+  <p>Every random draw comes from a seeded <code>random.Random</code>, so the same code gives the same numbers on every machine, and the whole check takes about two seconds. Some checks are statistical (for example, that 3,000 random batches average to the true gradient); they use fixed seeds and generous margins, and a failure prints the seed so you can replay it: <code>python3 check.py solution 4 3</code> runs milestone 4 with seed 3 for the cases that take a seed. Python 3.9 or newer, standard library only. There is no PyTorch and no NumPy: every vector is a list. That is slower than a tensor library, and it is also why nothing is hidden.</p>
+</div>
+
+<h2>What you'll build</h2>
+<figure class="diagram"><svg viewBox="0 0 760 250" role="img" aria-label="The loop shared by every milestone: the policy produces a rollout, the rollout gets a reward with a KL penalty, the reward becomes an advantage, and the clipped gradient updates the policy.">
+<defs><marker id="ahLT-L2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="24" text-anchor="start" class="t-sm t-bold">One loop, five milestones: each one changes a box</text>
+<rect x="10" y="46" width="134" height="76" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="77.0" y="70" text-anchor="middle" class="t-sm t-bold">policy</text>
+<text x="77.0" y="90" text-anchor="middle" class="t-xs t-muted">softmax over logits</text>
+<text x="77.0" y="108" text-anchor="middle" class="t-xs t-faint">milestone 1</text>
+<line x1="146" y1="84" x2="162" y2="84" class="line sw-2" marker-end="url(#ahLT-L2a)"/>
+<rect x="164" y="46" width="134" height="76" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="231.0" y="70" text-anchor="middle" class="t-sm t-bold">rollout</text>
+<text x="231.0" y="90" text-anchor="middle" class="t-xs t-muted">sample, play episode</text>
+<text x="231.0" y="108" text-anchor="middle" class="t-xs t-faint">milestones 1, 3</text>
+<line x1="300" y1="84" x2="316" y2="84" class="line sw-2" marker-end="url(#ahLT-L2a)"/>
+<rect x="318" y="46" width="134" height="76" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="385.0" y="70" text-anchor="middle" class="t-sm t-bold">reward</text>
+<text x="385.0" y="90" text-anchor="middle" class="t-xs t-muted">r - beta (log pi - log ref)</text>
+<text x="385.0" y="108" text-anchor="middle" class="t-xs t-faint">milestone 5</text>
+<line x1="454" y1="84" x2="470" y2="84" class="line sw-2" marker-end="url(#ahLT-L2a)"/>
+<rect x="472" y="46" width="134" height="76" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="539.0" y="70" text-anchor="middle" class="t-sm t-bold">advantage</text>
+<text x="539.0" y="90" text-anchor="middle" class="t-xs t-muted">G - baseline</text>
+<text x="539.0" y="108" text-anchor="middle" class="t-xs t-faint">milestones 2, 3</text>
+<line x1="608" y1="84" x2="624" y2="84" class="line sw-2" marker-end="url(#ahLT-L2a)"/>
+<rect x="626" y="46" width="134" height="76" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="693.0" y="70" text-anchor="middle" class="t-sm t-bold">update</text>
+<text x="693.0" y="90" text-anchor="middle" class="t-xs t-muted">A r grad log pi, clipped</text>
+<text x="693.0" y="108" text-anchor="middle" class="t-xs t-faint">milestone 4</text>
+<path d="M693.0,124 V170 H77.0 V126" class="line sw-2" marker-end="url(#ahLT-L2a)"/>
+<text x="380" y="190" text-anchor="middle" class="t-xs t-muted">new logits: the next iteration samples from the updated policy</text>
+<rect x="10" y="206" width="740" height="30" rx="8" class="fs-yellow s-yellow sw-2"/>
+<text x="380" y="226" text-anchor="middle" class="t-xs t-muted">With a language model: policy = transformer, rollout = generation, update = backpropagation (chapters 7 and 8).</text>
+</svg><figcaption><strong>The loop every RL method for language models shares.</strong> Purple is the stored state (the logits), blue the computation, cyan the reward signal. Milestone 2 changes how the advantage is computed, milestone 4 how the update uses it, milestone 5 what the reward contains.</figcaption></figure>
+<p>Five milestones. They share one loop, and each changes one box in it:</p>
+<ol class="steps">
+  <li><strong>The softmax policy:</strong> a numerically stable softmax and log-softmax, sampling by inverse CDF with exactly one random number, and the score function <code>onehot(a) &minus; &pi;</code> that is the heart of the policy gradient.</li>
+  <li><strong>REINFORCE with a baseline on a bandit:</strong> advantages with no baseline, a batch-mean baseline and a leave-one-out baseline, the gradient estimator, and a training loop. The checker measures bias and variance.</li>
+  <li><strong>REINFORCE on a gridworld:</strong> returns-to-go, an episode rollout, a tabular softmax policy trained against a learned state-value baseline.</li>
+  <li><strong>PPO's clipped objective:</strong> the probability ratio, the clipped surrogate, its gradient (zero exactly when the sample is clipped), and a bandit where one batch is reused ten times.</li>
+  <li><strong>PPO with a KL penalty:</strong> reward shaping with the log-ratio to a reference policy, the k3 estimator, and the gridworld trained from a reference policy at four values of &beta;.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are in this guide's folder, <code>llm-training/labs/code/lab02/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab02/starter.py"><code>starter.py</code></a></td><td>Your file. The bandits, the <code>GridWorld</code>, the reference policy and the evaluation helpers are given; every function you write has a docstring and raises <code>NotImplementedError</code> until you do.</td></tr>
+    <tr><td><a href="code/lab02/check.py"><code>check.py</code></a></td><td>The self-check: hand-computed values, finite-difference gradient checks, statistical tests of bias and variance, and training runs with thresholds.</td></tr>
+    <tr><td><a href="code/lab02/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+    <tr><td><code>exp_*.py</code></td><td>Five small scripts behind the tables on this page (<a href="code/lab02/exp_variance.py"><code>exp_variance.py</code></a>, <a href="code/lab02/exp_grid.py"><code>exp_grid.py</code></a>, <a href="code/lab02/exp_clip.py"><code>exp_clip.py</code></a>, <a href="code/lab02/exp_drift.py"><code>exp_drift.py</code></a>, <a href="code/lab02/exp_kl.py"><code>exp_kl.py</code></a>). They import <code>solution</code>; change the import to <code>starter</code> once yours passes to see your own numbers.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Everything is unimplemented, and it says so cleanly:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 2 checks against starter.py
+
+  … Milestone 1: the softmax policy: not implemented yet (TODO milestone 1: softmax)
+  … Milestone 2: REINFORCE with a baseline on a bandit: not implemented yet (TODO milestone 2: advantages)
+  … Milestone 3: REINFORCE on a gridworld: not implemented yet (TODO milestone 3: returns_to_go)
+  … Milestone 4: PPO's clipped objective: not implemented yet (TODO milestone 4: ratio)
+  … Milestone 5: PPO with a KL penalty: not implemented yet (TODO milestone 5: kl_k3)
+
+0/5 milestones passing  (0.0 s)</span></code></pre>
+<p>Notation follows chapters 6 to 8: &pi;<sub>&theta;</sub>(a | s) is a softmax over logits z; a trajectory has states s<sub>t</sub>, actions a<sub>t</sub> and rewards r<sub>t</sub>; G<sub>t</sub> is the discounted return from step t; A is the advantage; r(&theta;) = &pi;<sub>&theta;</sub>(a | s) / &pi;<sub>old</sub>(a | s) is the probability ratio; &epsilon; is the clip range and &beta; the KL coefficient. In this lab &theta; is the logits themselves (one row per state), so a gradient is a list of numbers the same shape as the logits.</p>
+
+<h2>Milestone 1: the softmax policy</h2>
+
+<p>A <span class="term">softmax policy</span> turns a vector of logits z into action probabilities &pi;(a) = e<sup>z<sub>a</sub></sup> / &sum;<sub>b</sub> e<sup>z<sub>b</sub></sup>. A language model does exactly this at every position, over a vocabulary V instead of four actions. Three small functions carry the whole lab, and each has a classic way to go wrong.</p>
+<ul>
+  <li><strong>Stable softmax.</strong> e<sup>1000</sup> overflows a float. Subtracting the largest logit from every logit changes nothing mathematically (the common factor cancels) and keeps every exponent at or below zero. The same trick appears in <a href="../../ml-foundations/chapters/11-numerics.html">floating point and numerical stability</a>. The checker feeds <code>softmax([1000, 1001])</code>.</li>
+  <li><strong>Log-softmax.</strong> The log-probability log &pi;(a) = z<sub>a</sub> &minus; log &sum;<sub>b</sub> e<sup>z<sub>b</sub></sup> is what PPO's ratio and the KL penalty are made of. Computing it as <code>log(softmax(z)[a])</code> breaks when a probability underflows to zero; the log-sum-exp form with the maximum subtracted does not. <code>log_softmax([1000, 0])</code> must be <code>[0, -1000]</code>.</li>
+  <li><strong>Sampling.</strong> Draw u uniformly in [0, 1) and walk along the running total of the probabilities; the first action whose total exceeds u is the sample. This uses exactly one call to <code>rng.random()</code>, which matters for reproducibility (a rollout of 6 steps must consume 6 numbers) and is why the checker feeds you a fake random number generator with chosen values.</li>
+</ul>
+<p>The fourth function is the score. Chapter 7 derived it: for a softmax policy the gradient of log &pi;(a) with respect to the logits is <code>onehot(a) &minus; &pi;</code>. In words, a sampled action's logit rises by 1 &minus; &pi;(a) and every other logit falls by its own probability. A rare action that is sampled and rewarded moves a lot; an action that already has probability near 1 barely moves. The checker confirms the formula against <a href="../../ml-foundations/chapters/08-derivatives.html">finite differences</a> on random logits, and that the entries sum to zero (probabilities always sum to one, so a logit shift cannot change their total).</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>softmax(logits)</code>, <code>log_softmax(logits)</code>, <code>sample_action(probs, rng)</code> and <code>grad_log_prob(logits, a)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks <code>softmax([1, 2, 3])</code> to seven digits, the huge-logit cases, that <code>exp(log_softmax(z))</code> equals <code>softmax(z)</code>, six inverse-CDF cases with a fake generator (<code>u = 0.2</code> must give index 1 for probabilities <code>[0.2, 0.5, 0.3]</code>), that exactly one random number is used, 60,000 real draws within 0.01 of the probabilities, and five seeded random logit vectors against finite differences.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>m = max(logits)</code>, then <code>e = [math.exp(z - m) for z in logits]</code> and divide by <code>sum(e)</code>.</li>
+      <li>Log-softmax: <code>lse = m + math.log(sum(math.exp(z - m) for z in logits))</code>, and return <code>z - lse</code> for each logit.</li>
+      <li>Sampling: keep a running <code>total</code>; return the first index with <code>u &lt; total</code>. If the loop ends (rounding can leave <code>u</code> a hair above the last total), return the last index.</li>
+      <li><code>grad_log_prob</code> is a list comprehension over the softmax: <code>(1.0 if k == a else 0.0) - p[k]</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> softmax(logits):
+    <span class="str">"""Probabilities proportional to exp(logit). Subtract the maximum first so that
+    logits like 1000 do not overflow."""</span>
+    m = max(logits)
+    e = [math.exp(z - m) <span class="kw">for</span> z <span class="kw">in</span> logits]
+    total = sum(e)
+    <span class="kw">return</span> [x / total <span class="kw">for</span> x <span class="kw">in</span> e]
+
+<span class="kw">def</span> log_softmax(logits):
+    <span class="str">"""log of softmax(logits), computed stably as z - max - log(sum(exp(z - max)))."""</span>
+    m = max(logits)
+    lse = m + math.log(sum(math.exp(z - m) <span class="kw">for</span> z <span class="kw">in</span> logits))
+    <span class="kw">return</span> [z - lse <span class="kw">for</span> z <span class="kw">in</span> logits]
+
+<span class="kw">def</span> sample_action(probs, rng):
+    <span class="str">"""Draw an index with the given probabilities using EXACTLY ONE call to rng.random():
+    walk along the cumulative sum and return the first index whose running total is
+    greater than u. If rounding leaves u above the last total, return the last index."""</span>
+    u = rng.random()
+    total = <span class="num">0.0</span>
+    <span class="kw">for</span> a, p <span class="kw">in</span> enumerate(probs):
+        total += p
+        <span class="kw">if</span> u &lt; total:
+            <span class="kw">return</span> a
+    <span class="kw">return</span> len(probs) - <span class="num">1</span>
+
+<span class="kw">def</span> grad_log_prob(logits, a):
+    <span class="str">"""Gradient of log pi(a) with respect to the logits: onehot(a) - softmax(logits)."""</span>
+    p = softmax(logits)
+    <span class="kw">return</span> [(<span class="num">1.0</span> <span class="kw">if</span> k == a <span class="kw">else</span> <span class="num">0.0</span>) - pk <span class="kw">for</span> k, pk <span class="kw">in</span> enumerate(p)]</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: REINFORCE with a baseline on a bandit</h2>
+
+<p>A <span class="term">bandit</span> is the simplest RL problem: K arms, one decision per episode, a noisy reward. The policy is a softmax over K logits, and the quantity to maximise is the expected reward J(z) = &sum;<sub>a</sub> &pi;(a) &mu;(a). The policy gradient of chapter 7 estimates its gradient from samples:</p>
+<p style="text-align:center">g = (1/B) &sum;<sub>i</sub> A<sub>i</sub> &middot; (onehot(a<sub>i</sub>) &minus; &pi;)</p>
+<p>where A<sub>i</sub> = R<sub>i</sub> &minus; b<sub>i</sub> is the <span class="term">advantage</span>, the reward minus a <span class="term">baseline</span>. This milestone is about the choice of b. The checker uses the bandit from chapter 7's variance experiment: four arms with mean rewards 0.2, 0.4, 0.6 and 0.8, reward noise 0.3, a uniform policy, where the true gradient of the best arm's logit is 0.075. You implement three baselines:</p>
+<ul>
+  <li><code>"none"</code>: A = R. Unbiased, and noisy in proportion to the size of the rewards, not to the differences between them.</li>
+  <li><code>"mean"</code>: subtract the mean of the batch. It adapts to the prompt (here, to the reward scale), but the mean contains the sample being weighted, so the baseline depends slightly on that sample's action. The expected gradient is shrunk by (B &minus; 1)/B.</li>
+  <li><code>"loo"</code>: leave-one-out, subtract the mean of the <em>other</em> B &minus; 1 rewards. The baseline is independent of sample i's action, so there is no bias, and no second model is needed. This is the baseline behind RLOO and, with a scale normalisation added, GRPO (<a href="../chapters/14-rlvr-grpo.html">chapter 14</a>).</li>
+</ul>
+<p>The checker measures all of this rather than asserting it. It draws 3,000 batches of 16 with the rewards shifted up by 10 (adding a constant to every reward does not change which arm is best) and records the best arm's gradient entry from each batch. With your functions the result reproduces chapter 7's table (script <code>exp_variance.py</code>, 4,000 batches):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_variance.py</span>
+<span class="out">true gradient of the best arm's logit: 0.075
+
+reward shift +0, batch of 16, 4,000 estimates
+baseline      mean     std  sign right
+none         0.075   0.081       82.3%
+mean         0.070   0.039       97.4%
+loo          0.075   0.041       97.4%
+
+reward shift +10, batch of 16, 4,000 estimates
+baseline      mean     std  sign right
+none         0.088   1.140       59.9%
+mean         0.070   0.039       97.3%
+loo          0.075   0.041       97.3%</span></code></pre>
+<p>Shifting the rewards by 10 multiplies the spread without a baseline by about fourteen (0.081 to 1.140) and the best arm's gradient points the right way only 60% of the time. Both baselines keep it near 0.04, with the sign right 97% of the time. The means show the bias: the batch-mean estimate averages 0.070, not 0.075, which is the (B &minus; 1)/B = 15/16 shrinkage. With batches of two the effect is stark, and the checker tests exactly that: the batch-mean estimate must average half the true gradient while leave-one-out averages the truth.</p>
+<p>Finally <code>train_bandit</code> puts the pieces in a loop: sample a batch, compute advantages, ascend. At reward shift +10 the leave-one-out run finds the best arm in all 30 seeds and the no-baseline run in only a third of them, because its steps are dominated by noise.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>advantages(rewards, baseline)</code> for <code>"none"</code>, <code>"mean"</code> and <code>"loo"</code> (raise <code>ValueError</code> for leave-one-out with fewer than two rewards, and for an unknown name), <code>policy_gradient(logits, actions, advs)</code> (the mean over samples of A &middot; <code>grad_log_prob</code>) and <code>train_bandit(bandit, steps, batch, lr, baseline, seed)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks <code>advantages([1, 0, 0.5], "loo")</code> is <code>[0.75, -0.75, 0]</code>; a two-sample gradient by hand; that eight samples in exactly the proportions of &pi; give exactly the true gradient; the variance and bias experiment above (no-baseline spread at least ten times the baselined one, leave-one-out unbiased with the sign right 95% of the time, batch mean shrunk to half at B = 2); and training on the shifted bandit, where leave-one-out must succeed in at least 27 of 30 seeds and no baseline in at least five fewer.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Leave-one-out for sample i is <code>(total - r_i) / (n - 1)</code> where <code>total = sum(rewards)</code>; that avoids an inner loop.</li>
+      <li><code>policy_gradient</code>: accumulate <code>adv * d</code> into a list for every sample, then divide by the number of samples (the mean, not the sum).</li>
+      <li>In <code>train_bandit</code>, create <code>rng = random.Random(seed)</code> once. Compute <code>probs = softmax(logits)</code> at the start of each step, draw an action then its reward for each sample in turn (<code>bandit.pull(a, rng)</code>), and update with <code>logits = [z + lr * g for ...]</code>.</li>
+      <li>If your batch-mean test passes but leave-one-out fails the bias test, check whether the other-samples mean is dividing by <code>n</code> instead of <code>n - 1</code>.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> advantages(rewards, baseline=<span class="str">"loo"</span>):
+    <span class="str">"""Turn rewards into advantages A_i = R_i - b_i.
+
+        "none"  b_i = 0
+        "mean"  b_i = the mean of ALL the rewards in the batch (includes sample i)
+        "loo"   b_i = the mean of the OTHER rewards (leave-one-out); needs at least 2 rewards,
+                else ValueError
+    Any other name raises ValueError.
+    """</span>
+    n = len(rewards)
+    <span class="kw">if</span> baseline == <span class="str">"none"</span>:
+        <span class="kw">return</span> list(rewards)
+    <span class="kw">if</span> baseline == <span class="str">"mean"</span>:
+        m = sum(rewards) / n
+        <span class="kw">return</span> [r - m <span class="kw">for</span> r <span class="kw">in</span> rewards]
+    <span class="kw">if</span> baseline == <span class="str">"loo"</span>:
+        <span class="kw">if</span> n &lt; <span class="num">2</span>:
+            <span class="kw">raise</span> ValueError(<span class="str">"leave-one-out needs at least two samples"</span>)
+        total = sum(rewards)
+        <span class="kw">return</span> [r - (total - r) / (n - <span class="num">1</span>) <span class="kw">for</span> r <span class="kw">in</span> rewards]
+    <span class="kw">raise</span> ValueError(<span class="str">f"unknown baseline {baseline!r}"</span>)
+
+<span class="kw">def</span> policy_gradient(logits, actions, advs):
+    <span class="str">"""The REINFORCE estimate: the mean over samples of A_i * grad log pi(a_i).
+    Returns a list the length of `logits`."""</span>
+    g = [<span class="num">0.0</span>] * len(logits)
+    <span class="kw">for</span> a, adv <span class="kw">in</span> zip(actions, advs):
+        <span class="kw">for</span> k, d <span class="kw">in</span> enumerate(grad_log_prob(logits, a)):
+            g[k] += adv * d
+    <span class="kw">return</span> [x / len(actions) <span class="kw">for</span> x <span class="kw">in</span> g]
+
+<span class="kw">def</span> train_bandit(bandit, steps=<span class="num">300</span>, batch=<span class="num">8</span>, lr=<span class="num">0.5</span>, baseline=<span class="str">"loo"</span>, seed=<span class="num">0</span>):
+    <span class="str">"""Train a softmax policy on a bandit and return its logits.
+
+    Start from zero logits. Each step: sample `batch` actions from the current policy, pull
+    each (action first, then its reward, for every sample in turn), compute advantages with
+    `baseline`, and ascend: logits += lr * policy_gradient(...).
+    """</span>
+    rng = random.Random(seed)
+    logits = [<span class="num">0.0</span>] * bandit.k
+    <span class="kw">for</span> _ <span class="kw">in</span> range(steps):
+        probs = softmax(logits)
+        actions, rewards = [], []
+        <span class="kw">for</span> _ <span class="kw">in</span> range(batch):
+            a = sample_action(probs, rng)
+            actions.append(a)
+            rewards.append(bandit.pull(a, rng))
+        g = policy_gradient(logits, actions, advantages(rewards, baseline))
+        logits = [z + lr * gi <span class="kw">for</span> z, gi <span class="kw">in</span> zip(logits, g)]
+    <span class="kw">return</span> logits</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 3: REINFORCE on a gridworld</h2>
+
+<p>A bandit has one decision. A language model makes a sequence of them, and a gridworld is the smallest place to see what changes. The world is a 4 &times; 4 grid. The agent starts in the top-left corner, a goal in the bottom-right pays +1 and ends the episode, two pits pay &minus;1 and end it, a wall blocks one cell, and every other step costs &minus;0.01. An episode is cut off after 30 steps. The policy is a table: one row of four logits per state, the softmax of which is the probability of moving up, down, left or right. A uniformly random policy reaches the goal in about 9% of its episodes (the other 91% hit a pit or run out of steps) and averages a return of &minus;0.79. The <code>GridWorld</code> class is given; you write the learning.</p>
+<figure class="diagram"><svg viewBox="0 0 760 310" role="img" aria-label="The 4 by 4 gridworld with the policy learned by REINFORCE: arrows point along a path from the start in the top-left corner, down the left column, along the third row and into the goal in the bottom-right. Next to it, a learning curve of the mean return per iteration rising from about minus 0.9 to 0.9.">
+<text x="10" y="22" text-anchor="start" class="t-sm t-bold">The grid, and the greedy action of the policy after 150 iterations</text>
+<rect x="30" y="44" width="66" height="66" class="fs-yellow s-yellow sw-2"/>
+<text x="63.0" y="81.0" text-anchor="middle" class="t-bold" style="font-size:24px">↓</text>
+<text x="91" y="104" text-anchor="end" class="t-xs t-muted">0.79</text>
+<text x="35" y="57" text-anchor="start" class="t-xs t-bold">S</text>
+<rect x="96" y="44" width="66" height="66" class="box"/>
+<text x="129.0" y="81.0" text-anchor="middle" class="t-bold" style="font-size:24px">←</text>
+<text x="157" y="104" text-anchor="end" class="t-xs t-muted">0.83</text>
+<rect x="162" y="44" width="66" height="66" class="box"/>
+<text x="195.0" y="81.0" text-anchor="middle" class="t-bold" style="font-size:24px">←</text>
+<text x="223" y="104" text-anchor="end" class="t-xs t-muted">0.76</text>
+<rect x="228" y="44" width="66" height="66" class="box"/>
+<text x="261.0" y="81.0" text-anchor="middle" class="t-bold" style="font-size:24px">←</text>
+<text x="289" y="104" text-anchor="end" class="t-xs t-muted">0.15</text>
+<rect x="30" y="110" width="66" height="66" class="box"/>
+<text x="63.0" y="147.0" text-anchor="middle" class="t-bold" style="font-size:24px">↓</text>
+<text x="91" y="170" text-anchor="end" class="t-xs t-muted">0.83</text>
+<rect x="96" y="110" width="66" height="66" class="box"/><text x="129.0" y="147.0" text-anchor="middle" class="t-xs t-muted">wall</text>
+<rect x="162" y="110" width="66" height="66" class="box"/>
+<text x="195.0" y="147.0" text-anchor="middle" class="t-bold" style="font-size:24px">↓</text>
+<text x="223" y="170" text-anchor="end" class="t-xs t-muted">0.86</text>
+<rect x="228" y="110" width="66" height="66" class="fs-red s-red sw-2"/><text x="261.0" y="141.0" text-anchor="middle" class="t-sm t-bold">P</text><text x="261.0" y="159.0" text-anchor="middle" class="t-xs t-muted">-1</text>
+<rect x="30" y="176" width="66" height="66" class="box"/>
+<text x="63.0" y="213.0" text-anchor="middle" class="t-bold" style="font-size:24px">→</text>
+<text x="91" y="236" text-anchor="end" class="t-xs t-muted">0.70</text>
+<rect x="96" y="176" width="66" height="66" class="box"/>
+<text x="129.0" y="213.0" text-anchor="middle" class="t-bold" style="font-size:24px">→</text>
+<text x="157" y="236" text-anchor="end" class="t-xs t-muted">0.72</text>
+<rect x="162" y="176" width="66" height="66" class="box"/>
+<text x="195.0" y="213.0" text-anchor="middle" class="t-bold" style="font-size:24px">↓</text>
+<text x="223" y="236" text-anchor="end" class="t-xs t-muted">0.84</text>
+<rect x="228" y="176" width="66" height="66" class="box"/>
+<text x="261.0" y="213.0" text-anchor="middle" class="t-bold" style="font-size:24px">↓</text>
+<text x="289" y="236" text-anchor="end" class="t-xs t-muted">0.59</text>
+<rect x="30" y="242" width="66" height="66" class="fs-red s-red sw-2"/><text x="63.0" y="273.0" text-anchor="middle" class="t-sm t-bold">P</text><text x="63.0" y="291.0" text-anchor="middle" class="t-xs t-muted">-1</text>
+<rect x="96" y="242" width="66" height="66" class="box"/>
+<text x="129.0" y="279.0" text-anchor="middle" class="t-bold" style="font-size:24px">→</text>
+<text x="157" y="302" text-anchor="end" class="t-xs t-muted">0.98</text>
+<rect x="162" y="242" width="66" height="66" class="box"/>
+<text x="195.0" y="279.0" text-anchor="middle" class="t-bold" style="font-size:24px">→</text>
+<text x="223" y="302" text-anchor="end" class="t-xs t-muted">0.99</text>
+<rect x="228" y="242" width="66" height="66" class="fs-green s-green sw-2"/><text x="261.0" y="273.0" text-anchor="middle" class="t-sm t-bold">G</text><text x="261.0" y="291.0" text-anchor="middle" class="t-xs t-muted">+1</text>
+<text x="30" y="330" text-anchor="start" class="t-xs t-muted">arrow: most likely action; small number: learned V(s)</text>
+<text x="30" y="346" text-anchor="start" class="t-xs t-muted">step cost -0.01; cut off after 30 steps</text>
+<text x="400" y="50" text-anchor="start" class="t-xs t-bold">mean return per iteration (16 episodes)</text>
+<line x1="400" y1="236.0" x2="735" y2="236.0" class="line-thin"/><text x="394" y="240.0" text-anchor="end" class="t-xs t-muted">-1</text>
+<line x1="400" y1="193.5" x2="735" y2="193.5" class="line-thin"/><text x="394" y="197.5" text-anchor="end" class="t-xs t-muted">-0.5</text>
+<line x1="400" y1="151.0" x2="735" y2="151.0" class="line-dash"/><text x="394" y="155.0" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="400" y1="108.5" x2="735" y2="108.5" class="line-thin"/><text x="394" y="112.5" text-anchor="end" class="t-xs t-muted">0.5</text>
+<line x1="400" y1="66.0" x2="735" y2="66.0" class="line-thin"/><text x="394" y="70.0" text-anchor="end" class="t-xs t-muted">1</text>
+<text x="400.0" y="252" text-anchor="middle" class="t-xs t-muted">0</text>
+<text x="511.7" y="252" text-anchor="middle" class="t-xs t-muted">50</text>
+<text x="623.3" y="252" text-anchor="middle" class="t-xs t-muted">100</text>
+<text x="735.0" y="252" text-anchor="middle" class="t-xs t-muted">150</text>
+<text x="567.5" y="270" text-anchor="middle" class="t-xs t-muted">iteration</text>
+<polyline points="400.0,208.4 402.2,209.1 404.5,233.8 406.7,196.1 408.9,189.7 411.2,168.2 413.4,203.2 415.6,202.8 417.9,215.5 420.1,187.7 422.3,204.2 424.6,176.3 426.8,212.4 429.0,200.1 431.3,192.2 433.5,180.6 435.7,183.1 438.0,181.8 440.2,158.4 442.4,168.0 444.7,213.3 446.9,159.8 449.1,163.5 451.4,148.1 453.6,145.8 455.8,115.1 458.1,161.5 460.3,128.3 462.5,128.5 464.8,107.3 467.0,116.4 469.2,106.1 471.5,105.5 473.7,93.1 475.9,102.9 478.2,98.5 480.4,109.0 482.6,95.9 484.9,92.0 487.1,87.0 489.3,77.3 491.6,106.0 493.8,84.4 496.0,84.6 498.3,92.2 500.5,94.8 502.7,74.9 505.0,86.1 507.2,95.0 509.4,85.4 511.7,74.7 513.9,115.5 516.1,84.0 518.4,81.9 520.6,94.7 522.8,83.7 525.1,84.1 527.3,83.9 529.5,72.3 531.8,73.2 534.0,73.2 536.2,73.8 538.5,73.3 540.7,74.0 542.9,83.1 545.2,73.3 547.4,73.2 549.6,94.2 551.9,71.9 554.1,84.2 556.3,72.6 558.6,83.6 560.8,72.7 563.0,83.7 565.3,73.2 567.5,83.6 569.7,82.7 572.0,71.9 574.2,72.7 576.4,104.5 578.7,72.1 580.9,72.0 583.1,71.8 585.4,72.1 587.6,71.5 589.8,71.8 592.1,72.3 594.3,82.7 596.5,71.4 598.8,72.1 601.0,72.0 603.2,81.9 605.5,72.4 607.7,72.2 609.9,72.7 612.2,92.9 614.4,82.6 616.6,82.6 618.9,71.8 621.1,82.2 623.3,72.0 625.6,82.2 627.8,71.7 630.0,72.2 632.3,82.7 634.5,71.6 636.7,71.3 639.0,71.8 641.2,72.3 643.4,71.7 645.7,82.4 647.9,71.4 650.1,71.8 652.4,72.1 654.6,83.1 656.8,72.1 659.1,71.4 661.3,81.8 663.5,72.7 665.8,72.0 668.0,71.5 670.2,83.0 672.5,71.3 674.7,71.2 676.9,71.8 679.2,82.6 681.4,71.0 683.6,71.7 685.9,71.3 688.1,92.7 690.3,71.7 692.6,71.3 694.8,71.4 697.0,71.9 699.3,71.6 701.5,71.2 703.7,71.4 706.0,72.3 708.2,71.5 710.4,71.0 712.7,71.5 714.9,71.3 717.1,71.8 719.4,83.7 721.6,71.6 723.8,71.2 726.1,70.9 728.3,71.2 730.5,71.3 732.8,82.0" fill="none" class="s-blue" stroke-width="2"/>
+</svg><figcaption><strong>A tabular policy, learned in about a second.</strong> The agent has learnt the route down the left column and along the third row (arrows in states it visits). The corner states it never visits (the top-right cell) keep a meaningless arrow and a low value: a table only learns where it has been. The blue line is the mean undiscounted return of each iteration, from the run in <code>exp_grid.py</code>.</figcaption></figure>
+<p>Three ideas turn the bandit estimator into a sequential one.</p>
+<ul>
+  <li><strong>Return-to-go.</strong> An action at step t cannot affect rewards before step t, so each action is weighted by the discounted sum of what follows: G<sub>t</sub> = r<sub>t</sub> + &gamma; G<sub>t+1</sub> (chapter 6). With rewards 0, 0, 0, 10 and &gamma; = 0.9 the returns are 7.29, 8.1, 9 and 10. The exact derivation also carries a factor &gamma;<sup>t</sup>; nearly every implementation, this one included, leaves it out.</li>
+  <li><strong>A learned baseline.</strong> A table V[s] estimates the return from each state, and the weight of a step is G<sub>t</sub> &minus; V[s<sub>t</sub>], the advantage. V is updated towards the returns actually observed, V[s] += &alpha; (G<sub>t</sub> &minus; V[s]), <em>after</em> the gradient step, so the baseline that weights a batch does not depend on that batch's own actions. It is the small tabular version of the critic of <a href="../chapters/09-value-functions.html">chapter 9</a>.</li>
+  <li><strong>Averaging.</strong> The gradient of the whole batch is the sum of every step's A &middot; <code>grad_log_prob</code>, added to the row of the state in which the step happened, then divided by the number of <em>episodes</em> (a mean over trajectories, as in chapter 7), not the number of steps.</li>
+</ul>
+<p>After 150 iterations of 16 episodes, the reference solution has learned the policy in the figure (script <code>exp_grid.py</code>):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_grid.py</span>
+<span class="out">mean return per 25 iterations: [-0.44, 0.59, 0.83, 0.87, 0.9, 0.91]
+trained policy: return 0.93, reaches the goal in 100% of episodes
+v &lt; &lt; &lt;     V:  0.79  0.83  0.76  0.15
+v # v P     V:  0.83  0.00  0.86  0.00
+&gt; &gt; v v     V:  0.70  0.72  0.84  0.59
+P &gt; &gt; G     V:  0.00  0.98  0.99  0.00</span></code></pre>
+<p>The first 25 iterations average a return of &minus;0.44: the agent mostly falls into pits and times out. Iterations 25 to 49 average 0.59, and after 150 the trained policy reaches the goal in every one of the 200 evaluation episodes. The right-hand columns are the learned V: about 0.98 next to the goal, 0.7 to 0.8 near the start, and 0.15 in the top-right corner, a state the policy almost never visits and so has barely learnt about. Reading V like this is a good habit: it is a map of where the agent has actually been. Also note what the baseline does <em>not</em> do on this grid. The rewards already straddle zero, so training without V learns about as fast as training with it. The baseline mattered in milestone 2 because the rewards were shifted far from zero. Which one a problem needs depends on the scale of its returns, and that is the reason RL libraries normalise or baseline rewards by default.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>returns_to_go(rewards, gamma)</code>, <code>run_episode(env, table, rng)</code> (returns the lists <code>states</code>, <code>actions</code>, <code>rewards</code>, where <code>states[t]</code> is the state before action t), <code>reinforce_grid_gradient(table, episodes, V, gamma)</code>, <code>update_values(V, episodes, gamma, alpha)</code> (in place) and <code>train_reinforce_grid(...)</code>, which returns the table, V and the per-iteration mean undiscounted return.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. Hand cases: returns-to-go; three episodes forced by logits of 50 (a walk to the goal, a walk into the pit, an edge-bumping episode cut off at <code>max_steps = 5</code>), and that a six-step episode uses six random numbers; the gradient of one episode and of two episodes of different length (divide by the number of episodes); that a baseline equal to the returns gives a zero gradient; and the in-place value update, including a state visited twice. Then three seeds of training: the trained policy must reach the goal in at least 90% of 300 evaluation episodes with a mean return of at least 0.7, the mean return must climb by more than 1.0, and V next to the goal must exceed 0.8.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>returns_to_go</code>: walk the rewards backwards with a running <code>g = r + gamma * g</code>, collect, then reverse.</li>
+      <li><code>run_episode</code>: <code>s = env.reset()</code>; for up to <code>env.max_steps</code> steps sample from <code>softmax(table[s])</code>, call <code>env.step(s, a)</code> to get <code>(s2, r, done)</code>, append the state <em>before</em> the move, and stop when <code>done</code>.</li>
+      <li>In the gradient, <code>adv = g - V[s]</code> for each step and the update goes to row <code>s</code> only. Return a table the same shape as <code>table</code>.</li>
+      <li>Order inside one training iteration: collect episodes, take the gradient step with the <em>current</em> V, update V from the same episodes. Do not let V see the batch before the gradient does.</li>
+      <li>If training is stuck near a return of &minus;0.8, check the sign of the update (ascent: <code>+ lr * grad</code>) and that you divided by the number of episodes and not the number of steps.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> returns_to_go(rewards, gamma):
+    <span class="str">"""G_t = r_t + gamma * G_{t+1}, for every t (the last return is the last reward)."""</span>
+    out, g = [], <span class="num">0.0</span>
+    <span class="kw">for</span> r <span class="kw">in</span> reversed(rewards):
+        g = r + gamma * g
+        out.append(g)
+    <span class="kw">return</span> out[::-<span class="num">1</span>]
+
+<span class="kw">def</span> run_episode(env, table, rng):
+    <span class="str">"""Play one episode with the sampling policy softmax(table[s]).
+
+    Returns (states, actions, rewards), three lists of equal length: states[t] is the state
+    BEFORE action t. Start at env.reset(); at each step sample an action with sample_action;
+    stop when env.step says done or after env.max_steps steps.
+    """</span>
+    s = env.reset()
+    states, actions, rewards = [], [], []
+    <span class="kw">for</span> _ <span class="kw">in</span> range(env.max_steps):
+        a = sample_action(softmax(table[s]), rng)
+        s2, r, done = env.step(s, a)
+        states.append(s)
+        actions.append(a)
+        rewards.append(r)
+        s = s2
+        <span class="kw">if</span> done:
+            <span class="kw">break</span>
+    <span class="kw">return</span> states, actions, rewards
+
+<span class="kw">def</span> reinforce_grid_gradient(table, episodes, V, gamma):
+    <span class="str">"""The REINFORCE gradient for a tabular softmax policy, as a table shaped like `table`.
+
+    For every step t of every episode add (G_t - V[s_t]) * grad log pi(a_t | s_t) to row s_t;
+    finally divide everything by the NUMBER OF EPISODES. G_t is the discounted return-to-go
+    and V[s] is the state-value baseline. (The gamma^t factor of the exact derivation is
+    left out, as nearly every implementation does.)
+    """</span>
+    grad = [[<span class="num">0.0</span>] * len(row) <span class="kw">for</span> row <span class="kw">in</span> table]
+    <span class="kw">for</span> states, actions, rewards <span class="kw">in</span> episodes:
+        G = returns_to_go(rewards, gamma)
+        <span class="kw">for</span> s, a, g <span class="kw">in</span> zip(states, actions, G):
+            adv = g - V[s]
+            <span class="kw">for</span> k, d <span class="kw">in</span> enumerate(grad_log_prob(table[s], a)):
+                grad[s][k] += adv * d
+    n = len(episodes)
+    <span class="kw">return</span> [[x / n <span class="kw">for</span> x <span class="kw">in</span> row] <span class="kw">for</span> row <span class="kw">in</span> grad]
+
+<span class="kw">def</span> update_values(V, episodes, gamma, alpha):
+    <span class="str">"""Move each visited state's value towards the returns observed from it:
+    V[s] += alpha * (G_t - V[s]), step by step in the order they happened. Changes V in place."""</span>
+    <span class="kw">for</span> states, _, rewards <span class="kw">in</span> episodes:
+        <span class="kw">for</span> s, g <span class="kw">in</span> zip(states, returns_to_go(rewards, gamma)):
+            V[s] += alpha * (g - V[s])
+
+<span class="kw">def</span> train_reinforce_grid(env, iterations=<span class="num">150</span>, episodes=<span class="num">16</span>, lr=<span class="num">0.5</span>, gamma=<span class="num">0.99</span>, v_lr=<span class="num">0.2</span>, baseline=<span class="kw">True</span>, seed=<span class="num">0</span>):
+    <span class="str">"""Train a tabular softmax policy with REINFORCE and return (table, V, history).
+
+    Each iteration: play `episodes` episodes with the current table, take one gradient step
+    table[s][k] += lr * grad[s][k] (the baseline V is all zeros when `baseline` is False),
+    THEN update V from the same episodes. history[i] is the mean undiscounted return of
+    iteration i's episodes.
+    """</span>
+    rng = random.Random(seed)
+    table, V, history = zeros_table(env), [<span class="num">0.0</span>] * env.n_states, []
+    <span class="kw">for</span> _ <span class="kw">in</span> range(iterations):
+        eps = [run_episode(env, table, rng) <span class="kw">for</span> _ <span class="kw">in</span> range(episodes)]
+        history.append(sum(sum(r) <span class="kw">for</span> _, _, r <span class="kw">in</span> eps) / episodes)
+        grad = reinforce_grid_gradient(table, eps, V <span class="kw">if</span> baseline <span class="kw">else</span> [<span class="num">0.0</span>] * env.n_states, gamma)
+        <span class="kw">for</span> s <span class="kw">in</span> range(env.n_states):
+            <span class="kw">for</span> k <span class="kw">in</span> range(N_ACTIONS):
+                table[s][k] += lr * grad[s][k]
+        <span class="kw">if</span> baseline:
+            update_values(V, eps, gamma, v_lr)
+    <span class="kw">return</span> table, V, history</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: PPO's clipped objective</h2>
+
+<p>Rollouts are the expensive part of RL for language models, so we want several gradient steps per batch. But after the first step the policy is no longer the one that produced the samples, and the REINFORCE formula is only valid for the policy that did. Chapter 8's fix is the <span class="term">probability ratio</span> r = &pi;<sub>&theta;</sub>(a | s) / &pi;<sub>old</sub>(a | s), where &pi;<sub>old</sub> is the policy frozen at the start of the iteration, and a <span class="term">clipped surrogate</span> that stops paying the policy for moving further than &epsilon; from it in the direction the advantage asks for:</p>
+<p style="text-align:center">L = (1/n) &sum;<sub>i</sub> min( r<sub>i</sub> A<sub>i</sub>, clip(r<sub>i</sub>, 1 &minus; &epsilon;, 1 + &epsilon;) A<sub>i</sub> )</p>
+<p>Read it by cases, and let the checker's table be your test. With &epsilon; = 0.2:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>A</th><th>r</th><th>objective</th><th>passes gradient?</th><th>why</th></tr></thead>
+  <tbody>
+    <tr><td>+1</td><td>1.5</td><td>1.2</td><td>no (clipped)</td><td>a good action already 50% likelier: no more credit</td></tr>
+    <tr><td>&minus;1</td><td>0.5</td><td>&minus;0.8</td><td>no (clipped)</td><td>a bad action already 50% less likely: no more credit</td></tr>
+    <tr><td>&minus;1</td><td>1.5</td><td>&minus;1.5</td><td>yes</td><td>a bad action that became <em>more</em> likely: the min picks the unclipped term, and the gradient corrects the mistake</td></tr>
+    <tr><td>+1</td><td>0.5</td><td>0.5</td><td>yes</td><td>a good action that became less likely: correct it</td></tr>
+    <tr><td>+1</td><td>0.9</td><td>0.9</td><td>yes</td><td>inside the clip range nothing is clipped</td></tr>
+  </tbody>
+</table></div>
+<p>So the clip removes the incentive to overshoot and never the incentive to correct. For the gradient you need one identity: &nabla;r = r &middot; &nabla;log &pi;. An unclipped sample therefore contributes A &middot; r &middot; (onehot(a) &minus; &pi;), which at r = 1 is exactly the REINFORCE term, and a clipped sample contributes zero. Divide by the number of samples. The checker tests that at &pi; = &pi;<sub>old</sub> your PPO gradient equals your policy gradient exactly, and then compares it with finite differences of the objective on random cases away from the kinks of the clip.</p>
+<p>Then the experiment of chapter 8. A six-armed bandit with true rewards 0, 0.2, 0.4, 0.6, 1.0 and 0.1 (arm 4 is best), reward noise 0.5, and only eight samples per iteration, deliberately noisy. Each batch is reused for ten gradient steps with a learning rate of 1.0. Without the clip, one lucky draw can make a poor arm look good and ten steps on that batch drive its probability towards 1. With the clip they cannot (script <code>exp_clip.py</code>, 100 seeds):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_clip.py</span>
+<span class="out">setting                      E[reward]  stuck
+no clip                          0.904    18%
+eps = 0.02                       0.942     0%
+eps = 0.1                        0.976     0%
+eps = 0.2                        0.979     1%
+eps = 0.5                        0.981     2%
+no clip, batch of 64             0.998     0%</span></code></pre>
+<p>The unclipped run ends with an expected reward of 0.904 and is stuck on a wrong arm in 18% of runs; the clipped run reaches 0.979 and is stuck in 1%. (Chapter 8 reports 0.89 and 0.98 with NumPy's random numbers; the numbers differ in the third digit because the generator is different, and the lesson is the same.) Two further rows are worth reading. A very small &epsilon; of 0.02 costs a little because it forbids most of the progress, and &epsilon; = 0.5 is hardly different from 0.2 at this scale. And a bigger batch of 64 fixes the problem without any clip, by averaging away the lucky draw: the clip is a way to be safe with a small, expensive batch. One more script shows <em>why</em> it works, by recording the largest change in probability among the batch's sampled actions after each of the ten epochs (script <code>exp_drift.py</code>):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_drift.py</span>
+<span class="out">unclipped  0.35  0.86  1.57  2.41  3.19  3.74  4.08  4.29  4.42  4.52
+clipped    0.35  0.33  0.34  0.35  0.36  0.37  0.37  0.37  0.37  0.37
+epoch         1     2     3     4     5     6     7     8     9    10</span></code></pre>
+<p>Without the clip the ratio of some sampled action drifts to 5.5 (a change of 4.5) and is still growing. With it, the change stops at about 0.37. That is above &epsilon; = 0.2, and the number is worth noticing: the clip is not a hard constraint. The first step already moves some ratios past the boundary, the gradient of the samples still inside the range keeps pushing through the shared logits, and what the clip guarantees is that the samples outside the boundary stop contributing, not that the policy stays inside it (the point of the "Common misconception" box in chapter 8).</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>ratio(logp_new, logp_old)</code>, <code>clipped_surrogate(r, adv, eps)</code>, <code>is_clipped(r, adv, eps)</code> (true if the sample passes no gradient; a sample exactly on the boundary still does), <code>ppo_gradient(logits, old_logits, actions, advs, eps)</code> and <code>train_bandit_ppo(bandit, iters, batch, epochs, lr, eps, clip, seed)</code>. In the training function normalise the rewards of each batch to advantages with the mean and the population standard deviation (plus 1e-8), reuse the batch for <code>epochs</code> steps against the frozen &pi;<sub>old</sub>, and when <code>clip=False</code> pass an infinite &epsilon; so nothing is clipped.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. Eight cases of the clipped surrogate and of <code>is_clipped</code> including both of the "wrong way" cases; that the PPO gradient equals the REINFORCE gradient at &pi; = &pi;<sub>old</sub>; that a sample with A = +1 and r = 1.5 contributes exactly zero while one with A = &minus;1 and r = 1.5 contributes &minus;1.5 &middot; (onehot &minus; &pi;); that duplicated samples do not change a mean; six random cases against finite differences (a failure prints the seed, the ratios and the advantages); and the six-armed bandit over 100 seeds: the clipped runs must end at least 0.04 higher in expected reward, above 0.95, with at most 3 runs stuck on a wrong arm against at least 8 unclipped.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>clipped_surrogate</code>: <code>min(r * adv, min(max(r, 1 - eps), 1 + eps) * adv)</code>.</li>
+      <li><code>is_clipped</code>: the sample is clipped when the unclipped term is <em>strictly larger</em> than the clipped one, because then the min picks the clipped term, which has no dependence on &theta;.</li>
+      <li><code>ppo_gradient</code>: compute <code>p = softmax(logits)</code> and <code>p_old = softmax(old_logits)</code> once; for each sample <code>r = p[a] / p_old[a]</code>; skip it if clipped; otherwise add <code>adv * r * d</code> for <code>d</code> in <code>grad_log_prob(logits, a)</code>. Divide by the number of samples at the end (clipped ones still count in the denominator).</li>
+      <li>If the finite-difference test fails only on some seeds, you are probably treating a sample on the wrong side of the clip as clipped (the "wrong way" cases of the table pass gradient).</li>
+      <li>In <code>train_bandit_ppo</code>, take <code>old = list(logits)</code> before sampling, and compute the gradient against <code>old</code>, not against the previous epoch's logits.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> ratio(logp_new, logp_old):
+    <span class="str">"""The probability ratio pi_new(a|s) / pi_old(a|s), from log-probabilities."""</span>
+    <span class="kw">return</span> math.exp(logp_new - logp_old)
+
+<span class="kw">def</span> clipped_surrogate(r, adv, eps=<span class="num">0.2</span>):
+    <span class="str">"""min(r * A, clip(r, 1 - eps, 1 + eps) * A): the PPO objective for one sample."""</span>
+    <span class="kw">return</span> min(r * adv, min(max(r, <span class="num">1.0</span> - eps), <span class="num">1.0</span> + eps) * adv)
+
+<span class="kw">def</span> is_clipped(r, adv, eps=<span class="num">0.2</span>):
+    <span class="str">"""True if the sample passes NO gradient: the clipped term is the smaller one.
+    A sample at exactly the boundary (r == 1 + eps with A &gt; 0) still passes gradient."""</span>
+    <span class="kw">return</span> r * adv &gt; min(max(r, <span class="num">1.0</span> - eps), <span class="num">1.0</span> + eps) * adv
+
+<span class="kw">def</span> ppo_gradient(logits, old_logits, actions, advs, eps=<span class="num">0.2</span>):
+    <span class="str">"""Gradient, with respect to `logits`, of the MEAN clipped surrogate over the samples.
+
+    For sample i the ratio is r_i = pi_logits(a_i) / pi_old_logits(a_i). A clipped sample
+    contributes nothing; any other contributes A_i * r_i * grad log pi(a_i), because
+    grad r = r * grad log pi. Divide by the number of samples.
+    """</span>
+    p, p_old = softmax(logits), softmax(old_logits)
+    g = [<span class="num">0.0</span>] * len(logits)
+    <span class="kw">for</span> a, adv <span class="kw">in</span> zip(actions, advs):
+        r = p[a] / p_old[a]
+        <span class="kw">if</span> is_clipped(r, adv, eps):
+            <span class="kw">continue</span>
+        <span class="kw">for</span> k, d <span class="kw">in</span> enumerate(grad_log_prob(logits, a)):
+            g[k] += adv * r * d
+    <span class="kw">return</span> [x / len(actions) <span class="kw">for</span> x <span class="kw">in</span> g]
+
+<span class="kw">def</span> train_bandit_ppo(bandit, iters=<span class="num">30</span>, batch=<span class="num">8</span>, epochs=<span class="num">10</span>, lr=<span class="num">1.0</span>, eps=<span class="num">0.2</span>, clip=<span class="kw">True</span>, seed=<span class="num">0</span>):
+    <span class="str">"""Train a softmax policy on a bandit with PPO-style batch reuse; return the logits.
+
+    Each iteration: freeze old = a copy of the logits; sample `batch` actions and rewards from
+    it; normalise the rewards to advantages (R - mean) / (std + 1e-8) with the population
+    standard deviation; then take `epochs` gradient steps on that SAME batch:
+    logits += lr * ppo_gradient(...). With clip=False the ratio is used but never clipped
+    (every sample passes gradient).
+    """</span>
+    rng = random.Random(seed)
+    logits = [<span class="num">0.0</span>] * bandit.k
+    <span class="kw">for</span> _ <span class="kw">in</span> range(iters):
+        old = list(logits)
+        probs = softmax(old)
+        actions, rewards = [], []
+        <span class="kw">for</span> _ <span class="kw">in</span> range(batch):
+            a = sample_action(probs, rng)
+            actions.append(a)
+            rewards.append(bandit.pull(a, rng))
+        mean = sum(rewards) / batch
+        std = math.sqrt(sum((r - mean) ** <span class="num">2</span> <span class="kw">for</span> r <span class="kw">in</span> rewards) / batch)
+        advs = [(r - mean) / (std + <span class="num">1e-8</span>) <span class="kw">for</span> r <span class="kw">in</span> rewards]
+        <span class="kw">for</span> _ <span class="kw">in</span> range(epochs):
+            g = ppo_gradient(logits, old, actions, advs, eps <span class="kw">if</span> clip <span class="kw">else</span> float(<span class="str">"inf"</span>))
+            logits = [z + lr * gi <span class="kw">for</span> z, gi <span class="kw">in</span> zip(logits, g)]
+    <span class="kw">return</span> logits</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: PPO with a KL penalty</h2>
+
+<p>The clip limits how far the policy moves per iteration and says nothing about how far it moves in total. After a thousand iterations the policy may be nowhere near where it started, which for a language model means a reward model being exploited outside the region where it was trained (chapter 13) and a fluent model turned into a degenerate one. The second safety rope, from Ziegler et al. (2019) and used in every RLHF system, is a penalty for drifting from a fixed <span class="term">reference policy</span> &pi;<sub>ref</sub>. The objective becomes E[R] &minus; &beta; &middot; KL(&pi;<sub>&theta;</sub> &Vert; &pi;<sub>ref</sub>), and it is implemented by charging each sampled action a small amount at the step where it was taken:</p>
+<p style="text-align:center">r<sub>t</sub>' = r<sub>t</sub> &minus; &beta; ( log &pi;<sub>&theta;</sub>(a<sub>t</sub> | s<sub>t</sub>) &minus; log &pi;<sub>ref</sub>(a<sub>t</sub> | s<sub>t</sub>) )</p>
+<p>The sum of these log-ratios along a trajectory is a single-sample estimate of the KL, so the penalty is placed where the drift happened and the advantage estimator can see it. The sign is the thing to watch. A sampled action is, by construction, one the policy likes, so on average log &pi; &minus; log &pi;<sub>ref</sub> is positive and the penalty reduces the reward; individual steps can come out negative, which is noise and not a bug.</p>
+<p>To <em>report</em> the KL you can use the same log-ratio (the estimator k1 in Schulman's 2020 note), but it is noisy and sometimes negative. Chapter 8 recommends the k3 estimator, (&rho; &minus; 1) &minus; log &rho; with &rho; = &pi;<sub>ref</sub>(a) / &pi;<sub>&theta;</sub>(a): unbiased and never negative. You write it, and the checker draws 40,000 samples from a four-token distribution and requires the mean to match the exact KL.</p>
+<p>Now the experiment. The reference policy (given as <code>reference_table</code>) is a mild preference for moving right and down, logit +0.5 on both; it reaches the goal in 16% of its episodes and averages a return of &minus;0.76. <code>train_ppo_grid</code> starts a copy of it and trains with PPO's clip and the shaped reward. Your loop per iteration: freeze a copy of the table as &pi;<sub>old</sub> and play 16 episodes with it; compute for each step the log-probabilities under &pi;<sub>old</sub> and under the reference, shape the rewards, take returns-to-go and subtract V; group the steps by state; take four epochs of <code>ppo_gradient</code> per state (each state's gradient weighted by its share of the steps), with the clip computed against the frozen &pi;<sub>old</sub>; and update V towards the shaped returns. Running it for four values of &beta; (script <code>exp_kl.py</code>, seed 0):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 exp_kl.py</span>
+<span class="out"> beta  exact KL  mean k3  return  success
+  0.0     0.438    0.408    0.88     0.98
+  0.1     0.246    0.218    0.78     0.94
+  0.3     0.125    0.138    0.64     0.87
+  1.0     0.029    0.031   -0.03     0.53
+  3.0     0.003    0.003   -0.61     0.23</span></code></pre>
+<figure class="diagram"><svg viewBox="0 0 760 270" role="img" aria-label="Return against mean KL to the reference for five values of beta. Beta 0 sits at KL 0.44 and return 0.88; beta 3 sits near the reference at KL 0.003 and return minus 0.61. A larger beta moves the point down and to the left.">
+<text x="10" y="16" text-anchor="start" class="t-sm t-bold">What the leash costs: return against drift, one point per beta</text>
+<line x1="80" y1="210.0" x2="700" y2="210.0" class="line-thin"/><text x="72" y="214.0" text-anchor="end" class="t-xs t-muted">-1</text>
+<line x1="80" y1="165.0" x2="700" y2="165.0" class="line-thin"/><text x="72" y="169.0" text-anchor="end" class="t-xs t-muted">-0.5</text>
+<line x1="80" y1="120.0" x2="700" y2="120.0" class="line-thin"/><text x="72" y="124.0" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="80" y1="75.0" x2="700" y2="75.0" class="line-thin"/><text x="72" y="79.0" text-anchor="end" class="t-xs t-muted">0.5</text>
+<line x1="80" y1="30.0" x2="700" y2="30.0" class="line-thin"/><text x="72" y="34.0" text-anchor="end" class="t-xs t-muted">1</text>
+<text x="80.0" y="226" text-anchor="middle" class="t-xs t-muted">0</text>
+<text x="204.0" y="226" text-anchor="middle" class="t-xs t-muted">0.1</text>
+<text x="328.0" y="226" text-anchor="middle" class="t-xs t-muted">0.2</text>
+<text x="452.0" y="226" text-anchor="middle" class="t-xs t-muted">0.3</text>
+<text x="576.0" y="226" text-anchor="middle" class="t-xs t-muted">0.4</text>
+<text x="700.0" y="226" text-anchor="middle" class="t-xs t-muted">0.5</text>
+<line x1="80" y1="210" x2="700" y2="210" class="line"/><line x1="80" y1="30" x2="80" y2="210" class="line"/>
+<text x="390.0" y="246" text-anchor="middle" class="t-xs t-muted">mean KL to the reference over visited steps (nats)</text>
+<text x="80" y="22" text-anchor="start" class="t-xs t-muted">mean return</text>
+<polyline points="83.6,175.0 116.5,122.3 235.5,62.3 385.6,49.9 623.2,40.4" fill="none" class="s-blue" stroke-width="2"/>
+<circle cx="80.0" cy="190.9" r="6" class="f-yellow"/>
+<text x="92.0" y="206.9" text-anchor="start" class="t-xs t-bold">reference policy</text>
+<circle cx="623.2" cy="40.4" r="5" class="f-blue"/>
+<text x="633.2" y="32.4" text-anchor="start" class="t-xs">beta = 0</text>
+<circle cx="385.6" cy="49.9" r="5" class="f-blue"/>
+<text x="395.6" y="41.9" text-anchor="start" class="t-xs">beta = 0.1</text>
+<circle cx="235.5" cy="62.3" r="5" class="f-blue"/>
+<text x="245.5" y="54.3" text-anchor="start" class="t-xs">beta = 0.3</text>
+<circle cx="116.5" cy="122.3" r="5" class="f-blue"/>
+<text x="126.5" y="114.3" text-anchor="start" class="t-xs">beta = 1</text>
+<circle cx="83.6" cy="175.0" r="5" class="f-blue"/>
+<text x="93.6" y="167.0" text-anchor="start" class="t-xs">beta = 3</text>
+</svg><figcaption><strong>The price of staying close.</strong> Each blue point is a PPO run on the grid from the reference policy (yellow). Moving up the curve buys reward and costs drift; the policy at beta = 0 has moved furthest. A real run picks beta where the reward signal can still be trusted. Numbers from <code>exp_kl.py</code> (seed 0).</figcaption></figure>
+<p>At &beta; = 0 the policy solves the grid (return 0.88, success 98%) and has moved 0.44 nats per visited step from the reference. At &beta; = 3 it has barely moved (0.003) and does only a little better than the reference (return &minus;0.61 against &minus;0.76): the leash is so short that the policy hardly learns. In between there is a smooth trade, each step of &beta; buying a smaller KL for a lower return. This curve is the whole story of KL-regularised training: &beta; is chosen where the reward you can keep is acceptable and the drift is small enough to trust the reward signal. The "mean k3" column estimates the same KL from sampled steps alone, as a training run would, and agrees with the exact value to within the sampling noise of 300 episodes.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>kl_k3(logp, logp_ref)</code>, <code>shaped_rewards(rewards, logps, logps_ref, beta)</code> and <code>train_ppo_grid(env, ref, beta, ...)</code> as described above. It returns the trained table and V; it must start from a copy of <code>ref</code> and never modify <code>ref</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks k3 at equal probabilities (zero), at &rho; = 0.5 (0.1931), that it is never negative on 200 random pairs and that its mean over 40,000 samples matches the exact KL; shaped rewards by hand, with &beta; = 0 leaving the rewards alone; that zero iterations return an equal but separate copy of the reference and that training leaves the reference unchanged; then four values of &beta; (0, 0.3, 1, 3), each averaged over two seeds. At &beta; = 0 the policy must reach success 0.9 and return 0.7; going to each larger &beta; the mean KL must fall by at least a third and the return must fall; and at &beta; = 3 the KL must be under 0.02.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>shaped_rewards</code> is one list comprehension. The log-ratio is policy minus reference.</li>
+      <li>Collect log-probabilities with <code>log_softmax(old[s])[a]</code> and <code>log_softmax(ref[s])[a]</code> at the time of the rollout, from the frozen &pi;<sub>old</sub>.</li>
+      <li>Build <code>groups = {}</code> from state to <code>(actions, advantages)</code>; the advantage of a step is its shaped return-to-go minus <code>V[s]</code> before V is updated.</li>
+      <li>The step for state s is <code>lr * (n_s / N) * ppo_gradient(table[s], old[s], acts, advs, eps)</code>, with <code>n_s</code> the steps in that state and <code>N</code> the total, so the sum over states is a mean over steps.</li>
+      <li>If the KL does not fall as &beta; grows, print the average of the shaped penalty: it should be positive at a policy that has moved away from the reference.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> kl_k3(logp, logp_ref):
+    <span class="str">"""Schulman's k3 estimator of KL(pi || ref) from ONE sample drawn from pi:
+    (rho - 1) - log(rho) with rho = pi_ref(a) / pi(a). Always &gt;= 0."""</span>
+    log_rho = logp_ref - logp
+    <span class="kw">return</span> math.exp(log_rho) - <span class="num">1.0</span> - log_rho
+
+<span class="kw">def</span> shaped_rewards(rewards, logps, logps_ref, beta):
+    <span class="str">"""Per-step rewards with the KL penalty of chapter 8: r_t - beta * (log pi(a_t|s_t) - log ref(a_t|s_t))."""</span>
+    <span class="kw">return</span> [r - beta * (lp - lr_) <span class="kw">for</span> r, lp, lr_ <span class="kw">in</span> zip(rewards, logps, logps_ref)]
+
+<span class="kw">def</span> train_ppo_grid(env, ref, beta=<span class="num">0.0</span>, iterations=<span class="num">100</span>, episodes=<span class="num">16</span>, epochs=<span class="num">4</span>, lr=<span class="num">1.0</span>, eps=<span class="num">0.2</span>,
+                   gamma=<span class="num">0.99</span>, v_lr=<span class="num">0.2</span>, seed=<span class="num">0</span>):
+    <span class="str">"""PPO with a KL penalty to the reference table `ref` on the gridworld. Returns (table, V).
+
+    Start from a COPY of `ref` (the tuned model starts as the reference). Each iteration:
+      1. old = a copy of the table; play `episodes` episodes with `old`.
+      2. For every step, log pi_old(a|s) and log ref(a|s); shape the rewards with beta
+         (shaped_rewards), take returns-to-go with gamma, and advantage = G_t - V[s_t].
+      3. Group the steps by state. For each of `epochs` passes, for every state that appears:
+         table[s][k] += lr * (n_s / N) * ppo_gradient(table[s], old[s], actions_s, advs_s, eps)[k],
+         where n_s is the number of steps in that state and N the total number of steps.
+      4. Update V towards the SHAPED returns (update_values-style, with v_lr).
+    """</span>
+    rng = random.Random(seed)
+    table = [row[:] <span class="kw">for</span> row <span class="kw">in</span> ref]
+    V = [<span class="num">0.0</span>] * env.n_states
+    <span class="kw">for</span> _ <span class="kw">in</span> range(iterations):
+        old = [row[:] <span class="kw">for</span> row <span class="kw">in</span> table]
+        eps_data, groups, total = [], {}, <span class="num">0</span>
+        <span class="kw">for</span> _ <span class="kw">in</span> range(episodes):
+            states, actions, rewards = run_episode(env, old, rng)
+            logps = [log_softmax(old[s])[a] <span class="kw">for</span> s, a <span class="kw">in</span> zip(states, actions)]
+            refs = [log_softmax(ref[s])[a] <span class="kw">for</span> s, a <span class="kw">in</span> zip(states, actions)]
+            shaped = shaped_rewards(rewards, logps, refs, beta)
+            eps_data.append((states, actions, shaped))
+            <span class="kw">for</span> s, a, g <span class="kw">in</span> zip(states, actions, returns_to_go(shaped, gamma)):
+                groups.setdefault(s, ([], []))
+                groups[s][<span class="num">0</span>].append(a)
+                groups[s][<span class="num">1</span>].append(g - V[s])
+                total += <span class="num">1</span>
+        <span class="kw">for</span> _ <span class="kw">in</span> range(epochs):
+            <span class="kw">for</span> s, (acts, advs) <span class="kw">in</span> groups.items():
+                g = ppo_gradient(table[s], old[s], acts, advs, eps)
+                w = lr * len(acts) / total
+                <span class="kw">for</span> k <span class="kw">in</span> range(N_ACTIONS):
+                    table[s][k] += w * g[k]
+        update_values(V, eps_data, gamma, v_lr)
+    <span class="kw">return</span> table, V</code></pre>
+  </details>
+</div>
+
+<h2>Run it all</h2>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution</span>
+<span class="out">Lab 2 checks against solution.py
+
+  ✔ Milestone 1: the softmax policy
+      stable softmax, inverse-CDF sampling with one random draw, and onehot(a) - pi agreeing with finite differences
+  ✔ Milestone 2: REINFORCE with a baseline on a bandit
+      hand values, then 3,000 batches of 16 at reward shift +10: gradient spread 1.14 (no baseline), 0.039 (batch mean), 0.041 (leave-one-out);
+      batch of 2: batch-mean averages 0.038, leave-one-out 0.077, truth 0.075;
+      training at shift +10 finds the best arm in 30/30 seeds with leave-one-out and 10/30 with no baseline
+  ✔ Milestone 3: REINFORCE on a gridworld
+      hand values, forced-path episodes, then REINFORCE with a value baseline on the 4 x 4 grid:
+      seed 0: return -0.59 -&gt; 0.91 in training; trained policy reaches the goal in 99% of episodes, V[start] = 0.79
+      seed 1: return -0.65 -&gt; 0.91 in training; trained policy reaches the goal in 98% of episodes, V[start] = 0.88
+      seed 2: return -0.60 -&gt; 0.91 in training; trained policy reaches the goal in 99% of episodes, V[start] = 0.87
+  ✔ Milestone 4: PPO's clipped objective
+      hand values, finite-difference gradient checks on 6 random cases, then the six-armed bandit (100 seeds, batch of 8 reused 10 times):
+      unclipped: expected reward 0.904, stuck on a wrong arm in 18 runs;  clipped: 0.979, stuck in 1
+  ✔ Milestone 5: PPO with a KL penalty
+      hand values, then PPO on the grid starting from the reference policy (average of 2 seeds):
+        beta 0.0: mean KL to the reference 0.365  return +0.89  success 0.98
+        beta 0.3: mean KL to the reference 0.166  return +0.64  success 0.87
+        beta 1.0: mean KL to the reference 0.047  return +0.06  success 0.57
+        beta 3.0: mean KL to the reference 0.006  return -0.53  success 0.27
+
+5/5 milestones passing  (1.9 s)</span></code></pre>
+<p>Every milestone shows a tick, and the numbers above them are the ones this page quotes. If a milestone fails, the message says what was expected, what you produced and the likely mistake; statistical failures print the numbers they measured.</p>
+
+<h2>Look under the hood</h2>
+
+<ul>
+  <li><strong>Why test statistics, not exact values.</strong> Exact numbers would depend on the order in which you consume random numbers (action before reward, or all actions first). The checker therefore asserts properties that every correct implementation shares: an unbiased estimator averages to the truth, a baseline reduces the spread by a factor, a clip prevents a stuck run, a larger &beta; lowers the KL. The thresholds have a wide margin over the reference solution so that legitimate variations pass and the classic bugs (a batch mean for leave-one-out, a sum for a mean, an unclipped "clipped" gradient, a wrong-sign penalty) do not.</li>
+  <li><strong>Where the language model hides.</strong> Replace "state" by "prompt plus tokens so far", "action" by "next token" and the table of logits by a transformer, and every function here maps over. The gradient of the logits flows back into the network by backpropagation; the group of episodes for one prompt is the group of GRPO; the per-step shaped reward is the per-token KL penalty of RLHF. What is lost in the tabular version is generalisation: updating one state's row does nothing for any other, while in a network a single update moves every prompt, which is why clip fractions and KL are logged on every step of a real run.</li>
+  <li><strong>What the milestone 4 table does not show.</strong> It uses advantages normalised within each batch of 8, which is common in practice and has a side effect: a batch where all rewards are equal gives all-zero advantages (the 1e-8 in the denominator keeps it finite). Chapter 14 returns to this when a group of answers is all right or all wrong.</li>
+  <li><strong>Why V is small here and large in practice.</strong> A learned critic is a second network the size of the policy in PPO RLHF; chapter 8 counts 252 GB of model state for a 7B setup. The tabular V is free. That cost is the reason critic-free methods (leave-one-out, GRPO) took over for large models.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"The KL penalty and the clip do the same job, so one of them is enough." They bound different things. The clip limits how much the policy changes between two consecutive iterations and is blind to the total; the penalty charges for the total distance from the reference and does not prevent a single large step. The table of milestone 5 was produced with the clip on, and the drift at &beta; = 0 is still 0.44 nats per visited step, because many small clipped steps add up. Real runs use both, and log both (clip fraction and KL to the reference) on every step.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Reward scale.</strong> In <code>exp_variance.py</code> change the shift from 10 to 100 and to &minus;10. Predict first: does the spread without a baseline grow linearly with the size of the shift, and does a negative shift behave like a positive one? Then change the batch from 16 to 2 and compare the means of the batch-mean and leave-one-out estimates at every shift: the shrinkage should not depend on the shift at all. Why?</li>
+    <li><strong>Break the clip.</strong> In <code>exp_clip.py</code> try <code>epochs=1</code> and <code>epochs=40</code> with and without the clip. When does reuse stop paying for itself? Then make the clip one-sided: in your own copy of <code>is_clipped</code>, remove the "wrong way" cases (clip whenever r is outside the range, regardless of the sign of A) and see which runs get stuck.</li>
+    <li><strong>The wrong-sign penalty.</strong> In your <code>shaped_rewards</code> use <code>+ beta *</code> instead of <code>- beta *</code> and run <code>exp_kl.py</code>. The KL now rises a little with &beta; instead of falling, and the success rate collapses. Explain what the agent is being paid for (print a few shaped return-to-go values), and what a real run would show in its KL curve.</li>
+    <li><strong>Move the reference.</strong> Change <code>reference_table</code> to prefer left and up (the wrong way). Even at &beta; = 0 the policy now fails to learn within 100 iterations (its success rate stays near zero). Why does a reference that never reaches the goal starve the gradient, and what does that say about starting RL from a model that almost never produces a correct answer (<a href="../chapters/14-rlvr-grpo.html">chapter 14</a>)?</li>
+  </ol>
+</div>
+
+<h2>Stretch goals</h2>
+
+<ul>
+  <li><strong>Group-relative advantage.</strong> Replace the value baseline of milestone 3 with a group baseline: sample K = 8 episodes per start state (use random starting cells) and set the advantage to (R &minus; mean) / (std + 1e-8) within the group. This is GRPO in miniature; compare its learning curve with the learned baseline (<a href="../chapters/14-rlvr-grpo.html">chapter 14</a>).</li>
+  <li><strong>Generalised advantage estimation.</strong> Implement GAE(&gamma;, &lambda;) from the V table and sweep &lambda; from 0 to 1, watching the bias-variance trade-off of <a href="../chapters/09-value-functions.html">chapter 9</a>.</li>
+  <li><strong>A stochastic gridworld.</strong> Make each move slip to a random direction with probability 0.2. The policy that skirts the pits stops being optimal; does the learned policy change, and does a larger &beta; help or hurt?</li>
+  <li><strong>Adaptive KL.</strong> Instead of a fixed &beta;, raise it by 10% when the measured KL exceeds a target and lower it by 10% when it falls below half of it (the controller used by early RLHF implementations). Plot &beta; and the KL over training.</li>
+  <li><strong>A policy with shared parameters.</strong> Replace the table by a linear softmax policy over a feature vector for each state (row, column, distance to the goal) and train with the same code. Watch what one update now does to states it did not visit.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>The loop of this lab is also the shape of the infrastructure. The "rollout" box is generation: memory-bound, dominated by the KV cache and best served by a batching engine (<a href="../chapters/18-kv-cache.html">KV cache</a>, <a href="../chapters/20-serving-engines.html">serving engines</a>), and it is usually the slow part of an RL step. The "update" box is ordinary training with all its memory pressure (<a href="../chapters/02-gpu-memory.html">GPU memory</a>), with a reference model and sometimes a critic held next to the policy. The old log-probabilities that PPO's ratio needs must be recorded at rollout time, from the same weights that generated the tokens; if the serving engine and the trainer disagree numerically (different kernels, different precision) the ratio is not 1 at the first step and the clip statistics lie. That mismatch can be a source of instability in RL training, and it is one reason a trainer may recompute the log-probabilities itself instead of trusting the serving engine's.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>The policy gradient of a softmax policy is A &middot; (onehot(a) &minus; &pi;) averaged over samples. It is unbiased, and its noise scales with the size of the rewards unless a baseline removes the common part.</li>
+    <li>A leave-one-out baseline is unbiased and needs no second model; the batch mean includes the sample's own reward and shrinks the gradient by (B &minus; 1)/B, which is half at B = 2.</li>
+    <li>Returns-to-go weight each step by what followed it; a learned state-value baseline helps when returns sit far from zero and matters less when they straddle it.</li>
+    <li>PPO's ratio lets one batch be reused. The clipped objective passes gradient while the sample's ratio is inside the range or on the wrong side of it, and stops it when the sample has already moved far enough in the helpful direction. The clip is not a hard constraint on the policy.</li>
+    <li>The KL penalty charges each sampled action &beta; (log &pi; &minus; log &pi;<sub>ref</sub>). A larger &beta; lowers the drift and the reward together; k3 is a non-negative unbiased estimate to log.</li>
+    <li>Every step of the loop can be tested in isolation: by hand, against finite differences, and by sampling its bias and variance.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A training loop computes each sample's advantage as its reward minus the mean reward of the whole batch of 2 samples. Compared with the true policy gradient, the expected update is:</p>
+    <ol class="q-options">
+      <li>Unbiased, because subtracting any constant leaves the gradient unchanged</li>
+      <li>Half the size, because the baseline contains the sample's own reward</li>
+      <li>Twice the size, because two samples are averaged</li>
+      <li>Zero, because the two advantages sum to zero</li>
+    </ol>
+    <div class="q-explain">A baseline leaves the gradient unchanged only if it does not depend on the sampled action. The batch mean includes the sample's own reward, which scales the expected gradient by (B &minus; 1)/B, here 1/2. The advantages do sum to zero, but each is multiplied by a different score vector, so the update is not zero. Leave-one-out removes the problem.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">In PPO with &epsilon; = 0.2, a sampled token has advantage &minus;1 and its probability under the current policy is 1.5 times its probability under the old one. What happens to its gradient?</p>
+    <ol class="q-options">
+      <li>It is zero, because the ratio is outside [0.8, 1.2]</li>
+      <li>It is zero, because the advantage is negative</li>
+      <li>It is clipped to the value at r = 1.2</li>
+      <li>It passes through unclipped and pushes the token's probability down</li>
+    </ol>
+    <div class="q-explain">The min of r&middot;A = &minus;1.5 and clip(r)&middot;A = &minus;1.2 is &minus;1.5, the unclipped term, so the gradient is live. The clip blocks overshoots in the helpful direction, not corrections of a mistake: a bad token that became more likely must still be pushed down. The first option is the tempting one, because it is true for A = +1.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">A run uses &beta; = 0 and ends with a high reward and a large KL to the reference. You raise &beta; to 1. Which pair of changes should you expect?</p>
+    <ol class="q-options">
+      <li>Lower KL and lower reward: the policy stays closer to the reference and gives up some reward</li>
+      <li>Lower KL and higher reward: staying close makes the reward model more reliable</li>
+      <li>The same KL and lower reward: the penalty only changes the reward</li>
+      <li>Higher KL and higher reward: the penalty acts as an exploration bonus</li>
+    </ol>
+    <div class="q-explain">The penalty trades reward for closeness. In the lab, going from &beta; = 0 to 1 cut the mean KL from 0.44 to 0.03 and the return from 0.88 to &minus;0.03. Higher true reward at a higher &beta; can happen when the reward signal is exploitable far from the reference, but on this grid the reward is exact and the trade is monotone.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">An episode has rewards 0, 0, 1 and &gamma; = 0.9. What are the returns-to-go, and which is the weight of the first action in REINFORCE (before any baseline)?</p>
+    <ol class="q-options">
+      <li>[1, 1, 1]; the weight is 1</li>
+      <li>[0.9, 0.9, 1]; the weight is 0.9</li>
+      <li>[0.81, 0.9, 1]; the weight is 0.81</li>
+      <li>[0, 0, 1]; the weight is 0</li>
+    </ol>
+    <div class="q-explain">G<sub>2</sub> = 1, G<sub>1</sub> = 0 + 0.9 &times; 1 = 0.9, G<sub>0</sub> = 0 + 0.9 &times; 0.9 = 0.81. The first action gets credit for the later reward, discounted twice. Using the raw rewards would give the first action no credit at all, and ignoring the discount gives every action the same weight.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">You reuse a batch of 8 samples for ten gradient steps with the clip on and still see the ratio of one sampled action reach 1.4 at &epsilon; = 0.2. Which explanation is correct?</p>
+    <ol class="q-options">
+      <li>There is a bug: a clipped objective keeps every ratio inside [0.8, 1.2]</li>
+      <li>This is possible: the clip zeroes the gradient of samples already past the boundary, but other samples' gradients and shared parameters can still push it further</li>
+      <li>The learning rate must be zero for that sample, so the ratio should not change</li>
+      <li>The clip applies to the advantage, not to the ratio, so the ratio is unbounded by design</li>
+    </ol>
+    <div class="q-explain">The clip is a rule for which samples contribute gradient, not a projection of the policy. In the lab's drift experiment the clipped run still reaches a change of 0.37 against a clip range of 0.2, while the unclipped run exceeds 4. A real run therefore logs the clip fraction and the KL, instead of assuming the ratio is bounded.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

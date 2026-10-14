@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serving Engines · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/llm20-batching.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="20">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Serving Engines</h1>
+  <p class="lede">A model that is fast for one user can be slow and wasteful for a thousand. Serving engines such as vLLM and SGLang close that gap with three ideas: schedule work one token at a time (continuous batching), manage the KV cache like virtual memory (paged attention), and never compute the same prefix twice (prefix caching). This chapter builds each from the problem it solves.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Most teams that run their own models do not write a serving system; they configure one. The settings that matter (how many sequences to run at once, how much memory to give the cache, how big a prompt chunk may be) only make sense if you know what the scheduler is doing. This chapter explains the machinery behind those settings, so that when latency spikes at high load, or throughput is half what the hardware should allow, you can say which mechanism is responsible. It builds directly on <a href="18-kv-cache.html">chapter 18</a> (the KV cache and the memory-bound decode loop) and feeds <a href="22-token-economics.html">chapter 22</a> (what a token costs).</p>
+</div>
+
+<h2>Serving is a scheduling problem</h2>
+
+<p>Chapter 18 established two facts. Generating each token requires a forward pass that reads all the weights from HBM, so a single sequence leaves the arithmetic units mostly idle. And each running sequence owns a KV cache that grows by one entry per token. Both facts point at the same remedy: run many sequences in the same forward pass, so the cost of reading the weights is shared. The larger the batch, the more tokens per second per GPU, until the arithmetic units are busy or memory runs out.</p>
+
+<p>The hard part is that requests do not come in neat batches. They arrive at random times, prompts have different lengths, and nobody knows in advance how many tokens an answer will take: one request ends after 5 tokens, another after 800. A serving engine is therefore a scheduler with three jobs.</p>
+<ol class="steps">
+  <li><strong>Decide who runs in each step.</strong> Which waiting requests join the batch, which running ones continue, and how much prompt work to mix in with the decoding.</li>
+  <li><strong>Decide where the cache lives.</strong> Every running request needs KV memory that grows unpredictably; the engine must allocate it without wasting most of the GPU.</li>
+  <li><strong>Avoid repeated work.</strong> Many requests start with the same text (a system prompt, a document, a chat history); recomputing it each time wastes compute and delays the first token.</li>
+</ol>
+
+<p>Three numbers describe how well it does. <span class="term">Time to first token</span> (TTFT) is how long a user waits before the answer begins, dominated by queueing and prefill. <span class="term">Inter-token latency</span> (ITL, also called time per output token) is the gap between consecutive tokens once streaming starts. <span class="term">Throughput</span> is total tokens per second across all users. A good engine raises throughput without letting the other two grow past what the product tolerates: the same trade-off as in any queueing system (<a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>), with the twist that here the unit of work is a single token and the "server" processes many at once.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 90" role="img" aria-label="Three measures for one streamed answer on a timeline: time to first token from request arrival to the first token, inter-token latency between successive tokens, and total latency to the last token.">
+    <defs><marker id="ahLT20m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <line x1="30" y1="50" x2="730" y2="50" class="line"/>
+    <circle cx="40" cy="50" r="6" class="f-green"/><text x="40" y="76" text-anchor="middle" class="t-xs">request</text>
+    <circle cx="300" cy="50" r="5" class="f-blue"/><circle cx="360" cy="50" r="5" class="f-blue"/><circle cx="420" cy="50" r="5" class="f-blue"/><circle cx="480" cy="50" r="5" class="f-blue"/><circle cx="540" cy="50" r="5" class="f-blue"/><circle cx="600" cy="50" r="5" class="f-blue"/><circle cx="700" cy="50" r="5" class="f-blue"/>
+    <line x1="42" y1="30" x2="298" y2="30" class="line" marker-end="url(#ahLT20m)"/>
+    <text x="170" y="22" text-anchor="middle" class="t-xs t-bold">TTFT: queue + prefill</text>
+    <line x1="362" y1="30" x2="418" y2="30" class="line" marker-end="url(#ahLT20m)"/>
+    <text x="390" y="22" text-anchor="middle" class="t-xs t-bold">ITL</text>
+    <text x="500" y="76" text-anchor="middle" class="t-xs t-muted">one dot per generated token</text>
+    <text x="700" y="76" text-anchor="middle" class="t-xs">last token</text>
+  </svg>
+  <figcaption><strong>Three clocks for one request.</strong> Time to first token covers waiting and prompt processing; inter-token latency is the steady rhythm of decoding; total latency is the sum over all tokens. Chapter 22 returns to how they trade against throughput.</figcaption>
+</figure>
+
+<h2>Continuous batching</h2>
+
+<h3>The problem with static batches</h3>
+
+<p>The textbook way to batch is static: collect <em>B</em> requests, run them together until every one has finished, return the results, then collect the next <em>B</em>. For a model that produces a fixed-size output (an image classifier) this is ideal. For text generation it is wasteful, because the batch runs as long as its longest member. A request that needed 20 tokens sits in its slot, producing nothing, while a neighbour generates 500. Worse, nothing is returned until the whole batch ends, so short requests wait for long ones.</p>
+
+<p>Yu and colleagues (2022), in "Orca: A Distributed Serving System for Transformer-Based Generative Models" (OSDI 2022), named the fix <span class="term">iteration-level scheduling</span>: make the scheduling decision after every single decode iteration, not after every request. The batch is just whoever is running right now. When a request emits its end-of-sequence token, it leaves immediately and its answer is returned; a waiting request takes the freed slot on the very next step. This is now called <span class="term">continuous batching</span> (or in-flight batching).</p>
+
+<p>The simulation below makes the difference concrete. It draws 400 requests with a long-tailed output length (mean about 100 tokens, a few near 500), gives the GPU 16 batch slots, and assumes each decode step takes the same time whatever the number of running sequences. That assumption holds roughly while decode is memory-bound; it ignores prefill, which later sections add back.</p>
+
+<pre class="terminal" data-title="batching.py"><code>&quot;&quot;&quot;Static versus continuous batching for 400 requests with random output lengths.
+One decode step produces one token for every running request; step time is taken as constant (memory-bound decode).&quot;&quot;&quot;
+import random
+
+rng = random.Random(7)
+N, SLOTS = 400, 16
+lengths = [max(5, min(500, int(rng.lognormvariate(4.3, 0.9)))) for _ in range(N)]   # output tokens per request
+print(f&quot;{N} requests, output length mean {sum(lengths)/N:.0f}, median {sorted(lengths)[N//2]}, max {max(lengths)}; {SLOTS} batch slots&quot;)
+
+def static(lengths):
+    t, done, useful = 0, [], 0
+    for i in range(0, len(lengths), SLOTS):
+        batch = lengths[i:i + SLOTS]
+        t0 = t
+        t += max(batch)                          # the batch runs until its longest request finishes
+        done += [t] * len(batch)                 # every request is returned only when the batch ends
+        useful += sum(batch)
+    return t, done, useful
+
+def continuous(lengths):
+    t, queue, running, done, useful = 0, list(lengths), [], [], 0
+    while queue or running:
+        while queue and len(running) &lt; SLOTS:    # refill free slots at every step
+            running.append(queue.pop(0))
+        t += 1
+        useful += len(running)
+        running = [r - 1 for r in running]
+        done += [t] * sum(1 for r in running if r == 0)
+        running = [r for r in running if r &gt; 0]
+    return t, done, useful
+
+print(f&quot;{&#x27;policy&#x27;:&lt;12}{&#x27;steps&#x27;:&gt;7}{&#x27;tokens/step&#x27;:&gt;13}{&#x27;slot use&#x27;:&gt;10}{&#x27;mean latency&#x27;:&gt;14}{&#x27;p95 latency&#x27;:&gt;13}&quot;)
+for name, f in ((&quot;static&quot;, static), (&quot;continuous&quot;, continuous)):
+    t, done, useful = f(lengths)
+    d = sorted(done)
+    print(f&quot;{name:&lt;12}{t:&gt;7}{useful/t:&gt;13.2f}{useful/(t*SLOTS):&gt;10.0%}{sum(d)/N:&gt;14.0f}{d[int(.95*N)]:&gt;13}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>400 requests, output length mean 100, median 68, max 500; 16 batch slots
+policy        steps  tokens/step  slot use  mean latency  p95 latency
+static         8644         4.61       29%          4336         8512
+continuous     2674        14.90       93%          1239         2404</code></pre>
+
+<p>Static batching keeps the slots busy only 29% of the time and finishes in 8,644 steps. Continuous batching fills the slots 93% of the time and finishes in 2,674 steps: 3.2 times the throughput from the same GPU, and a mean time to finish of 1,239 steps instead of 4,336. (Every request is queued at step 0 here, so the latencies include waiting; the ratio is what matters.) The gain depends on how variable the lengths are. If every request produced exactly 100 tokens the two policies would tie; the longer the tail, the more static batching wastes.</p>
+
+<div class="widget" id="llm20-batching">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Static versus continuous batching</h4></div>
+  <div class="l20-ctl">
+    <div><label>Batch slots: <output data-act="slots-out">8</output></label><input type="range" min="2" max="16" value="8" data-act="slots" aria-label="Batch slots"></div>
+    <div><label>Length spread: <output data-act="spread-out">0.8</output></label><input type="range" min="0" max="15" value="8" data-act="spread" aria-label="Spread of output lengths"></div>
+    <div><label>Requests: <output data-act="n-out">24</output></label><input type="range" min="8" max="64" value="24" data-act="n" aria-label="Number of requests"></div>
+    <div><button class="btn" data-act="new" type="button">New random lengths</button></div>
+  </div>
+  <p class="widget-help">Each row is a batch slot, each coloured bar is one request, and bar length is how many decode steps it needs. Gaps are idle slots. Both charts use the same requests and the same time axis. Set the spread to 0 and the policies tie.</p>
+  <p class="widget-help"><strong>Static batching</strong></p>
+  <svg class="l20-chart l20-static" role="img" aria-label="Timeline of requests in batch slots under static batching"></svg>
+  <p class="widget-help"><strong>Continuous batching</strong></p>
+  <svg class="l20-chart l20-cont" role="img" aria-label="Timeline of requests in batch slots under continuous batching"></svg>
+  <div class="l20-stats"><div class="widget-out l20-stat-s"></div><div class="widget-out l20-stat-c"></div></div>
+</div>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the bus and the ski lift</p>
+  <p>Static batching is a bus that leaves only when full and does not let anyone off until the last passenger's stop. Continuous batching is a ski lift: a chair leaves every few seconds, people get on whenever a seat is free and get off at their own stop, and the lift never waits for the slowest skier.</p>
+  <p><em>Where it breaks down:</em> a ski lift's seats are interchangeable, but each LLM request brings its own memory (the KV cache) that stays on the GPU for as long as the request runs. A free slot is only useful if there is also free cache memory for the newcomer, which is the subject of the next section.</p>
+</div>
+
+<h3>What a step contains</h3>
+
+<p>With iteration-level scheduling, the batch in one step is a mixture: some requests are in their prefill (processing a whole prompt, thousands of tokens), others are decoding one token each. Orca's second idea, <span class="term">selective batching</span>, handles the awkwardness of running such a mixture through one pass. Most of a transformer's operations (the linear layers and the normalisations) treat each token independently, so all tokens in the step, from all requests, can be flattened into one matrix and processed together. Attention is the exception: each token attends only to its own request's cache, so attention is computed per request. Modern engines work the same way: the model sees a flat list of tokens plus metadata saying which request each belongs to and where its cache blocks are.</p>
+
+<h2>Paged attention</h2>
+
+<h3>Why memory, not slots, is the limit</h3>
+
+<p>Continuous batching can only fill a slot if the KV cache for a new request fits. Chapter 18 computed the cache per token: 128 KiB for the Llama 3 8B shape. The difficulty is that a request's final length is unknown, and the early engines stored each sequence's cache in one contiguous slab of memory. To be safe, they reserved room for the maximum possible length when the request arrived.</p>
+
+<p>Kwon and colleagues (2023), in "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023), measured what this wasted. They report that in existing systems only 20.4% to 38.2% of the KV cache memory held actual token states. The rest was lost three ways: <span class="term">reservation</span> (space held for tokens not yet generated, and that may never be), <span class="term">internal fragmentation</span> (the part of a reservation never used because the sequence ended early), and <span class="term">external fragmentation</span> (gaps between slabs too small for any new request).</p>
+
+<p>The fix borrows from operating systems. A process thinks it has a large contiguous address space, but the OS stores it in fixed-size pages scattered through physical memory, with a page table translating between them (<a href="../../systems/chapters/06-virtual-memory.html">virtual memory</a>). <span class="term">PagedAttention</span> does the same for the KV cache. The cache is divided into fixed-size <span class="term">blocks</span> of tokens (16 by default in vLLM, per the paper). A sequence's cache is a list of block numbers, its <span class="term">block table</span>, and the attention kernel is written to follow the table, gathering keys and values from wherever the blocks happen to be. Blocks are allocated one at a time as the sequence grows and returned to a free list when it ends.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 204" role="img" aria-label="Comparison of two memory layouts for three sequences. Top: contiguous reservation, where each sequence has a long slab with a small used part, a large reserved but unused part, and gaps between slabs. Bottom: paged layout, where each sequence has just enough blocks, all slots are used except part of each last block, and blocks of different sequences are interleaved.">
+    <text x="20" y="18" class="t-sm t-bold">Contiguous reservation (maximum length per request)</text>
+    <rect x="20" y="28" width="720" height="34" rx="4" class="box"/>
+    <rect x="22" y="30" width="60" height="30" class="f-blue"/><rect x="82" y="30" width="170" height="30" class="f-red" opacity="0.35"/>
+    <rect x="262" y="30" width="45" height="30" class="f-green"/><rect x="307" y="30" width="185" height="30" class="f-red" opacity="0.35"/>
+    <rect x="512" y="30" width="90" height="30" class="f-purple"/><rect x="602" y="30" width="110" height="30" class="f-red" opacity="0.35"/>
+    <text x="52" y="78" text-anchor="middle" class="t-xs">A used</text><text x="167" y="78" text-anchor="middle" class="t-xs tc-red">A reserved, unused</text>
+    <text x="400" y="78" text-anchor="middle" class="t-xs tc-red">B reserved, unused</text><text x="557" y="78" text-anchor="middle" class="t-xs">C used</text>
+    <text x="20" y="116" class="t-sm t-bold">Paged blocks (allocated as the sequence grows)</text>
+    <rect x="20" y="126" width="720" height="34" rx="4" class="box"/>
+    <g>
+      <rect x="22" y="128" width="40" height="30" class="f-blue"/><rect x="64" y="128" width="40" height="30" class="f-green"/><rect x="106" y="128" width="40" height="30" class="f-purple"/><rect x="148" y="128" width="40" height="30" class="f-blue"/>
+      <rect x="190" y="128" width="40" height="30" class="f-purple"/><rect x="232" y="128" width="40" height="30" class="f-purple"/><rect x="274" y="128" width="40" height="30" class="f-blue"/>
+      <rect x="316" y="128" width="40" height="30" class="f-green"/><rect x="358" y="128" width="40" height="30" class="f-purple"/>
+    </g>
+    <text x="20" y="178" class="t-xs t-muted">Colours are sequences A, B, C. Only the last block of each sequence has unused slots.</text><text x="20" y="193" class="t-xs t-muted">The empty blocks on the right go to whichever request needs them next.</text>
+  </svg>
+  <figcaption><strong>The same three sequences, two layouts.</strong> Reserving the maximum length strands memory inside each reservation (red) and between them. Paging gives each sequence just the blocks it has filled; the waste is bounded by one partly filled block per sequence. Not to scale.</figcaption>
+</figure>
+
+<h3>Blocks, tables and sharing</h3>
+
+<p>Step through what the block manager does for two requests that begin with the same system prompt.</p>
+
+<div class="widget stepper" data-autoplay-ms="4500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">Block tables: how two requests share GPU memory</h4></div>
+  <svg viewBox="0 0 760 330" role="img" aria-label="Eight physical KV cache blocks in a row. Above them is the block table of request A, below it the block table of request B. Arrows map each logical block to a physical block. Request A gets scattered blocks, request B shares the first two with A, A finishes and frees its private blocks, and finally B finishes and its shared blocks stay cached.">
+    <defs><marker id="ahLT20s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="18" class="t-xs t-muted">Request A: logical blocks (16 tokens each)</text>
+    <text x="740" y="216" text-anchor="end" class="t-xs t-muted">GPU memory: physical blocks, in no particular order</text>
+    <text x="20" y="318" class="t-xs t-muted">Request B: logical blocks</text>
+    <rect x="20" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="60" y="198" text-anchor="middle" class="t-xs t-faint">P0</text>
+    <rect x="110" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="150" y="198" text-anchor="middle" class="t-xs t-faint">P1</text>
+    <rect x="200" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="240" y="198" text-anchor="middle" class="t-xs t-faint">P2</text>
+    <rect x="290" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="330" y="198" text-anchor="middle" class="t-xs t-faint">P3</text>
+    <rect x="380" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="420" y="198" text-anchor="middle" class="t-xs t-faint">P4</text>
+    <rect x="470" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="510" y="198" text-anchor="middle" class="t-xs t-faint">P5</text>
+    <rect x="560" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="600" y="198" text-anchor="middle" class="t-xs t-faint">P6</text>
+    <rect x="650" y="140" width="80" height="46" rx="6" class="box"/>
+    <text x="690" y="198" text-anchor="middle" class="t-xs t-faint">P7</text>
+    <g data-steps="1-3" data-active="1"><rect x="110" y="28" width="80" height="34" rx="6" class="fs-blue s-blue sw-2"/><text x="150" y="49" text-anchor="middle" class="t-xs t-bold">A:L0</text></g>
+    <g data-steps="1-3"><rect x="230" y="28" width="80" height="34" rx="6" class="fs-blue s-blue sw-2"/><text x="270" y="49" text-anchor="middle" class="t-xs t-bold">A:L1</text></g>
+    <g data-steps="1-3"><rect x="350" y="28" width="80" height="34" rx="6" class="fs-blue s-blue sw-2"/><text x="390" y="49" text-anchor="middle" class="t-xs t-bold">A:L2</text></g>
+    <g data-steps="2-3" data-active="2"><rect x="470" y="28" width="80" height="34" rx="6" class="fs-blue s-blue sw-2"/><text x="510" y="49" text-anchor="middle" class="t-xs t-bold">A:L3</text></g>
+    <g data-steps="1-3"><line x1="150" y1="62" x2="150" y2="140" class="line s-blue" marker-end="url(#ahLT20s)"/></g>
+    <g data-steps="1-3"><line x1="270" y1="62" x2="330" y2="140" class="line s-blue" marker-end="url(#ahLT20s)"/></g>
+    <g data-steps="1-3"><line x1="390" y1="62" x2="60" y2="140" class="line s-blue" marker-end="url(#ahLT20s)"/></g>
+    <g data-steps="2-3"><line x1="510" y1="62" x2="600" y2="140" class="line s-blue" marker-end="url(#ahLT20s)"/></g>
+    <g data-steps="3-4" data-active="3"><rect x="110" y="262" width="80" height="34" rx="6" class="fs-cyan s-cyan sw-2"/><text x="150" y="283" text-anchor="middle" class="t-xs t-bold">B:L0</text></g>
+    <g data-steps="3-4"><line x1="150" y1="262" x2="150" y2="186" class="line s-cyan" marker-end="url(#ahLT20s)"/></g>
+    <g data-steps="3-4"><rect x="230" y="262" width="80" height="34" rx="6" class="fs-cyan s-cyan sw-2"/><text x="270" y="283" text-anchor="middle" class="t-xs t-bold">B:L1</text></g>
+    <g data-steps="3-4"><line x1="270" y1="262" x2="330" y2="186" class="line s-cyan" marker-end="url(#ahLT20s)"/></g>
+    <g data-steps="3-4"><rect x="350" y="262" width="80" height="34" rx="6" class="fs-green s-green sw-2"/><text x="390" y="283" text-anchor="middle" class="t-xs t-bold">B:L2</text></g>
+    <g data-steps="3-4"><line x1="390" y1="262" x2="420" y2="186" class="line s-green" marker-end="url(#ahLT20s)"/></g>
+    <g data-steps="1-2"><rect x="110" y="140" width="80" height="46" rx="6" class="fs-blue s-blue sw-2"/><text x="150" y="159" text-anchor="middle" class="t-xs t-bold">A:L0 16/16</text><text x="150" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="1-2"><rect x="290" y="140" width="80" height="46" rx="6" class="fs-blue s-blue sw-2"/><text x="330" y="159" text-anchor="middle" class="t-xs t-bold">A:L1 16/16</text><text x="330" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="1"><rect x="20" y="140" width="80" height="46" rx="6" class="fs-blue s-blue sw-2"/><text x="60" y="159" text-anchor="middle" class="t-xs t-bold">A:L2 8/16</text><text x="60" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="2-3"><rect x="20" y="140" width="80" height="46" rx="6" class="fs-blue s-blue sw-2"/><text x="60" y="159" text-anchor="middle" class="t-xs t-bold">A:L2 16/16</text><text x="60" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="2-3"><rect x="560" y="140" width="80" height="46" rx="6" class="fs-blue s-blue sw-2"/><text x="600" y="159" text-anchor="middle" class="t-xs t-bold">A:L3 1/16</text><text x="600" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="3"><rect x="110" y="140" width="80" height="46" rx="6" class="fs-cyan s-cyan sw-2"/><text x="150" y="159" text-anchor="middle" class="t-xs t-bold">prefix 0-15</text><text x="150" y="176" text-anchor="middle" class="t-xs">ref 2</text></g>
+    <g data-steps="3"><rect x="290" y="140" width="80" height="46" rx="6" class="fs-cyan s-cyan sw-2"/><text x="330" y="159" text-anchor="middle" class="t-xs t-bold">prefix 16-31</text><text x="330" y="176" text-anchor="middle" class="t-xs">ref 2</text></g>
+    <g data-steps="3-4"><rect x="380" y="140" width="80" height="46" rx="6" class="fs-green s-green sw-2"/><text x="420" y="159" text-anchor="middle" class="t-xs t-bold">B:L2 12/16</text><text x="420" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="4"><rect x="110" y="140" width="80" height="46" rx="6" class="fs-cyan s-cyan sw-2"/><text x="150" y="159" text-anchor="middle" class="t-xs t-bold">prefix 0-15</text><text x="150" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="4"><rect x="290" y="140" width="80" height="46" rx="6" class="fs-cyan s-cyan sw-2"/><text x="330" y="159" text-anchor="middle" class="t-xs t-bold">prefix 16-31</text><text x="330" y="176" text-anchor="middle" class="t-xs">ref 1</text></g>
+    <g data-steps="5" data-active="5"><rect x="110" y="140" width="80" height="46" rx="6" class="fs-cyan s-cyan sw-2" stroke-dasharray="5 3"/><text x="150" y="159" text-anchor="middle" class="t-xs t-bold">cached</text><text x="150" y="176" text-anchor="middle" class="t-xs">ref 0</text><rect x="290" y="140" width="80" height="46" rx="6" class="fs-cyan s-cyan sw-2" stroke-dasharray="5 3"/><text x="330" y="159" text-anchor="middle" class="t-xs t-bold">cached</text><text x="330" y="176" text-anchor="middle" class="t-xs">ref 0</text></g>
+    <g data-steps="5"><rect x="150" y="230" width="460" height="34" rx="8" class="box"/><text x="380" y="252" text-anchor="middle" class="t-xs t-bold">A and B are gone; a new request with the same prompt hits P1 and P3</text></g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>A arrives with a 40-token prompt.</strong> It needs three 16-token blocks. The allocator hands out whichever physical blocks are free (P1, P3, P0); nothing requires them to be adjacent. The block table maps logical block numbers to physical ones, like a page table. The last block is only half full.</li>
+    <li><strong>A decodes nine more tokens.</strong> The third block fills up and the next token needs a fourth, so one more block (P6) is taken. Memory is allocated one block at a time as the sequence grows, so at most 15 slots are ever wasted per sequence, instead of a whole maximum-length reservation.</li>
+    <li><strong>B arrives with the same first 32 tokens.</strong> A hash of each full block (chained with the previous block's hash) finds that P1 and P3 already hold exactly this prefix. B's table points at them and their reference count becomes 2. Only B's own 12 extra tokens need a new block (P4). Nothing was recomputed or copied for the shared 32 tokens.</li>
+    <li><strong>A finishes.</strong> A's private blocks (P0 and P6) go back to the free list. The shared blocks stay because B still references them: their count drops to 1.</li>
+    <li><strong>B finishes.</strong> P4 is freed. P1 and P3 now have no users, but the engine does not clear them: they stay as cached prefix blocks (dashed) until memory is needed, when the least recently used are evicted first. The next request with this prompt reuses them for free.</li>
+  </ol>
+</div>
+
+
+<p>Two further properties follow from the table. First, blocks can be <strong>shared</strong>: when several sequences need the same content (the n outputs of a request that asks for n samples, the branches of beam search, or any common prefix), their tables point at the same physical blocks, with a <span class="term">reference count</span> saying how many sequences use each. Second, if one of them must write into a shared block (the next token lands in a partly filled block that others also hold), the engine uses <span class="term">copy-on-write</span>: allocate a new block, copy the contents, drop the reference to the old one, then write. The paper reports memory savings from sharing of 6.1% to 30.5% for parallel sampling and 37.6% to 66.3% for beam search, depending on the dataset.</p>
+
+<p>The cost of paging is that attention must follow the table: a custom kernel gathers from scattered blocks. The paper reports that vLLM, built on this, improves throughput by 2 to 4 times over systems such as FasterTransformer and Orca at similar latency, with larger gains for longer sequences and larger models. (Treat the figures as the authors' own measurements on 2023 hardware and models; the direction has held up.)</p>
+
+<h3>What the memory policy is worth</h3>
+
+<p>The next script gives two policies the same workload and the same cache budget: 20,000 tokens of KV cache (about 2.4 GiB for the 8B shape) and 300 requests with prompts averaging 320 tokens and outputs averaging 210. One policy reserves the maximum length of 2,048 tokens per request. The other allocates 16-token blocks on demand. When a growing sequence finds no free block, the paged policy preempts the most recently admitted sequence and later restarts it from scratch (recomputation, one of the two policies the paper describes; the other is swapping the blocks to CPU memory). Lost decode work is charged as extra steps; the recomputed prompt processing is not charged, which flatters the paged result slightly.</p>
+
+<pre class="terminal" data-title="paging.py"><code>&quot;&quot;&quot;KV cache memory policies under the same workload: reserve the maximum length, versus allocate 16-token blocks on demand.
+Capacity is counted in tokens of KV cache (one 8B-model token is 128 KiB, so 20,000 tokens is about 2.4 GiB: an illustrative budget).&quot;&quot;&quot;
+import random
+
+CAPACITY, BLOCK, MAXLEN, N = 20_000, 16, 2048, 300
+rng = random.Random(11)
+reqs = []
+for _ in range(N):
+    p = max(20, min(1500, int(rng.lognormvariate(5.5, 0.8))))       # prompt tokens
+    o = max(10, min(MAXLEN - p, int(rng.lognormvariate(5.0, 0.9)))) # output tokens
+    reqs.append((p, o))
+print(f&quot;{N} requests: mean prompt {sum(p for p,_ in reqs)/N:.0f}, mean output {sum(o for _,o in reqs)/N:.0f}, reservation {MAXLEN} tokens, capacity {CAPACITY} tokens&quot;)
+
+def run(policy):
+    waiting, running, steps, tokens = list(range(N)), {}, 0, 0
+    used_sum = alloc_sum = batch_sum = preempt = 0
+    blocks_free = CAPACITY // BLOCK
+    def need_blocks(n): return -(-n // BLOCK)
+    while waiting or running:
+        # admit (first come first served)
+        while waiting:
+            i = waiting[0]; p, o = reqs[i]
+            if policy == &quot;reserve&quot;:
+                cost = need_blocks(MAXLEN)               # whole maximum length up front
+            else:
+                cost = need_blocks(p + 1)                # just the prompt (plus the first token)
+            if cost &gt; blocks_free: break
+            blocks_free -= cost; waiting.pop(0)
+            running[i] = {&quot;len&quot;: p, &quot;gen&quot;: 0, &quot;blocks&quot;: cost}
+        # one decode step: every running sequence adds one token
+        for i in list(running):
+            if i not in running: continue                # preempted earlier in this step
+            s = running[i]
+            if need_blocks(s[&quot;len&quot;] + 1) &gt; s[&quot;blocks&quot;]:
+                if blocks_free == 0:                     # out of memory: preempt the newest sequence, recompute later
+                    victim = max(running)
+                    blocks_free += running[victim][&quot;blocks&quot;]; del running[victim]
+                    waiting.insert(0, victim); preempt += 1
+                    if victim == i: continue
+                blocks_free -= 1; s[&quot;blocks&quot;] += 1
+            s[&quot;len&quot;] += 1; s[&quot;gen&quot;] += 1
+        steps += 1
+        used_sum += sum(s[&quot;len&quot;] for s in running.values())
+        alloc_sum += sum(s[&quot;blocks&quot;] for s in running.values()) * BLOCK
+        batch_sum += len(running)
+        for i in [i for i, s in running.items() if s[&quot;gen&quot;] &gt;= reqs[i][1]]:
+            tokens += reqs[i][1]
+            blocks_free += running[i][&quot;blocks&quot;]; del running[i]
+    return steps, tokens, batch_sum / steps, used_sum / alloc_sum, preempt
+
+print(f&quot;{&#x27;policy&#x27;:&lt;16}{&#x27;steps&#x27;:&gt;7}{&#x27;mean batch&#x27;:&gt;12}{&#x27;tokens/step&#x27;:&gt;13}{&#x27;allocated memory holding tokens&#x27;:&gt;34}{&#x27;preemptions&#x27;:&gt;13}&quot;)
+for name in (&quot;reserve&quot;, &quot;paged&quot;):
+    steps, tokens, batch, util, pre = run(name)
+    print(f&quot;{name:&lt;16}{steps:&gt;7}{batch:&gt;12.1f}{tokens/steps:&gt;13.1f}{util:&gt;34.0%}{pre:&gt;13}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>300 requests: mean prompt 320, mean output 210, reservation 2048 tokens, capacity 20000 tokens
+policy            steps  mean batch  tokens/step   allocated memory holding tokens  preemptions
+reserve            7145         8.8          8.8                               25%            0
+paged              2233        28.7         28.2                               99%          188</code></pre>
+
+<p>With reservation, only 25% of allocated memory holds real tokens, the mean batch is 8.8 and the whole workload takes 7,145 steps. With blocks, 99% of allocated memory holds tokens, the mean batch is 28.7, and it takes 2,233 steps: a 3.2 times gain, in the same range as the paper's 2 to 4 times though the settings are different. The price is 188 preemptions: with memory this full, growth sometimes cannot be satisfied and someone is evicted. Real engines hold back a margin of free blocks and prefer swapping or recomputation depending on block size (the paper finds block sizes from 16 to 64 perform comparably, and that recomputation overhead never exceeds 20% of swapping's latency).</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Paged attention makes attention itself faster." It does not; the arithmetic is the same and the gather from scattered blocks costs a little. What it changes is how many sequences fit in memory at once, which raises the batch size, and a bigger batch is what raises throughput. If your workload never fills the cache (short prompts, few users), paging gains little.</p>
+</div>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Architecture of an LLM serving engine. Clients send requests to an API server that tokenises them and streams tokens back. The API server passes requests to a scheduler holding a waiting queue and a running set, backed by a KV block manager. Each step the scheduler sends a batch to the model workers on the GPU, which return one new token per running request.">
+    <defs><marker id="ahLT20a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="14" y="50" width="96" height="60" rx="8" class="fs-green s-green sw-2"/>
+    <text x="62" y="76" text-anchor="middle" class="t-sm t-bold">Clients</text><text x="62" y="94" text-anchor="middle" class="t-xs t-muted">HTTP, SSE</text>
+    <rect x="160" y="50" width="120" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="220" y="74" text-anchor="middle" class="t-sm t-bold">API server</text><text x="220" y="92" text-anchor="middle" class="t-xs t-muted">tokenise, stream</text>
+    <rect x="330" y="30" width="190" height="100" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="425" y="52" text-anchor="middle" class="t-sm t-bold">Scheduler</text>
+    <rect x="344" y="62" width="76" height="26" rx="5" class="fs-orange s-orange sw-2"/><text x="382" y="79" text-anchor="middle" class="t-xs">waiting</text>
+    <rect x="430" y="62" width="76" height="26" rx="5" class="fs-yellow s-yellow sw-2"/><text x="468" y="79" text-anchor="middle" class="t-xs">running</text>
+    <text x="425" y="112" text-anchor="middle" class="t-xs t-muted">pick work for the next step</text>
+    <rect x="570" y="50" width="176" height="60" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="658" y="74" text-anchor="middle" class="t-sm t-bold">GPU workers</text><text x="658" y="92" text-anchor="middle" class="t-xs t-muted">forward pass, sampling</text>
+    <rect x="330" y="190" width="190" height="60" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="425" y="214" text-anchor="middle" class="t-sm t-bold">KV block manager</text><text x="425" y="232" text-anchor="middle" class="t-xs t-muted">free list, block tables, hashes</text>
+    <rect x="570" y="190" width="176" height="60" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="658" y="214" text-anchor="middle" class="t-sm t-bold">HBM</text><text x="658" y="232" text-anchor="middle" class="t-xs t-muted">weights + KV blocks</text>
+    <line x1="110" y1="68" x2="158" y2="68" class="line" marker-end="url(#ahLT20a)"/>
+    <line x1="158" y1="94" x2="110" y2="94" class="line-dash" marker-end="url(#ahLT20a)"/>
+    <line x1="280" y1="68" x2="328" y2="68" class="line" marker-end="url(#ahLT20a)"/>
+    <line x1="328" y1="94" x2="280" y2="94" class="line-dash" marker-end="url(#ahLT20a)"/>
+    <line x1="520" y1="68" x2="568" y2="68" class="line" marker-end="url(#ahLT20a)"/>
+    <line x1="568" y1="94" x2="520" y2="94" class="line-dash" marker-end="url(#ahLT20a)"/>
+    <line x1="425" y1="130" x2="425" y2="188" class="line" marker-end="url(#ahLT20a)"/>
+    <line x1="658" y1="110" x2="658" y2="188" class="line" marker-end="url(#ahLT20a)"/>
+    <text x="545" y="58" text-anchor="middle" class="t-xs t-faint">batch</text>
+    <text x="545" y="108" text-anchor="middle" class="t-xs t-faint">tokens</text>
+    <text x="435" y="164" text-anchor="start" class="t-xs t-faint">allocate / free blocks</text>
+    <text x="668" y="164" text-anchor="start" class="t-xs t-faint">read, write KV</text>
+    <text x="20" y="284" class="t-xs t-muted">Solid arrows: work going in. Dashed arrows: tokens coming back. One loop per step.</text>
+  </svg>
+  <figcaption><strong>Every serving engine has this shape.</strong> The scheduler decides, step by step, which requests run; the block manager decides where their KV entries live; the workers do the arithmetic. Blue is computation, orange the waiting queue, purple state, green the client.</figcaption>
+</figure>
+
+
+<h2>Prefix caching</h2>
+
+<p>Block tables make a third idea cheap. A large share of real prompts begin identically: the system prompt of a product, the tool definitions of an agent, the few-shot examples of a classifier, the long document a user is asking several questions about, the whole history of a conversation resent on every turn. The KV entries for a prefix depend only on the tokens in it (because attention is causal: a token never looks at later ones), so if two requests share a prefix, the cache for it is identical and need not be computed twice.</p>
+
+<p>vLLM's <span class="term">automatic prefix caching</span> hashes each full block. A block's hash combines the hash of the previous block, the tokens in this block, and any extra keys that must separate otherwise-equal prompts (a LoRA adapter id, an image hash, a cache salt for tenant isolation), according to the vLLM design documentation. Chaining the hashes means a block's hash identifies the entire prefix up to and including it. A new request hashes its prompt block by block; for each hash found in the cache it reuses the physical block and skips computing it. Blocks of finished requests are kept rather than cleared and evicted least-recently-used first when memory is needed; the documentation notes that a request's blocks are freed in reverse order so that its last blocks, least likely to be reused, go first. Only full blocks are cached, so the final partial block of a prompt is always recomputed.</p>
+
+<p>The script below builds this from scratch (same chained hash, LRU with deepest-first eviction) and runs 60 chats of 6 turns each against a shared 800-token system prompt, interleaved as real traffic would be, with each turn resending the conversation so far.</p>
+
+<pre class="terminal" data-title="prefix_cache.py"><code>&quot;&quot;&quot;Automatic prefix caching: KV blocks are keyed by a hash of (previous block hash, this block&#x27;s tokens), so two prompts
+that share a prefix share its blocks. Workload: a shared system prompt, then multi-turn chats that resend their history.&quot;&quot;&quot;
+import random
+from collections import OrderedDict
+
+BLOCK = 16
+rng = random.Random(5)
+def toks(n): return [rng.randrange(50_000) for _ in range(n)]
+
+class PrefixCache:
+    def __init__(self, capacity_blocks):
+        self.cap, self.lru = capacity_blocks, OrderedDict()
+        self.hit_tokens = self.total_tokens = 0
+    def process(self, prompt):
+        h, hit, chain = 0, True, []
+        for i in range(0, len(prompt) - len(prompt) % BLOCK, BLOCK):   # only full blocks are cached
+            h = hash((h, tuple(prompt[i:i + BLOCK])))
+            chain.append(h)
+            if h in self.lru:
+                if hit: self.hit_tokens += BLOCK
+            else:
+                hit = False                                            # first miss: the rest must be computed
+                self.lru[h] = True
+        for h in reversed(chain):                                      # touch deepest first, so on ties the deepest block is evicted first
+            if h in self.lru: self.lru.move_to_end(h)
+        while len(self.lru) &gt; self.cap: self.lru.popitem(last=False)   # evict least recently used
+        self.total_tokens += len(prompt)
+
+SYSTEM = toks(800)
+def workload(n_chats=60, turns=6):
+    chats = [SYSTEM + toks(rng.randrange(20, 80)) for _ in range(n_chats)]
+    reqs = []
+    for t in range(turns):                                  # interleave: every chat sends turn t, then turn t+1 ...
+        for c in range(n_chats):
+            reqs.append(list(chats[c]))
+            chats[c] = chats[c] + toks(rng.randrange(150, 300)) + toks(rng.randrange(20, 80))   # reply + next user message
+    return reqs
+
+reqs = workload()
+print(f&quot;{len(reqs)} requests, mean prompt {sum(map(len, reqs))/len(reqs):.0f} tokens, shared system prompt 800 tokens&quot;)
+print(f&quot;{&#x27;cache size&#x27;:&gt;18}{&#x27;tokens reused&#x27;:&gt;16}&quot;)
+for cap in (0, 50, 500, 3000, 10_000):
+    c = PrefixCache(cap)
+    for r in reqs: c.process(r)
+    print(f&quot;{cap:&gt;8} blocks ({cap*BLOCK:&gt;7} tok){c.hit_tokens/c.total_tokens:&gt;13.0%}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>360 requests, mean prompt 1549 tokens, shared system prompt 800 tokens
+        cache size   tokens reused
+       0 blocks (      0 tok)           0%
+      50 blocks (    800 tok)          52%
+     500 blocks (   8000 tok)          52%
+    3000 blocks (  48000 tok)          60%
+   10000 blocks ( 160000 tok)          84%</code></pre>
+
+<p>The shared system prompt is 52% of the average prompt, and a cache of 50 blocks (exactly the 800 tokens) captures it: that is the first and cheapest win. To reuse conversation histories as well, the cache must hold every active chat's history, since turn <em>t+1</em> of a chat arrives after the other 59 chats have each sent a turn. At 3,000 blocks reuse reaches 60%, at 10,000 it reaches 84%; the remainder is each turn's genuinely new text. The lesson is about sizing: the cache must be large enough to hold the working set between visits, or the entries are evicted just before they would have been reused. The memory comes out of the same pool as running sequences, so prefix caching competes with batch size.</p>
+
+<h3>The radix tree</h3>
+
+<p>SGLang (Zheng et al., 2023, "SGLang: Efficient Execution of Structured Language Model Programs") stores the same information differently. <span class="term">RadixAttention</span> keeps the cached prompts and outputs in a <span class="term">radix tree</span>: a tree whose edges are runs of tokens and where two prompts share a path for as long as they share tokens. A new request walks from the root as far as it matches and computes only the remainder. The authors' blog describes LRU eviction applied recursively to leaf nodes, so a node is evicted only after everything below it, and the tree lives on the CPU while the KV tensors stay on the GPU. The paper reports up to 6.4 times higher throughput than leading inference systems on tasks that reuse prefixes heavily, such as multi-call "programs" and agents.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 260" role="img" aria-label="A radix tree of cached prompts. The root leads to one shared system-prompt node of 800 tokens. Below it are three chat nodes, with 410, 230 and 390 tokens of history. Chats one and two have a second-turn child node. Leaves are evicted first; the shared node is used by every request and is evicted last.">
+    <defs><marker id="ahLT20r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <circle cx="40" cy="120" r="14" class="fs-purple s-purple sw-2"/><text x="40" y="146" text-anchor="middle" class="t-xs t-muted">root</text>
+    <rect x="100" y="94" width="170" height="52" rx="8" class="fs-cyan s-cyan sw-3"/>
+    <text x="185" y="116" text-anchor="middle" class="t-sm t-bold">System prompt</text><text x="185" y="134" text-anchor="middle" class="t-xs">800 tokens, used by 3</text>
+    <rect x="340" y="24" width="150" height="48" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="415" y="45" text-anchor="middle" class="t-sm t-bold">Chat 1</text><text x="415" y="62" text-anchor="middle" class="t-xs">+410 tokens</text>
+    <rect x="340" y="98" width="150" height="48" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="415" y="119" text-anchor="middle" class="t-sm t-bold">Chat 2</text><text x="415" y="136" text-anchor="middle" class="t-xs">+230 tokens</text>
+    <rect x="340" y="172" width="150" height="48" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="415" y="193" text-anchor="middle" class="t-sm t-bold">Chat 3</text><text x="415" y="210" text-anchor="middle" class="t-xs">+390 tokens</text>
+    <rect x="570" y="24" width="170" height="48" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="655" y="45" text-anchor="middle" class="t-sm t-bold">Chat 1, turn 2</text><text x="655" y="62" text-anchor="middle" class="t-xs">+260 tokens (leaf)</text>
+    <rect x="570" y="98" width="170" height="48" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="655" y="119" text-anchor="middle" class="t-sm t-bold">Chat 2, turn 2</text><text x="655" y="136" text-anchor="middle" class="t-xs">+300 tokens (leaf)</text>
+    <line x1="54" y1="120" x2="98" y2="120" class="line" marker-end="url(#ahLT20r)"/>
+    <line x1="270" y1="108" x2="338" y2="52" class="line" marker-end="url(#ahLT20r)"/>
+    <line x1="270" y1="120" x2="338" y2="122" class="line" marker-end="url(#ahLT20r)"/>
+    <line x1="270" y1="132" x2="338" y2="190" class="line" marker-end="url(#ahLT20r)"/>
+    <line x1="490" y1="48" x2="568" y2="48" class="line" marker-end="url(#ahLT20r)"/>
+    <line x1="490" y1="122" x2="568" y2="122" class="line" marker-end="url(#ahLT20r)"/>
+    <text x="20" y="250" class="t-xs t-muted">Evict least recently used leaves first (yellow, then chat 3). A node with a running request below it is pinned.</text>
+  </svg>
+  <figcaption><strong>A radix tree stores prompts by shared prefix.</strong> Each edge holds a run of tokens; a new prompt walks down from the root as far as it matches and only the rest needs computing. Cyan marks cached context; yellow marks the leaves that go first when memory runs short.</figcaption>
+</figure>
+
+
+<p>Both designs capture the same effect; the difference is mostly how the lookup is organised (hashes of blocks versus tokens in a tree) and how fine the granularity is. SGLang's tree can match to the exact token, while block hashing can only reuse whole blocks. SGLang also pairs the cache with scheduling that prefers requests with long cache hits, so that related requests run while their shared prefix is still in memory.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Almost every mechanism here is an old one in a new place. The block table is a page table (<a href="../../systems/chapters/06-virtual-memory.html">virtual memory</a>); copy-on-write is how <code>fork</code> shares memory (<a href="../../systems/chapters/05-processes.html">processes</a>); the scheduler's choice of what runs next is the subject of <a href="../../systems/chapters/07-scheduling.html">scheduling</a>; prefix caching with LRU and a working set is the <a href="../../design/chapters/06-distributed-cache.html">cache design</a> you already know, where the hit rate depends on whether capacity covers the working set. The dedicated lab for these ideas is <a href="../labs/lab-06-serving-sim.html">Lab 6: A Serving Simulator</a>, and the original system is the subject of <a href="../cases/case-04-vllm.html">Case 4: vLLM and PagedAttention</a>.</p>
+</div>
+
+<h2>Prefill versus decode inside one step</h2>
+
+<p>Chapter 18 explained that the two phases have opposite characters. Prefill processes thousands of prompt tokens at once and is compute-bound; decode processes one token per sequence and is memory-bound. Putting them in the same step creates a problem. A 4,000-token prefill takes much longer than a decode step, and every decoding user must wait for it to finish before receiving their next token. To everyone mid-answer, the arrival of a long prompt looks like a stall.</p>
+
+<h3>Chunked prefill</h3>
+
+<p>Agrawal and colleagues (2024), in "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve", split each prefill into near-equal <span class="term">chunks</span> and give each step a <span class="term">token budget</span>: decodes go first (one token each), and the remaining budget is filled with the next chunk of a waiting prompt. They call this <em>stall-free batching</em>, because new requests are added without pausing ongoing decodes. Their reported capacity gains under tail-latency limits include 2.6 times for Mistral-7B on one A100 and up to 3.7 times for Yi-34B on two, compared with vLLM at the time. The vLLM V1 engine writes the same idea into its scheduler: each scheduling decision is a map from request to a number of tokens for this step, without a separate prefill or decode phase, which subsumes chunked prefill and prefix caching.</p>
+
+<p>The script uses an assumed cost model (20 ms fixed per step, 0.05 ms per token processed; the numbers are illustrative, not measured on any GPU) with eight users decoding and a new 4,000-token prompt every second.</p>
+
+<pre class="terminal" data-title="chunked_prefill.py"><code>&quot;&quot;&quot;Why long prompts stall other users&#x27; streams, and what chunked prefill changes.
+Step time model (ASSUMED, illustrative): 20 ms fixed cost to stream the weights + 0.05 ms per token processed in the step.
+8 users are decoding; every 1 s a new 4,000-token prompt arrives.&quot;&quot;&quot;
+FIXED, PER_TOK, DECODERS, PROMPT, GAP = 20.0, 0.05, 8, 4000, 1000.0
+
+def simulate(budget, horizon=20_000.0):
+    t, next_arrival, pending, itl, ttft = 0.0, 0.0, [], [], []
+    while t &lt; horizon:
+        if t &gt;= next_arrival:
+            pending.append([PROMPT, next_arrival]); next_arrival += GAP
+        tokens = DECODERS                                  # every decoding user advances by one token
+        room = budget - tokens if budget else PROMPT       # prefill tokens allowed in this step
+        if pending and room &gt; 0:
+            take = min(room, pending[0][0]); pending[0][0] -= take; tokens += take
+        dt = FIXED + PER_TOK * tokens
+        t += dt
+        itl.append(dt)                                     # gap between consecutive tokens seen by each decoding user
+        if pending and pending[0][0] == 0:
+            ttft.append(t - pending[0][1]); pending.pop(0)
+    itl.sort()
+    return itl[len(itl)//2], itl[int(len(itl)*0.99)], max(itl), sum(ttft)/len(ttft)
+
+print(f&quot;{&#x27;policy&#x27;:&lt;28}{&#x27;median ITL&#x27;:&gt;11}{&#x27;p99 ITL&#x27;:&gt;9}{&#x27;worst ITL&#x27;:&gt;11}{&#x27;prompt TTFT&#x27;:&gt;13}   (ms)&quot;)
+for name, b in ((&quot;whole prompt in one step&quot;, 0), (&quot;chunked, 2048 tokens/step&quot;, 2048), (&quot;chunked, 512 tokens/step&quot;, 512), (&quot;chunked, 128 tokens/step&quot;, 128)):
+    m, p99, mx, tt = simulate(b)
+    print(f&quot;{name:&lt;28}{m:&gt;11.1f}{p99:&gt;9.1f}{mx:&gt;11.1f}{tt:&gt;13.0f}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>policy                       median ITL  p99 ITL  worst ITL  prompt TTFT   (ms)
+whole prompt in one step           20.4    220.4      220.4          231
+chunked, 2048 tokens/step          20.4    122.4      122.4          251
+chunked, 512 tokens/step           20.4     45.6       45.6          373
+chunked, 128 tokens/step           26.4     26.4       26.4          904</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two timelines of GPU steps. In the first, a 4,000-token prompt arrives at 60 milliseconds and is processed in a single 220 millisecond step, during which no other user receives a token. In the second, the same prompt is processed in eight chunks of about 46 milliseconds mixed with the decode steps, so other users wait at most 46 milliseconds between tokens.">
+    <defs><marker id="ahLT20c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="32" class="t-sm t-bold">Whole prompt in one step</text>
+    <rect x="60.0" y="40" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="88.6" y="40" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="117.1" y="40" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="145.7" y="40" width="307.1" height="34" rx="2" class="f-orange"/>
+    <rect x="454.2" y="40" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="482.8" y="40" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="511.4" y="40" width="27.1" height="34" rx="2" class="f-blue"/>
+    <text x="20" y="142" class="t-sm t-bold">Chunked, 512 tokens per step</text>
+    <rect x="60.0" y="150" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="88.6" y="150" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="117.1" y="150" width="27.1" height="34" rx="2" class="f-blue"/>
+    <rect x="145.7" y="150" width="62.3" height="34" rx="2" class="f-orange"/>
+    <rect x="209.5" y="150" width="62.3" height="34" rx="2" class="f-orange"/>
+    <rect x="273.4" y="150" width="62.3" height="34" rx="2" class="f-orange"/>
+    <rect x="337.2" y="150" width="62.3" height="34" rx="2" class="f-orange"/>
+    <rect x="401.0" y="150" width="62.3" height="34" rx="2" class="f-orange"/>
+    <rect x="464.9" y="150" width="62.3" height="34" rx="2" class="f-orange"/>
+    <line x1="60" y1="108" x2="740" y2="108" class="line-thin"/>
+    <text x="144" y="122" text-anchor="middle" class="t-xs tc-orange">prompt arrives (60 ms)</text>
+    <text x="20" y="214" class="t-xs t-muted">time, 0 to 480 ms. Blue: a step with only decode work. Orange: a step that also does prefill work.</text>
+    <text x="298" y="94" text-anchor="middle" class="t-xs t-bold">220 ms with no token for anyone</text>
+    <text x="326" y="204" text-anchor="middle" class="t-xs t-bold">every step about 46 ms</text>
+  </svg>
+  <figcaption><strong>The same prompt, scheduled two ways.</strong> Each rectangle is one step of the engine. Without chunking, users who are mid-answer see a pause as long as the whole prefill. With a per-step token budget, the prefill is spread over several steps and each step is short. The prompt itself finishes later, which is the price. Step lengths come from the assumed cost model of the script above.</figcaption>
+</figure>
+
+
+<p>The table shows the knob. A whole-prompt step stalls every decoding user for 220 ms, and that is the p99 inter-token latency, ten times the median of 20 ms. A budget of 512 tokens per step cuts the worst stall to 46 ms, at the cost of the prompt taking 373 ms to its first token instead of 231 ms. With 128 tokens the stalls nearly vanish (26 ms) but the prompt takes 904 ms. The right budget depends on which latency the product promises: an interactive chat protects inter-token latency, a batch summariser does not care. This is why <code>--max-num-batched-tokens</code> is one of the settings worth understanding.</p>
+
+<h3>Disaggregation</h3>
+
+<p>A different answer is to stop sharing GPUs between the phases. Zhong and colleagues (2024), in "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving" (OSDI 2024), run prefill and decode on separate GPUs, so they no longer interfere, and tune the parallelism of each to its own latency target. They report serving 7.4 times more requests, or meeting 12.6 times tighter latency targets, than state-of-the-art systems on their workloads. The price is moving each request's KV cache from the prefill GPU to the decode GPU over the interconnect, which is why the approach pays off most when the network is fast and the workload is large enough to keep both pools busy.</p>
+
+<h2>Inside the engines</h2>
+
+<p>The architecture in the figure above is common to vLLM, SGLang and their relatives. The loop runs once per step.</p>
+<ol class="steps">
+  <li><strong>Collect arrivals.</strong> The API server tokenises new requests and hands them to the scheduler's waiting queue.</li>
+  <li><strong>Schedule.</strong> The scheduler orders running requests first, then admits waiting ones while the token budget and free blocks allow. It asks the block manager for blocks, reusing cached ones where hashes match. If a running request needs a block and none is free, it preempts a request (by default the newest) to free its blocks.</li>
+  <li><strong>Run the step.</strong> Workers execute one forward pass over the flattened tokens of all scheduled requests. On multi-GPU models, the layers are split by tensor parallelism (<a href="03-parallelism.html">chapter 3</a>) and each step ends with collective communication.</li>
+  <li><strong>Sample.</strong> One new token is chosen per request that finished its prompt (or last chunk) using the request's decoding settings (<a href="../../deep-learning/chapters/15-decoding.html">A2 chapter 15</a>).</li>
+  <li><strong>Return and retire.</strong> New tokens stream to clients; requests that produced an end token or hit their limit release their blocks.</li>
+</ol>
+
+<p>Engineering detail is where much of the speed comes from, because at small batch sizes a step takes only tens of milliseconds and CPU work between steps becomes visible. The vLLM V1 announcement (January 2025) describes isolating a core loop that does only scheduling and model execution, with tokenisation, detokenisation and streaming in separate processes so the CPU work overlaps with GPU execution; a persistent batch that applies per-step diffs instead of rebuilding inputs; and <code>torch.compile</code> with piecewise CUDA graphs. It reports up to 1.7 times higher throughput than the previous engine, attributed mainly to reduced CPU overhead, and turned prefix caching on by default after measuring under 1% throughput loss even at a 0% hit rate. Those are the vendor's own measurements.</p>
+
+<p>The two projects have different emphases. vLLM grew from the memory manager outwards and aims to be a general high-throughput server for many models, quantisation formats and hardware backends. SGLang grew from the programming side: a frontend for multi-call programs (branching, parallel calls, constrained output) and a runtime built around RadixAttention, so it is especially strong where requests share structure, as in agent loops and few-shot pipelines. Both now implement the same core techniques (continuous batching, paged KV, prefix caching, chunked prefill, quantisation, speculative decoding), and each release shifts the benchmark gap, so treat any head-to-head table as a snapshot.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>vLLM and SGLang are the two most widely used open-source engines; others exist, including NVIDIA's TensorRT-LLM and Hugging Face's Text Generation Inference, and llama.cpp for CPUs and laptops. Versions move monthly: aggregator sites in October 2026 reported vLLM releases in the 0.2x series, but I could not confirm the current number from the project's own release page, so check <code>github.com/vllm-project/vllm/releases</code> before relying on any flag or default. The behaviour of settings such as chunked prefill and prefix caching differs between versions (the V1 engine enables prefix caching by default, per its announcement). This chapter's mechanisms have been stable since 2023; the defaults are not.</p>
+</div>
+
+<h3>The settings that matter</h3>
+
+<p>This is how a deployment is typically started. The command is illustrative and was not run here; flag names are those documented for vLLM at the time of writing and may differ in your version.</p>
+
+<pre class="terminal" data-title="serve.sh (illustrative, not run here)"><code><span class="prompt">$</span> <span class="cmd">vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.90 \
+    --max-num-seqs 128 \
+    --max-num-batched-tokens 2048 \
+    --enable-prefix-caching</span></code></pre>
+
+<dl class="terms">
+  <dt><code>--max-model-len</code></dt><dd>The longest sequence (prompt plus output) accepted. It bounds the worst case for one request and so how many can be admitted safely.</dd>
+  <dt><code>--gpu-memory-utilization</code></dt><dd>The fraction of GPU memory the engine may claim. After loading the weights and measuring peak activation memory, whatever remains within this share becomes the pool of KV blocks. Too high risks out-of-memory errors from other processes; too low wastes cache.</dd>
+  <dt><code>--max-num-seqs</code></dt><dd>The cap on concurrent sequences, the "slots" of the simulation. Higher raises throughput and inter-token latency together.</dd>
+  <dt><code>--max-num-batched-tokens</code></dt><dd>The token budget per step, which with chunked prefill sets the chunk size and so the trade in the table above.</dd>
+</dl>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Run the scripts, then break them on purpose.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 batching.py</span>
+<span class="prompt">$</span> <span class="cmd">sed -i.bak 's/SLOTS = 400, 16/SLOTS = 400, 64/' batching.py &amp;&amp; python3 batching.py</span></code></pre>
+  <p>(Edit the line <code>N, SLOTS = 400, 16</code> by hand if your <code>sed</code> differs.) Questions to answer: how does the throughput ratio change with 64 slots, and why? Change the length distribution in <code>batching.py</code> to a constant 100 tokens and confirm the policies tie. In <code>paging.py</code>, set <code>CAPACITY</code> to 100,000 and ask whether paging still matters; then set <code>MAXLEN</code> to 512 (and cap the outputs accordingly) and ask the same. In <code>prefix.py</code>, change the interleaving so each chat sends all six turns in a row before the next chat starts, and predict what a 50-block cache will do before you run it.</p>
+</div>
+
+<h2>When it goes wrong</h2>
+
+<p>Serving engines fail in characteristic ways, and each traces to a mechanism above.</p>
+<ul>
+  <li><strong>Latency climbs with load.</strong> Adding concurrent sequences raises the time per step (more tokens, more KV to read), so inter-token latency rises gradually with batch size, while the waiting queue grows sharply once demand exceeds capacity, the "latency knee" of <a href="../../reliability/chapters/08-queueing-theory.html">queueing theory</a>. Admission control and load shedding apply here exactly as in any service (<a href="../../reliability/chapters/11-overload.html">overload</a>).</li>
+  <li><strong>Preemption storms.</strong> If the cache is nearly full, sequences are repeatedly evicted and recomputed, and the engine does the same work over and over. The symptoms are rising preemption counters and throughput that falls as load rises. Fix by lowering <code>--max-num-seqs</code>, giving the cache more memory, shortening the maximum context, or quantising the cache.</li>
+  <li><strong>Tail latency from long prompts.</strong> One huge prompt can raise everyone's latency if prefill is not chunked or the token budget is large. Watch p99 inter-token latency, not the mean (<a href="../../reliability/chapters/09-tail-latency.html">tail latency</a>).</li>
+  <li><strong>A cold cache after a deploy.</strong> A restart empties the prefix cache, so the first minutes are slower and the hit rate recovers gradually; routing requests with the same prefix to the same replica keeps caches warm.</li>
+  <li><strong>Isolation across tenants.</strong> A shared prefix cache can leak timing information about other users' prompts (a hit is faster than a miss). That is why block hashes can include a salt per tenant, at the cost of sharing less (<a href="../../security/chapters/15-multi-tenancy.html">security</a> covers multi-tenancy).</li>
+</ul>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Throughput comes from batching, but requests have unpredictable lengths. Continuous (iteration-level) batching lets requests join and leave every step; in the chapter's simulation it gave 3.2 times the throughput of static batching.</li>
+    <li>Contiguous per-request reservation wastes most of the KV cache (20.4% to 38.2% used in the systems the vLLM paper measured). Paged attention allocates fixed-size blocks through a block table, bounding waste to one partial block per sequence.</li>
+    <li>Block tables enable sharing: reference counts, copy-on-write, and prefix caching by chained block hashes (vLLM) or a radix tree (SGLang).</li>
+    <li>A long prefill stalls everyone else's decoding. Chunked prefill spreads it over steps under a token budget, trading the new prompt's first-token time for others' smoothness. Disaggregation separates the phases onto different GPUs.</li>
+    <li>The settings (maximum sequences, token budget, memory share, context length) map directly to these mechanisms, and preemption, queue length and p99 inter-token latency are the metrics to watch.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023)</a>. The vLLM paper: the waste measurements, block tables, copy-on-write and preemption.</li>
+  <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu" target="_blank" rel="noopener">Yu et al., "Orca: A Distributed Serving System for Transformer-Based Generative Models" (OSDI 2022)</a>. Iteration-level scheduling and selective batching. (Not fetched here; cited from the published paper.)</li>
+  <li><a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs" (2023)</a>. RadixAttention and the frontend language.</li>
+  <li><a href="https://arxiv.org/abs/2403.02310" target="_blank" rel="noopener">Agrawal et al., "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve" (2024)</a>. Chunked prefill and stall-free batching.</li>
+  <li><a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener">Zhong et al., "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving" (OSDI 2024)</a>. Separating the two phases onto different GPUs.</li>
+  <li><a href="https://vllm.ai/blog/2025-01-27-v1-alpha-release" target="_blank" rel="noopener">vLLM team, "vLLM V1: A Major Upgrade to vLLM's Core Architecture" (January 2025)</a>. The engine-loop redesign and default prefix caching.</li>
+  <li><a href="https://docs.vllm.ai/en/latest/design/prefix_caching/" target="_blank" rel="noopener">vLLM documentation, "Automatic Prefix Caching" design page</a>. Block hashing and eviction as implemented.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A static-batching server handles a batch of 16 requests whose output lengths are 12, 15, 20, twelve others near 15, plus one that runs to 480 tokens. Roughly what limits its throughput?</p>
+    <ol class="q-options"><li>The weights must be reloaded for every request</li><li>Prefill is slower than decode</li><li>The batch runs 480 steps, during which 15 of the 16 slots are mostly idle</li><li>The KV cache is too large for 16 sequences</li></ol>
+    <div class="q-explain">The batch is held until its longest member ends, so fifteen slots sit empty for most of the run. Continuous batching refills them every step. Option 3 might be true in other settings but nothing in the question says memory is short; option 0 is false, since weights are loaded once per step for the whole batch.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why does paging the KV cache raise throughput if it does not make attention arithmetic any faster?</p>
+    <ol class="q-options"><li>Less wasted memory leaves room for more concurrent sequences, giving a bigger batch</li><li>Blocks are stored in faster memory than contiguous slabs</li><li>It lets the GPU skip attention for old tokens</li><li>It reduces the number of weights to be read</li></ol>
+    <div class="q-explain">Throughput in memory-bound decode grows with batch size, and batch size is limited by how many caches fit. Paging recovers the reserved-but-unused and fragmented memory. The blocks live in the same HBM, nothing is skipped, and the weights are untouched.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">Two requests share a 32-token prefix and the block size is 16. The second request is sent after the first has finished. What happens with prefix caching enabled and enough free memory?</p>
+    <ol class="q-options"><li>Nothing is reused, because the first request has finished and its memory was cleared</li><li>Only a request running at the same time can share the blocks</li><li>The whole second prompt is reused, including its different suffix</li><li>The two full prefix blocks are found by hash and reused, and only the remaining tokens are computed</li></ol>
+    <div class="q-explain">Finished requests' blocks are kept with reference count zero and evicted only under memory pressure, so a later request can hit them. Only matching full blocks are reused; the differing suffix must be computed.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">Your chat product shows users a visible pause in streaming whenever someone pastes a very long document. Which change most directly addresses it?</p>
+    <ol class="q-options"><li>Raise the maximum number of concurrent sequences</li><li>Enable chunked prefill with a moderate per-step token budget</li><li>Increase the fraction of GPU memory given to the engine</li><li>Quantise the weights from 16 to 8 bits</li></ol>
+    <div class="q-explain">The pause is a long prefill occupying a whole step while other users wait for their next token; a token budget spreads it over many short steps. More sequences would make steps longer, extra memory does not change step length, and quantisation speeds up all steps but does not remove the stall.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In the prefix-caching simulation, caches of 50 and of 500 blocks both reuse 52% of tokens, yet 10,000 blocks reuse 84%. Why?</p>
+    <ol class="q-options"><li>Cache hits require at least 500 blocks to be enabled</li><li>Larger caches use a better hash function</li><li>Conversation histories only help if the cache can hold all active chats between a chat's turns, otherwise they are evicted before reuse</li><li>The system prompt is evicted once more blocks exist</li></ol>
+    <div class="q-explain">The system prompt is touched by every request, so it stays resident even in a tiny cache. Each chat's history is reused only when that chat returns, after the other chats have each sent a turn; the cache must cover that working set. The hash function and the size threshold play no part.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">An engine preempts and recomputes sequences constantly, and throughput falls as traffic rises. Which action is most likely to help?</p>
+    <ol class="q-options"><li>Lower the cap on concurrent sequences or give the cache more memory</li><li>Increase the per-step token budget</li><li>Disable prefix caching</li><li>Raise the cap on concurrent sequences so the queue is shorter</li></ol>
+    <div class="q-explain">Constant preemption means the admitted sequences' caches grow beyond the pool, so the engine redoes work. Admitting fewer sequences, or enlarging the pool, stops the thrashing. More concurrency makes it worse; the token budget concerns prefill chunking, not memory; disabling prefix caching frees little and removes savings.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/llm20-batching.js"></script>
+</body>
+</html>

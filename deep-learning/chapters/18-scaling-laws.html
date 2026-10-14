@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scaling Laws · Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/dl18-optimal.css">
+</head>
+<body data-root="../.." data-course="dl" data-chapter="18">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Scaling Laws</h1>
+  <p class="lede">Given a fixed budget of compute, should you train a bigger model on fewer tokens or a smaller one on more? This chapter shows that the loss of a language model falls as a smooth power law in model size, data and compute; reproduces the effect in a tiny experiment of our own; derives the compute-optimal recipe from a fitted formula; and explains why practical models now deliberately depart from it.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>A frontier training run costs tens of millions of dollars and cannot be repeated, so the choices of model size and token count have to be right the first time. Scaling laws are how that is done: train many small models, fit a curve, and use it to predict what a run a thousand times larger will achieve. They also explain the history in this part of the course. GPT-3 was large and short of data, Chinchilla showed that was a poor use of compute, and the open models since then are smaller and trained for far longer. After this chapter you can read a "tokens per parameter" figure in a model card, estimate a sensible size for a given budget with the 6ND rule of chapter 16, judge how far to trust an extrapolation, and see why a model built for heavy use is trained beyond its compute-optimal point.</p>
+</div>
+
+<h2>A straight line on log-log paper</h2>
+
+<p>A <span class="term">power law</span> is a relationship y = a &middot; x<sup>b</sup>. Take logarithms and it becomes log y = log a + b log x, a straight line whose slope is the exponent b. Power laws describe quantities that change by the same <em>factor</em> each time x changes by a fixed factor: if b = &minus;0.076, every doubling of x multiplies y by 2<sup>-0.076</sup> = 0.949, a 5% fall, whether x is a thousand or a billion.</p>
+
+<p>Kaplan et al. (2020, "Scaling Laws for Neural Language Models") trained Transformer language models over wide ranges of size, data and compute and found that the test loss follows such laws, with trends "spanning more than seven orders of magnitude". With N the number of non-embedding parameters, D the number of training tokens and C_min the compute of the most efficient run, they fitted</p>
+<ul>
+  <li>L(N) = (N<sub>c</sub>/N)<sup>0.076</sup>, with N<sub>c</sub> = 8.8 &times; 10<sup>13</sup>, when data is plentiful;</li>
+  <li>L(D) = (D<sub>c</sub>/D)<sup>0.095</sup>, with D<sub>c</sub> = 5.4 &times; 10<sup>13</sup> tokens, when the model is large enough;</li>
+  <li>L(C<sub>min</sub>) &prop; C<sub>min</sub><sup>-0.050</sup>, for compute-efficient training.</li>
+</ul>
+<p>The loss here is cross-entropy in nats per token on held-out text (chapter 14). The exponents are small: a tenfold increase in parameters multiplies the loss by only 10<sup>-0.076</sup> = 0.84. Progress is steady and expensive, not sudden. They also found that the architecture details (depth against width, number of heads) matter little compared with the totals N, D and C.</p>
+
+<h3>The same thing in a tiny experiment</h3>
+
+<p>Rather than take that on trust, we can see the effect with models small enough to train in seconds. The script below builds a text source with structure: 400 pseudo-words drawn with Zipf-law frequencies (a few words common, most rare), so the text has a known noise floor. It then trains character-level MLP language models (a window of 8 characters is embedded, passed through one tanh layer of width H, and mapped to a distribution over the 27 characters) at six widths, each on four amounts of training text, one pass over the data each. That is 24 runs. The held-out loss is measured on a fresh sample. Training uses Adam with a warmup and cosine decay (chapter 17). The runs take about 20 seconds in NumPy.</p>
+
+<pre class="terminal" data-title="tiny_scaling.py"><code># A real (tiny) scaling experiment: train character-level MLP language models of several sizes on several amounts of data.
+import numpy as np, time, json, sys
+
+def make_text(n_chars, seed):
+    """Text from a fixed Zipf-distributed vocabulary of 400 pseudo-words, so the data has structure and a noise floor."""
+    vr = np.random.default_rng(12345)                       # the vocabulary is the same for every call
+    letters = np.array(list("abcdefghijklmnopqrstuvwxyz"))
+    words = ["".join(vr.choice(letters, vr.integers(2, 9), p=None)) for _ in range(400)]
+    p = 1 / np.arange(1, 401) ** 1.1; p /= p.sum()
+    rng = np.random.default_rng(seed)
+    out, n = [], 0
+    while n &lt; n_chars:
+        w = words[rng.choice(400, p=p)]; out.append(w); n += len(w) + 1
+    text = " ".join(out)[:n_chars]
+    ent = -(p * np.log(p)).sum() / (sum(len(w) * q for w, q in zip(words, p)) + 1)   # nats per char, if words were known
+    return text, ent
+
+CHARS = "abcdefghijklmnopqrstuvwxyz "; IDX = {c: i for i, c in enumerate(CHARS)}; V = len(CHARS); K = 8; E_DIM = 12
+
+def windows(text):
+    a = np.array([IDX[c] for c in text]); n = len(a) - K
+    X = np.stack([a[i:n + i] for i in range(K)], 1); return X, a[K:K + n]
+
+def init(H, seed):
+    r = np.random.default_rng(seed)
+    return [r.normal(0, .3, (V, E_DIM)), r.normal(0, 1 / np.sqrt(K * E_DIM), (K * E_DIM, H)), np.zeros(H),
+            r.normal(0, 1 / np.sqrt(H), (H, V)), np.zeros(V)]
+
+def forward(P, X):
+    emb = P[0][X].reshape(len(X), -1); h = np.tanh(emb @ P[1] + P[2]); z = h @ P[3] + P[4]
+    z = z - z.max(1, keepdims=True); lp = z - np.log(np.exp(z).sum(1, keepdims=True)); return emb, h, lp
+
+def train(H, D, seed=0, batch=128, lr=4e-3):
+    X, Y = windows(make_text(D + K, seed)[0]); P = init(H, seed); m = [np.zeros_like(p) for p in P]; v = [np.zeros_like(p) for p in P]
+    steps = D // batch
+    for t in range(1, steps + 1):
+        s = (t - 1) * batch; xb, yb = X[s:s + batch], Y[s:s + batch]
+        cur = lr * min(1, t / 50) * (0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * t / steps)))
+        emb, h, lp = forward(P, xb); g = np.exp(lp); g[np.arange(batch), yb] -= 1; g /= batch
+        gh = (g @ P[3].T) * (1 - h ** 2); ge = (gh @ P[1].T).reshape(batch, K, E_DIM)
+        grads = [np.zeros_like(P[0]), emb.T @ gh, gh.sum(0), h.T @ g, g.sum(0)]; np.add.at(grads[0], xb, ge)
+        for i in range(5):
+            m[i] = .9 * m[i] + .1 * grads[i]; v[i] = .95 * v[i] + .05 * grads[i] ** 2
+            P[i] -= cur * (m[i] / (1 - .9 ** t)) / (np.sqrt(v[i] / (1 - .95 ** t)) + 1e-8)
+    Xe, Ye = windows(make_text(40_000 + K, 999)[0]); lp = forward(P, Xe)[2]
+    return float(-lp[np.arange(len(Ye)), Ye].mean()), sum(p.size for p in P)
+
+if __name__ == "__main__":
+    Hs = [4, 8, 16, 32, 64, 128]; Ds = [20_000, 80_000, 320_000, 1_280_000]; res = []
+    print(f"entropy rate of the source if the words were known: {make_text(100, 0)[1]:.3f} nats per character")
+    print(f"{'H':&gt;4} {'N':&gt;8} " + " ".join(f"{'D=' + format(d, ','):&gt;12}" for d in Ds))
+    for H in Hs:
+        row = []
+        for D in Ds:
+            t0 = time.time(); L, N = train(H, D); row.append(L); res.append((N, D, L))
+        print(f"{H:&gt;4} {N:&gt;8,} " + " ".join(f"{l:&gt;12.3f}" for l in row), flush=True)
+    json.dump(res, open("tiny_results.json", "w"))</code></pre>
+<pre class="terminal" data-title="output"><code>entropy rate of the source if the words were known: 0.684 nats per character
+   H        N     D=20,000     D=80,000    D=320,000  D=1,280,000
+   4      847        2.734        2.199        1.980        1.857
+   8    1,343        2.577        1.922        1.598        1.472
+  16    2,335        2.376        1.743        1.421        1.255
+  32    4,319        2.215        1.652        1.278        1.031
+  64    8,287        2.018        1.583        1.157        0.854
+ 128   16,223        1.902        1.561        1.100        0.769</code></pre>
+
+<p>Read across a row: more data lowers the loss at every size. Read down a column: more parameters lower it, until the column flattens, as in the 20,000-token column where doubling a small model barely helps. The plot shows the same table on log-log axes.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 800 270" role="img" aria-label="Log-log plot of held-out loss against parameter count for four training-set sizes, from 20 thousand to 1.28 million characters. Each curve falls as the model grows, and the curves for more data lie lower. The curves bend: they fall steeply for small models and flatten when the model is large relative to its data.">
+    <line x1="70" y1="201.6" x2="710" y2="201.6" class="line-thin"/><text x="64" y="205.6" text-anchor="end" class="t-xs t-muted">0.8</text>
+    <line x1="70" y1="171.0" x2="710" y2="171.0" class="line-thin"/><text x="64" y="175.0" text-anchor="end" class="t-xs t-muted">1</text>
+    <line x1="70" y1="115.3" x2="710" y2="115.3" class="line-thin"/><text x="64" y="119.3" text-anchor="end" class="t-xs t-muted">1.5</text>
+    <line x1="70" y1="75.7" x2="710" y2="75.7" class="line-thin"/><text x="64" y="79.7" text-anchor="end" class="t-xs t-muted">2</text>
+    <line x1="70" y1="20.0" x2="710" y2="20.0" class="line-thin"/><text x="64" y="24.0" text-anchor="end" class="t-xs t-muted">3</text>
+    <line x1="157.7" y1="20" x2="157.7" y2="220" class="line-thin"/><text x="157.7" y="236" text-anchor="middle" class="t-xs t-muted">1,000</text>
+    <line x1="346.2" y1="20" x2="346.2" y2="220" class="line-thin"/><text x="346.2" y="236" text-anchor="middle" class="t-xs t-muted">3,000</text>
+    <line x1="552.8" y1="20" x2="552.8" y2="220" class="line-thin"/><text x="552.8" y="236" text-anchor="middle" class="t-xs t-muted">10,000</text>
+    <text x="390.0" y="256" text-anchor="middle" class="t-xs">parameters N (log scale)</text>
+    <text x="24" y="120.0" transform="rotate(-90 24 120.0)" text-anchor="middle" class="t-xs">held-out loss, nats per char (log)</text>
+    <polyline points="129.2,32.8 208.3,40.9 303.2,52.1 408.7,61.7 520.5,74.5 635.8,82.6" fill="none" class="s-orange sw-2"/>
+    <circle cx="129.2" cy="32.8" r="3.5" class="f-orange"/>
+    <circle cx="208.3" cy="40.9" r="3.5" class="f-orange"/>
+    <circle cx="303.2" cy="52.1" r="3.5" class="f-orange"/>
+    <circle cx="408.7" cy="61.7" r="3.5" class="f-orange"/>
+    <circle cx="520.5" cy="74.5" r="3.5" class="f-orange"/>
+    <circle cx="635.8" cy="82.6" r="3.5" class="f-orange"/>
+    <text x="643.8" y="86.6" class="t-xs t-bold tc-orange">D = 20,000</text>
+    <polyline points="129.2,62.7 208.3,81.2 303.2,94.6 408.7,102.0 520.5,107.9 635.8,109.7" fill="none" class="s-yellow sw-2"/>
+    <circle cx="129.2" cy="62.7" r="3.5" class="f-yellow"/>
+    <circle cx="208.3" cy="81.2" r="3.5" class="f-yellow"/>
+    <circle cx="303.2" cy="94.6" r="3.5" class="f-yellow"/>
+    <circle cx="408.7" cy="102.0" r="3.5" class="f-yellow"/>
+    <circle cx="520.5" cy="107.9" r="3.5" class="f-yellow"/>
+    <circle cx="635.8" cy="109.7" r="3.5" class="f-yellow"/>
+    <text x="643.8" y="113.7" class="t-xs t-bold tc-yellow">D = 80,000</text>
+    <polyline points="129.2,77.1 208.3,106.5 303.2,122.7 408.7,137.3 520.5,150.9 635.8,157.9" fill="none" class="s-green sw-2"/>
+    <circle cx="129.2" cy="77.1" r="3.5" class="f-green"/>
+    <circle cx="208.3" cy="106.5" r="3.5" class="f-green"/>
+    <circle cx="303.2" cy="122.7" r="3.5" class="f-green"/>
+    <circle cx="408.7" cy="137.3" r="3.5" class="f-green"/>
+    <circle cx="520.5" cy="150.9" r="3.5" class="f-green"/>
+    <circle cx="635.8" cy="157.9" r="3.5" class="f-green"/>
+    <text x="643.8" y="161.9" class="t-xs t-bold tc-green">D = 320,000</text>
+    <polyline points="129.2,85.9 208.3,117.8 303.2,139.7 408.7,166.8 520.5,192.7 635.8,207.1" fill="none" class="s-blue sw-2"/>
+    <circle cx="129.2" cy="85.9" r="3.5" class="f-blue"/>
+    <circle cx="208.3" cy="117.8" r="3.5" class="f-blue"/>
+    <circle cx="303.2" cy="139.7" r="3.5" class="f-blue"/>
+    <circle cx="408.7" cy="166.8" r="3.5" class="f-blue"/>
+    <circle cx="520.5" cy="192.7" r="3.5" class="f-blue"/>
+    <circle cx="635.8" cy="207.1" r="3.5" class="f-blue"/>
+    <text x="643.8" y="211.1" class="t-xs t-bold tc-blue">D = 1,280,000</text>
+  </svg>
+  <figcaption><strong>Our own small scaling law.</strong> Twenty-four real training runs from <code>tiny_scaling.py</code>. More parameters help, more data helps, and each curve flattens once the model is big for its data: the shape the formula L = E + A/N<sup>&alpha;</sup> + B/D<sup>&beta;</sup> describes.</figcaption>
+</figure>
+
+<p>Now fit the form that Hoffmann et al. (2022) used, L(N, D) = E + A/N<sup>&alpha;</sup> + B/D<sup>&beta;</sup>. The three terms have a reading. E is an <b>irreducible</b> loss that no model of any size trained on any amount of data can go below: the entropy of the source itself (chapter 14). The second term is the <b>capacity</b> penalty of having only N parameters. The third is the <b>data</b> penalty of having seen only D tokens. The script scans all pairs (&alpha;, &beta;), solves for E, A and B by least squares at each pair, and keeps the best. It then repeats the fit on only the 18 runs with fewer than a million tokens and asks it to predict the six runs with 1.28 million.</p>
+
+<pre class="terminal" data-title="fit.py"><code># Fit L(N, D) = E + A / N^alpha + B / D^beta to the grid of runs by scanning (alpha, beta) and solving the rest by least squares.
+import json, numpy as np
+from tiny_scaling import make_text
+runs = np.array(json.load(open("tiny_results.json"))); N, D, L = runs[:, 0], runs[:, 1], runs[:, 2]
+
+def fit(N, D, L):
+    best = None
+    for a in np.arange(0.05, 2.0, 0.01):
+        for b in np.arange(0.05, 2.0, 0.01):
+            M = np.stack([np.ones_like(N), N ** -a, D ** -b], 1)
+            coef, *_ = np.linalg.lstsq(M, L, rcond=None)
+            if coef[1] &lt; 0 or coef[2] &lt; 0: continue
+            err = ((M @ coef - L) ** 2).sum()
+            if best is None or err &lt; best[0]: best = (err, a, b, *coef)
+    return best
+
+err, a, b, E, A, B = fit(N, D, L)
+print(f"fit on {len(L)} runs: L = {E:.3f} + {A:.3g} / N^{a:.2f} + {B:.3g} / D^{b:.2f}")
+print(f"root-mean-square error of the fit: {np.sqrt(err / len(L)):.3f} nats")
+mask = D &lt; 1_000_000                                   # fit only the smaller runs, predict the largest-data runs
+_, a2, b2, E2, A2, B2 = fit(N[mask], D[mask], L[mask])
+pred = E2 + A2 / N[~mask] ** a2 + B2 / D[~mask] ** b2
+print("held out: the six runs with D = 1,280,000 tokens")
+print("  parameters   measured   predicted from the other 18 runs")
+for n, l, p in zip(N[~mask], L[~mask], pred): print(f"  N={n:&gt;8,.0f}   {l:7.3f}   {p:7.3f}")
+print(f"\nfitted floor E = {E:.3f} nats; the source's true entropy rate is {make_text(100, 0)[1]:.3f} nats per character, so no model can reach below that")</code></pre>
+<pre class="terminal" data-title="output"><code>fit on 24 runs: L = 0.317 + 102 / N^0.69 + 32.7 / D^0.31
+root-mean-square error of the fit: 0.066 nats
+held out: the six runs with D = 1,280,000 tokens
+  parameters   measured   predicted from the other 18 runs
+  N=     847     1.857     1.648
+  N=   1,343     1.472     1.403
+  N=   2,335     1.255     1.198
+  N=   4,319     1.031     1.047
+  N=   8,287     0.854     0.945
+  N=  16,223     0.769     0.879
+
+fitted floor E = 0.317 nats; the source's true entropy rate is 0.684 nats per character, so no model can reach below that</code></pre>
+
+<p>The fit describes the grid reasonably (typical error 0.07 nats), with exponents &alpha; = 0.69 and &beta; = 0.31 (Chinchilla's are 0.34 and 0.28; a different model family and data give different values). But look at what it also shows, because both failures are instructive. First, the <b>held-out prediction misses by as much as 0.21 nats</b> (for the smallest model) and by 0.11 nats for the largest, which it predicts too pessimistically: a curve fitted on small data bends away from where the next points land. Second, the fitted floor E = 0.317 is <b>below the true entropy of the source</b>, which is 0.684 nats per character for a model that knows the words, so no real model could reach it. Neither means the idea is wrong; they mean that three-parameter fits to two dozen small runs are rough, and extrapolation beyond the range of the data is where fits break. Keep that in mind whenever a scaling law is quoted with several confident digits.</p>
+
+<h2>Chinchilla: the right balance of size and data</h2>
+
+<p>Kaplan et al. concluded that, for a fixed compute budget, most of the extra compute should go into a bigger model, with data growing slowly (their optimal N grows as C<sup>0.73</sup> and D as C<sup>0.27</sup>, as summarised in the Hoffmann et al. paper). Models of the following two years followed that advice: GPT-3 had 175 billion parameters but was trained on about 300 billion tokens, Gopher had 280 billion parameters and the same 300 billion tokens.</p>
+
+<p>Hoffmann et al. (2022, "Training Compute-Optimal Large Language Models"), working at DeepMind, trained more than 400 models from under 70 million to over 16 billion parameters on 5 to 500 billion tokens and reached a different answer. They estimated the compute-optimal frontier by three methods:</p>
+<ol class="steps">
+  <li><b>Training curves.</b> For each model size, train on a long token budget and record the loss; at each compute level take the best size. (Result: N and D both grow as C<sup>0.50</sup>.)</li>
+  <li><b>IsoFLOP profiles.</b> Pick a compute budget, train models of many sizes each with exactly that budget (small models on many tokens, big models on few), and find the size with the lowest loss. Repeat at several budgets. (Result: exponents 0.49 and 0.51.)</li>
+  <li><b>A parametric fit.</b> Fit L(N, D) = E + A/N<sup>&alpha;</sup> + B/D<sup>&beta;</sup> to all runs, as we just did, and minimise it under C = 6ND. (Result: exponents 0.46 and 0.54.)</li>
+</ol>
+<p>All three say that <b>parameters and tokens should grow in equal proportion</b>: for every doubling of the model, double the data. In their Table 3, the optimal token counts come to about 20 per parameter at every scale: 20.2 billion tokens for a 1-billion-parameter model, 205 billion for 10 billion, 1.5 trillion for 67 billion. They tested the conclusion by training <b>Chinchilla</b>, 70 billion parameters on 1.4 trillion tokens, with the same compute as Gopher (280 billion parameters, 300 billion tokens). Chinchilla outperformed Gopher, GPT-3 and others on a wide range of tasks, reaching 67.5% average accuracy on the MMLU benchmark, over seven points above Gopher; being a quarter of Gopher's size, it is also cheaper to run. <a href="../cases/case-04-chinchilla.html">Case study 4</a> reads the paper in detail.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 800 285" role="img" aria-label="Three U-shaped curves of predicted loss against model size, one each for compute budgets of 1e19, 1e21 and 1e23 FLOPs. Each curve has a single minimum, marked with a yellow dot; the minimum moves right and down as the budget grows. Each curve is flat near its minimum.">
+    <line x1="70" y1="213.1" x2="710" y2="213.1" class="line-thin"/><text x="64" y="217.1" text-anchor="end" class="t-xs t-muted">2</text>
+    <line x1="70" y1="139.8" x2="710" y2="139.8" class="line-thin"/><text x="64" y="143.8" text-anchor="end" class="t-xs t-muted">2.5</text>
+    <line x1="70" y1="79.9" x2="710" y2="79.9" class="line-thin"/><text x="64" y="83.9" text-anchor="end" class="t-xs t-muted">3</text>
+    <line x1="70" y1="29.3" x2="710" y2="29.3" class="line-thin"/><text x="64" y="33.3" text-anchor="end" class="t-xs t-muted">3.5</text>
+    <line x1="70.0" y1="20" x2="70.0" y2="230" class="line-thin"/><text x="70.0" y="246" text-anchor="middle" class="t-xs t-muted">10^7</text>
+    <line x1="198.0" y1="20" x2="198.0" y2="230" class="line-thin"/><text x="198.0" y="246" text-anchor="middle" class="t-xs t-muted">10^8</text>
+    <line x1="326.0" y1="20" x2="326.0" y2="230" class="line-thin"/><text x="326.0" y="246" text-anchor="middle" class="t-xs t-muted">10^9</text>
+    <line x1="454.0" y1="20" x2="454.0" y2="230" class="line-thin"/><text x="454.0" y="246" text-anchor="middle" class="t-xs t-muted">10^10</text>
+    <line x1="582.0" y1="20" x2="582.0" y2="230" class="line-thin"/><text x="582.0" y="246" text-anchor="middle" class="t-xs t-muted">10^11</text>
+    <line x1="710.0" y1="20" x2="710.0" y2="230" class="line-thin"/><text x="710.0" y="246" text-anchor="middle" class="t-xs t-muted">10^12</text>
+    <text x="390.0" y="266" text-anchor="middle" class="t-xs">parameters N for a fixed compute budget (log scale)</text>
+    <text x="24" y="125.0" transform="rotate(-90 24 125.0)" text-anchor="middle" class="t-xs">predicted loss</text>
+    <polyline points="95.6,27.3 108.4,36.7 121.2,45.3 134.0,53.2 146.8,60.3 159.6,66.6 172.4,72.1 185.2,76.8 198.0,80.7 210.8,83.8 223.6,86.0 236.4,87.4 249.2,88.0 262.0,87.7 274.8,86.6 287.6,84.7 300.4,81.9 313.2,78.2 326.0,73.7 338.8,68.4 351.6,62.2 364.4,55.2 377.2,47.3 390.0,38.6 402.8,29.1" fill="none" class="s-orange sw-2"/>
+    <circle cx="251.6" cy="88.0" r="5" class="f-yellow"/>
+    <text x="251.6" y="74.0" text-anchor="middle" class="t-xs t-bold tc-orange">C = 10^19 FLOPs</text>
+    <polyline points="82.8,30.6 95.6,42.4 108.4,53.6 121.2,64.3 134.0,74.4 146.8,83.9 159.6,92.9 172.4,101.3 185.2,109.2 198.0,116.6 210.8,123.4 223.6,129.7 236.4,135.4 249.2,140.7 262.0,145.4 274.8,149.7 287.6,153.4 300.4,156.7 313.2,159.5 326.0,161.8 338.8,163.7 351.6,165.0 364.4,165.9 377.2,166.4 390.0,166.4 402.8,165.9 415.6,164.9 428.4,163.4 441.2,161.5 454.0,159.1 466.8,156.1 479.6,152.7 492.4,148.8 505.2,144.3 518.0,139.3 530.8,133.7 543.6,127.6 556.4,121.0 569.2,113.7 582.0,105.9 594.8,97.5 607.6,88.4 620.4,78.8 633.2,68.5 646.0,57.6 658.8,46.1 671.6,34.0" fill="none" class="s-green sw-2"/>
+    <circle cx="382.8" cy="166.4" r="5" class="f-yellow"/>
+    <text x="382.8" y="152.4" text-anchor="middle" class="t-xs t-bold tc-green">C = 10^21 FLOPs</text>
+    <polyline points="82.8,33.1 95.6,45.3 108.4,56.9 121.2,67.9 134.0,78.5 146.8,88.5 159.6,98.0 172.4,107.1 185.2,115.6 198.0,123.7 210.8,131.3 223.6,138.4 236.4,145.2 249.2,151.5 262.0,157.3 274.8,162.8 287.6,167.9 300.4,172.7 313.2,177.1 326.0,181.1 338.8,184.8 351.6,188.2 364.4,191.3 377.2,194.2 390.0,196.7 402.8,198.9 415.6,200.9 428.4,202.6 441.2,204.1 454.0,205.3 466.8,206.3 479.6,207.1 492.4,207.6 505.2,207.9 518.0,207.9 530.8,207.7 543.6,207.3 556.4,206.6 569.2,205.7 582.0,204.6 594.8,203.1 607.6,201.5 620.4,199.5 633.2,197.3 646.0,194.8 658.8,192.0 671.6,188.8 684.4,185.4 697.2,181.6 710.0,177.4" fill="none" class="s-blue sw-2"/>
+    <circle cx="514.0" cy="207.9" r="5" class="f-yellow"/>
+    <text x="514.0" y="193.9" text-anchor="middle" class="t-xs t-bold tc-blue">C = 10^23 FLOPs</text>
+  </svg>
+  <figcaption><strong>IsoFLOP curves.</strong> For a fixed budget, a model that is too small is starved of capacity and one that is too large sees too few tokens; the best size sits at the yellow dot. Computed from the Besiroglu et al. refit of the Chinchilla law with D = C/6N. The bottoms are broad: within a factor of two of the optimum the loss moves by about 0.01.</figcaption>
+</figure>
+
+<p>The IsoFLOP view is worth studying because it is the clearest way to see the trade-off. With the budget fixed, loss against model size is a U: too small a model is limited by capacity, and too large a model by the few tokens it can afford to see. The bottom of the U is the compute-optimal model, it moves to larger models as the budget grows, and it is <b>broad</b>. That flat bottom matters in practice, as we will see.</p>
+
+<details class="deeper">
+  <summary>Go deeper <span class="hint">optional</span>: deriving the optimum from the parametric loss</summary>
+  <p>Fix the budget C = 6ND, so D = C/(6N). Substitute into L(N, D) = E + A N<sup>-&alpha;</sup> + B D<sup>-&beta;</sup>:</p>
+  <p style="text-align:center">L(N) = E + A N<sup>-&alpha;</sup> + B (C/6)<sup>-&beta;</sup> N<sup>&beta;</sup></p>
+  <p>Differentiate with respect to N and set to zero: &minus;&alpha; A N<sup>-&alpha;-1</sup> + &beta; B (C/6)<sup>-&beta;</sup> N<sup>&beta;-1</sup> = 0. Multiply through by N and rearrange: &alpha; A N<sup>-&alpha;</sup> = &beta; B D<sup>-&beta;</sup>. At the optimum the two penalty terms are in the fixed ratio &beta;B : &alpha;A (here the data term's weight is the capacity term's times &alpha;A/&beta;B). Solving for N,</p>
+  <p style="text-align:center">N<sub>opt</sub> = G &middot; (C/6)<sup>&beta;/(&alpha;+&beta;)</sup>, &nbsp; D<sub>opt</sub> = G<sup>-1</sup> &middot; (C/6)<sup>&alpha;/(&alpha;+&beta;)</sup>, &nbsp; G = (&alpha;A / &beta;B)<sup>1/(&alpha;+&beta;)</sup>.</p>
+  <p>So N<sub>opt</sub> grows as C raised to &beta;/(&alpha;+&beta;) and D<sub>opt</sub> as C raised to &alpha;/(&alpha;+&beta;). With &alpha; = 0.34 and &beta; = 0.28 these exponents are 0.45 and 0.55; with &alpha; close to &beta; they are both near one half, the "scale equally" result. The code in <code>optimal.py</code> implements exactly these two lines. The second derivative is positive, so this is a minimum.</p>
+</details>
+
+<p>The script applies the formula with two sets of constants: those printed in the Hoffmann paper (E = 1.69, A = 406.4, B = 410.7, &alpha; = 0.34, &beta; = 0.28) and those from a replication by Besiroglu et al. (2024, Epoch AI), who reconstructed the data from the paper's figure and refitted. They report that the printed numbers are inconsistent with the paper's own first two methods, and attribute that to an optimiser that stopped before convergence and to rounding of the published constants; their refit agrees with methods 1 and 2.</p>
+
+<pre class="terminal" data-title="optimal.py"><code># Compute-optimal N and D from a parametric loss L(N, D) = E + A/N^alpha + B/D^beta under the budget C = 6*N*D.
+import numpy as np
+
+FITS = {"Hoffmann et al. 2022 (as printed)": (1.69, 406.4, 410.7, 0.34, 0.28),
+        "Besiroglu et al. 2024 (replication)": (1.8172, 482.01, 2085.43, 0.3478, 0.3658)}
+
+def optimum(C, fit):
+    E, A, B, a, b = fit
+    G = (a * A / (b * B)) ** (1 / (a + b))              # from setting dL/dN = 0 along N*D = C/6
+    N = G * (C / 6) ** (b / (a + b)); D = C / (6 * N)
+    return N, D, E + A / N ** a + B / D ** b
+
+if __name__ == "__main__":
+    for name, fit in FITS.items():
+        E, A, B, a, b = fit
+        print(f"{name}: N_opt ~ C^{b/(a+b):.2f}, D_opt ~ C^{a/(a+b):.2f}")
+        for C in (1e19, 1e21, 5.76e23, 3.8e25):
+            N, D, L = optimum(C, fit)
+            print(f"  C={C:8.2e}  N={N:10.3e}  D={D:10.3e}  D/N={D/N:5.1f}  predicted loss {L:.3f}")
+    # Check against the paper's Table A3 (Approach 3): a 10B-parameter model, 410.1B tokens, 2.46e22 FLOPs
+    E, A, B, a, b = FITS["Hoffmann et al. 2022 (as printed)"]
+    print("\nHoffmann Table A3 rows (N, D) and the C each implies via 6ND, against the formula's optimum at that C:")
+    for Np, Dp in ((1e9, 27.1e9), (10e9, 410.1e9), (67e9, 4.1e12)):
+        C = 6 * Np * Dp; N, D, _ = optimum(C, FITS["Hoffmann et al. 2022 (as printed)"])
+        print(f"  table: N={Np:.1e} D={Dp:.2e} (C={C:.2e})   formula: N={N:.2e} D={D:.2e}")</code></pre>
+<pre class="terminal" data-title="output"><code>Hoffmann et al. 2022 (as printed): N_opt ~ C^0.45, D_opt ~ C^0.55
+  C=1.00e+19  N= 2.280e+08  D= 7.311e+09  D/N= 32.1  predicted loss 2.986
+  C=1.00e+21  N= 1.824e+09  D= 9.136e+10  D/N= 50.1  predicted loss 2.329
+  C=5.76e+23  N= 3.219e+10  D= 2.982e+12  D/N= 92.6  predicted loss 1.931
+  C=3.80e+25  N= 2.135e+11  D= 2.967e+13  D/N=139.0  predicted loss 1.817
+Besiroglu et al. 2024 (replication): N_opt ~ C^0.51, D_opt ~ C^0.49
+  C=1.00e+19  N= 2.622e+08  D= 6.357e+09  D/N= 24.2  predicted loss 2.927
+  C=1.00e+21  N= 2.778e+09  D= 5.999e+10  D/N= 21.6  predicted loss 2.306
+  C=5.76e+23  N= 7.225e+10  D= 1.329e+12  D/N= 18.4  predicted loss 1.974
+  C=3.80e+25  N= 6.187e+11  D= 1.024e+13  D/N= 16.5  predicted loss 1.892
+
+Hoffmann Table A3 rows (N, D) and the C each implies via 6ND, against the formula's optimum at that C:
+  table: N=1.0e+09 D=2.71e+10 (C=1.63e+20)   formula: N=8.03e+08 D=3.37e+10
+  table: N=1.0e+10 D=4.10e+11 (C=2.46e+22)   formula: N=7.75e+09 D=5.29e+11
+  table: N=6.7e+10 D=4.10e+12 (C=1.65e+24)   formula: N=5.18e+10 D=5.31e+12</code></pre>
+
+<p>The two fits disagree in an instructive way. The printed constants imply that the optimal ratio of tokens to parameters rises with the budget (32 at 10<sup>19</sup> FLOPs, 93 at Gopher's budget), which contradicts the "about 20 tokens per parameter at every scale" of the paper's own Table 3. The refit gives a ratio near 20 and falling slowly (24 down to 16.5), in line with it, and puts the Gopher-budget optimum at 72 billion parameters and 1.3 trillion tokens, close to the 70 billion and 1.4 trillion that DeepMind trained. The last block of the output checks the printed constants against the paper's Table A3 rows: its model sizes come out 20 to 25% lower than the table's, which fits the rounding problem the replication describes. So the <b>20-tokens-per-parameter rule of thumb is well supported</b>, while any specific constants should be treated as approximate.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: studying for an exam</p>
+  <p>Treat compute as the hours you have. Model size is how capable a student you are; data is how many practice problems you work through. A brilliant student with a handful of problems will not do as well as a good student with plenty, and a student who does a thousand problems with no capacity to absorb them wastes the hours. For a fixed number of hours there is a best balance of the two, and it is not the extreme of either. Scaling laws put numbers on the balance for language models.</p>
+  <p><em>Where it breaks down:</em> a student can choose which problems to practise and can reason beyond what they have seen, whereas a language model's training data are fixed in advance and the model improves only on average, smoothly, in the loss. And the quality of the practice problems matters: the best balance moves when the data are better or worse, a fact the analogy hides.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Chinchilla says every model should be trained on 20 tokens per parameter." The 20 is the optimum for one specific question: the lowest loss for a fixed <em>training</em> compute. It says nothing about the cost of using the model afterwards, and it was fitted to one family of models, one data distribution and one set of hyperparameters. A model that will serve billions of requests should be smaller and trained for longer than that optimum, as the next section shows; and the ratio changes with data quality and architecture.</p>
+</div>
+
+<h2>Using a scaling law to plan a run</h2>
+
+<p>Suppose you have a budget of 10<sup>22</sup> FLOPs (on an H100 at 40% MFU, chapter 16 shows that is about 7,000 GPU-hours). The recipe is:</p>
+<ol class="steps">
+  <li><b>Choose a fit.</b> Use published constants as a first guess, then run your own small grid on <em>your</em> data and architecture, as in our tiny experiment but with models of 10 million to 1 billion parameters. The law depends on the data distribution and the recipe, and the published ones do not transfer exactly.</li>
+  <li><b>Compute the optimum.</b> From the Besiroglu refit, 10<sup>22</sup> FLOPs gives about 9 billion parameters on 180 billion tokens (see the last block of <code>compare.py</code> below); 6ND checks the budget.</li>
+  <li><b>Hold out a margin.</b> Because of the flat bottom, anything within a factor of two of the optimum costs about 0.01 nats. You have room to adjust for hardware, inference or data constraints.</li>
+  <li><b>Validate by extrapolating.</b> Train a few runs at one or two orders of magnitude below the target, check they sit on the fitted curve, and treat a departure as a warning.</li>
+</ol>
+
+<p>The Llama 3 team did a version of this at scale. They trained models from 40 million to 16 billion parameters at budgets from 6 &times; 10<sup>18</sup> to 10<sup>22</sup> FLOPs, fitted a parabola to each IsoFLOP curve to find its minimum, and fitted a power law for the optimal number of training tokens against compute, with exponent 0.53. Extrapolating to their 3.8 &times; 10<sup>25</sup> FLOP budget gave 402 billion parameters on 16.55 trillion tokens; they trained 405 billion parameters on 15.6 trillion tokens, noting that the IsoFLOP curves "become flatter around the minimum" at larger budgets, so the result was robust to small changes. They also fitted a relationship from the compute of a run to benchmark accuracy, in two steps (compute to the loss of the correct answer, then loss to accuracy with a sigmoid), to forecast downstream performance of the flagship model before training it.</p>
+
+<pre class="terminal" data-title="compare.py"><code># Predicted loss of famous (N, D) choices under the two published fits, and the price of straying from the optimum.
+from optimal import FITS, optimum
+
+def loss(N, D, fit):
+    E, A, B, a, b = fit
+    return E + A / N ** a + B / D ** b
+
+models = [("GPT-3", 175e9, 300e9), ("Gopher", 280e9, 300e9), ("Chinchilla", 70e9, 1.4e12), ("Llama 3 405B", 405e9, 15.6e12), ("8B on 15T tokens", 8e9, 15e12)]
+if __name__ == "__main__":
+    names = list(FITS)
+    print(f"{'model':&lt;16}{'N':&gt;9}{'D':&gt;10}{'D/N':&gt;6}{'6ND':&gt;10}" + "".join(f"{n.split(' (')[0][:22]:&gt;24}" for n in names))
+    for m, N, D in models:
+        same_data = m in ("GPT-3", "Gopher", "Chinchilla")          # the fits describe DeepMind's data; other corpora have other losses
+        print(f"{m:&lt;16}{N:&gt;9.2e}{D:&gt;10.2e}{D/N:&gt;6.0f}{6*N*D:&gt;10.2e}" + "".join((f"{loss(N, D, FITS[n]):&gt;24.3f}" if same_data else f"{'(other corpus)':&gt;24}") for n in names))
+    
+    print("\nLoss at a fixed budget of 1e22 FLOPs as the model size is varied (Besiroglu et al. fit):")
+    fit = FITS[names[1]]; C = 1e22; Nopt = optimum(C, fit)[0]
+    for f in (0.25, 0.5, 1, 2, 4, 8):
+        N = Nopt * f; D = C / (6 * N)
+        print(f"  N = {f:&gt;4}x optimum = {N:9.3e}  D = {D:9.3e}  loss {loss(N, D, fit):.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code>model                   N         D   D/N       6ND    Hoffmann et al. 2022   Besiroglu et al. 2024
+GPT-3            1.75e+11  3.00e+11     2  3.15e+23                   2.002                   2.009
+Gopher           2.80e+11  3.00e+11     1  5.04e+23                   1.993                   2.000
+Chinchilla       7.00e+10  1.40e+12    20  5.88e+23                   1.937                   1.974
+Llama 3 405B     4.05e+11  1.56e+13    39  3.79e+25          (other corpus)          (other corpus)
+8B on 15T tokens 8.00e+09  1.50e+13  1875  7.20e+23          (other corpus)          (other corpus)
+
+Loss at a fixed budget of 1e22 FLOPs as the model size is varied (Besiroglu et al. fit):
+  N = 0.25x optimum = 2.261e+09  D = 7.370e+11  loss 2.181
+  N =  0.5x optimum = 4.523e+09  D = 3.685e+11  loss 2.151
+  N =    1x optimum = 9.045e+09  D = 1.843e+11  loss 2.141
+  N =    2x optimum = 1.809e+10  D = 9.213e+10  loss 2.151
+  N =    4x optimum = 3.618e+10  D = 4.607e+10  loss 2.182
+  N =    8x optimum = 7.236e+10  D = 2.303e+10  loss 2.236</code></pre>
+
+<p>The top block repeats Hoffmann's comparison under both fits: Gopher and Chinchilla have almost the same 6ND (the paper's more careful count gives 5.76 &times; 10<sup>23</sup> for Gopher) but the fits predict a loss about 0.05 to 0.06 lower for Chinchilla, which is the sign of the measured result. The losses of the last two rows are not shown because the fits describe DeepMind's data, and a loss on another corpus is not comparable. The bottom block makes the flat bottom concrete: at a fixed 10<sup>22</sup> FLOPs, a model four times too big or four times too small costs about 0.04 nats in loss, and a factor of two about 0.01.</p>
+
+<p>Try the flat bottom yourself in the calculator. It uses either set of constants, finds the optimum for any budget from 10<sup>18</sup> to 10<sup>26</sup> FLOPs, and lets you move away from it.</p>
+
+<div class="widget" id="dl18-optimal">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Compute-optimal calculator</h4></div>
+  <p class="widget-help">Drag the budget and watch the optimum move. Then drag "model size relative to the optimum" away from 1x: the orange dot leaves the yellow one, and the table shows how much extra loss that costs, expressed as the smaller budget at which a well-chosen model would match it.</p>
+  <div class="dl18-ctl">
+    <div><label for="dl18-c">Compute budget: <output data-act="c-out">10^22.0</output> FLOPs</label><input id="dl18-c" data-act="c" type="range" min="18" max="26" step="0.1" value="22"></div>
+    <div><label for="dl18-fit">Constants</label>
+      <select id="dl18-fit" data-act="fit"><option value="besi" selected>Epoch refit (2024)</option><option value="hoff">Hoffmann (as printed)</option></select></div>
+    <div><label for="dl18-m">Model size relative to optimum: <output data-act="m-out">1x</output></label><input id="dl18-m" data-act="m" type="range" min="-4" max="4" step="0.25" value="0"></div>
+  </div>
+  <svg class="dl18-chart" viewBox="0 0 700 176" role="img" aria-label="Predicted loss against model size for the chosen compute budget, a U-shaped curve with the optimum marked in yellow and the chosen model size in orange."></svg>
+  <table class="dl18-table"></table>
+</div>
+
+<h2>Beyond compute-optimal: the cost of serving</h2>
+
+<p>Chinchilla minimises the loss for a fixed <em>training</em> bill. But a model that is trained once and then queried billions of times has a second bill, inference, that grows with the model size: every generated token costs about 2N FLOPs and reads every weight (chapter 16). If two models reach the same loss, the smaller one is cheaper to use forever. Sardana et al. (2023, "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws") add the inference cost to the Chinchilla law and find that researchers expecting large inference demand (they consider on the order of a billion requests) should train smaller models for longer than Chinchilla-optimal. The extra training tokens are paid once, and the saving is repeated on every request.</p>
+
+<p>This is what the field does. Llama 3 405B, trained for a budget of 3.8 &times; 10<sup>25</sup> FLOPs, sits at about 39 tokens per parameter, about twice the Chinchilla ratio, and the paper describes a pre-training corpus of about 15 trillion tokens for the family: an 8-billion-parameter model that saw all of it would be at nearly 2,000 tokens per parameter (the top point in the figure below, which is illustrative, since this chapter does not state that model's own token count). Such a model is far from compute-optimal for its training cost; it is optimal for a different objective, loss per unit of lifetime cost. The sensible reading of the Chinchilla result is not "use 20 tokens per parameter" but "do not spend a training budget on parameters the data cannot fill".</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 800 305" role="img" aria-label="A log-log plane of training tokens against parameters. Thin diagonal lines mark constant compute of 1e23, 1e24 and 1e25 FLOPs. A dashed line marks 20 tokens per parameter. GPT-3 and Gopher lie far below it with about 300 billion tokens. Chinchilla lies on it. Llama 3 405B lies above it at about 39 tokens per parameter, and an 8 billion parameter model trained on 15 trillion tokens lies far above it.">
+    <line x1="70" y1="250.0" x2="710" y2="250.0" class="line-thin"/><text x="64" y="254.0" text-anchor="end" class="t-xs t-muted">100B</text>
+    <line x1="70" y1="173.3" x2="710" y2="173.3" class="line-thin"/><text x="64" y="177.3" text-anchor="end" class="t-xs t-muted">1T</text>
+    <line x1="70" y1="96.7" x2="710" y2="96.7" class="line-thin"/><text x="64" y="100.7" text-anchor="end" class="t-xs t-muted">10T</text>
+    <line x1="70" y1="20.0" x2="710" y2="20.0" class="line-thin"/><text x="64" y="24.0" text-anchor="end" class="t-xs t-muted">100T</text>
+    <line x1="70.0" y1="20" x2="70.0" y2="250" class="line-thin"/><text x="70.0" y="266" text-anchor="middle" class="t-xs t-muted">1B</text>
+    <line x1="283.3" y1="20" x2="283.3" y2="250" class="line-thin"/><text x="283.3" y="266" text-anchor="middle" class="t-xs t-muted">10B</text>
+    <line x1="496.7" y1="20" x2="496.7" y2="250" class="line-thin"/><text x="496.7" y="266" text-anchor="middle" class="t-xs t-muted">100B</text>
+    <line x1="710.0" y1="20" x2="710.0" y2="250" class="line-thin"/><text x="710.0" y="266" text-anchor="middle" class="t-xs t-muted">1T</text>
+    <text x="390.0" y="286" text-anchor="middle" class="t-xs">parameters N (log scale)</text>
+    <text x="24" y="135.0" transform="rotate(-90 24 135.0)" text-anchor="middle" class="t-xs">training tokens D (log scale)</text>
+    <line x1="219.1" y1="250.0" x2="710.0" y2="73.6" class="line-dash s-green"/>
+    <text x="143.1" y="199.9" class="t-xs t-bold tc-green">D = 20 N (Chinchilla)</text>
+    <line x1="70.0" y1="79.7" x2="543.6" y2="249.9" class="line-thin"/>
+    <text x="78.0" y="95.7" class="t-xs t-faint">10^23 FLOPs</text>
+    <line x1="119.1" y1="20.6" x2="710.0" y2="233.0" class="line-thin"/>
+    <text x="127.1" y="36.6" class="t-xs t-faint">10^24 FLOPs</text>
+    <line x1="332.4" y1="20.6" x2="710.0" y2="156.3" class="line-thin"/>
+    <text x="340.4" y="36.6" class="t-xs t-faint">10^25 FLOPs</text>
+    <circle cx="548.5" cy="213.4" r="5" class="f-orange"/>
+    <text x="556.5" y="227.4" text-anchor="start" class="t-xs t-bold tc-orange">GPT-3</text>
+    <circle cx="592.1" cy="213.4" r="5" class="f-red"/>
+    <text x="600.1" y="227.4" text-anchor="start" class="t-xs t-bold tc-red">Gopher</text>
+    <circle cx="463.6" cy="162.1" r="5" class="f-green"/>
+    <text x="455.6" y="152.1" text-anchor="end" class="t-xs t-bold tc-green">Chinchilla</text>
+    <circle cx="626.3" cy="81.9" r="5" class="f-blue"/>
+    <text x="618.3" y="71.9" text-anchor="end" class="t-xs t-bold tc-blue">Llama 3 405B</text>
+    <circle cx="262.7" cy="83.2" r="5" class="f-purple"/>
+    <text x="272.7" y="87.2" text-anchor="start" class="t-xs t-bold tc-purple">8B, 15T tokens</text>
+  </svg>
+  <figcaption><strong>Where real models sit.</strong> Moving along a thin diagonal spends the same compute. Gopher and Chinchilla (about the same compute) sit at opposite ends of that diagonal. Models intended for heavy use are now placed above the dashed line, trading training compute for cheaper inference.</figcaption>
+</figure>
+
+<p>Two more limits keep the practical optimum from being a simple formula.</p>
+<ul>
+  <li><b>Data is finite.</b> The calculation assumes you can always find fresh tokens. Muennighoff et al. (2023, "Scaling Data-Constrained Language Models") trained over 400 models, some for up to 1,500 epochs, and found that training for up to about four epochs on repeated data gives negligible change in loss relative to fresh data at the same compute, with returns diminishing rapidly beyond that. Pretraining data and its limits are the subject of <a href="../../llm-training/chapters/01-pretraining-data.html">A3 chapter 01</a>.</li>
+  <li><b>Data quality moves the optimum.</b> Replications discussed by Besiroglu et al. note, citing the DeepSeek LLM report (Bi et al., 2024), that the best ratio of data to parameters is sensitive to the quality of the data, with a lower tokens-per-parameter ratio optimal for higher-quality data. A law fitted on one corpus is not a law of nature.</li>
+</ul>
+
+<h2>What scaling laws do not say</h2>
+
+<ul>
+  <li><b>Loss is not capability.</b> The laws are about cross-entropy on held-out text. How a given loss translates to the ability to answer questions or write code is a separate and less regular relationship. Wei et al. (2022, "Emergent Abilities of Large Language Models") described abilities that appear abruptly at some scale; Schaeffer et al. (2023, "Are Emergent Abilities of Large Language Models a Mirage?") argued that much of that sharpness comes from the choice of all-or-nothing metrics, with smooth underlying improvement. The question is not settled in general, but a good habit follows: before believing a sudden jump, plot the same data with a smooth metric such as the probability assigned to the right answer.</li>
+  <li><b>Laws are conditional on the recipe.</b> Learning rate, batch size, architecture, data mix and tokeniser all change the constants. Hoffmann et al. attribute part of the difference from Kaplan's conclusion to this: Kaplan used one fixed learning-rate schedule for all runs, which overstates the loss of runs with less data, and most of Kaplan's models were small. When you change the recipe, refit.</li>
+  <li><b>Extrapolation is risky.</b> Our tiny experiment missed by up to 0.2 nats when asked to extrapolate by a factor of four in data. The published fits cover about 2 to 3 orders of magnitude of compute and are used to extrapolate one or two more; there is no guarantee the line continues forever, and the loss is bounded below by the entropy of the data.</li>
+  <li><b>Replication matters.</b> The Chinchilla constants are cited in hundreds of papers, and the reconstruction by Besiroglu et al. found that the printed numbers did not fit the paper's own data well. Quote the finding (about 20 tokens per parameter) and the method, not the third significant digit.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The Chinchilla-style analysis, trained dense models, a clean web corpus and a fixed 6ND budget, describes a regime that frontier practice has moved beyond in at least three ways. (1) <b>Compute is spent after training too.</b> Models that spend more tokens at inference time (long reasoning traces, repeated sampling, search) improve with test-time compute; Snell et al. (2024, "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters") studied the trade-off against pretraining. Reinforcement-learning stages (<a href="../../llm-training/chapters/14-rlvr-grpo.html">A3 chapter 14</a>) add compute whose scaling behaviour is still being measured. (2) <b>Architectures change the constants.</b> Mixtures of experts (chapter 20) decouple total parameters from per-token compute, so "N" in the formula needs a definition. (3) <b>Data, not compute, is the binding constraint for some labs</b>, which makes synthetic data and multi-epoch training, discussed above, central. I have not verified specific scaling-law exponents reported for these newer regimes; the durable parts of this chapter are the method (fit small runs, extrapolate carefully, validate) and the balance idea, not any single set of constants. Check recent technical reports for the current numbers.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Extrapolating from small experiments to a large production run is capacity planning with a different resource. A load test at 10% of the target traffic does not guarantee that the system behaves at 100%, because bottlenecks appear that did not show at small scale; see <a href="../../reliability/chapters/10-load-testing-capacity.html">load testing and capacity planning</a> for how engineers decide how far to trust an extrapolation and how much headroom to keep. The flat bottom of the IsoFLOP curve is the same kind of fact as a wide, shallow cost minimum in a system design: it means you can choose for other reasons (hardware shape, serving cost, risk) at little penalty. The serving-versus-training trade-off continues in <a href="../../llm-training/chapters/22-token-economics.html">A3 chapter 22</a>.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>1. In <code>tiny_scaling.py</code> change the Zipf exponent 1.1 to 1.5 or 0.8 and rerun the fit: does the irreducible loss move as you expect? 2. Raise the window <code>K</code> from 8 to 16 characters and watch whether the large models improve more than the small ones. 3. In <code>fit.py</code> hold out the largest model sizes instead of the largest data size, and compare the prediction error. 4. In <code>optimal.py</code> add your own budget (for example the FLOPs of the chapter 16 calculator's 1B model on 20B tokens) and read off the suggested size. 5. Lab 6 (<a href="../labs/lab-06-resources.html">The Model Resource Calculator</a>) asks for compute-optimal sizes for published models.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 tiny_scaling.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 fit.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 optimal.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 compare.py</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Language-model loss falls as a power law in parameters, data and compute: a straight line on log-log axes. Kaplan et al. (2020) measured exponents of about 0.076 (parameters), 0.095 (data) and 0.050 (compute) over seven orders of magnitude.</li>
+    <li>A useful model of the loss is L(N, D) = E + A/N<sup>&alpha;</sup> + B/D<sup>&beta;</sup>: an irreducible floor, a capacity penalty and a data penalty. Minimising it under C = 6ND gives N and D that grow as C raised to &beta;/(&alpha;+&beta;) and &alpha;/(&alpha;+&beta;).</li>
+    <li>Hoffmann et al. (2022) found that parameters and tokens should grow in proportion, at about 20 tokens per parameter, so GPT-3 and Gopher were too large and too short of data; Chinchilla, 70B on 1.4T tokens, beat Gopher at the same compute.</li>
+    <li>The bottom of the IsoFLOP curve is flat: within a factor of two of the optimal size costs about 0.01 nats, so you can choose model size for other reasons.</li>
+    <li>Models meant for heavy use are trained beyond compute-optimal (Llama 3 405B at 39 tokens per parameter, small Llama 3 models far beyond), because inference cost scales with parameters.</li>
+    <li>Treat constants with caution: they depend on data, recipe and N's definition, a replication found the printed Chinchilla constants inconsistent with the paper's other methods, and extrapolation can fail. Loss is not capability.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">Kaplan et al., "Scaling Laws for Neural Language Models" (2020)</a>. The original power laws in parameters, data and compute; the summary table of constants is on one page.</li>
+  <li><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener">Hoffmann et al., "Training Compute-Optimal Large Language Models" (2022)</a>. The Chinchilla paper: three estimation methods, Table 3 and the Gopher comparison.</li>
+  <li><a href="https://arxiv.org/abs/2404.10102" target="_blank" rel="noopener">Besiroglu et al., "Chinchilla Scaling: A replication attempt" (2024)</a>. A careful check of the parametric fit, with refitted constants.</li>
+  <li><a href="https://arxiv.org/abs/2401.00448" target="_blank" rel="noopener">Sardana et al., "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws" (2023)</a>. Why models for heavy use are trained longer.</li>
+  <li><a href="https://arxiv.org/abs/2305.16264" target="_blank" rel="noopener">Muennighoff et al., "Scaling Data-Constrained Language Models" (2023)</a>. What repeating data costs and how far it can go.</li>
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Llama Team, "The Llama 3 Herd of Models" (2024)</a>. Section 3.2.1 describes a modern scaling-law study used to choose the flagship size.</li>
+  <li><a href="https://arxiv.org/abs/2304.15004" target="_blank" rel="noopener">Schaeffer et al., "Are Emergent Abilities of Large Language Models a Mirage?" (2023)</a>, and <a href="https://arxiv.org/abs/2206.07682" target="_blank" rel="noopener">Wei et al., "Emergent Abilities of Large Language Models" (2022)</a>. The two sides of the emergence debate.</li>
+  <li><a href="https://arxiv.org/abs/2408.03314" target="_blank" rel="noopener">Snell et al., "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters" (2024)</a>. Scaling behaviour when compute is spent at inference time.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A loss follows L(N) = (N<sub>c</sub>/N)<sup>0.076</sup>. By what factor does the loss change when the parameter count is multiplied by 10?</p>
+    <ol class="q-options"><li>It falls by 7.6%</li><li>It is multiplied by about 0.84, a fall of about 16%</li><li>It is divided by 10</li><li>It falls by 0.076 nats</li></ol>
+    <div class="q-explain">Multiplying N by 10 multiplies L by 10<sup>-0.076</sup> = 0.84. The first option mistakes the exponent for the percentage change; the third treats the law as inversely proportional; the fourth treats it as an absolute subtraction, which a power law is not.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">You have 6 &times; 10<sup>23</sup> FLOPs (about Gopher's budget). Using the Chinchilla rule of roughly 20 tokens per parameter and C = 6ND, which model size is closest to compute-optimal?</p>
+    <ol class="q-options"><li>280 billion parameters</li><li>7 billion parameters</li><li>20 billion parameters</li><li>about 70 billion parameters</li></ol>
+    <div class="q-explain">C = 6 N (20 N) = 120 N<sup>2</sup>, so N = &radic;(6 &times; 10<sup>23</sup>/120) = &radic;(5 &times; 10<sup>21</sup>) = 7 &times; 10<sup>10</sup>, about 70 billion, with 1.4 trillion tokens: Chinchilla itself. 280 billion is Gopher, which was too large for the budget. The smaller answers come from dropping a factor of ten in the square root.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Two models reach the same loss. One is a compute-optimal 70B model; the other is a 20B model trained on far more tokens. A company expects to serve the model to millions of users. Which statement is most accurate?</p>
+    <ol class="q-options"><li>The 20B model may be the better choice overall, because it costs more to train but much less to serve, and inference cost depends on parameters</li><li>The 70B model is always better because it is compute-optimal</li><li>The 20B model cannot reach the same loss</li><li>Training cost is the only cost that matters</li></ol>
+    <div class="q-explain">"Compute-optimal" refers to training compute only. Serving cost scales with parameters (about 2N FLOPs and N weights read per generated token), so with heavy use the cheaper-to-serve model wins even though its training run was less efficient. This is the argument of Sardana et al. and the practice of the Llama 3 small models. The third claim is false, since more data can compensate for fewer parameters up to a point.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In our tiny experiment, a fit made on runs with at most 320,000 tokens mispredicted the 1.28-million-token runs by up to about 0.2 nats, and the fitted floor was below the source's true entropy. What is the best lesson?</p>
+    <ol class="q-options"><li>Scaling laws do not exist for small models</li><li>The fit should be repeated until the numbers match</li><li>Fits to a few small runs are rough, and extrapolating beyond the fitted range (and reading the floor E as a physical quantity) is risky; validate with held-out larger runs</li><li>The loss should be measured in bits instead of nats</li></ol>
+    <div class="q-explain">The trend was real, but a three-parameter curve fitted to a narrow range can bend away from the next points, and a fitted constant can be impossible. That is why Llama 3 validated predictions across orders of magnitude of compute. The unit of loss does not affect the issue, and tuning until numbers match is overfitting.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">An IsoFLOP curve for a 10<sup>22</sup> FLOP budget has its minimum at 9 billion parameters. A team wants a model that is cheaper to serve and chooses 4.5 billion parameters, training on twice as many tokens. According to the calculation in this chapter, what is the likely price in training loss?</p>
+    <ol class="q-options"><li>Large: the loss rises by about 1 nat</li><li>Small: roughly 0.01 nats, because the bottom of the curve is flat</li><li>Zero: the loss is identical by definition</li><li>It cannot be said without training the model</li></ol>
+    <div class="q-explain">The curve is broad near its minimum: in the chapter's calculation a model half the optimal size costs about 0.01 nats, which is why designing for serving cost or hardware shape is cheap. The loss is not identical, only close, and the fit does give a prediction, though it is uncertain. A rise of one nat would be a catastrophic change that the shape of the curve rules out.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A paper reports that "emergent" abilities appear suddenly at a certain model size. Which first check does this chapter suggest?</p>
+    <ol class="q-options"><li>Assume the ability is a phase transition and plan compute to reach it</li><li>Ignore the result because loss is smooth</li><li>Re-plot the same results with a continuous metric, such as the probability of the correct answer, to see whether the jump comes from an all-or-nothing score</li><li>Check that the model has more than 100 billion parameters</li></ol>
+    <div class="q-explain">Schaeffer et al. argued that many sharp transitions come from thresholded metrics like exact-match accuracy applied to smoothly improving models. Looking at a continuous metric distinguishes the cases. It is too strong to dismiss all emergence, and parameter count is not the test.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/widgets/dl18-optimal.js"></script>
+</body>
+</html>

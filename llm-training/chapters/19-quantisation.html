@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quantisation · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="19">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Quantisation</h1>
+  <p class="lede">A 70-billion-parameter model in 16-bit numbers needs 141 GB of memory before it has read a single prompt. Quantisation stores the same weights in 8, 4 or fewer bits. This chapter explains how a number is squeezed into a few bits, why a handful of outliers make that hard, how GPTQ and AWQ keep 4-bit models usable, and how to measure what the squeeze cost you.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Decoding is limited by how many bytes the GPU must read for every token (<a href="18-kv-cache.html">chapter 18</a>), and a model that does not fit in memory cannot be served at all. Cutting weights from 16 bits to 4 shrinks both problems by about four times, which is the difference between needing a rack and needing one 24 GB card. The price is error, and the error is not spread evenly: a few badly handled numbers can ruin a model that looked fine on average. After this chapter you will be able to work out what fits on a given GPU at a given precision, choose a scale granularity, explain why outliers are the central difficulty, say what GPTQ and AWQ each do, and design an evaluation that notices the damage before your users do.</p>
+</div>
+
+<h2>Why shrink the numbers at all</h2>
+
+<p>Chapter 2 counted the bytes a model needs to train. Serving needs far fewer, but the weights are still the largest item. A parameter stored in <span class="term">bf16</span> (a 16-bit floating-point format, see <a href="../../deep-learning/chapters/17-training-stability.html">A2 chapter 17</a>) costs 2 bytes, so a model with <em>N</em> parameters needs 2<em>N</em> bytes. For Llama 3 8B, with 8.03 billion parameters counted from the shapes in the Llama 3 report (Dubey et al., 2024), that is 16.1 GB. For the 70B model it is 141 GB, which does not fit on any single GPU sold today, and needs two 80 GB cards even before the cache.</p>
+
+<p><span class="term">Quantisation</span> means representing each weight (and sometimes each activation or cache entry) with fewer bits by mapping it to the nearest of a small set of allowed values. It buys two things.</p>
+<ul>
+  <li><strong>Capacity.</strong> Fewer bytes per weight leaves room for a bigger model, or for more KV cache, which means more concurrent sequences.</li>
+  <li><strong>Speed in the memory-bound regime.</strong> Chapter 18 showed that generating one token at small batch size is limited by reading the weights from HBM once per step. A step cannot be faster than the weight bytes divided by the memory bandwidth. NVIDIA lists 3.35 TB/s for the H100 SXM, so the 16.1 GB bf16 model has an upper bound of about 209 tokens a second for a single sequence, the same model at 8 bits about 417, and at 4 bits with group scales (about 4.14 GB) about 809. Those are ceilings, not measurements: real kernels, the KV cache and overheads come on top.</li>
+</ul>
+
+<p>Here is what that capacity looks like on a 24 GB card, with 2 GB set aside for activations and the CUDA context (an assumption), and a bf16 KV cache of 128 KiB per token for the 8B model.</p>
+
+<pre class="terminal" data-title="fit24.py"><code>&quot;&quot;&quot;What fits on one 24 GB GPU: weights at several precisions plus KV cache (shapes from the Llama 3 report, Table 3).&quot;&quot;&quot;
+MODELS = {  # layers, heads, kv_heads, width, ffn, vocab
+    &quot;8B&quot;:  (32, 32, 8, 4096, 14336, 128256),
+    &quot;70B&quot;: (80, 64, 8, 8192, 28672, 128256),
+}
+def params(L, H, KV, D, F, V):
+    hd = D // H
+    attn = 2 * D * D + 2 * D * KV * hd
+    return L * (attn + 3 * D * F + 2 * D) + 2 * V * D + D      # untied embedding and output head
+FORMATS = {&quot;bf16&quot;: 16, &quot;fp8 / int8&quot;: 8, &quot;int4, group 128&quot;: 4 + 16 / 128, &quot;int3, group 128&quot;: 3 + 16 / 128}
+GPU, OVERHEAD, CTX = 24e9, 2e9, 8192
+print(f&quot;GPU 24 GB, {OVERHEAD/1e9:.0f} GB assumed overhead, KV cache in bf16 at {CTX} tokens&quot;)
+for name, shp in MODELS.items():
+    L, H, KV, D, F, V = shp
+    n = params(*shp)
+    kv_tok = 2 * L * KV * (D // H) * 2
+    print(f&quot;\nLlama 3 {name}: {n/1e9:.2f} B parameters, KV cache {kv_tok/1024:.0f} KiB/token = {kv_tok*CTX/2**30:.2f} GiB per {CTX}-token sequence&quot;)
+    for fname, bits in FORMATS.items():
+        w = n * bits / 8
+        room = GPU - OVERHEAD - w
+        seqs = int(room // (kv_tok * CTX)) if room &gt; 0 else 0
+        print(f&quot;  {fname:&lt;18}{w/1e9:&gt;7.1f} GB weights  -&gt;  {&#x27;does not fit&#x27; if room &lt;= 0 else f&#x27;{seqs} sequences of {CTX} tokens&#x27;}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>GPU 24 GB, 2 GB assumed overhead, KV cache in bf16 at 8192 tokens
+
+Llama 3 8B: 8.03 B parameters, KV cache 128 KiB/token = 1.00 GiB per 8192-token sequence
+  bf16                 16.1 GB weights  -&gt;  5 sequences of 8192 tokens
+  fp8 / int8            8.0 GB weights  -&gt;  13 sequences of 8192 tokens
+  int4, group 128       4.1 GB weights  -&gt;  16 sequences of 8192 tokens
+  int3, group 128       3.1 GB weights  -&gt;  17 sequences of 8192 tokens
+
+Llama 3 70B: 70.55 B parameters, KV cache 320 KiB/token = 2.50 GiB per 8192-token sequence
+  bf16                141.1 GB weights  -&gt;  does not fit
+  fp8 / int8           70.6 GB weights  -&gt;  does not fit
+  int4, group 128      36.4 GB weights  -&gt;  does not fit
+  int3, group 128      27.6 GB weights  -&gt;  does not fit</code></pre>
+
+<p>Read the numbers carefully. The 8B model fits at bf16 but leaves room for only five 8,192-token sequences. At 4 bits it holds sixteen, a threefold gain in concurrency from the same card. Going from 4 bits to 3 bits adds almost nothing, because the KV cache, not the weights, is now the main user of memory. And the 70B model does not fit on 24 GB at <em>any</em> of these precisions: 4-bit weights alone need 36 GB. Quantisation does not repeal arithmetic; it moves the line.</p>
+
+<h2>How a number becomes a few bits</h2>
+
+<p>Start with the simplest scheme, which is also the one in most production use. Take a group of real-valued weights. Find the largest magnitude, call it <em>m</em>. Choose a <span class="term">scale</span> <em>s</em> so that <em>m</em> lands on the largest integer the format allows. Divide every weight by <em>s</em> and round to the nearest integer. To use the weight later, multiply the integer back by <em>s</em> (this is <span class="term">dequantisation</span>). For a signed 4-bit integer the range is &minus;8 to 7, and the symmetric scheme uses &minus;7 to 7 for the scale, so <em>s</em> = <em>m</em> / 7.</p>
+
+<p style="text-align:center">q = round(w / s), &nbsp; w&#770; = q &times; s, &nbsp; s = max|w| / q<sub>max</sub></p>
+
+<p>This is <span class="term">symmetric absmax quantisation</span>. The alternative, <span class="term">asymmetric</span> quantisation, adds a <span class="term">zero point</span> <em>z</em> so the integer range can be placed over any interval: <em>q</em> = round(<em>w</em>/<em>s</em>) + <em>z</em>. It wastes fewer levels when the values are all positive (as the outputs of a ReLU are), at the cost of one more number per group and a slightly more expensive multiply. Weights are close to symmetric around zero, so symmetric is the usual choice for them.</p>
+
+<p>Here are eight weights taken through int4 by hand, then the same procedure applied to a whole matrix.</p>
+
+<pre class="terminal" data-title="round_to_nearest.py"><code>&quot;&quot;&quot;Round-to-nearest quantisation by hand, then three scale granularities.&quot;&quot;&quot;
+import numpy as np
+from qlib import quantise, rel
+
+# 1. eight numbers, int4, one scale
+w = np.array([0.02, -0.11, 0.07, 0.31, -0.05, 0.00, 0.13, -0.28])
+s = np.abs(w).max() / 7
+q = np.round(w / s).astype(int)
+print(f&quot;scale = {np.abs(w).max()} / 7 = {s:.4f}&quot;)
+print(&quot;integers  :&quot;, q.tolist())
+print(&quot;recovered :&quot;, np.round(q * s, 3).tolist())
+print(&quot;abs error :&quot;, np.round(np.abs(q * s - w), 3).tolist())
+
+# 2. a weight matrix where two output rows have a much larger range
+rng = np.random.default_rng(0)
+W = rng.normal(0, 0.02, (1024, 1024))
+W[7] *= 12; W[300] *= 20                          # two &#x27;loud&#x27; rows (illustrative)
+print(&quot;\nrelative weight error ||W - Wq|| / ||W||&quot;)
+print(f&quot;{&#x27;scheme&#x27;:&lt;28}{&#x27;int8&#x27;:&gt;10}{&#x27;int4&#x27;:&gt;10}&quot;)
+for name, kw in [(&quot;per-tensor&quot;, {}), (&quot;per-row (per-channel)&quot;, {&quot;axis&quot;: 1}), (&quot;group of 128&quot;, {&quot;group&quot;: 128})]:
+    print(f&quot;{name:&lt;28}&quot; + &quot;&quot;.join(f&quot;{rel(quantise(W, b, **kw), W):&gt;10.4f}&quot; for b in (8, 4)))</code></pre>
+<pre class="terminal" data-title="output"><code>scale = 0.31 / 7 = 0.0443
+integers  : [0, -2, 2, 7, -1, 0, 3, -6]
+recovered : [0.0, -0.089, 0.089, 0.31, -0.044, 0.0, 0.133, -0.266]
+abs error : [0.02, 0.021, 0.019, 0.0, 0.006, 0.0, 0.003, 0.014]
+
+relative weight error ||W - Wq|| / ||W||
+scheme                            int8      int4
+per-tensor                      0.1183    0.8146
+per-row (per-channel)           0.0078    0.1404
+group of 128                    0.0064    0.1168</code></pre>
+
+<p>The largest weight, 0.31, becomes 7 and comes back exactly. Every other weight is off by up to half a step, which is 0.022 here. Notice what rounding did to 0.02: it became 0 and the weight vanished. The maximum possible error per weight is <em>s</em>/2, so the whole game is keeping <em>s</em> small, and <em>s</em> is set by the largest number in the group.</p>
+
+<h3>The formats you will meet</h3>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Format</th><th>Bits</th><th>Distinct values</th><th>Where used</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>bf16</td><td>16</td><td>about 65,000</td><td>Training and default serving</td><td>8 exponent bits: the same range as fp32, coarse precision (7 mantissa bits)</td></tr>
+    <tr><td>int8</td><td>8</td><td>256</td><td>Weights, activations, KV cache</td><td>Evenly spaced; needs a scale; fast integer tensor cores</td></tr>
+    <tr><td>fp8 E4M3</td><td>8</td><td>256 (minus special values)</td><td>Weights and activations on H100-class GPUs</td><td>4 exponent bits, 3 mantissa bits: more precision, smaller range</td></tr>
+    <tr><td>fp8 E5M2</td><td>8</td><td>256 (minus special values)</td><td>Gradients in fp8 training</td><td>5 exponent bits, 2 mantissa bits: more range, less precision</td></tr>
+    <tr><td>int4</td><td>4</td><td>16</td><td>Weight-only inference (GPTQ, AWQ, GGUF)</td><td>Needs group scales; two values pack into one byte</td></tr>
+    <tr><td>NF4</td><td>4</td><td>16, at normal quantiles</td><td>QLoRA's frozen base</td><td>See <a href="11-lora.html">chapter 11</a></td></tr>
+  </tbody>
+</table></div>
+
+<p>The fp8 formats come from Micikevicius et al. (2022), "FP8 Formats for Deep Learning", which defines E4M3 (4 exponent bits and 3 mantissa bits) and E5M2. The difference from int8 is spacing. Integers are spaced evenly across the range; floating-point values are dense near zero and sparse far from it, which matches the bell-shaped distribution of weights and activations better than a uniform grid does.</p>
+
+<h2>Granularity: how many numbers share a scale</h2>
+
+<p>One scale for a whole weight matrix is the cheapest choice and the worst. The reason is in the sentence above: the scale is set by the largest value, so one large weight coarsens the grid for every other weight sharing its scale. Three choices of how many weights share a scale are in common use.</p>
+
+<dl class="terms">
+  <dt>Per-tensor</dt><dd>One scale for the whole matrix. Cheapest to store and apply, but a single large entry sets the step for millions of small ones.</dd>
+  <dt>Per-channel</dt><dd>One scale per output channel, meaning per row of the weight matrix in the layout where each row produces one output number. The dot product for that output then multiplies by a single scale, so it costs almost nothing at run time.</dd>
+  <dt>Per-group (or per-block)</dt><dd>One scale for each run of <em>g</em> consecutive weights along a row, with <em>g</em> typically 32, 64 or 128. This is what 4-bit formats use. It adds storage: a 16-bit scale per 128 weights costs 16/128 = 0.125 bit per weight, so "4-bit" is really 4.125 bits (4.25 if a 16-bit zero point is stored as well).</dd>
+</dl>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Three copies of an eight by eight grid of weights. In the first, one scale covers the whole grid. In the second, each row has its own scale. In the third, each row is split into two groups of four, each with its own scale. A single dark cell in the grid marks an outlier weight; the region sharing its scale is shaded.">
+    <defs><marker id="ahLT19a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="110" y="22" text-anchor="middle" class="t-sm t-bold">Per-tensor</text>
+    <text x="380" y="22" text-anchor="middle" class="t-sm t-bold">Per-channel (row)</text>
+    <text x="650" y="22" text-anchor="middle" class="t-sm t-bold">Per-group of 4</text>
+    <!-- grid 1 -->
+    <rect x="30" y="34" width="160" height="160" rx="4" class="fs-red s-red sw-2" opacity="0.35"/>
+    <rect x="300" y="34" width="160" height="160" rx="4" class="box"/>
+    <rect x="570" y="34" width="160" height="160" rx="4" class="box"/>
+    <!-- row stripes in grid 2: row 2 (outlier row) shaded -->
+    <rect x="300" y="74" width="160" height="20" class="fs-red s-red sw-2" opacity="0.35"/>
+    <!-- group shading in grid 3: outlier group, row 2, cols 5-8 -> x 650..730 -->
+    <rect x="650" y="74" width="80" height="20" class="fs-red s-red sw-2" opacity="0.35"/>
+    <!-- lines -->
+    <g class="line-thin">
+      <line x1="300" y1="54" x2="460" y2="54"/><line x1="300" y1="74" x2="460" y2="74"/><line x1="300" y1="94" x2="460" y2="94"/><line x1="300" y1="114" x2="460" y2="114"/><line x1="300" y1="134" x2="460" y2="134"/><line x1="300" y1="154" x2="460" y2="154"/><line x1="300" y1="174" x2="460" y2="174"/>
+      <line x1="570" y1="54" x2="730" y2="54"/><line x1="570" y1="74" x2="730" y2="74"/><line x1="570" y1="94" x2="730" y2="94"/><line x1="570" y1="114" x2="730" y2="114"/><line x1="570" y1="134" x2="730" y2="134"/><line x1="570" y1="154" x2="730" y2="154"/><line x1="570" y1="174" x2="730" y2="174"/>
+      <line x1="650" y1="34" x2="650" y2="194"/>
+    </g>
+    <!-- outlier cell (row 2, col 6) in each grid: x = left + 5*20 -->
+    <rect x="130" y="74" width="20" height="20" class="f-red"/>
+    <rect x="400" y="74" width="20" height="20" class="f-red"/>
+    <rect x="670" y="74" width="20" height="20" class="f-red"/>
+    <text x="110" y="216" text-anchor="middle" class="t-xs t-muted">1 scale: all 64 weights</text>
+    <text x="110" y="232" text-anchor="middle" class="t-xs t-muted">pay for the one outlier</text>
+    <text x="380" y="216" text-anchor="middle" class="t-xs t-muted">8 scales: only row 2 pays</text>
+    <text x="650" y="216" text-anchor="middle" class="t-xs t-muted">16 scales: only 4 weights pay</text>
+    <text x="650" y="232" text-anchor="middle" class="t-xs t-muted">cost: 16 bits per 128 weights</text>
+  </svg>
+  <figcaption><strong>The outlier (dark cell) sets the step for everything that shares its scale.</strong> The shaded region is the set of weights whose resolution it degrades. Finer granularity confines the damage and costs more scale numbers to store.</figcaption>
+</figure>
+
+<p>The effect on a real matrix is large. The first script also builds a 1,024 &times; 1,024 matrix of small random weights in which two rows are given 12 and 20 times the usual spread, then quantises it three ways.</p>
+
+<p>Look at the last table in the output of the first script. At int8 the three schemes are all tolerable (relative error 0.118, 0.008, 0.006), but at int4 the per-tensor error is 0.81, meaning the quantised matrix is mostly noise, while per-channel gives 0.14 and groups of 128 give 0.12. Finer scales matter more as the bit width falls, because there are fewer levels to waste.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Two number lines showing the 15 int4 levels. On the top line the range is set by one outlier at 0.6, so the levels are 0.086 apart and almost all ordinary weights, which lie within 0.06 of zero, round to zero or one level. On the bottom line the range is set by the ordinary weights alone, the levels are 0.0086 apart, and the same weights spread over all fifteen levels.">
+    <text x="20" y="22" class="t-sm t-bold">One scale shared with an outlier at 0.6</text>
+    <line x1="60" y1="70" x2="700" y2="70" class="line"/>
+    <g class="line-thin" id="tickstop"></g>
+    <!-- ticks for k=-7..7 spacing 45.71 around 380 -->
+    <path d="M60,62V78M105.7,62V78M151.4,62V78M197.1,62V78M242.9,62V78M288.6,62V78M334.3,62V78M380,62V78M425.7,62V78M471.4,62V78M517.1,62V78M562.9,62V78M608.6,62V78M654.3,62V78M700,62V78" class="line"/>
+    <rect x="348" y="52" width="64" height="36" rx="4" class="fs-cyan s-cyan sw-2" opacity="0.5"/>
+    <circle cx="700" cy="70" r="6" class="f-red"/>
+    <text x="700" y="102" text-anchor="middle" class="t-xs tc-red t-bold">outlier 0.6</text>
+    <text x="380" y="108" text-anchor="middle" class="t-xs t-muted">ordinary weights: all within 0.06 of zero</text>
+    <text x="380" y="124" text-anchor="middle" class="t-xs t-muted">step 0.086: they land on 0 and &plusmn;1 only</text>
+    <text x="20" y="162" class="t-sm t-bold">A scale fitted to the ordinary weights (group without the outlier)</text>
+    <line x1="60" y1="210" x2="700" y2="210" class="line"/>
+    <path d="M60,202V218M150.7,202V218M241.3,202V218M332,202V218M422.7,202V218M513.3,202V218M604,202V218M694.7,202V218" class="line"/>
+    <path d="M377.2,204V216M373.5,204V216M382,204V216M386,204V216M368,204V216M390,204V216M395,204V216M363,204V216M364,206V214" class="line-thin"/>
+    <rect x="348" y="192" width="64" height="36" rx="4" class="fs-cyan s-cyan sw-2" opacity="0.5"/>
+    <text x="380" y="246" text-anchor="middle" class="t-xs t-muted">step 0.0086 (same pixel scale, zoomed in by the shaded box): fifteen levels all in use</text>
+  </svg>
+  <figcaption><strong>Why one outlier costs so much.</strong> The shaded box is where nearly all weights live. Top: with the outlier in the group, that box contains only the levels 0 and &plusmn;1, so most weights round to zero or to one magnitude. Bottom: without it, the same box is spread across all fifteen levels. The lower line is a schematic zoom, not to scale.</figcaption>
+</figure>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: one ruler for a whole workshop</p>
+  <p>Imagine measuring every part in a workshop with a ruler marked only in whole centimetres, and a single huge beam forces you to choose a metre stick with marks every 10 cm. Every bolt becomes "0 cm" or "10 cm". Giving each bench its own ruler, marked for the parts on that bench, costs a few extra rulers but keeps every measurement useful.</p>
+  <p><em>Where it breaks down:</em> a ruler's marks are fixed once printed, whereas a neural network's mistakes compound: a rounding error in layer 3 changes the inputs to layer 4, which has its own rounding error, and the final answer depends on all of them together.</p>
+</div>
+
+<h2>Outliers: the real difficulty</h2>
+
+<p>Weights are the easier half. Their distribution is fairly stable and known in advance, so you can pick scales offline. <strong>Activations</strong>, the numbers flowing between layers, are harder, because they depend on the input and because transformers develop a few input channels whose values are far larger than the rest. Dettmers, Lewis, Belkada and Zettlemoyer (2022), in "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale", describe these <span class="term">outlier features</span>: systematic, large-magnitude dimensions that appear in the hidden states of large transformers and that matter for quality. Their fix was a mixed-precision decomposition: do the few outlier dimensions in 16-bit and everything else in int8, and they report halving inference memory with no measurable performance loss for models up to 175B parameters.</p>
+
+<p>Why do outliers hurt activations specifically? A matrix multiplication <em>Y</em> = <em>X</em>&middot;<em>W</em> multiplies each input channel <em>j</em> of the activations <em>X</em> by row <em>j</em> of the weights <em>W</em>. If you want fast integer arithmetic, both sides must be integers, so <em>X</em> needs a scale too. A per-tensor scale for <em>X</em> is set by its largest entry, which is an outlier channel, and every other channel is crushed. You cannot use one scale per input channel, because the integer matrix multiply sums over channels and the scales would have to be pulled inside the sum, destroying the integer kernel.</p>
+
+<p>Xiao and colleagues (2022), "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models" (ICML 2023), used a mathematically equivalent rewrite. Divide input channel <em>j</em> of <em>X</em> by a factor <em>s<sub>j</sub></em> and multiply row <em>j</em> of <em>W</em> by the same factor. The product is unchanged, but the outlier has been moved from the activations into the weights, where per-channel scales can absorb it. In the paper's words, it migrates the quantisation difficulty from activations to weights offline.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 230" role="img" aria-label="Before smoothing: activation matrix X with one tall outlier channel times weight matrix W gives Y. After smoothing: the outlier channel of X is divided by a factor s, the matching row of W is multiplied by s, and the product Y is identical. Both matrices now have moderate ranges.">
+    <defs><marker id="ahLT19b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="190" y="20" text-anchor="middle" class="t-sm t-bold">Before</text>
+    <rect x="40" y="36" width="120" height="100" rx="4" class="fs-green s-green sw-2"/>
+    <rect x="86" y="36" width="14" height="100" class="f-red"/>
+    <text x="100" y="156" text-anchor="middle" class="t-xs t-muted">X: channel j is 40x larger</text>
+    <text x="180" y="92" text-anchor="middle" class="t-sm">&times;</text>
+    <rect x="200" y="36" width="120" height="100" rx="4" class="fs-purple s-purple sw-2"/>
+    <rect x="200" y="78" width="120" height="14" class="fs-purple s-purple" opacity="0.6"/>
+    <text x="260" y="156" text-anchor="middle" class="t-xs t-muted">W: row j is ordinary</text>
+    <text x="190" y="190" text-anchor="middle" class="t-xs t-muted">per-tensor int8 for X: ordinary channels get ~3 levels</text>
+    <line x1="340" y1="86" x2="420" y2="86" class="line" marker-end="url(#ahLT19b)"/>
+    <text x="380" y="76" text-anchor="middle" class="t-xs t-muted">divide X[:, j] by s</text>
+    <text x="380" y="106" text-anchor="middle" class="t-xs t-muted">multiply W[j, :] by s</text>
+    <text x="580" y="20" text-anchor="middle" class="t-sm t-bold">After (same product)</text>
+    <rect x="440" y="36" width="120" height="100" rx="4" class="fs-green s-green sw-2"/>
+    <rect x="486" y="36" width="14" height="100" class="f-green" opacity="0.5"/>
+    <text x="500" y="156" text-anchor="middle" class="t-xs t-muted">X/s: ranges even</text>
+    <text x="580" y="92" text-anchor="middle" class="t-sm">&times;</text>
+    <rect x="600" y="36" width="120" height="100" rx="4" class="fs-purple s-purple sw-2"/>
+    <rect x="600" y="78" width="120" height="14" class="f-purple" opacity="0.7"/>
+    <text x="660" y="156" text-anchor="middle" class="t-xs t-muted">sW: row j is larger</text>
+    <text x="580" y="190" text-anchor="middle" class="t-xs t-muted">per-channel weight scales absorb the larger row</text>
+    <text x="380" y="220" text-anchor="middle" class="t-xs t-muted">Y = X W = (X / s)(s W) exactly, so nothing about the model changes</text>
+  </svg>
+  <figcaption><strong>Moving difficulty, not removing it.</strong> The product is exactly the same; only where the large number lives has changed. Colours: green are activations, purple weights; red marks the outlier channel.</figcaption>
+</figure>
+
+<p>The script below recreates the situation: two activation channels 40 times larger than the rest (an assumed, illustrative size), and measures the relative error of the output <em>Y</em>.</p>
+
+<pre class="terminal" data-title="outliers.py"><code>&quot;&quot;&quot;Activation outliers, SmoothQuant-style rescaling, and AWQ-style scaling for 4-bit weights.&quot;&quot;&quot;
+import numpy as np
+from qlib import quantise, rel
+
+rng = np.random.default_rng(1)
+T, C, D = 256, 512, 512                           # tokens, input width, output width
+X = rng.normal(0, 1, (T, C))
+X[:, [11, 301]] *= 40                             # two outlier channels, 40x larger (assumed, mimics the pattern in LLM.int8())
+W = rng.normal(0, 0.03, (C, D))
+Y = X @ W
+
+# A. W8A8: quantise activations per tensor, weights per output channel
+Xq = quantise(X, 8)
+Wq = quantise(W.T, 8, axis=1).T
+print(f&quot;A. int8 weights + int8 activations, per-tensor activation scale: output error {rel(Xq @ Wq, Y):.4f}&quot;)
+# per-token scales (one per row of X) help less when the outlier is in every row
+Xt = quantise(X, 8, axis=1)
+print(f&quot;   same, one activation scale per token                      : output error {rel(Xt @ Wq, Y):.4f}&quot;)
+
+# B. SmoothQuant: divide channel j of X by s_j, multiply row j of W by s_j (exactly equivalent)
+alpha = 0.5
+s = np.abs(X).max(axis=0) ** alpha / np.abs(W).max(axis=1) ** (1 - alpha)
+Xs, Ws = X / s, W * s[:, None]
+assert np.allclose(Xs @ Ws, Y)
+Y8 = quantise(Xs, 8) @ quantise(Ws.T, 8, axis=1).T
+print(f&quot;B. after SmoothQuant rescaling (alpha=0.5)                   : output error {rel(Y8, Y):.4f}&quot;)
+
+# C. 4-bit weight-only, group 128: RTN versus AWQ-style scaling by activation magnitude
+Wr = quantise(W.T, 4, group=128).T
+print(f&quot;C. int4 weights (group 128), round to nearest                : output error {rel(X @ Wr, Y):.4f}&quot;)
+act = np.abs(X).mean(axis=0)
+best = None
+for a in np.linspace(0, 1, 11):
+    s = act ** a
+    s = s / np.sqrt(s.max() * s.min())
+    Wa = quantise((W * s[:, None]).T, 4, group=128).T / s[:, None]
+    e = rel(X @ Wa, Y)
+    if best is None or e &lt; best[1]: best = (a, e)
+    if a in (0.0, 0.5, 1.0): print(f&quot;   AWQ-style scale, exponent {a:.1f}: output error {e:.4f}&quot;)
+print(f&quot;   best exponent on the grid = {best[0]:.1f}, error {best[1]:.4f}&quot;)</code></pre>
+<pre class="terminal" data-title="output"><code>A. int8 weights + int8 activations, per-tensor activation scale: output error 0.1215
+   same, one activation scale per token                      : output error 0.0431
+B. after SmoothQuant rescaling (alpha=0.5)                   : output error 0.0211
+C. int4 weights (group 128), round to nearest                : output error 0.1191
+   AWQ-style scale, exponent 0.0: output error 0.1191
+   AWQ-style scale, exponent 0.5: output error 0.0773
+   AWQ-style scale, exponent 1.0: output error 0.2143
+   best exponent on the grid = 0.3, error 0.0577</code></pre>
+
+<p>In part A, with int8 on both sides and a single activation scale, the output is off by 12%. Giving each token its own activation scale helps (4.3%) but cannot separate the outlier channels from the others within a token. After the SmoothQuant-style rescaling, part B, the error falls to 2.1%. The factor used is <em>s<sub>j</sub></em> = max|<em>X<sub>j</sub></em>|<sup>&alpha;</sup> / max|<em>W<sub>j</sub></em>|<sup>1&minus;&alpha;</sup> with &alpha; = 0.5, the middle setting the paper describes for balancing the two sides.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A quantised model is the same model, just smaller." It is a different function that approximates the original, and the approximation is uneven. Average error can be small while a rare, important behaviour (a long arithmetic chain, a rarely used language, a tool-call format) degrades sharply. The error is also not guaranteed to be monotone in bit width across tasks. You get the model you measured, not the model you started with.</p>
+</div>
+
+<h2>Weight-only 4-bit: GPTQ and AWQ</h2>
+
+<p>At 4 bits, plain round-to-nearest (RTN) with group scales is often noticeably worse than the original, and the cheapest remedy is to quantise <em>cleverly</em> using a small calibration set: a few hundred text snippets run through the model to see what its activations look like. Two methods dominate weight-only quantisation. In weight-only schemes the activations stay in 16-bit and the weights are dequantised on the fly inside the kernel, the format called W4A16 (4-bit weights, 16-bit activations).</p>
+
+<h3>GPTQ: round, then repair the damage</h3>
+
+<p>Frantar, Ashkboos, Hoefler and Alistarh (2022), in "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers", ask a sharper question than "which grid point is nearest?". For one layer with weights <em>W</em> and calibration inputs <em>X</em>, the quantity that matters is the layer's <em>output</em>, so they minimise the squared output error ||<em>WX</em> &minus; <em>&Wcirc;X</em>||<sup>2</sup> rather than the weight error. This is a classic problem with an approximate second-order solution (the Optimal Brain Surgeon lineage): quantise one weight, then adjust the not-yet-quantised weights in the same row to compensate for the error just introduced, using the Hessian of the layer's loss, which for this objective is proportional to <em>XX</em><sup>T</sup>. The paper reports quantising GPT models with 175 billion parameters in about four GPU hours down to 3 or 4 bits with little accuracy loss.</p>
+
+<p>The intuition: when you round a weight up, nudge its neighbours down so the dot product with typical inputs stays about the same. Inputs that are often large (outlier channels) get rounded more carefully, because the Hessian weights them more heavily.</p>
+
+<h3>AWQ: protect the weights that matter</h3>
+
+<p>Lin and colleagues (2023), "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration", start from the observation that not all weights are equally important: a small fraction of weight channels, identified by the size of the <em>activations</em> that multiply them, account for most of the output error. The obvious fix, keeping those channels in 16 bits, produces a mixed-precision format that GPUs run badly. AWQ instead scales the salient channels up before quantising and scales the activation down to compensate, using the same equivalence as SmoothQuant but applied to protect 4-bit weights. Because the group scale is set by the group's maximum, multiplying one weight by <em>s</em> &gt; 1 does not change the group's grid much, but it reduces that weight's <em>relative</em> rounding error by about a factor of <em>s</em>.</p>
+
+<details class="deeper"><summary>Go deeper <span class="hint">why scaling a weight up reduces its error</span></summary>
+<p>Let a group have scale &Delta; = max|w| / 7. Round-to-nearest adds an error to each weight that is roughly uniform in [&minus;&Delta;/2, &Delta;/2], whatever the weight's size. Now take input channel <em>j</em>, with activation value <em>x</em> and weight <em>w</em>, contributing <em>xw</em> to the output. The quantised contribution is <em>x</em>(<em>w</em> + &epsilon;) with &epsilon; the rounding error, so the output error from this channel is <em>x</em>&epsilon;, of typical size |<em>x</em>|&Delta;/&radic;12.</p>
+<p>Replace <em>w</em> by <em>sw</em> and <em>x</em> by <em>x</em>/<em>s</em>. If <em>sw</em> does not raise the group maximum, &Delta; is unchanged. The rounding error &epsilon; on <em>sw</em> is still of size &Delta;/&radic;12, but after dividing the activation by <em>s</em> the output error becomes (<em>x</em>/<em>s</em>)&epsilon;, which is <em>s</em> times smaller. So channels with large |<em>x</em>| are the best ones to scale up. The cost: if <em>s</em> is large enough to raise the group maximum, &Delta; grows for every other weight in the group. AWQ therefore searches a single exponent &alpha; in <em>s<sub>j</sub></em> = (mean activation<sub>j</sub>)<sup>&alpha;</sup> over a grid, scoring each candidate by output error on the calibration data.</p>
+</details>
+
+<p>The second half of the script above (part C) does exactly that search on the toy problem, with the same two loud channels. Plain RTN at int4 with groups of 128 gives an output error of 11.9%. An exponent of 0.5 gives 7.7%, an exponent of 1.0 overshoots to 21.4% because the scaled weights now raise the group maximum, and the best value on the grid, 0.3, gives 5.8%. The shape of that curve, falling and then rising, is the whole method in miniature. Real AWQ also keeps no weights in 16 bits and does no backpropagation; it needs only the activation statistics.</p>
+
+<table>
+  <thead><tr><th></th><th>RTN</th><th>GPTQ</th><th>AWQ</th></tr></thead>
+  <tbody>
+    <tr><td>Idea</td><td>Nearest grid point</td><td>Round one weight at a time and repair the rest using second-order information</td><td>Scale up activation-salient channels before rounding</td></tr>
+    <tr><td>Needs calibration data</td><td>No</td><td>Yes (hundreds of samples)</td><td>Yes (activation statistics)</td></tr>
+    <tr><td>Changes weights beyond rounding</td><td>No</td><td>Yes, compensating updates</td><td>Only by a per-channel scale</td></tr>
+    <tr><td>Cost to run</td><td>Seconds</td><td>Hours for the largest models</td><td>Fast; a scale search per layer</td></tr>
+    <tr><td>Main risk</td><td>Visible quality loss at 4 bits and below</td><td>Overfitting to the calibration set</td><td>Calibration data that does not match deployment</td></tr>
+  </tbody>
+</table>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Change the toy experiments and watch where the error goes.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 outliers.py</span>
+<span class="prompt">$</span> <span class="cmd">sed -i.bak 's/\*= 40/*= 4/' outliers.py &amp;&amp; python3 outliers.py</span></code></pre>
+  <p>With outlier channels only 4 times larger, how much of the gap between parts A and B disappears? Then set the group size in <code>quantise(..., group=128)</code> to 32 and then to 512: how does the int4 error move, and what does it cost in extra scale storage (16 bits per group)? Finally, change the weight spread in the AWQ part (the 0.03 in <code>rng.normal(0, 0.03, ...)</code>) and check that the best exponent barely moves: the scale search depends on the activations, not on the weight magnitudes.</p>
+</div>
+
+<h2>Where the speed comes from</h2>
+
+<p>Smaller weights are not automatically faster, and it helps to separate the two phases from <a href="18-kv-cache.html">chapter 18</a>.</p>
+<ul>
+  <li><strong>Decode</strong> at small batch size is memory-bound. The weight bytes read per step fall by four times at 4 bits, so the step is faster, <em>provided</em> the kernel dequantises inside the matrix multiply without writing a bf16 copy back to memory. A fused dequantise-and-multiply kernel does that; a naive one does not, and can be slower than bf16.</li>
+  <li><strong>Prefill</strong> and large-batch decode are compute-bound. Reading fewer weight bytes barely helps; what helps is doing the arithmetic on cheaper units. W4A16 still multiplies in 16 bits, so it gains little here. W8A8 (int8 or fp8 for both operands) uses the 8-bit tensor cores, which NVIDIA rates at twice the bf16 rate on the H100 (the datasheet lists 3,958 for fp8 and 1,979 for bf16 <em>with sparsity</em>; the dense figures are half of each, so the 2:1 ratio holds).</li>
+</ul>
+
+<p>That explains the usual pairing. For a low-traffic deployment dominated by decode (a single user, an on-device model, a modest self-hosted endpoint), 4-bit weight-only is the strongest option. For a busy server with large batches and long prompts, fp8 or int8 weights <em>and</em> activations are the better fit, because the system is compute-bound for much of its time and 8-bit units double the arithmetic rate. Chapter 22 puts prices on the difference.</p>
+
+<h3>Quantising the KV cache</h3>
+<p>Once weights are small, the KV cache dominates memory (see the 3-bit row of the table above). The cache can be stored in fp8 or int8, halving its size, with an extra scale per head or per token. The error behaves differently from weight error: it enters through attention scores, so it is worth testing on long-context tasks specifically, where many cached entries contribute.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Block-scaled 4-bit floating-point formats are now a hardware feature, not just a research idea. MXFP4 is an Open Compute Project microscaling format in which 32 values share an 8-bit power-of-two scale. NVFP4, NVIDIA's format for its Blackwell GPUs, uses 16-value blocks with an fp8 scale, which one preprint reports gives lower error than MXFP4 at about 4.5 bits per value instead of 4.25 (vendor-adjacent sources; independent comparisons are still sparse). In the open-source tooling, GGUF (llama.cpp) is the common format for laptops and CPUs, while GPTQ and AWQ checkpoints are widely served from vLLM and similar engines. Format names, kernel support and which GPU generation supports which format change quickly: check the engine's documentation before choosing.</p>
+</div>
+
+<h2>Measuring the damage</h2>
+
+<p>A quantised model should never ship on the strength of "it still sounds fluent". Three measurements, in order of cheapness, give a fair picture. The script below uses a small random network as a stand-in for a language model: its output is a probability distribution over 500 tokens, so the same metrics apply.</p>
+
+<dl class="terms">
+  <dt>Perplexity</dt><dd>The exponential of the average negative log-probability the model gives to held-out text (<a href="../../deep-learning/chapters/14-language-modelling.html">A2 chapter 14</a>). Cheap and standard, but it averages over all tokens, so it understates damage to rare, high-stakes ones.</dd>
+  <dt>KL divergence to the original</dt><dd>How far the quantised model's next-token distribution is from the full-precision one, averaged over positions. It needs no labels and compares the two models directly, which makes it the most sensitive of the three.</dd>
+  <dt>Agreement (flip rate)</dt><dd>How often the most likely next token is the same in both models. Greedy generation can diverge after a single flip, so low agreement predicts different outputs even if perplexity looks fine.</dd>
+</dl>
+
+<pre class="terminal" data-title="damage.py"><code>&quot;&quot;&quot;Measuring quantisation damage on a small random &#x27;language model&#x27;: next-token distributions before and after.&quot;&quot;&quot;
+import numpy as np
+from qlib import quantise
+
+rng = np.random.default_rng(3)
+C, F, V, N = 256, 1024, 500, 4000                  # width, hidden, vocabulary, test positions
+W1 = rng.normal(0, 1 / np.sqrt(C), (C, F)); W1[:, rng.choice(F, 6, replace=False)] *= 8   # a few loud hidden units
+W2 = rng.normal(0, 1 / np.sqrt(F), (F, V)) * 4.0
+X = rng.normal(0, 1, (N, C))
+
+def forward(W1, W2, X):
+    h = np.maximum(X @ W1, 0)
+    z = h @ W2
+    z = z - z.max(1, keepdims=True)
+    return z - np.log(np.exp(z).sum(1, keepdims=True))     # log-probabilities
+
+ref = forward(W1, W2, X); p = np.exp(ref)
+y = np.array([rng.choice(V, p=pi / pi.sum()) for pi in p])   # &#x27;true&#x27; next tokens drawn from the full-precision model
+nll = lambda lp: -lp[np.arange(N), y].mean()
+print(f&quot;full precision: perplexity on its own samples = {np.exp(nll(ref)):.2f}&quot;)
+print(f&quot;{&#x27;scheme&#x27;:&lt;26}{&#x27;bits/wt&#x27;:&gt;8}{&#x27;KL (nats)&#x27;:&gt;11}{&#x27;top-1 agree&#x27;:&gt;13}{&#x27;perplexity&#x27;:&gt;12}&quot;)
+def row(name, bits, q):
+    lp = forward(q(W1), q(W2), X)
+    kl = (p * (ref - lp)).sum(1).mean()
+    agree = (lp.argmax(1) == ref.argmax(1)).mean()
+    print(f&quot;{name:&lt;26}{bits:&gt;8.2f}{kl:&gt;11.5f}{agree:&gt;13.1%}{np.exp(nll(lp)):&gt;12.2f}&quot;)
+qt = lambda b, **kw: (lambda W: quantise(W.T, b, **kw).T)      # quantise along the input dimension of each output column
+row(&quot;int8 per-channel&quot;, 8, qt(8, axis=1))
+row(&quot;int4 per-tensor&quot;, 4, lambda W: quantise(W, 4))
+row(&quot;int4 per-channel&quot;, 4, qt(4, axis=1))
+row(&quot;int4 group 128&quot;, 4 + 16 / 128, qt(4, group=128))
+row(&quot;int3 group 128&quot;, 3 + 16 / 128, qt(3, group=128))
+row(&quot;int2 group 128&quot;, 2 + 16 / 128, qt(2, group=128))</code></pre>
+<pre class="terminal" data-title="output"><code>full precision: perplexity on its own samples = 15.44
+scheme                     bits/wt  KL (nats)  top-1 agree  perplexity
+int8 per-channel              8.00    0.00046        98.4%       15.43
+int4 per-tensor               4.00    2.23716        18.1%      135.19
+int4 per-channel              4.00    0.16078        69.6%       18.05
+int4 group 128                4.12    0.11527        73.5%       17.46
+int3 group 128                3.12    0.61201        49.2%       28.55
+int2 group 128                2.12    4.53984        11.6%     1478.81</code></pre>
+
+<p>Three lessons fall out of this table. First, int8 per-channel is nearly free (KL 0.0005, 98% agreement). Second, the same 4 bits with <em>per-tensor</em> scales is a disaster (18% agreement) while per-channel or group scales keep 70 to 74%, the same lesson as the matrix experiment. Third, <strong>perplexity is the gentlest metric</strong>: int4 with groups moves perplexity from 15.4 to 17.5 (a 13% rise), while the top token changes in 26% of positions. A quantised model can look acceptable on perplexity and still behave differently in generation.</p>
+
+<p>For a real model, add task-level evaluation (<a href="23-evaluating-models.html">chapter 23</a>): run the benchmarks and the product-specific tests you care about on both versions, with the same prompts, and compare with confidence intervals. Include the following, because they are where quantisation damage tends to show first.</p>
+<ul>
+  <li><strong>Long-context and multi-step tasks</strong>, where small errors accumulate across many tokens.</li>
+  <li><strong>Structured output</strong>: JSON validity and tool-call formats, which fail when a single token flips.</li>
+  <li><strong>Less common languages and domains</strong>, which are underrepresented in the calibration data.</li>
+  <li><strong>Safety and refusal behaviour</strong>, which may shift in ways general benchmarks do not show (<a href="../../evals/chapters/00-start-here.html">A6</a> covers how to test for it).</li>
+</ul>
+<p>Choose the calibration set to resemble deployment traffic. GPTQ and AWQ both fit to it, and a set of generic web text can leave a code-heavy or multilingual deployment under-served.</p>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Everything above is the <a href="../../systems/chapters/02-memory-hierarchy.html">memory hierarchy</a> at work: the gain from 4-bit weights is a gain in bytes moved from the slowest level (HBM) to the compute units, and the roofline view in <a href="../../systems/chapters/21-parallelism-gpus.html">Parallelism, SIMD &amp; GPUs</a> says when bytes, not arithmetic, set the speed. Choosing a calibration set and checking an approximation against a reference is the same discipline as validating any lossy optimisation, such as a cache or an approximate index: define the error you can live with before you measure it, then <a href="../../reliability/chapters/12-deployments.html">roll it out gradually</a>.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Quantisation maps weights to a few allowed values with a scale; the step size is set by the largest number sharing that scale, so granularity (per-tensor, per-channel, per-group) decides the damage.</li>
+    <li>Group scales make "4-bit" about 4.125 bits per weight; the saving is real but not exactly 4x.</li>
+    <li>Outlier channels in activations are the central difficulty. SmoothQuant moves them into the weights; LLM.int8() handles them in 16-bit.</li>
+    <li>GPTQ minimises layer-output error by compensating each rounding with the remaining weights; AWQ protects activation-salient channels by scaling them. Both use calibration data.</li>
+    <li>Weight-only 4-bit speeds up memory-bound decode; 8-bit weights and activations speed up compute-bound prefill and big batches.</li>
+    <li>Measure the damage with KL divergence, agreement and task evaluations on your own workload; perplexity alone understates it.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">Dettmers, Lewis, Belkada and Zettlemoyer, "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale" (2022)</a>. Introduces the outlier-feature phenomenon and the mixed-precision decomposition.</li>
+  <li><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">Xiao et al., "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models" (2022)</a>. The equivalent-rescaling trick for W8A8.</li>
+  <li><a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">Frantar, Ashkboos, Hoefler and Alistarh, "GPTQ" (2022)</a>. Layer-wise second-order quantisation of large models in hours.</li>
+  <li><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">Lin et al., "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration" (2023)</a>. Salient channels from activation statistics, and the TinyChat inference framework.</li>
+  <li><a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">Micikevicius et al., "FP8 Formats for Deep Learning" (2022)</a>. Defines E4M3 and E5M2 and shows where each is used.</li>
+  <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA, H100 Tensor Core GPU product page</a>. Memory size, bandwidth and tensor-core throughput (the headline figures include sparsity).</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A weight matrix is quantised to int4 with one scale for the whole tensor and the result is mostly noise. A colleague proposes 128-weight groups. What is the main reason this helps?</p>
+    <ol class="q-options"><li>Groups give each weight more bits, so each is represented more precisely</li><li>The scale of each group is set by its own largest value, so an outlier only coarsens the weights in its group</li><li>Groups let the GPU skip multiplying weights that round to zero</li><li>Groups remove the need to round at all</li></ol>
+    <div class="q-explain">The number of bits per weight is unchanged (it even rises slightly because of the scales). What changes is how many weights share a step size set by the largest of them. Option 0 is the tempting wrong answer: bits per weight are still four. Option 2 is not how dense kernels work.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">An 8B model in bf16 has weights of 16.1 GB. At 4 bits with a 16-bit scale per group of 128, which weight size is closest?</p>
+    <ol class="q-options"><li>2.0 GB</li><li>3.0 GB</li><li>4.0 GB exactly</li><li>4.1 GB</li></ol>
+    <div class="q-explain">4 + 16/128 = 4.125 bits per weight, so 8.03 billion &times; 4.125 / 8 is about 4.14 GB. Four exactly ignores the scales. Embeddings and norms that are often kept in higher precision would add a little more in practice.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why can SmoothQuant divide an activation channel by <em>s</em> and multiply the matching weight row by <em>s</em> without changing the model?</p>
+    <ol class="q-options"><li>The product X&middot;W sums x<sub>j</sub>w<sub>j</sub> over channels, and (x<sub>j</sub>/s)(s w<sub>j</sub>) equals x<sub>j</sub>w<sub>j</sub></li><li>The model is retrained afterwards to absorb the change</li><li>Dividing by s reduces the number of outliers in the weights</li><li>Activations are always rescaled by the next layer's normalisation</li></ol>
+    <div class="q-explain">It is an exact algebraic identity in full precision; only the quantisation error changes, because the large value now lives where per-channel scales can handle it. No retraining is involved, which is why the method is called post-training.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">You serve a quantised 8B model to many users with large batches and long prompts, and measure that most time is spent in compute-bound matrix multiplies. Which change is most likely to raise throughput?</p>
+    <ol class="q-options"><li>Moving from 4-bit to 3-bit weights while keeping 16-bit activations</li><li>Quantising only the embedding table</li><li>Using fp8 or int8 for both weights and activations so the 8-bit tensor cores are used</li><li>Increasing the group size from 128 to 1,024</li></ol>
+    <div class="q-explain">When compute-bound, bytes read are not the limit, so smaller weights alone do little (option 0, and option 3 only saves scale storage). Using 8-bit arithmetic raises the arithmetic rate, about twice bf16 on the H100 per the datasheet ratio.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A 4-bit model scores within 1% of the original on perplexity. Which further check is most likely to reveal damage that perplexity hides?</p>
+    <ol class="q-options"><li>Re-measuring perplexity on the same text with a different batch size</li><li>Comparing next-token agreement and KL divergence to the original, and running your task suite including structured output</li><li>Checking that the file is smaller</li><li>Measuring tokens per second</li></ol>
+    <div class="q-explain">Perplexity averages over tokens and is the gentlest metric; in the chapter's experiment a 13% perplexity rise came with the top token changing at about a quarter of positions. Speed and file size say nothing about quality.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In the AWQ-style search, the error first falls and then rises as the exponent &alpha; goes from 0 to 1. What explains the rise?</p>
+    <ol class="q-options"><li>The activations become too small to represent</li><li>The calibration data runs out</li><li>Large scale factors raise the group maximum, so the step size grows for all the other weights in the group</li><li>Rounding becomes biased towards zero</li></ol>
+    <div class="q-explain">Scaling a salient weight up protects it, but if the scaled value exceeds the group's old maximum the shared step grows and the ordinary weights get coarser. The best exponent balances the two effects.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tracing &amp; Observability for LLM Systems · Evals, Guardrails &amp; Safe Operation</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="evl" data-chapter="17">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Tracing &amp; Observability for LLM Systems</h1>
+  <p class="lede">An LLM application can return a fast, well-formed, wrong answer and every ordinary dashboard stays green. This chapter shows how to record each request as a tree of spans for model calls, tool calls and checks, which fields to keep and which to leave out, how OpenTelemetry's GenAI conventions name them, and how to sample so that you keep the traces worth reading without paying to store them all.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Everything earlier in this course, from reading traces by hand to running judges and regression suites, assumes you have traces to read. In production they do not appear by themselves. If the prompt version, the retrieved passages, the tool arguments and the model's reply were not recorded, a bad answer from last Tuesday is a rumour you cannot investigate, and an evaluator cannot score what it cannot see. The opposite error is as common: recording every prompt and reply forever, which is expensive and turns your logging system into a store of customer secrets. After this chapter you will be able to design the span structure for an LLM request, choose the attributes to capture and what to do with the content, instrument a small agent, estimate and tune a sampling policy, and explain what is and is not stable in the OpenTelemetry GenAI conventions.</p>
+</div>
+
+<h2>Why LLM systems need their own observability habits</h2>
+
+<p><span class="term">Observability</span> is the ability to answer new questions about a running system from the data it emits, without shipping new code to find out. Track-1 courses already gave you the three classic signals: metrics for aggregates (<a href="../../reliability/chapters/04-metrics.html">Metrics, Percentiles &amp; Histograms</a>), structured events for single occurrences (<a href="../../reliability/chapters/05-logs-events.html">Logs &amp; Structured Events</a>) and distributed traces for the path of one request through many services (<a href="../../reliability/chapters/06-tracing.html">Distributed Tracing</a>). A <span class="term">trace</span> is the whole record of one request; it is made of <span class="term">spans</span>, each a timed operation with a name, attributes, a parent and a status. Those ideas carry over unchanged. Four properties of LLM systems change how you use them.</p>
+
+<ul>
+  <li><strong>Success is not a status code.</strong> A call that returns 200 may contain a hallucinated policy, an ignored tool result or a refusal of a reasonable request. The signal you need, whether the answer was good, comes from evaluators, user feedback and review, and has to be attached to the trace after the fact.</li>
+  <li><strong>The content is the evidence.</strong> Diagnosing a failure usually needs the actual prompt, the retrieved passages and the reply, not just their sizes. Ordinary telemetry avoids payloads; here you want them, and they are sensitive.</li>
+  <li><strong>Behaviour depends on a bundle of versions.</strong> The same user message can produce different results under a different prompt template, model snapshot, tool schema or index. Without the versions on the trace you cannot tell whether a regression came from your change or from a provider's.</li>
+  <li><strong>Requests are multi-step and cost money per step.</strong> One user message may trigger several model calls and tool calls in a loop (<a href="../../agents/chapters/02-tool-loop.html">Tool Calling: The Agent Loop</a>). Latency, tokens and failures need attributing to the step that caused them.</li>
+</ul>
+
+<h2>The span tree of one request</h2>
+
+<p>The natural structure follows the agent loop. The root span is the request or agent invocation. Under it come one span per model call, one per tool call, and, where you have them, spans for retrieval and for each guardrail check from <a href="15-guardrails.html">Guardrail Classifiers &amp; Content Policy</a>. A tool call that itself calls another service becomes the parent of that service's spans, if you propagate the trace context across the boundary, which is the same context-propagation rule as in any distributed system.</p>
+
+<p>The script below is a miniature tracer, written for this chapter in the standard library, that records spans for a two-step agent: the model asks to look up an order, the tool runs, and the model writes the answer. It uses the lab-support <code>ScriptedModel</code> as the model and a fake clock, so the timings are the same every run. Attribute names follow the OpenTelemetry GenAI conventions described below. Pay attention to two details in the code: the user's text is not stored in any span, because content capture is switched off by default, and when it is switched on the text passes through a redaction function first.</p>
+
+<pre class="terminal" data-title="mini_tracer.py"><code>import json, re
+from contextlib import contextmanager
+from llm import ScriptedModel, tool_use, text_of, tool_calls, tool_result
+
+CLOCK = [0.0]                                    # fake clock in milliseconds, so output is reproducible
+def work(ms): CLOCK[0] += ms
+
+class Tracer:
+    def __init__(self): self.spans, self.stack, self.n = [], [], 0
+    @contextmanager
+    def span(self, name, kind="INTERNAL", **attrs):
+        self.n += 1
+        s = {"id": f"s{self.n}", "parent": self.stack[-1]["id"] if self.stack else None, "name": name,
+             "kind": kind, "start": CLOCK[0], "attrs": dict(attrs), "status": "OK"}
+        self.stack.append(s); self.spans.append(s)
+        try:
+            yield s
+        except Exception as e:
+            s["status"] = "ERROR"; s["attrs"]["error.type"] = type(e).__name__; raise
+        finally:
+            s["end"] = CLOCK[0]; self.stack.pop()
+
+REDACT = [(re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "[EMAIL]")]
+def redact(t):
+    for pat, rep in REDACT: t = pat.sub(rep, t)
+    return t
+
+T = Tracer()
+MODEL = ScriptedModel([[tool_use("lookup_order", {"order_id": "A-1042"}, id="call_1")],
+                       "Order A-1042 shipped on 3 October and arrives on Friday."])
+TOOLS = [{"name": "lookup_order", "description": "Find an order", "input_schema": {"type": "object"}}]
+CAPTURE_CONTENT = False                          # opt-in, as in the OpenTelemetry GenAI conventions
+
+def chat(messages):
+    with T.span("chat demo-model", "CLIENT", **{"gen_ai.operation.name": "chat", "gen_ai.provider.name": "demo",
+                "gen_ai.request.model": "demo-model", "gen_ai.request.temperature": 0.0}) as s:
+        work(620 if len(messages) == 1 else 480)
+        r = MODEL.complete(messages, tools=TOOLS)
+        s["attrs"].update({"gen_ai.usage.input_tokens": r.usage["input_tokens"],
+                           "gen_ai.usage.output_tokens": r.usage["output_tokens"],
+                           "gen_ai.response.finish_reasons": [r.stop_reason]})
+        if CAPTURE_CONTENT: s["attrs"]["gen_ai.output.messages"] = redact(text_of(r))
+        return r
+
+def run(user_text):
+    with T.span("invoke_agent support-bot", "INTERNAL", **{"gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": "support-bot", "gen_ai.conversation.id": "conv-7"}):
+        messages = [{"role": "user", "content": user_text}]
+        r = chat(messages)
+        for call in tool_calls(r):
+            with T.span(f"execute_tool {call['name']}", "INTERNAL", **{"gen_ai.operation.name": "execute_tool",
+                        "gen_ai.tool.name": call["name"], "gen_ai.tool.call.id": call["id"]}):
+                work(95)                         # the database lookup
+            messages += [r.as_message(), {"role": "user", "content": [tool_result(call["id"], "shipped 3 Oct; ETA Fri")]}]
+        return text_of(chat(messages))
+
+run("Where is order A-1042? My email is jo@example.com")
+by_id = {s["id"]: s for s in T.spans}
+def depth(s): return 0 if s["parent"] is None else 1 + depth(by_id[s["parent"]])
+t0 = T.spans[0]["start"]
+for s in T.spans:
+    tok = ""
+    if "gen_ai.usage.input_tokens" in s["attrs"]:
+        tok = f"  in={s['attrs']['gen_ai.usage.input_tokens']} out={s['attrs']['gen_ai.usage.output_tokens']} finish={s['attrs']['gen_ai.response.finish_reasons'][0]}"
+    print(f"{'  ' * depth(s)}{s['name']:&lt;{34 - 2 * depth(s)}} {s['kind']:&lt;8} {s['start']-t0:&gt;5.0f} to {s['end']-t0:&gt;5.0f} ms{tok}")
+chats = [s for s in T.spans if s["attrs"].get("gen_ai.operation.name") == "chat"]
+print("\ntotal input tokens :", sum(s["attrs"]["gen_ai.usage.input_tokens"] for s in chats))
+print("total output tokens:", sum(s["attrs"]["gen_ai.usage.output_tokens"] for s in chats))
+print("model time share   :", f"{sum(s['end']-s['start'] for s in chats) / (T.spans[0]['end']-t0):.0%} of the request")
+print("user text stored in any span?", any("jo@example.com" in json.dumps(s) for s in T.spans))</code></pre>
+<pre class="terminal" data-title="output"><code>invoke_agent support-bot           INTERNAL     0 to  1195 ms
+  chat demo-model                  CLIENT       0 to   620 ms  in=36 out=6 finish=tool_use
+  execute_tool lookup_order        INTERNAL   620 to   715 ms
+  chat demo-model                  CLIENT     715 to  1195 ms  in=48 out=14 finish=end_turn
+
+total input tokens : 84
+total output tokens: 20
+model time share   : 92% of the request
+user text stored in any span? False</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Waterfall chart of the trace from the script. Row one: invoke_agent support-bot from 0 to 1195 milliseconds. Row two: first chat call from 0 to 620 milliseconds. Row three: execute_tool lookup_order from 620 to 715 milliseconds. Row four: second chat call from 715 to 1195 milliseconds.">
+    <line x1="200" y1="40" x2="200" y2="200" class="line-thin"/><line x1="394" y1="40" x2="394" y2="200" class="line-thin"/><line x1="548" y1="40" x2="548" y2="200" class="line-thin"/><line x1="722" y1="40" x2="722" y2="200" class="line-thin"/>
+    <text x="200" y="224" text-anchor="middle" class="t-xs t-muted">0</text><text x="374" y="224" text-anchor="middle" class="t-xs t-muted">400 ms</text><text x="548" y="224" text-anchor="middle" class="t-xs t-muted">800 ms</text><text x="722" y="224" text-anchor="middle" class="t-xs t-muted">1,200 ms</text>
+    <text x="10" y="70" class="t-sm t-bold">invoke_agent support-bot</text>
+    <text x="30" y="110" class="t-sm">chat demo-model</text>
+    <text x="30" y="150" class="t-sm">execute_tool lookup_order</text>
+    <text x="30" y="190" class="t-sm">chat demo-model</text>
+    <rect x="200" y="54" width="520" height="24" rx="4" class="fs-purple s-purple sw-2"/><text x="460" y="71" text-anchor="middle" class="t-xs">1,195 ms</text>
+    <rect x="200" y="94" width="270" height="24" rx="4" class="fs-blue s-blue sw-2"/><text x="335" y="111" text-anchor="middle" class="t-xs">620 ms  in 36, out 6</text>
+    <rect x="470" y="134" width="41" height="24" rx="4" class="fs-orange s-orange sw-2"/><text x="531" y="151" class="t-xs">95 ms</text>
+    <rect x="511" y="174" width="209" height="24" rx="4" class="fs-blue s-blue sw-2"/><text x="615" y="191" text-anchor="middle" class="t-xs">480 ms  in 48, out 14</text>
+    <text x="380" y="256" text-anchor="middle" class="t-xs t-muted">Model calls take 92% of the request; the tool is 8%. Tune the thing that is long.</text>
+  </svg>
+  <figcaption><strong>A waterfall shows where the time went.</strong> Bars start where the span started and have the length of its duration; children sit inside their parent. Here the two model calls dominate, so speeding up the database would barely help.</figcaption>
+</figure>
+
+<p>Two readings of the output are worth practising. First, the totals: summing the token counts on the two <code>chat</code> spans gives the request's token use (84 in, 20 out). Sum only the leaf model-call spans, never the parent agent span as well, or you count every token twice. Multiply by your provider's price per token (look up the current rates; they change) and you have cost per request, which you can then break down by prompt version, route or customer. Second, the share of time: 92% of the request is spent in model calls, so the lever is the prompt length, the model choice or caching, not the tool. The same arithmetic is the basis of the trade-offs in <a href="19-cost-latency-quality.html">Cost, Latency &amp; Quality Trade-offs</a>.</p>
+
+<h2>What to record</h2>
+
+<p>Decide the fields by the questions you will need to ask later: why was this slow, why was this expensive, what did the model see, what changed, and was the answer good. The table lists a sensible minimum per span type.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Span</th><th>Always record</th><th>Record when safe</th></tr></thead>
+<tbody>
+<tr><td>Request (root)</td><td>Release and prompt version, route, conversation id, tenant (hashed), start, end, status, user feedback when it arrives</td><td>User message (redacted)</td></tr>
+<tr><td>Model call</td><td>Provider, requested and actual model, temperature and other sampling settings, input and output tokens (and cached or reasoning tokens if the provider reports them), finish reason, latency, time to first token if streaming, error type</td><td>Full messages, system prompt, tool definitions</td></tr>
+<tr><td>Tool call</td><td>Tool name, call id, duration, status, retry count, error type</td><td>Arguments and result (often contain personal data)</td></tr>
+<tr><td>Retrieval</td><td>Index and snapshot version, top-k, document ids and scores, latency</td><td>Query text, passage text</td></tr>
+<tr><td>Guardrail or evaluator</td><td>Which check, version, verdict, score, latency, action taken</td><td>The text it judged</td></tr>
+</tbody></table></div>
+
+<p>The left column is metadata: cheap, small and rarely sensitive. It supports every dashboard and most diagnosis ("latency doubled for the new prompt version, in the second model call, only for conversations over six turns"). The right column is content: it is what you need for error analysis and for building regression cases (<a href="01-error-analysis.html">Error Analysis</a>), and it is also where personal data, commercial secrets and customer documents live.</p>
+
+<h3>The content question</h3>
+
+<p>There are four defensible policies, and they combine.</p>
+<ol class="steps">
+  <li><strong>Metadata only.</strong> Safest. You can see that something went wrong and where, but not why. Reasonable for regulated or highly sensitive products, with a separate, access-controlled way to reproduce a case.</li>
+  <li><strong>Redacted content.</strong> Capture messages after a PII filter has masked identifiers, as in <a href="15-guardrails.html">the previous chapter</a>. The filter has a recall ceiling, so this reduces risk and does not remove it.</li>
+  <li><strong>Sampled content.</strong> Keep full content only for a small random sample plus the flagged traces (the policy in the sampling section), with a short retention period.</li>
+  <li><strong>Tiered storage.</strong> Content goes to a separate store with strict access, audit logging and a deletion path; metadata goes to the general observability system.</li>
+</ol>
+
+<p>Whichever you choose, treat the trace store as a data store holding personal data: it needs access control, retention limits, deletion on request, and a place in your privacy assessment (<a href="../../security/chapters/17-data-protection.html">Data Protection &amp; Privacy</a>, and the AI-specific questions in <a href="22-privacy-data.html">Privacy &amp; Data Handling for AI</a>). Never put secrets or raw credentials in a span, including in tool arguments.</p>
+
+<h2>OpenTelemetry's GenAI conventions</h2>
+
+<p><span class="term">OpenTelemetry</span> (OTel) is the open standard and set of libraries for emitting traces, metrics and logs, and for sending them to a collector and then to any compatible backend. Its <span class="term">semantic conventions</span> are agreed names for common attributes, so that two tools describing the same thing use the same key. The GenAI conventions define such names for model calls, tool calls and agents, and they matter for a practical reason: if your spans use the standard keys, a backend that understands them can show token usage, latency and costs without custom parsing, and you are less tied to one vendor's SDK.</p>
+
+<p>I fetched the current span specification from the dedicated repository (the OpenTelemetry site now says the pages have moved to <code>open-telemetry/semantic-conventions-genai</code>) and read the pages on spans, inference and agents. What they say, in summary:</p>
+
+<ul>
+  <li><strong>Span names</strong> are the operation plus the thing operated on: a model call is <code>{gen_ai.operation.name} {gen_ai.request.model}</code> (for example <code>chat demo-model</code>), a tool call is <code>execute_tool {gen_ai.tool.name}</code>, an agent invocation is <code>invoke_agent {gen_ai.agent.name}</code> when the agent name is available. Identifiers that vary on every request, such as a response id, stay out of names, because span names are used for grouping.</li>
+  <li><strong>Span kind</strong> for a model call is <code>CLIENT</code> (your process is a client of the model service). Tool execution is <code>INTERNAL</code>; agent invocation is <code>CLIENT</code> for a remote agent service and <code>INTERNAL</code> for one running in your process.</li>
+  <li><strong>Operation names</strong> include <code>chat</code>, <code>text_completion</code>, <code>embeddings</code>, <code>retrieval</code>, <code>execute_tool</code>, <code>invoke_agent</code>, <code>create_agent</code>, <code>plan</code>, <code>invoke_workflow</code> and several memory operations.</li>
+  <li><strong>Required</strong> on a model-call span: <code>gen_ai.operation.name</code> and <code>gen_ai.provider.name</code>. <strong>Conditionally required:</strong> <code>gen_ai.request.model</code> when available and <code>error.type</code> if the call failed. <strong>Recommended</strong> include <code>gen_ai.usage.input_tokens</code>, <code>gen_ai.usage.output_tokens</code>, <code>gen_ai.response.model</code>, <code>gen_ai.response.finish_reasons</code> and the request settings such as <code>gen_ai.request.temperature</code> and <code>gen_ai.request.max_tokens</code>, with further usage attributes for cached-input and reasoning tokens.</li>
+  <li><strong>Content is opt-in.</strong> <code>gen_ai.input.messages</code>, <code>gen_ai.output.messages</code>, <code>gen_ai.system_instructions</code>, <code>gen_ai.tool.definitions</code>, and for tools <code>gen_ai.tool.call.arguments</code> and <code>gen_ai.tool.call.result</code> are marked opt-in, and the specification warns that they are likely to contain sensitive information. This matches the policy question above: capturing content is a decision, not a default.</li>
+  <li><strong>Metrics</strong> are defined as well, including a client inference duration histogram and a time-to-first-chunk histogram for streaming.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Every page of the GenAI conventions I read is marked <strong>Development</strong> status, not Stable: names and requirement levels can still change, and a breaking change will not be announced by an error in your code, only by a dashboard that goes quiet. The conventions have grown a lot. Compared with the copy of the spans page in the core repository at version 1.37.0, which I also fetched, the current pages add attributes for cached and reasoning tokens, prompt name and version, and operations for workflows and memory, none of which the older page mentions. The material has also moved repositories, which is a sign the area is still being reorganised. Practical advice: pin the version of the conventions and of your instrumentation library; write your own attribute names under a prefix of your own for anything you need beyond the standard (for example <code>app.prompt_version</code>), so a rename upstream does not hit you; and before adopting a vendor SDK, check which version of the conventions it emits and whether you can export in plain OTLP, the protocol OTel uses to ship data. Open-source LLM tracing backends such as Langfuse and Arize Phoenix exist (see the Tracing tools in the <a href="../toolbox.html">toolbox</a>), and I did not test them for this edition.</p>
+</div>
+
+<h2>Sampling: which traces to keep</h2>
+
+<p>Storing every trace with its content is rarely affordable or wise. A support bot with 50,000 conversations a day, each a few thousand tokens of prompts and replies plus retrieved passages, produces gigabytes a day, mostly of ordinary successful requests that nobody will read. <span class="term">Sampling</span> keeps a subset. The choice is between two points of decision.</p>
+
+<ul>
+  <li><strong>Head sampling</strong> decides when the trace starts, before anything is known: keep 5% at random. It is cheap and simple. Its flaw is that it is blind: the rare traces you care about are kept at the same 5% as the rest.</li>
+  <li><strong>Tail sampling</strong> decides after the trace is complete, so rules can use what happened: keep every trace that had an error, was unusually slow, was flagged by an evaluator, drew a thumbs-down or hit a guardrail block, plus a small random baseline. It needs a collector that buffers a trace's spans until it ends, and a way for late signals (like feedback that arrives minutes afterwards) to mark a trace to keep.</li>
+</ul>
+
+<p>The script simulates a day of 50,000 traces with illustrative rates (about 1.5% errors, 2% slow, 3% flagged by an evaluator, 0.4% thumbs-down) and compares four policies.</p>
+
+<pre class="terminal" data-title="sampling.py"><code>import random
+
+rng = random.Random(17)
+N = 50_000                                       # traces in a day (illustrative)
+traces = []
+for i in range(N):
+    error = rng.random() &lt; 0.015                 # tool or provider error
+    slow = rng.random() &lt; 0.02                   # far slower than usual
+    low = rng.random() &lt; 0.03                    # an online evaluator flagged a bad answer
+    feedback = rng.random() &lt; 0.004              # user clicked thumbs-down
+    traces.append({"interesting": error or slow or low or feedback, "error": error, "low": low, "fb": feedback})
+
+def head(rate):
+    return [rng.random() &lt; rate for _ in traces]
+def tail(base):
+    return [t["interesting"] or rng.random() &lt; base for t in traces]
+
+total_bad = sum(t["interesting"] for t in traces)
+rare = [t for t in traces if t["fb"]]   # the rarest signal: a user clicked thumbs-down
+print(f"{N} traces, {total_bad} interesting ({total_bad/N:.1%}); {len(rare)} have a thumbs-down\n")
+print(f"{'policy':&lt;34}{'stored':&gt;8}{'interesting kept':&gt;18}{'thumbs-down kept':&gt;24}")
+for name, keep in [("keep everything", [True] * N), ("head sampling 5%", head(0.05)), ("head sampling 20%", head(0.20)),
+                   ("tail rules + 2% baseline", tail(0.02))]:
+    stored = sum(keep)
+    kept_bad = sum(k and t["interesting"] for k, t in zip(keep, traces))
+    kept_rare = sum(k and t["fb"] for k, t in zip(keep, traces))
+    print(f"{name:&lt;34}{stored/N:&gt;8.1%}{kept_bad/total_bad:&gt;18.1%}{kept_rare:&gt;10} of {len(rare)}")</code></pre>
+<pre class="terminal" data-title="output"><code>50000 traces, 3442 interesting (6.9%); 182 have a thumbs-down
+
+policy                              stored  interesting kept        thumbs-down kept
+keep everything                     100.0%            100.0%       182 of 182
+head sampling 5%                      5.1%              4.8%        11 of 182
+head sampling 20%                    19.8%             20.3%        29 of 182
+tail rules + 2% baseline              8.8%            100.0%       182 of 182</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Bar chart of four sampling policies. Keep everything: 100 percent storage, 100 percent of thumbs-down traces kept. Head sampling at 5 percent: 5.1 percent storage, 6 percent of thumbs-down kept. Head sampling at 20 percent: 19.8 percent storage, 16 percent kept. Tail rules plus 2 percent baseline: 8.8 percent storage, 100 percent kept.">
+    <line x1="190" y1="30" x2="190" y2="230" class="line"/>
+    <line x1="190" y1="230" x2="710" y2="230" class="line"/>
+    <text x="190" y="248" text-anchor="middle" class="t-xs t-muted">0%</text><text x="450" y="248" text-anchor="middle" class="t-xs t-muted">50%</text><text x="710" y="248" text-anchor="middle" class="t-xs t-muted">100%</text>
+    <text x="180" y="62" text-anchor="end" class="t-sm t-bold">keep everything</text>
+    <rect x="190" y="44" width="520" height="14" class="f-blue"/><rect x="190" y="60" width="520" height="14" class="f-green"/>
+    <text x="180" y="122" text-anchor="end" class="t-sm t-bold">head sampling 5%</text>
+    <rect x="190" y="104" width="26.5" height="14" class="f-blue"/><rect x="190" y="120" width="31" height="14" class="f-green"/><text x="228" y="132" class="t-xs">6% of thumbs-down</text>
+    <text x="180" y="182" text-anchor="end" class="t-sm t-bold">head sampling 20%</text>
+    <rect x="190" y="164" width="103" height="14" class="f-blue"/><rect x="190" y="180" width="83" height="14" class="f-green"/><text x="300" y="192" class="t-xs">16% of thumbs-down</text>
+    <text x="180" y="228" text-anchor="end" class="t-sm t-bold">tail rules + 2%</text>
+    <rect x="190" y="206" width="46" height="10" class="f-blue"/><rect x="190" y="217" width="520" height="10" class="f-green"/>
+    <rect x="200" y="266" width="12" height="12" class="f-blue"/><text x="218" y="277" class="t-xs">share of all traces stored</text>
+    <rect x="420" y="266" width="12" height="12" class="f-green"/><text x="438" y="277" class="t-xs">share of thumbs-down traces kept</text>
+  </svg>
+  <figcaption><strong>Pay for what you will read.</strong> Head sampling keeps rare problems at the same rate as everything else. A tail policy that always keeps flagged traces stores less than half as much as a 20% head sample and keeps every one of them.</figcaption>
+</figure>
+
+<p>The head policies keep exactly what you would expect: about 5% and 20% of the thumbs-down traces, because each trace has the same chance of being kept. The tail policy stores 8.8% of the traffic (the 6.9% flagged plus the 2% baseline) and keeps all 182 thumbs-down traces. Two warnings apply to that tidy result. First, it is tidy because the simulation decides "interesting" from signals known at the end of each trace; in a real system an evaluator that runs minutes later, or a user who clicks hours later, must be able to trigger retention, which means keeping a short-lived buffer for everything and promoting the flagged traces to long-term storage. Second, any sample that is not uniform distorts your statistics. If you keep all errors and 2% of successes, then the error rate in the stored data is not the error rate in production. Record the sampling rule and weight on each trace (a trace kept with probability 0.02 counts as 50) and compute rates from the weighted counts, or compute the headline metrics from unsampled aggregate counters emitted for every request.</p>
+
+<div class="cols">
+  <div class="card accent-green"><h4>Always keep</h4><p>Errors, timeouts, guardrail blocks and overrides, thumbs-down and escalations, traces from a canary release, the most expensive 1% by tokens, and anything an on-call person marks.</p></div>
+  <div class="card accent-blue"><h4>Sample at random</h4><p>A baseline of ordinary traffic per route and per tenant, kept even when nothing is wrong. It is the only unbiased view of normal behaviour and the source of the misses that no signal flagged.</p></div>
+  <div class="card accent-orange"><h4>Keep only metadata</h4><p>Everything else: counters, durations and token counts without content, so aggregates are exact while storage stays small.</p></div>
+</div>
+
+<h2>From traces to numbers and alerts</h2>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 240" role="img" aria-label="Telemetry pipeline. The application with an OpenTelemetry SDK emits spans to a collector that redacts and samples them. The collector writes to a trace store. From the store, three consumers read: dashboards and alerts, online evaluators that score sampled traces, and review queues where people label failures.">
+    <defs><marker id="ahEV17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="10" y="88" width="130" height="64" rx="8" class="fs-blue s-blue sw-2"/><text x="75" y="115" text-anchor="middle" class="t-sm t-bold">App + SDK</text><text x="75" y="133" text-anchor="middle" class="t-xs t-muted">emits spans</text>
+    <rect x="180" y="88" width="150" height="64" rx="8" class="fs-orange s-orange sw-2"/><text x="255" y="115" text-anchor="middle" class="t-sm t-bold">Collector</text><text x="255" y="133" text-anchor="middle" class="t-xs t-muted">redact, then sample</text>
+    <rect x="370" y="88" width="130" height="64" rx="8" class="fs-purple s-purple sw-2"/><text x="435" y="115" text-anchor="middle" class="t-sm t-bold">Trace store</text><text x="435" y="133" text-anchor="middle" class="t-xs t-muted">retention, access</text>
+    <rect x="560" y="20" width="190" height="52" rx="8" class="fs-cyan s-cyan sw-2"/><text x="655" y="42" text-anchor="middle" class="t-sm t-bold">Dashboards, alerts</text><text x="655" y="60" text-anchor="middle" class="t-xs t-muted">cost, latency, quality</text>
+    <rect x="560" y="94" width="190" height="52" rx="8" class="fs-blue s-blue sw-2"/><text x="655" y="116" text-anchor="middle" class="t-sm t-bold">Online evaluators</text><text x="655" y="134" text-anchor="middle" class="t-xs t-muted">score sampled traces</text>
+    <rect x="560" y="168" width="190" height="52" rx="8" class="fs-green s-green sw-2"/><text x="655" y="190" text-anchor="middle" class="t-sm t-bold">Review queues</text><text x="655" y="208" text-anchor="middle" class="t-xs t-muted">people label failures</text>
+    <line x1="140" y1="120" x2="178" y2="120" class="line" marker-end="url(#ahEV17a)"/>
+    <line x1="330" y1="120" x2="368" y2="120" class="line" marker-end="url(#ahEV17a)"/>
+    <line x1="500" y1="110" x2="558" y2="50" class="line" marker-end="url(#ahEV17a)"/>
+    <line x1="500" y1="120" x2="558" y2="120" class="line" marker-end="url(#ahEV17a)"/>
+    <line x1="500" y1="130" x2="558" y2="190" class="line" marker-end="url(#ahEV17a)"/>
+    <text x="255" y="188" text-anchor="middle" class="t-xs t-muted">PII masking happens here,</text><text x="255" y="204" text-anchor="middle" class="t-xs t-muted">before anything is stored</text>
+  </svg>
+  <figcaption><strong>Redact before storing, sample before paying.</strong> The collector is the right place for both, because the application does not have to change when the rules do. Evaluators and reviewers read from the store and write scores back onto the traces.</figcaption>
+</figure>
+
+<p>Once traces flow, derive a small set of signals and treat the important ones as service-level indicators (<a href="../../reliability/chapters/02-slos-error-budgets.html">SLIs, SLOs &amp; Error Budgets</a>). Slice every one of them by release, prompt version and route, because a regression is almost always specific to one of those.</p>
+
+<ul>
+  <li><strong>Cost:</strong> tokens and money per request, per route, per tenant; the share spent on retries and on cached versus uncached input.</li>
+  <li><strong>Latency:</strong> percentiles per span type and for the whole request, and time to first token for streamed replies. Report p95 or p99, not the mean.</li>
+  <li><strong>Reliability:</strong> tool error rate, provider error and timeout rate, retry rate, share of conversations that end in an escalation.</li>
+  <li><strong>Quality:</strong> the pass rate of online evaluators on sampled traces, the thumbs-down rate, and the guardrail block and override rates. These need the calibrated judges from <a href="03-llm-judges.html">LLM-as-Judge</a>, and the confidence intervals from <a href="04-eval-statistics.html">Statistics for Evals</a>; a quality score without a count is hard to act on.</li>
+</ul>
+
+<p>Alert on symptoms users feel, with enough data behind them. "Evaluator pass rate for the refund route fell from 0.92 to 0.81 over the last 400 sampled traces" is an alert. "A single trace failed" is a ticket for the review queue. For metrics, avoid labels with unbounded values such as user ids or conversation ids: they explode the number of time series. Put those on traces, where high-cardinality attributes belong.</p>
+
+<h2>Pitfalls you will meet</h2>
+
+<dl class="terms">
+  <dt>Lost context across a boundary</dt>
+  <dd>If a tool runs in another process (an MCP server, a queue worker, a webhook), the trace context must travel with the call or its spans appear as a separate, orphaned trace. Propagate it in the headers or message metadata, as for any distributed trace.</dd>
+  <dt>Double-counted tokens</dt>
+  <dd>Summing token usage over a parent and its children counts the same tokens twice. Aggregate over leaf model-call spans only, or record usage on one level.</dd>
+  <dt>Streaming and cancellation</dt>
+  <dd>A streamed reply ends long after the first byte, and users close the tab. Decide which timestamp ends the span, record time to first token separately, and mark cancelled calls instead of leaving the span open.</dd>
+  <dt>Retries hiding in the middle</dt>
+  <dd>The conventions say a span should cover the logical operation including automatic retries. Record the retry count as an attribute, or a 40-second call will look like a model that is slow when it was a rate limit followed by success.</dd>
+  <dt>Clock and ordering</dt>
+  <dd>Spans from different machines have clocks that differ by milliseconds, so a child can appear to start before its parent. Trust the parent-child links, not the sort order of timestamps.</dd>
+  <dt>Content in the wrong place</dt>
+  <dd>Personal data in span names, metric labels or exception messages escapes your redaction rules, since those rules target the content fields. Keep variable text out of names and labels.</dd>
+</dl>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the flight recorder</p>
+  <p>An aircraft carries a recorder that notes altitude, speed and control inputs all the time, and the cockpit voice. After an incident, investigators can replay the last minutes and see what the crew saw. Nobody expects the recorder to prevent anything; it exists so that the question "what happened?" has an answer. Tracing is that recorder for each request, and the versions on the trace (like the aircraft's configuration) tell you which system produced the behaviour.</p>
+  <p><em>Where it breaks down:</em> a flight recorder is read after a rare event. A trace store is read daily, by people and by programs, to catch small failures before they become incidents, and unlike a recorder it holds your customers' words, so what you keep and for how long is itself a risk decision.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"We log every prompt and response, so we have observability." A pile of logged text answers only the questions you thought to ask before the incident. Observability needs structure (spans with parents, versions and numeric attributes you can aggregate), a way to find the interesting traces among millions (sampling and flags), and a path from a trace to action (labels, regression cases). A second misconception is the reverse: that a dashboard of cost and latency is "LLM observability". It tells you the system is busy and expensive, not that it is right.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Tracing here is the same tool you met in <a href="../../reliability/chapters/06-tracing.html">Distributed Tracing</a>, applied to a service whose critical path is a model call; the waterfall, the critical path and context propagation all transfer. Tail sampling is the standard answer to the "keep the interesting traces" problem in any high-volume system. The percentile and cardinality warnings come from <a href="../../reliability/chapters/04-metrics.html">Metrics, Percentiles &amp; Histograms</a>. The treatment of the trace store as a sensitive data store rests on <a href="../../security/chapters/17-data-protection.html">Data Protection &amp; Privacy</a>, and the audit-log habits in <a href="../../security/chapters/18-detection-response.html">Detection &amp; Security Incidents</a>.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Save <code>llm.py</code> (from <code>lab-support/</code>) and <code>mini_tracer.py</code> in one folder and run the tracer.</p>
+<pre class="terminal"><span class="prompt">$</span> <span class="cmd">python3 mini_tracer.py</span></pre>
+  <p>(1) Set <code>CAPTURE_CONTENT = True</code>, change the final scripted reply so that it mentions <code>jo@example.com</code>, and print <code>s["attrs"]["gen_ai.output.messages"]</code> for the chat spans. Confirm that the redaction function masks the address. (2) Add a retrieval span before the first model call, with <code>gen_ai.operation.name</code> set to <code>retrieval</code>, a <code>gen_ai.retrieval.top_k</code> of 4 and a made-up latency of 140 ms. What happens to the model's share of the request? (3) Add a <code>sampled_weight</code> attribute to the root span and, using the sampling script's rules, compute the true error rate from weighted counts. How far off is the unweighted error rate in the stored data?</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A trace is a tree: the request, then a span per model call, tool call, retrieval and check. Success is not an HTTP status, so quality signals are attached to traces after the fact.</li>
+    <li>Record metadata always (versions, tokens, latency, finish reason, errors) and content only on purpose. Redact before storing, treat the store as sensitive data, and limit retention.</li>
+    <li>OpenTelemetry's GenAI conventions give standard span names and attributes: <code>chat {model}</code>, <code>execute_tool {tool}</code>, <code>invoke_agent {name}</code>, <code>gen_ai.usage.*</code>, and opt-in content fields. They are in Development status, so pin versions and keep your own attributes under your own prefix.</li>
+    <li>Aggregate tokens over leaf model-call spans only, and use the waterfall to find which step to tune.</li>
+    <li>Tail sampling keeps the traces worth reading (errors, slow, flagged, thumbs-down, canary) plus a random baseline. Record sampling weights so rates computed from stored data are not biased.</li>
+    <li>Derive cost, latency, reliability and quality indicators by release and prompt version. Alert on symptoms with enough sampled traces behind them, and keep high-cardinality ids on traces, not metrics.</li>
+    <li>Traces are the raw material of everything in the rest of Part 5: error analysis, online evaluators and the regression suites of the next chapter.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://github.com/open-telemetry/semantic-conventions-genai" target="_blank" rel="noopener">OpenTelemetry, GenAI semantic conventions repository</a>. The current home of the span, agent and metric conventions; read the docs folder for the version you instrument against.</li>
+  <li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/" target="_blank" rel="noopener">OpenTelemetry, "Semantic conventions for generative AI systems"</a>. The documentation entry point, which at the time of reading pointed to the new repository.</li>
+  <li><a href="https://opentelemetry.io/docs/concepts/signals/traces/" target="_blank" rel="noopener">OpenTelemetry, "Traces" concept page</a>. Spans, context and attributes from first principles (not fetched for this edition).</li>
+  <li><a href="https://opentelemetry.io/docs/concepts/sampling/" target="_blank" rel="noopener">OpenTelemetry, "Sampling"</a>. Head and tail sampling and where each runs (not fetched for this edition).</li>
+  <li><a href="https://hamel.dev/blog/posts/evals/" target="_blank" rel="noopener">Husain, "Your AI Product Needs Evals"</a>. Why the trace-viewing and data-review habit comes first (not fetched for this edition).</li>
+  <li><a href="https://langfuse.com/blog/2025-08-29-error-analysis-to-evaluate-llm-applications" target="_blank" rel="noopener">Langfuse, "Error analysis to evaluate LLM applications" (2025)</a>. A tool-oriented walk-through of reading traces and turning failures into datasets (listed in the course research notes; not fetched here).</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A trace has an <code>invoke_agent</code> span with two child <code>chat</code> spans. The agent span has <code>gen_ai.usage.input_tokens</code> = 84 and each chat span records its own usage, summing to 84. A dashboard that sums all spans shows 168. What is wrong and what is the fix?</p>
+    <ol class="q-options"><li>The provider double-bills the tokens, so contact them</li><li>The same tokens are counted at two levels; aggregate over leaf model-call spans only, or record usage on one level</li><li>The clock is wrong on one of the machines</li><li>Tokens should never be recorded on spans</li></ol>
+    <div class="q-explain">Parent roll-ups plus child values count each token twice. The usage belongs on the model-call spans, which are the leaves; any roll-up is computed, not summed again. The provider bills once, clock skew does not change counts, and recording tokens on spans is the recommended practice.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A team keeps 10% of traces at random and finds that the thumbs-down traces they most want to read appear rarely, with only about 1 in 10 present. Which change fixes it at the least cost?</p>
+    <ol class="q-options"><li>Raise the random rate to 100%</li><li>Stop collecting thumbs-down feedback</li><li>Keep only metadata for every trace</li><li>Add tail rules that always keep flagged traces (thumbs-down, errors, guardrail blocks) plus a small random baseline, and weight counts by the sampling rate</li></ol>
+    <div class="q-explain">Random head sampling keeps rare events at the same rate as everything else. A tail rule retains them all at modest cost, and weights keep the aggregate rates honest. Sampling everything is expensive, dropping feedback removes the signal, and metadata alone cannot support reading the failure.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">According to the OpenTelemetry GenAI conventions as read for this chapter, how should prompt and reply text be treated?</p>
+    <ol class="q-options"><li>As opt-in attributes (<code>gen_ai.input.messages</code>, <code>gen_ai.output.messages</code>) that are likely to contain sensitive information, so capturing them is a deliberate choice</li><li>As required attributes on every span</li><li>As attributes to put in the span name so they can be searched</li><li>As values that must be hashed before recording</li></ol>
+    <div class="q-explain">The specification marks content fields as opt-in and warns they are likely to contain sensitive data. They are not required, they do not belong in span names (which are used for grouping and should be low in variety), and hashing is a design choice you may add, not a rule in the conventions.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">Your instrumentation emits GenAI attributes, and a library update renames one of them. Dashboards that filtered on the old name quietly show no data. What practice would have reduced the damage?</p>
+    <ol class="q-options"><li>Never upgrading libraries</li><li>Using only unstructured logs</li><li>Pinning the convention and library versions, watching for the Development status, and keeping your own attributes under your own prefix</li><li>Removing dashboards</li></ol>
+    <div class="q-explain">The conventions are in Development status, so renames and additions are expected. Pinning and deliberate upgrades, plus an alert on missing data, turn a silent break into a planned change. Never upgrading accumulates risk, and unstructured logs lose the benefits of structure.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A request spent 1,195 ms in total: two model calls of 620 ms and 480 ms and one database tool call of 95 ms. The team wants the largest latency reduction for the least work. Where should they look first?</p>
+    <ol class="q-options"><li>The database query, since it is the only part they own</li><li>The model calls: shorter prompts, a faster model, caching or fewer steps, since they are 92% of the time</li><li>The collector</li><li>The user's network</li></ol>
+    <div class="q-explain">Tuning the 95 ms tool could save at most 8% of the request. The waterfall points at the model calls. The collector does not sit on the user's critical path, and the user's network is not visible in these spans.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">A stored sample keeps every error and 2% of successful traces. A dashboard computed from the stored traces shows a 40% error rate, though production errors are 1.5%. What explains the gap, and what fixes the dashboard?</p>
+    <ol class="q-options"><li>The sample over-represents errors; compute rates using each trace's sampling weight, or from counters emitted for every request</li><li>The error classifier is broken</li><li>Errors have increased 25-fold</li><li>Dashboards cannot measure rates</li></ol>
+    <div class="q-explain">When errors are kept at 100% and successes at 2%, errors are over-represented about fifty-fold relative to their real share. Weighting each trace by the inverse of its keep probability (or using unsampled aggregate counters) restores the true rate. Nothing in the setup suggests a broken classifier or a real surge, and weighted rates are routine.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

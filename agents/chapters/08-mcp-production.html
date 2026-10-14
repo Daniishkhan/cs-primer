@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP in Production · Agents, Tools &amp; Protocols</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="agt" data-chapter="08">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>MCP in Production</h1>
+  <p class="lede">A server that works on your laptop over a pipe is not yet a service. This chapter takes MCP onto the network: how remote transports behave behind a load balancer, why the protocol was redesigned to be stateless, how authorisation works with OAuth, and how to build clients and servers that survive the next specification change.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The previous chapter ended with a local server that answered a client over stdin and stdout. Real deployments differ in three ways. The server runs on several machines behind a balancer, so anything it remembers in memory is sometimes missing. It serves users who must prove who they are, and a tool call may spend their money or touch their data. And the protocol itself keeps changing: the revision dated 2026-07-28 removed the handshake that chapter 7 taught. If you only know the demo, each of these arrives as a production incident. After this chapter you can read an MCP gateway log, explain why a request was rejected with 401, 403 or 400, design a server that scales horizontally, and keep an integration working across protocol revisions. <a href="../labs/lab-03-mcp.html">Lab 3</a> exercises the message layer; <a href="../cases/case-04-mcp-evolution.html">Case 4</a> tells the longer history.</p>
+</div>
+
+<h2>What changes when the server is remote</h2>
+
+<p>A stdio server is a child process of one client: nothing to scale, nothing to authenticate (the user's own account launched it), no network between the two. A remote server inverts all of that. It is a long-running service that many clients and users reach over <a href="../../networking/chapters/10-http.html">HTTP</a> through <a href="../../networking/chapters/14-load-balancers.html">load balancers</a>, so requests arrive on any replica, connections break and a request may be an attack. The transport is <span class="term">Streamable HTTP</span>, introduced in the 2025-03-26 revision to replace the older HTTP+SSE transport. In every revision it has the same outline: one HTTP endpoint, each JSON-RPC message sent as a POST, and a reply that is either a single JSON object or a <span class="term">Server-Sent Events</span> (SSE) stream, a long-lived HTTP response that delivers a sequence of text events.</p>
+
+<p>What changed is how much the server must remember between two requests. That one question explains most of the protocol's recent history.</p>
+
+<h2>Why sessions hurt: the 2025 design</h2>
+
+<p>In revisions up to 2025-11-25, a connection began with the <code>initialize</code> handshake you built in chapter 7. On HTTP, a server could also hand out a session identifier in an <code>Mcp-Session-Id</code> header, and the client then sent it on every later request. A client could open a second long-lived connection with a GET request to receive messages the server wanted to push, and a server could send its own JSON-RPC requests (to ask the user a question, or to ask the client's model for a completion) down an SSE stream. Interrupted streams could be resumed with the standard <code>Last-Event-ID</code> header.</p>
+
+<p>Each of those features needs the server to remember something: which sessions exist, which capabilities each one negotiated, which stream belongs to which client, which events were already delivered. With one process that is a dictionary. With three replicas, the dictionary lives in one of them. The next request, routed by a balancer that knows nothing about MCP, may land on a replica that has never heard of the session. The simulation below uses three replicas and four clients, each sending an <code>initialize</code> followed by three calls.</p>
+
+<pre class="terminal" data-title="lb_sim.py"><code>import itertools
+
+class LegacyReplica:                      # keeps the session in this process's memory
+    def __init__(self): self.sessions = set()
+    def call(self, sid, method):
+        if method == "initialize":
+            self.sessions.add(sid); return "ok"
+        return "ok" if sid in self.sessions else "400 unknown session"
+
+class ModernReplica:                      # everything arrives in the request itself
+    def call(self, sid, method):
+        return "ok"
+
+def run(replicas, sticky):
+    rr = itertools.cycle(range(len(replicas)))
+    pick = {}                              # sticky: remember which replica each client landed on
+    failures = 0
+    for sid in ["c1", "c2", "c3", "c4"]:
+        for method in ["initialize", "tools/list", "tools/call", "tools/call"]:
+            i = pick.setdefault(sid, next(rr)) if sticky else next(rr)
+            if replicas[i].call(sid, method) != "ok":
+                failures += 1
+    return failures
+
+print("legacy, round-robin :", run([LegacyReplica() for _ in range(3)], sticky=False), "of 16 requests failed")
+print("legacy, sticky      :", run([LegacyReplica() for _ in range(3)], sticky=True), "of 16 requests failed")
+print("modern, round-robin :", run([ModernReplica() for _ in range(3)], sticky=False), "of 16 requests failed")</code></pre>
+<pre class="terminal" data-title="output"><code>legacy, round-robin : 8 of 16 requests failed
+legacy, sticky      : 0 of 16 requests failed
+modern, round-robin : 0 of 16 requests failed</code></pre>
+
+<p>Half of the requests fail under round-robin routing, because three requests in four reach a replica that holds no session for that client. There are two standard remedies, and both cost something. <strong>Sticky routing</strong> pins each client to one replica: it works, but a deployment, a crash or a scale-down destroys the sessions on that replica, and the balancer must now understand MCP. <strong>Shared session storage</strong> (a database or cache every replica reads) works and survives restarts, but it adds a dependency on the hot path of every request and is a new thing to secure and keep consistent (<a href="../../data/chapters/14-caching.html">caching</a> has the failure modes). Neither is wrong; both are infrastructure that a tool server written to look up an order should not need.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 340" role="img" aria-label="Two panels. On the left, with sessions, a client sends initialize through a balancer to replica 1, which stores the session. A later tools/list request is routed to replica 2, which has no such session and answers 400. On the right, with stateless requests, each request carries its version and capabilities, so the balancer can send it to any of three replicas and all answer 200.">
+    <defs>
+      <marker id="ahAG08a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+      <marker id="ahAG08b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker>
+    </defs>
+    <text x="190" y="22" text-anchor="middle" class="t-sm t-bold">Through 2025-11-25: session in memory</text>
+    <text x="570" y="22" text-anchor="middle" class="t-sm t-bold">2026-07-28: everything in the request</text>
+    <line x1="380" y1="34" x2="380" y2="258" class="line-dash"/>
+
+    <rect x="14" y="126" width="84" height="48" rx="8" class="fs-green s-green sw-2"/>
+    <text x="56" y="148" text-anchor="middle" class="t-xs t-bold">Client</text>
+    <text x="56" y="163" text-anchor="middle" class="t-xs">session s1</text>
+    <rect x="130" y="126" width="84" height="48" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="172" y="148" text-anchor="middle" class="t-xs t-bold">Balancer</text>
+    <text x="172" y="163" text-anchor="middle" class="t-xs">round-robin</text>
+    <rect x="262" y="44" width="104" height="52" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="314" y="66" text-anchor="middle" class="t-xs t-bold">Replica 1</text>
+    <text x="314" y="82" text-anchor="middle" class="t-xs">holds s1</text>
+    <rect x="262" y="124" width="104" height="52" rx="8" class="fs-red s-red sw-2"/>
+    <text x="314" y="146" text-anchor="middle" class="t-xs t-bold">Replica 2</text>
+    <text x="314" y="162" text-anchor="middle" class="t-xs">no s1: 400</text>
+    <rect x="262" y="204" width="104" height="52" rx="8" class="box"/>
+    <text x="314" y="226" text-anchor="middle" class="t-xs t-bold">Replica 3</text>
+    <text x="314" y="242" text-anchor="middle" class="t-xs">no s1</text>
+    <line x1="100" y1="150" x2="128" y2="150" class="line" marker-end="url(#ahAG08a)"/>
+    <line x1="216" y1="138" x2="260" y2="76" class="line" marker-end="url(#ahAG08a)"/>
+    <line x1="216" y1="152" x2="260" y2="150" class="line s-red" marker-end="url(#ahAG08b)"/>
+    <line x1="216" y1="166" x2="260" y2="226" class="line-dash" marker-end="url(#ahAG08a)"/>
+
+    <rect x="394" y="126" width="84" height="48" rx="8" class="fs-green s-green sw-2"/>
+    <text x="436" y="148" text-anchor="middle" class="t-xs t-bold">Client</text>
+    <text x="436" y="163" text-anchor="middle" class="t-xs">adds _meta</text>
+    <rect x="510" y="126" width="84" height="48" rx="8" class="fs-orange s-orange sw-2"/>
+    <text x="552" y="148" text-anchor="middle" class="t-xs t-bold">Balancer</text>
+    <text x="552" y="163" text-anchor="middle" class="t-xs">any policy</text>
+    <rect x="642" y="44" width="104" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="694" y="66" text-anchor="middle" class="t-xs t-bold">Replica 1</text>
+    <text x="694" y="82" text-anchor="middle" class="t-xs">200</text>
+    <rect x="642" y="124" width="104" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="694" y="146" text-anchor="middle" class="t-xs t-bold">Replica 2</text>
+    <text x="694" y="162" text-anchor="middle" class="t-xs">200</text>
+    <rect x="642" y="204" width="104" height="52" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="694" y="226" text-anchor="middle" class="t-xs t-bold">Replica 3</text>
+    <text x="694" y="242" text-anchor="middle" class="t-xs">200</text>
+    <line x1="480" y1="150" x2="508" y2="150" class="line" marker-end="url(#ahAG08a)"/>
+    <line x1="596" y1="138" x2="640" y2="76" class="line" marker-end="url(#ahAG08a)"/>
+    <line x1="596" y1="152" x2="640" y2="150" class="line" marker-end="url(#ahAG08a)"/>
+    <line x1="596" y1="166" x2="640" y2="226" class="line" marker-end="url(#ahAG08a)"/>
+
+    <text x="14" y="286" class="t-xs">1. initialize reaches replica 1, which stores s1.</text>
+    <text x="14" y="304" class="t-xs">2. tools/list is routed to replica 2: unknown session.</text>
+    <text x="14" y="322" class="t-xs t-muted">Fix: sticky routing or a shared session store.</text>
+    <text x="394" y="286" class="t-xs">Version, capabilities and client identity ride in each</text>
+    <text x="394" y="304" class="t-xs">request, so any replica can answer any request.</text>
+    <text x="394" y="322" class="t-xs t-muted">Cross-call state becomes an explicit handle.</text>
+  </svg>
+  <figcaption><strong>Session state is the thing that stops a server scaling by copying.</strong> Remove it from the protocol and the balancer can be an ordinary balancer.</figcaption>
+</figure>
+
+<p>The reasoning of the MCP maintainers, as the specification now states it, is that a protocol-level session is the wrong place for this state. The statelessness section of the base protocol says all information needed to process a request must be in the request itself, that a server must not rely on earlier requests on the same connection, and that an open connection such as a stdio process is not a conversation. If a server genuinely needs to remember something across calls (a shopping basket, say), that state must be "referenced by an explicit identifier the client passes on each request". The model receives the identifier from one tool and passes it as an argument to the next, which is exactly how it already handles an order id.</p>
+
+<h2>The stateless redesign, revision 2026-07-28</h2>
+
+<p>The revision dated 2026-07-28 applies that idea throughout. I read the published specification and its changelog on 14 October 2026; the headline changes are these.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Concern</th><th>Through 2025-11-25</th><th>2026-07-28</th></tr></thead>
+  <tbody>
+    <tr><td>Opening</td><td><code>initialize</code> request, then <code>notifications/initialized</code></td><td>No handshake. Each request carries <code>_meta</code> with <code>io.modelcontextprotocol/protocolVersion</code> and <code>clientCapabilities</code> (both required), and normally <code>clientInfo</code></td></tr>
+    <tr><td>Finding out about a server</td><td>The <code>initialize</code> result</td><td><code>server/discover</code>, which every server must implement and clients may call first</td></tr>
+    <tr><td>Sessions</td><td><code>Mcp-Session-Id</code> header</td><td>Removed. List endpoints no longer vary per connection</td></tr>
+    <tr><td>Version mismatch</td><td>Negotiated during the handshake</td><td>Per request: <code>UnsupportedProtocolVersionError</code> (code -32022) listing the versions the server supports</td></tr>
+    <tr><td>Server asks the client something</td><td>Server sends its own request (<code>elicitation/create</code>, <code>sampling/createMessage</code>, <code>roots/list</code>) on an open stream</td><td>Multi round-trip requests: the server replies <code>input_required</code> and the client retries with answers</td></tr>
+    <tr><td>Server pushes changes</td><td>A GET stream, plus <code>resources/subscribe</code></td><td>One <code>subscriptions/listen</code> request whose response stays open</td></tr>
+    <tr><td>Resuming a broken stream</td><td><code>Last-Event-ID</code></td><td>Removed: the client re-issues the request with a new id</td></tr>
+    <tr><td>Routing information</td><td>In the JSON body</td><td>Also in headers: <code>Mcp-Method</code>, and <code>Mcp-Name</code> for calls that name something</td></tr>
+    <tr><td>Caching</td><td>None specified</td><td><code>ttlMs</code> and <code>cacheScope</code> on list and read results</td></tr>
+    <tr><td>Not-found resource</td><td>Error code -32002</td><td>-32602, the standard invalid-params code</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Everything a request needs</h3>
+
+<p>Here is the heart of the change in code. The server below is a pure function from one HTTP request to one reply, and it keeps nothing between calls. The checks are the ones the specification requires of a Streamable HTTP server: validate the <code>Origin</code> header (a defence against a web page in the user's browser talking to a local server, see <a href="../../security/chapters/10-web-security.html">the browser security model</a>), require the <code>_meta</code> fields, refuse versions it does not speak, and refuse requests whose headers disagree with their bodies.</p>
+
+<pre class="terminal" data-title="mcp_modern.py"><code>import json
+
+VERSIONS = ["2026-07-28"]
+ALLOWED_ORIGINS = {"https://app.example.com"}
+TOOLS = [{"name": "orders_lookup", "description": "Look up one order by id.",
+          "inputSchema": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                          "required": ["order_id"]}}]
+ORDERS = {"A-100": {"item": "kettle", "cents": 4200}, "A-101": {"item": "toaster", "cents": 3100}}
+
+def err(status, code, message, mid=None, data=None):
+    e = {"code": code, "message": message, **({"data": data} if data else {})}
+    return status, {"jsonrpc": "2.0", "id": mid, "error": e}
+
+def handle(headers, body):
+    """One HTTP POST in, (status, JSON-RPC reply) out. No state survives between calls."""
+    h = {k.lower(): v for k, v in headers.items()}
+    if "origin" in h and h["origin"] not in ALLOWED_ORIGINS:
+        return err(403, -32600, "Origin not allowed")
+    try:
+        msg = json.loads(body)
+    except ValueError:
+        return err(400, -32700, "Parse error")
+    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    meta = params.get("_meta", {})
+    version = meta.get("io.modelcontextprotocol/protocolVersion")
+    if version is None or "io.modelcontextprotocol/clientCapabilities" not in meta:
+        return err(400, -32602, "Missing required _meta fields", mid)
+    if version not in VERSIONS:
+        return err(400, -32022, "Unsupported protocol version", mid,
+                   {"supported": VERSIONS, "requested": version})
+    for header, want in (("mcp-protocol-version", version), ("mcp-method", method),
+                         ("mcp-name", params.get("name") if method == "tools/call" else None)):
+        if want is not None and h.get(header) != want:
+            return err(400, -32020, f"Header mismatch: {header}", mid)
+    info = {"io.modelcontextprotocol/serverInfo": {"name": "orders", "version": "1.0.0"}}
+    if method == "server/discover":
+        result = {"supportedVersions": VERSIONS, "capabilities": {"tools": {}}, "ttlMs": 3600000, "cacheScope": "public"}
+    elif method == "tools/list":
+        result = {"tools": sorted(TOOLS, key=lambda t: t["name"]), "ttlMs": 60000, "cacheScope": "public"}
+    elif method == "tools/call" and params.get("name") == "orders_lookup":
+        order = ORDERS.get(params.get("arguments", {}).get("order_id"))
+        text = json.dumps(order) if order else "No such order. Ids look like A-100."
+        result = {"content": [{"type": "text", "text": text}], "isError": order is None}
+    else:
+        return err(404, -32601, "Method not found", mid)
+    return 200, {"jsonrpc": "2.0", "id": mid, "result": {"resultType": "complete", **result, "_meta": info}}</code></pre>
+
+<p>Why must the headers match the body at all? The headers exist so that a gateway can route, rate-limit or log by method and tool name without parsing JSON. If a gateway allowed a request labelled <code>orders_lookup</code> through while the body actually called <code>refund_order</code>, the gateway's policy would be meaningless. So any server that reads the body must reject a mismatch, and intermediaries that enforce policy from the headers should refuse versions old enough that nobody validates them. Run the server through seven requests, including the failures:</p>
+
+<pre class="terminal" data-title="demo_modern.py"><code>import json
+from mcp_modern import handle
+
+META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}}
+
+def post(method, params=None, headers=None, meta=META):
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {**(params or {}), "_meta": meta}}
+    hdrs = {"MCP-Protocol-Version": meta.get("io.modelcontextprotocol/protocolVersion", ""), "Mcp-Method": method}
+    if "name" in (params or {}):
+        hdrs["Mcp-Name"] = params["name"]
+    hdrs.update(headers or {})
+    status, reply = handle(hdrs, json.dumps(body))
+    if "error" in reply:
+        e = reply["error"]
+        print(f"{status} {method:&lt;15} error {e['code']}: {e['message']}", e.get("data", ""))
+    else:
+        r = reply["result"]
+        what = r["content"][0]["text"] if "content" in r else json.dumps(r.get("supportedVersions", r.get("tools") and [t["name"] for t in r["tools"]]))
+        print(f"{status} {method:&lt;15} {r['resultType']}, isError={r.get('isError')}: {what}")
+
+post("server/discover")
+post("tools/call", {"name": "orders_lookup", "arguments": {"order_id": "A-100"}})
+post("tools/call", {"name": "orders_lookup", "arguments": {"order_id": "Z-9"}})
+post("tools/call", {"name": "orders_lookup", "arguments": {"order_id": "A-100"}}, headers={"Mcp-Name": "refund_order"})
+post("tools/list", meta={**META, "io.modelcontextprotocol/protocolVersion": "2025-11-25"})
+post("tools/list", meta={"io.modelcontextprotocol/protocolVersion": "2026-07-28"})
+post("tools/list", headers={"Origin": "https://evil.example"})</code></pre>
+<pre class="terminal" data-title="output"><code>200 server/discover complete, isError=None: ["2026-07-28"]
+200 tools/call      complete, isError=False: {"item": "kettle", "cents": 4200}
+200 tools/call      complete, isError=True: No such order. Ids look like A-100.
+400 tools/call      error -32020: Header mismatch: mcp-name 
+400 tools/list      error -32022: Unsupported protocol version {'supported': ['2026-07-28'], 'requested': '2025-11-25'}
+400 tools/list      error -32602: Missing required _meta fields 
+403 tools/list      error -32600: Origin not allowed </code></pre>
+
+<p>Read the failures as a gateway operator would. A status of 400 with -32020 means a client or an intermediary rewrote one side of the message. 400 with -32022 carries the list of versions the server will accept, so a client can retry; this replaces the negotiation that used to happen once at the start. 403 on a bad <code>Origin</code> is the DNS-rebinding defence. Note also that the unknown order id is a <em>successful</em> response with <code>isError</code> set: it is the model's mistake to read and fix, as in <a href="07-mcp.html">chapter 7</a>, not a protocol failure.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: the order slip</p>
+  <p>A stateful server is a barista who remembers that you take oat milk. It is pleasant until your usual barista is off and the new one has never met you. A stateless server is the order slip: it says "large, oat milk, name Sam", so any barista on the shift can make the drink. The slip does the remembering.</p>
+  <p><em>Where it breaks down:</em> a paper slip is trusted because you wrote it in front of the barista. A request that travels through a client is not: anything the server hands out to be echoed back can be altered on the way. The next section shows what that requires, and why moving state into the request does not make it disappear. It moves the work to making the state safe to carry.</p>
+</div>
+
+<h3>Asking the user a question without a session</h3>
+
+<p>The most interesting casualty of statelessness is the server-initiated request. A refund tool might want to ask "Refund 4,200 cents on A-100?" before it acts. In the old design the server sent an <code>elicitation/create</code> request down an open stream and waited, holding the pending tool call in memory. Whichever replica held that call had to receive the answer.</p>
+
+<p>The new pattern is called <span class="term">multi round-trip requests</span>. The server does not wait. It ends the request with a result whose <code>resultType</code> is <code>input_required</code>, carrying <code>inputRequests</code> (what it needs, keyed by names it chooses) and an opaque string <code>requestState</code>. The client gathers the answers and sends the original request again, with a new id, adding <code>inputResponses</code> and echoing <code>requestState</code> byte for byte. Each of the two requests is complete in itself, so they can even reach different replicas. Only <code>tools/call</code>, <code>prompts/get</code> and <code>resources/read</code> may return <code>input_required</code>.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="A sequence diagram with three vertical lines: client, replica A and replica B. The client sends tools/call with id 1 to replica A. Replica A returns input_required with an inputRequests entry and a signed requestState. The client asks the user, then sends tools/call with id 2, inputResponses and the same requestState to replica B. Replica B verifies the state and returns a complete result.">
+    <defs><marker id="ahAG08c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="40" y="8" width="140" height="32" rx="8" class="fs-green s-green sw-2"/>
+    <text x="110" y="29" text-anchor="middle" class="t-sm t-bold">Client</text>
+    <rect x="310" y="8" width="140" height="32" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="29" text-anchor="middle" class="t-sm t-bold">Replica A</text>
+    <rect x="580" y="8" width="140" height="32" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="650" y="29" text-anchor="middle" class="t-sm t-bold">Replica B</text>
+    <line x1="110" y1="42" x2="110" y2="322" class="line-thin"/>
+    <line x1="380" y1="42" x2="380" y2="322" class="line-thin"/>
+    <line x1="650" y1="42" x2="650" y2="322" class="line-thin"/>
+
+    <text x="245" y="70" text-anchor="middle" class="t-xs">tools/call refund_order (id 1)</text>
+    <line x1="112" y1="78" x2="378" y2="78" class="line s-blue" marker-end="url(#ahAG08c)"/>
+
+    <text x="245" y="112" text-anchor="middle" class="t-xs">input_required + requestState</text>
+    <text x="245" y="127" text-anchor="middle" class="t-xs t-muted">(signed: user, expiry, arguments)</text>
+    <line x1="378" y1="136" x2="112" y2="136" class="line s-green" marker-end="url(#ahAG08c)"/>
+
+    <rect x="24" y="158" width="172" height="40" rx="8" class="fs-yellow s-yellow sw-2"/>
+    <text x="110" y="176" text-anchor="middle" class="t-xs t-bold t-dark">User confirms</text>
+    <text x="110" y="191" text-anchor="middle" class="t-xs t-dark">client keeps requestState</text>
+
+    <text x="515" y="226" text-anchor="middle" class="t-xs">tools/call (id 2) + inputResponses</text>
+    <text x="515" y="241" text-anchor="middle" class="t-xs">+ the same requestState</text>
+    <line x1="112" y1="250" x2="648" y2="250" class="line s-blue" marker-end="url(#ahAG08c)"/>
+
+    <rect x="490" y="262" width="170" height="26" rx="6" class="fs-purple s-purple sw-2"/>
+    <text x="575" y="279" text-anchor="middle" class="t-xs">B verifies the signature</text>
+    <text x="515" y="314" text-anchor="middle" class="t-xs">complete: refunded</text>
+    <line x1="648" y1="298" x2="112" y2="298" class="line s-green" marker-end="url(#ahAG08c)"/>
+  </svg>
+  <figcaption><strong>The pending operation lives in the message, not in a replica.</strong> Replica B has never seen this refund before; the signed <code>requestState</code> gives it everything it needs to continue.</figcaption>
+</figure>
+
+<p>The catch is the one the analogy hinted at. <code>requestState</code> passes through the client, so the specification tells servers to treat it as attacker-controlled input: if it influences authorisation, resources or business logic, protect its integrity with an HMAC or authenticated encryption, and reject anything that fails verification. To limit replay, it should also contain the authenticated principal, a short expiry and a digest of the request. Here is a refund server that does exactly that, with two "replicas" that share only a signing key, followed by five ways to misuse the state.</p>
+
+<pre class="terminal" data-title="mrtr_refund.py"><code>import base64, hashlib, hmac, json
+
+SECRET = b"shared-signing-key"          # the ONLY thing the server instances share
+
+def sign(payload):
+    raw = json.dumps(payload, sort_keys=True).encode()
+    mac = hmac.new(SECRET, raw, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(raw + mac).decode()
+
+def verify(token, principal, now, digest):
+    blob = base64.urlsafe_b64decode(token.encode())
+    raw, mac = blob[:-32], blob[-32:]
+    if not hmac.compare_digest(mac, hmac.new(SECRET, raw, hashlib.sha256).digest()):
+        raise ValueError("bad signature")
+    p = json.loads(raw)
+    if p["sub"] != principal: raise ValueError("different principal")
+    if p["exp"] &lt; now:        raise ValueError("expired")
+    if p["args"] != digest:   raise ValueError("different arguments")
+    return p
+
+class Server:
+    """A stateless instance: no dict of pending refunds, nothing to share between replicas."""
+    def __init__(self, name): self.name = name
+    def refund(self, principal, args, now, input_responses=None, request_state=None):
+        digest = hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:12]
+        if request_state is None:
+            state = sign({"sub": principal, "exp": now + 300, "args": digest})
+            ask = {"confirm": {"method": "elicitation/create", "params": {
+                "message": f"Refund {args['cents']} cents on {args['order_id']}?",
+                "requestedSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}}}}
+            return {"resultType": "input_required", "inputRequests": ask, "requestState": state}
+        verify(request_state, principal, now, digest)
+        if not input_responses["confirm"]["content"]["ok"]:
+            return {"resultType": "complete", "content": "Cancelled by user.", "isError": False}
+        return {"resultType": "complete", "content": f"Refunded {args['cents']} on {args['order_id']} (served by {self.name})", "isError": False}</code></pre>
+<pre class="terminal" data-title="demo_mrtr.py"><code>from mrtr_refund import Server
+
+a, b = Server("replica-a"), Server("replica-b")
+args = {"order_id": "A-100", "cents": 4200}
+first = a.refund("alice", args, now=1000)
+print("1.", first["resultType"], "| asks:", first["inputRequests"]["confirm"]["params"]["message"])
+print("   requestState is", len(first["requestState"]), "opaque characters")
+answer = {"confirm": {"action": "accept", "content": {"ok": True}}}
+
+def retry(label, server, principal, now, a_=args, state=first["requestState"]):
+    try:
+        r = server.refund(principal, a_, now, answer, state)
+        print(f"{label}: {r['content']}")
+    except ValueError as e:
+        print(f"{label}: rejected ({e})")
+
+retry("2. other replica, same user    ", b, "alice", 1100)
+retry("3. tampered state              ", b, "alice", 1100, state=first["requestState"][:-4] + "AAAA")
+retry("4. different user replays state", b, "mallory", 1100)
+retry("5. arguments changed to 99900  ", b, "alice", 1100, a_={"order_id": "A-100", "cents": 99900})
+retry("6. retried after 10 minutes    ", b, "alice", 1600)</code></pre>
+<pre class="terminal" data-title="output"><code>1. input_required | asks: Refund 4200 cents on A-100?
+   requestState is 116 opaque characters
+2. other replica, same user    : Refunded 4200 on A-100 (served by replica-b)
+3. tampered state              : rejected (bad signature)
+4. different user replays state: rejected (different principal)
+5. arguments changed to 99900  : rejected (different arguments)
+6. retried after 10 minutes    : rejected (expired)</code></pre>
+
+<p>Case 2 is the point of the design: a different replica completes the refund. Cases 3 to 6 are the reasons for each field in the signed payload. The specification adds a warning worth repeating: these checks bound replay and block cross-user reuse, but they do not make the state single-use. A one-time redemption, such as a refund that must happen at most once, needs a server-side record keyed by an idempotency key, exactly as in <a href="../../networking/chapters/16-failure.html">failure, timeouts and retries</a>. That matters twice here, because a client whose response stream breaks must re-issue the request with a new id; the server cannot tell a retry from a fresh call unless you give it something to compare.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Stateless MCP means servers cannot keep state, so stateful tools such as a shopping basket or a database transaction are gone." The protocol dropped <em>protocol-level</em> state, not application state. A tool can create a basket and return a <code>basket_id</code>; later tools take it as an argument, and the server looks it up in its own database. The state is now explicit, visible in the transcript, durable across restarts and shareable across replicas, which is better engineering than a session that silently vanished when a pod was rescheduled. What you give up is the convenience of implicit context.</p>
+</div>
+
+<h3>Other changes worth knowing</h3>
+
+<ul>
+  <li><strong>Change notifications.</strong> A client that wants "tools changed" or "resource updated" messages sends <code>subscriptions/listen</code> naming the types it wants; the response is an SSE stream that stays open. Servers should send <code>X-Accel-Buffering: no</code> so proxies such as nginx do not buffer the events.</li>
+  <li><strong>Caching.</strong> List and read results carry <code>ttlMs</code> and <code>cacheScope</code> (<code>public</code> or <code>private</code>), modelled on HTTP caching. Servers should also return tools in a deterministic order. The tool list is part of the model's prompt, so a reordered or edited list changes the start of every prompt and invalidates the provider's prompt cache (<a href="10-context-engineering.html">chapter 10</a>): release tool changes deliberately, in batches.</li>
+  <li><strong>Long-running work and extensions.</strong> The experimental tasks feature moved out of the core into an official extension (<code>io.modelcontextprotocol/tasks</code>), polled with <code>tasks/get</code>. Code written against the experimental version had to be migrated, a fair warning about adopting experimental features. Extensions have a formal route now: reverse-DNS identifiers in an <code>extensions</code> map, versioned independently.</li>
+  <li><strong>Deprecations.</strong> Roots, sampling and logging are deprecated but still work; the specification suggests tool parameters or resource URIs, direct calls to model providers, and <code>stderr</code> or OpenTelemetry respectively. Dynamic Client Registration (below) and the old HTTP+SSE transport are deprecated too. A new lifecycle policy requires at least twelve months between deprecation and removal.</li>
+  <li><strong>Tracing.</strong> The <code>_meta</code> keys <code>traceparent</code>, <code>tracestate</code> and <code>baggage</code> carry W3C trace context, so one user request can be followed through the host, the MCP server and the systems behind it (<a href="../../reliability/chapters/06-tracing.html">distributed tracing</a>).</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>The 2026-07-28 revision is published and breaking: it removes the handshake and sessions, so a client written only for 2025-11-25 cannot talk to a server that implements only the new revision, and the reverse. The specification gives a compatibility matrix: dual-era clients work with both kinds of server, and a dual-era server can answer both kinds of client on the same endpoint. I did not survey which hosts, SDKs and public servers have moved; assume a mixed fleet for some time, and check the SDK tier and release notes of whatever you depend on. The deprecation window (twelve months at minimum) means sampling, roots and logging should keep working through 2027, but new code should not rely on them. Details here are from <a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" target="_blank" rel="noopener">the 2026-07-28 changelog</a>; if you read this later, check what has been added since.</p>
+</div>
+
+<h2>Authorisation: who is allowed to call this?</h2>
+
+<p>Over stdio the question hardly arises, since the user launched the process, and the specification says stdio servers should take credentials from the environment instead. Over HTTP, anyone who can reach the URL can send a request, so the server must establish who is calling and what they may do. MCP does not invent a scheme. It profiles <span class="term">OAuth 2.1</span>, the consolidated version of the OAuth framework covered in <a href="../../security/chapters/07-oauth-oidc.html">OAuth 2.0 and OpenID Connect</a>, and assigns the roles as follows. The MCP server is an <span class="term">OAuth resource server</span>: it accepts and validates access tokens and does not issue them. The MCP client is an OAuth client acting for a user. A separate <span class="term">authorisation server</span> authenticates the user, obtains consent and issues tokens. It may run alongside the MCP server or be an entirely different company's identity provider.</p>
+
+<p>The reason for this split is that a client cannot know in advance which identity provider protects an arbitrary MCP server. So the protocol makes it discoverable. Step through the full flow for a client meeting a protected server for the first time.</p>
+
+<div class="widget stepper" data-autoplay-ms="4500">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">First contact with a protected MCP server</h4></div>
+  <svg viewBox="0 0 760 450" role="img" aria-label="A sequence diagram with three vertical lines: client, MCP server and authorisation server. The client calls the MCP server without a token and receives 401 with a WWW-Authenticate header pointing to resource metadata. It fetches the resource metadata, then the authorisation server metadata, then sends the user through an authorisation request with PKCE and a resource parameter, receives a code with an issuer, exchanges it for a token, calls the MCP server with the token, and later receives 403 insufficient scope and steps up.">
+    <defs><marker id="ahAG08d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="60" y="6" width="140" height="30" rx="8" class="fs-green s-green sw-2"/>
+    <text x="130" y="26" text-anchor="middle" class="t-sm t-bold">Client</text>
+    <rect x="310" y="6" width="140" height="30" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="380" y="26" text-anchor="middle" class="t-sm t-bold">MCP server</text>
+    <rect x="560" y="6" width="140" height="30" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="630" y="26" text-anchor="middle" class="t-sm t-bold">Auth server</text>
+    <line x1="130" y1="38" x2="130" y2="442" class="line-thin"/>
+    <line x1="380" y1="38" x2="380" y2="442" class="line-thin"/>
+    <line x1="630" y1="38" x2="630" y2="442" class="line-thin"/>
+
+    <g data-steps="1-" data-active="1">
+      <text x="255" y="60" text-anchor="middle" class="t-xs">POST /mcp (no token)</text>
+      <line x1="132" y1="66" x2="378" y2="66" class="line s-blue" marker-end="url(#ahAG08d)"/>
+    </g>
+    <g data-steps="2-" data-active="2">
+      <text x="255" y="92" text-anchor="middle" class="t-xs">401 + WWW-Authenticate</text>
+      <text x="255" y="105" text-anchor="middle" class="t-xs t-muted">resource_metadata=URL, scope</text>
+      <line x1="378" y1="112" x2="132" y2="112" class="line s-red" marker-end="url(#ahAG08d)"/>
+    </g>
+    <g data-steps="3-" data-active="3">
+      <text x="255" y="138" text-anchor="middle" class="t-xs">GET protected resource metadata</text>
+      <line x1="132" y1="144" x2="378" y2="144" class="line s-blue" marker-end="url(#ahAG08d)"/>
+      <text x="255" y="166" text-anchor="middle" class="t-xs t-muted">names its authorisation server(s)</text>
+      <line x1="378" y1="172" x2="132" y2="172" class="line-dash s-green" marker-end="url(#ahAG08d)"/>
+    </g>
+    <g data-steps="4-" data-active="4">
+      <text x="505" y="198" text-anchor="middle" class="t-xs">GET authorisation server metadata</text>
+      <line x1="132" y1="204" x2="628" y2="204" class="line s-blue" marker-end="url(#ahAG08d)"/>
+      <text x="505" y="226" text-anchor="middle" class="t-xs t-muted">endpoints, issuer, features</text>
+      <line x1="628" y1="232" x2="132" y2="232" class="line-dash s-green" marker-end="url(#ahAG08d)"/>
+    </g>
+    <g data-steps="5-" data-active="5">
+      <text x="505" y="258" text-anchor="middle" class="t-xs">authorise: PKCE challenge, resource, scope</text>
+      <line x1="132" y1="264" x2="628" y2="264" class="line s-blue" marker-end="url(#ahAG08d)"/>
+      <rect x="510" y="272" width="190" height="22" rx="6" class="fs-yellow s-yellow sw-2"/>
+      <text x="605" y="287" text-anchor="middle" class="t-xs t-dark">user signs in and consents</text>
+      <text x="505" y="316" text-anchor="middle" class="t-xs t-muted">code + iss (client checks iss)</text>
+      <line x1="628" y1="322" x2="132" y2="322" class="line-dash s-green" marker-end="url(#ahAG08d)"/>
+    </g>
+    <g data-steps="6-" data-active="6">
+      <text x="505" y="348" text-anchor="middle" class="t-xs">token request: code_verifier, resource</text>
+      <line x1="132" y1="354" x2="628" y2="354" class="line s-blue" marker-end="url(#ahAG08d)"/>
+      <text x="505" y="376" text-anchor="middle" class="t-xs t-muted">access token for this server</text>
+      <line x1="628" y1="382" x2="132" y2="382" class="line-dash s-green" marker-end="url(#ahAG08d)"/>
+    </g>
+    <g data-steps="7-" data-active="7">
+      <text x="255" y="408" text-anchor="middle" class="t-xs">POST /mcp + Bearer token</text>
+      <line x1="132" y1="414" x2="378" y2="414" class="line s-blue" marker-end="url(#ahAG08d)"/>
+      <rect x="392" y="400" width="170" height="40" rx="6" class="fs-cyan s-cyan sw-2"/>
+      <text x="477" y="416" text-anchor="middle" class="t-xs t-bold t-dark">server checks</text>
+      <text x="477" y="431" text-anchor="middle" class="t-xs t-dark">audience, expiry, scope</text>
+    </g>
+    <g data-steps="8" data-active="8">
+      <rect x="30" y="408" width="340" height="34" rx="6" class="fs-red s-red sw-2"/>
+      <text x="200" y="422" text-anchor="middle" class="t-xs t-bold t-dark">later call needs more: 403 insufficient_scope</text>
+      <text x="200" y="436" text-anchor="middle" class="t-xs t-dark">client re-authorises with old + new scopes</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>An anonymous request.</strong> The client has only a URL. It sends an ordinary MCP request, with no credentials, to find out what the server wants.</li>
+    <li><strong>The challenge.</strong> The server answers 401 and adds a <code>WWW-Authenticate: Bearer</code> header carrying <code>resource_metadata</code> (a URL) and, ideally, the <code>scope</code> needed. This is plain HTTP authentication (<a href="../../networking/chapters/10-http.html">HTTP</a>) with one extra pointer.</li>
+    <li><strong>Resource metadata.</strong> The client fetches that document, defined by RFC 9728. Every MCP server must provide it, and it names the authorisation server or servers that can issue tokens for this resource.</li>
+    <li><strong>Authorisation server metadata.</strong> The client reads the authorisation server's description of itself (RFC 8414 or OpenID Connect discovery): its endpoints, its <code>issuer</code> identifier and what it supports. The client records the issuer now, from this validated document.</li>
+    <li><strong>The authorisation request.</strong> The client opens a browser for the user. It includes a <span class="term">PKCE</span> challenge (a hash of a secret only this client knows, so a stolen code is useless to anyone else), the <code>resource</code> parameter naming the MCP server, and the scope. The user signs in and consents. The redirect carries a code and, ideally, an <code>iss</code> parameter, which the client compares with the issuer it recorded in step 4 before using the code.</li>
+    <li><strong>The token.</strong> The client exchanges the code, proving possession with the PKCE verifier and repeating the <code>resource</code> parameter. The token it receives is bound to that resource as its audience.</li>
+    <li><strong>An authorised call.</strong> From now on every HTTP request carries <code>Authorization: Bearer</code>, never in the query string. The server must verify that the token was issued for <em>it</em>, is unexpired and carries enough scope.</li>
+    <li><strong>Step-up.</strong> When a call needs a scope the token lacks, the server answers 403 with <code>error="insufficient_scope"</code> and the scope required. The client requests a token with the union of old and new scopes, retrying only a few times so a permanent refusal does not loop.</li>
+  </ol>
+</div>
+
+<h3>The checks a server makes on every request</h3>
+
+<p>The flow is fiddly, but what a resource server does is short and worth writing down. The sketch below uses a keyed hash in place of a real signed token and has no network, so it can run anywhere. In a real server you would verify a JWT's signature against the authorisation server's published keys, or call its introspection endpoint (<a href="../../security/chapters/06-sessions-tokens.html">sessions, cookies and tokens</a> has the pitfalls).</p>
+
+<pre class="terminal" data-title="auth_gate.py"><code>import base64, hashlib, hmac, json
+
+AS_KEY = b"authorization-server-key"           # in real life: a public key fetched from the AS's JWKS
+RESOURCE = "https://mcp.example.com"           # this server's canonical URI
+METADATA_URL = RESOURCE + "/.well-known/oauth-protected-resource"
+
+def issue(aud, scopes, exp, sub="alice"):       # what the authorization server does
+    body = json.dumps({"iss": "https://auth.example.com", "aud": aud, "scope": " ".join(scopes),
+                       "exp": exp, "sub": sub}).encode()
+    return base64.urlsafe_b64encode(body).decode() + "." + hmac.new(AS_KEY, body, hashlib.sha256).hexdigest()
+
+def check(authorization, needs, now):           # what the MCP server does on EVERY request
+    if not authorization or not authorization.startswith("Bearer "):
+        return 401, f'Bearer resource_metadata="{METADATA_URL}", scope="{needs}"'
+    b64, mac = authorization[7:].rsplit(".", 1)
+    body = base64.urlsafe_b64decode(b64)
+    if not hmac.compare_digest(mac, hmac.new(AS_KEY, body, hashlib.sha256).hexdigest()):
+        return 401, f'Bearer error="invalid_token", resource_metadata="{METADATA_URL}"'
+    claims = json.loads(body)
+    if claims["exp"] &lt; now or claims["aud"] != RESOURCE:       # audience binding: the token must be FOR us
+        return 401, f'Bearer error="invalid_token", resource_metadata="{METADATA_URL}"'
+    if needs not in claims["scope"].split():
+        return 403, f'Bearer error="insufficient_scope", scope="{needs}", resource_metadata="{METADATA_URL}"'
+    return 200, f'ok, acting for {claims["sub"]}'</code></pre>
+<pre class="terminal" data-title="demo_auth.py"><code>from auth_gate import issue, check, RESOURCE, METADATA_URL
+
+now = 1_000
+cases = [
+    ("no token, wants files:read",           None,                                              "files:read"),
+    ("token minted for another API",         "Bearer " + issue("https://billing.example.com", ["files:read"], now + 600), "files:read"),
+    ("expired token",                        "Bearer " + issue(RESOURCE, ["files:read"], now - 1), "files:read"),
+    ("right audience, read scope, read op",  "Bearer " + issue(RESOURCE, ["files:read"], now + 600), "files:read"),
+    ("right audience, read scope, write op", "Bearer " + issue(RESOURCE, ["files:read"], now + 600), "files:write"),
+    ("after step-up: read + write",          "Bearer " + issue(RESOURCE, ["files:read", "files:write"], now + 600), "files:write"),
+]
+for label, header, needs in cases:
+    status, detail = check(header, needs, now)
+    print(f"{status} {label:&lt;38} {detail.replace(METADATA_URL, "&lt;prm-url&gt;")}")</code></pre>
+<pre class="terminal" data-title="output"><code>401 no token, wants files:read             Bearer resource_metadata="&lt;prm-url&gt;", scope="files:read"
+401 token minted for another API           Bearer error="invalid_token", resource_metadata="&lt;prm-url&gt;"
+401 expired token                          Bearer error="invalid_token", resource_metadata="&lt;prm-url&gt;"
+200 right audience, read scope, read op    ok, acting for alice
+403 right audience, read scope, write op   Bearer error="insufficient_scope", scope="files:write", resource_metadata="&lt;prm-url&gt;"
+200 after step-up: read + write            ok, acting for alice</code></pre>
+
+<p>The second row is the important one. A token minted for a billing API is a perfectly good token, signed by the right authorisation server, and the MCP server must still refuse it. The specification says a server must accept only tokens issued for itself and must not accept or pass on any others. If it forwarded the caller's token to a downstream API ("token passthrough"), the downstream service would believe the user had approved that exact call, and the MCP server would become a <span class="term">confused deputy</span>: a component that uses its own authority on behalf of someone who lacks it (<a href="../../security/chapters/08-authorization.html">authorisation</a> covers the pattern). If the MCP server needs to call another API, it should obtain a separate token for that API.</p>
+
+<p>The rest of the authorisation requirements bind every token to a purpose:</p>
+
+<ul>
+  <li><strong>Resource indicators.</strong> The client sends the <code>resource</code> parameter in both the authorisation and the token request, naming the MCP server by its canonical URI (<code>https://mcp.example.com</code>), whether or not the authorisation server supports it.</li>
+  <li><strong>Issuer checks.</strong> The client records the issuer from validated metadata and compares the <code>iss</code> in the authorisation response before redeeming the code. This defeats mix-up attacks, where a malicious authorisation server tricks a client into sending a code to the wrong place.</li>
+  <li><strong>Client registration.</strong> A client gets its id from a <span class="term">client ID metadata document</span> (the client uses an HTTPS URL as its id, and the authorisation server fetches a JSON description from it), from pre-registration, or from Dynamic Client Registration, which is deprecated. The first avoids manual registration and an unbounded registry of anonymous clients.</li>
+  <li><strong>Scopes.</strong> Ask for what the current operation needs. The challenge's <code>scope</code> is authoritative; the rest comes through step-up.</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Nothing in this section is specific to AI. A 401 with a challenge, a bearer token in a header and an audience check are the standard recipe from <a href="../../security/chapters/07-oauth-oidc.html">OAuth 2.0 and OpenID Connect</a>; the confused deputy is the same hazard that <a href="../../security/chapters/08-authorization.html">authorisation</a> describes; and a signed <code>requestState</code> is an ordinary signed cookie (<a href="../../security/chapters/03-applied-crypto.html">applied cryptography</a> explains the MAC). What is new is the consequence of a mistake. A tool server holds a model's judgement between a user and their data, so an over-broad token is more dangerous than it first appears: the model may be steered by text it read (<a href="19-agent-security.html">chapter 19</a>), and then acts with every permission the token carries.</p>
+</div>
+
+<h2>Operating a remote server</h2>
+
+<p>A server that is correct still has to be run. Three habits matter most.</p>
+
+<p><strong>Use the headers at the gateway.</strong> Because <code>Mcp-Method</code> and <code>Mcp-Name</code> mirror the body, a gateway can apply policy without parsing JSON: a lower rate limit for <code>refund_order</code> than for <code>orders_lookup</code>, a role check on risky tools, a tenant's traffic routed to its own pool, an audit line for every invocation. A server can also mark a tool parameter with <code>x-mcp-header</code> so that clients copy its value into an <code>Mcp-Param-</code> header (the specification's example is a region name, used for routing). The security value is the equality check above: a gateway and a server must never disagree about what a request says.</p>
+
+<p><strong>Make retries safe.</strong> A request stands alone, which makes retrying easy and idempotency your job. The transport rules say a broken response stream loses the in-flight request and the client must send it again with a new id. For a read, that is harmless. For a tool that creates a ticket or moves money, the first attempt may have succeeded before the connection dropped. Give such tools an idempotency key argument that the server remembers, say so in the description so the model supplies it, and set deadlines so a model never waits indefinitely (<a href="../../networking/chapters/16-failure.html">failure, timeouts and retries</a>, <a href="05-tool-design.html">tool design</a>). Long jobs belong behind the tasks extension or your own job id.</p>
+
+<p><strong>Log one structured event per request</strong>: method, tool, caller, protocol version, status, duration and the trace id from <code>traceparent</code> (<a href="../../reliability/chapters/05-logs-events.html">logs and structured events</a>). Counting requests by protocol version tells you when an old version can be dropped; counting <code>isError</code> results by tool tells you which descriptions confuse the model. Decide deliberately what you store of the arguments, which may be sensitive.</p>
+
+<h2>Surviving spec changes</h2>
+
+<p>Between November 2024 and July 2026 the protocol went through at least five dated revisions, replaced its remote transport, added and then changed authorisation, and finally removed its handshake. It will keep changing, and your integration needs to be built for that, not rescued after each release. These practices cost little and pay for themselves at the first revision.</p>
+
+<ol class="steps">
+  <li><strong>Put MCP behind your own interface.</strong> Your agent should depend on something like <code>list_tools()</code> and <code>call_tool(name, args)</code> that you define, with one module translating to MCP. When the wire changes, that module changes and nothing else does.</li>
+  <li><strong>Pin and record versions.</strong> Pin the SDK, name the protocol version you ask for, and log the version actually used. "It stopped working" becomes a diff.</li>
+  <li><strong>Gate on capabilities, not version numbers.</strong> Ask what a peer declares (capabilities, extensions) and degrade gracefully. The specification requires the other side to fall back to core behaviour or refuse clearly.</li>
+  <li><strong>Handle both eras if your fleet is mixed.</strong> Try a modern request first. A recognised modern error such as -32022 means a modern server: retry with a version it lists. Anything else means a legacy server: fall back to <code>initialize</code>. Cache the answer per server. On stdio the probe is <code>server/discover</code>. Never key the fallback on one error code, because legacy servers answer unknown methods however they like, or not at all.</li>
+  <li><strong>Keep recorded transcripts as regression tests.</strong> Save real traces (one JSON message per line) for each server and version and replay them in continuous integration.</li>
+  <li><strong>Read the deprecation registry.</strong> The twelve-month minimum is your warning. Search your code for roots, sampling and logging now.</li>
+  <li><strong>Treat the tool list as a dependency.</strong> Descriptions are instructions to your model. Record a hash of each tool's name, description and schema when a human approves it, and re-approve on change. This catches honest drift and a hostile server that changes behaviour after you trust it (<a href="19-agent-security.html">chapter 19</a>).</li>
+</ol>
+
+<p>Here is practice 4 in running code: a dual-era client that connects to a modern server (the one above), to a legacy server that insists on <code>initialize</code>, and to a modern server when the client prefers an old version.</p>
+
+<pre class="terminal" data-title="dual_era.py"><code>import json
+from mcp_modern import handle as modern_http     # the stateless server from earlier
+
+def legacy_http(headers, body):
+    """A 2025-11-25 style server: wants initialize first and knows nothing of the new methods."""
+    msg = json.loads(body)
+    if msg["method"] == "initialize":
+        return 200, {"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}}}
+    return 400, {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32600, "message": "Call initialize first"}}
+
+MODERN = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
+
+def connect(server, prefer="2026-07-28"):
+    """Dual-era client: try a modern request first; a recognised modern error means 'modern server'."""
+    meta = {**MODERN, "io.modelcontextprotocol/protocolVersion": prefer}
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": meta}})
+    status, reply = server({"MCP-Protocol-Version": prefer, "Mcp-Method": "server/discover"}, body)
+    if status == 200:
+        return "modern", reply["result"]["supportedVersions"]
+    if reply.get("error", {}).get("code") == -32022:                      # modern server, other version
+        supported = reply["error"]["data"]["supported"]
+        return ("modern, retry with " + supported[0]) if prefer not in supported else ("modern", supported)
+    status, reply = server({}, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}))
+    return "legacy: fell back to initialize", [reply["result"]["protocolVersion"]]
+
+print("modern server :", connect(modern_http))
+print("legacy server :", connect(legacy_http))
+print("old preference:", connect(modern_http, prefer="2025-11-25"))</code></pre>
+<pre class="terminal" data-title="output"><code>modern server : ('modern', ['2026-07-28'])
+legacy server : ('legacy: fell back to initialize', ['2025-11-25'])
+old preference: modern, retry with 2026-07-28</code></pre>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Copy the files above into a folder and run each with <code>python3</code>. Then change one thing at a time and predict the output before running.</p>
+  <pre class="terminal"><code><span class="prompt">$</span> <span class="cmd">python3 lb_sim.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 demo_mrtr.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 demo_auth.py</span></code></pre>
+  <ol class="steps">
+    <li>In <code>lb_sim.py</code> use five replicas instead of three. How does the round-robin failure count change, and why does the sticky count stay at zero?</li>
+    <li>In <code>mrtr_refund.py</code>, delete the <code>args</code> check in <code>verify</code> and rerun. Which case now succeeds, and what would a real attacker gain?</li>
+    <li>In <code>auth_gate.py</code>, add the check that was left out on purpose: reject tokens whose <code>iss</code> is not the authorisation server you trust. Write the token that would have passed before and fails now.</li>
+    <li>Add a second modern version, <code>"2027-01-01"</code>, to <code>VERSIONS</code> in <code>mcp_modern.py</code>. Which lines of <code>dual_era.py</code> output change?</li>
+  </ol>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Remote MCP servers run behind load balancers. Any state a server keeps in a replica's memory between requests is lost whenever a request lands elsewhere; sticky routing and shared stores are workarounds, not fixes.</li>
+    <li>The 2026-07-28 revision made MCP stateless: no handshake, no <code>Mcp-Session-Id</code>, version and capabilities in each request's <code>_meta</code>, discovery by <code>server/discover</code>, and routing headers that must match the body.</li>
+    <li>Server-initiated questions became multi round-trip requests: <code>input_required</code> plus a retry. The <code>requestState</code> passes through the client, so it must be signed and bound to the user, the request and an expiry, and it does not give single-use semantics.</li>
+    <li>Authorisation is OAuth 2.1: the MCP server is a resource server that advertises its authorisation server through protected resource metadata. Tokens are audience-bound with the <code>resource</code> parameter, issuers are checked, scopes are minimal with step-up on 403, and tokens for other services are never accepted or passed on.</li>
+    <li>Statelessness removes protocol state, not application state: use explicit handles such as a basket id, and idempotency keys for anything with side effects.</li>
+    <li>Survive revisions by isolating MCP behind your own interface, pinning and logging versions, probing for both eras, replaying recorded transcripts and hashing approved tool definitions.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" target="_blank" rel="noopener">Model Context Protocol, "Key changes" for revision 2026-07-28</a>. The authoritative list of what changed from 2025-11-25, including the deprecations.</li>
+  <li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http" target="_blank" rel="noopener">MCP specification, Streamable HTTP transport (2026-07-28)</a>. Request headers, validation rules, cancellation and the backward-compatibility procedure.</li>
+  <li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr" target="_blank" rel="noopener">MCP specification, Multi Round-Trip Requests</a>. The input_required pattern and the security requirements for requestState.</li>
+  <li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization" target="_blank" rel="noopener">MCP specification, Authorization (2026-07-28)</a>. The OAuth flow, resource indicators, scope handling and step-up.</li>
+  <li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning" target="_blank" rel="noopener">MCP specification, Versioning and compatibility</a>. Version errors, extension negotiation and the era compatibility matrix.</li>
+  <li><a href="https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/" target="_blank" rel="noopener">MCP blog, the 2026-07-28 release candidate post</a>. The maintainers' account of why the protocol became stateless.</li>
+  <li><a href="https://datatracker.ietf.org/doc/html/rfc9728" target="_blank" rel="noopener">RFC 9728, OAuth 2.0 Protected Resource Metadata</a>. The discovery document every MCP server must serve.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">A 2025-era MCP server keeps sessions in memory and runs as four replicas behind a round-robin balancer. About what fraction of non-initialize requests from a new client fail, and what is the cleanest long-term fix?</p>
+    <ol class="q-options">
+      <li>About one in four; add retries on the client</li>
+      <li>About three in four; remove the dependency on in-memory protocol state (the 2026-07-28 design)</li>
+      <li>Almost none, because the balancer retries on another replica</li>
+      <li>About half; use a larger instance so one replica handles everything</li>
+    </ol>
+    <div class="q-explain">Only the replica that handled <code>initialize</code> knows the session, so with four replicas roughly three requests in four go elsewhere and fail. Retrying (option 0) just rolls the dice again and still needs the session. A balancer cannot know which replica has the session, which rules out option 2. A single big instance (option 3) gives up horizontal scaling and availability. The durable fix is to stop needing the state.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A gateway receives <code>Mcp-Method: tools/call</code> and <code>Mcp-Name: orders_lookup</code>, but the JSON body calls <code>refund_order</code>. What should a conforming server do, and why does the rule exist?</p>
+    <ol class="q-options">
+      <li>Execute the body, because the body is the source of truth</li>
+      <li>Execute the header's tool, because headers are validated first</li>
+      <li>Ignore the headers, since they are only hints for logging</li>
+      <li>Reject with 400 and error -32020, because a gateway applying policy to the headers must never disagree with the server about what the request does</li>
+    </ol>
+    <div class="q-explain">The headers are required to match the body precisely so intermediaries can enforce policy from them. If a server executed the body, an attacker could pass a policy that allows <code>orders_lookup</code> while performing <code>refund_order</code>. Executing the header's tool (option 1) or ignoring the headers (option 2) leaves the same gap in different places. Rejecting the request is the only safe outcome.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">An MCP client holds a valid token that a billing API's authorisation server issued for <code>https://billing.example.com</code>. It sends that token to an MCP server at <code>https://mcp.example.com</code>. What should the MCP server do?</p>
+    <ol class="q-options">
+      <li>Reject it with 401, because the token's audience is not this server</li>
+      <li>Accept it, since the signature is valid and the user is the same</li>
+      <li>Accept it and forward it to the billing API to save a second login</li>
+      <li>Accept it if the scopes look sufficient</li>
+    </ol>
+    <div class="q-explain">Audience binding is the point of the <code>resource</code> parameter: a token is valid for the resource it was issued for. Accepting tokens meant for others, or passing yours onward, is the confused-deputy pattern the specification forbids. A valid signature (option 1) proves who issued the token, not who it is for, and scopes (option 3) are irrelevant to the wrong audience.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">In the multi round-trip pattern, the server returns <code>requestState</code> and the client echoes it on the retry. Which design is correct?</p>
+    <ol class="q-options">
+      <li>Put the pending refund amount in plain JSON in <code>requestState</code> and trust it on retry, since the server issued it</li>
+      <li>Store the pending refund in the replica's memory and put only its id in <code>requestState</code></li>
+      <li>Sign the state with a key the replicas share, and include the user, an expiry and a digest of the request; also record one-time actions server-side</li>
+      <li>Encrypt the state so the client cannot read it, with no other checks</li>
+    </ol>
+    <div class="q-explain">The state crosses an untrusted client, so integrity matters, and binding it to principal, expiry and request limits replay and cross-user reuse. Plain JSON (option 0) lets a client edit the amount. In-memory storage (option 1) reintroduces the replica affinity the pattern removes. Encryption without checks (option 3) hides content but still allows replay by another user or after expiry, and nothing here by itself guarantees single use, which needs a server-side record.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">Your client must work with both old (initialize-based) and new (stateless) servers. Over HTTP it sends a modern request and gets 400 with a JSON-RPC error body containing code -32022 and a <code>supported</code> list. What now?</p>
+    <ol class="q-options">
+      <li>Fall back to <code>initialize</code>, since the request failed</li>
+      <li>Treat the server as modern and retry with a version from the list</li>
+      <li>Give up, because the versions do not match</li>
+      <li>Fall back to the deprecated HTTP+SSE transport</li>
+    </ol>
+    <div class="q-explain">A recognised modern error identifies a modern server, so the client should negotiate by retrying with a mutually supported version. Falling back (options 0 and 3) is only for responses that are not recognised modern errors, such as an empty 400 or a 404 without the expected error body. Giving up (option 2) ignores that the list tells you exactly what the server accepts.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A team says "stateless MCP means our basket tool can no longer work". Which reply is most accurate?</p>
+    <ol class="q-options">
+      <li>Correct: stateful tools must move to stdio</li>
+      <li>Correct: they must wait for the sessions feature to return</li>
+      <li>Incorrect, but only if they use sticky routing</li>
+      <li>Incorrect: the basket becomes an explicit handle (a basket id) that tools take as an argument and the server looks up in its own storage</li>
+    </ol>
+    <div class="q-explain">The revision removed protocol-level sessions, not application state. Passing an explicit handle makes the state visible and durable. Sticky routing (option 2) is what the redesign removes the need for, and nothing needs to be moved to stdio (option 0).</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+</body>
+</html>

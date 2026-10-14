@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Function Calling Across Providers · Agents, Tools &amp; Protocols</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="agt" data-chapter="06">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Function Calling Across Providers</h1>
+  <p class="lede">Every major model API can ask your program to run a function, and every one spells the request differently. This chapter separates the idea from the dialects: the JSON Schema contract that describes a function, the shapes of calls and results on the wire, parallel calls, forcing or forbidding tools, and a small provider-neutral adapter that keeps your agent loop from caring which API is underneath.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>The loop from <a href="02-tool-loop.html">chapter 2</a> and the tool design from <a href="05-tool-design.html">chapter 5</a> are provider-independent ideas, but the bytes you send are not. A message that is valid for one API is a 400 error on another, an argument that arrives as an object in one arrives as a string of JSON in the next, and a flag such as "force this tool" has three spellings. Teams that hard-wire one dialect into their loop pay for it when they want to compare models, add a fallback provider, or move to a local model. After this chapter you can read any provider's tool-calling documentation quickly, because you know what it must contain, and you can write the thin layer that hides the differences.</p>
+</div>
+
+<h2>One idea, several dialects</h2>
+
+<p>The idea is the one you built in chapter 2. You describe functions to the model; the model replies with a structured request to call one, naming it and supplying arguments; your program runs it and sends back a result; the model continues. The word the industry settled on is <span class="term">function calling</span> (OpenAI's term, from 2023) or <span class="term">tool use</span> (Anthropic's), and the two mean the same mechanism for the functions you define. Google's Gemini API and most open-model servers use one of these two styles, or a close variant.</p>
+
+<p>What differs is the envelope. Where does the call live in the response? Is the argument an object, or a string you must parse? How is a result tied to its call? What does the schema key look like? What happens when the model wants several calls at once? These are plumbing questions, and they are answered differently enough that code written for one API does not run on another. Since the models improve and the prices change on a timescale of months, a design that keeps the dialect at the edge is cheap insurance.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: travel plug adapters</p>
+  <p>The electricity is the same everywhere, but the sockets are not, so travellers carry adapters. You do not rewire the laptop for each country; you put a small piece between it and the wall. A provider-neutral adapter is that piece: your loop plugs into one shape and the adapter fits it to each provider's socket.</p>
+  <p><em>Where it breaks down:</em> electricity is interchangeable, but provider features are not. A strict-schema guarantee, a thinking block that must be passed back, or a server-side search tool exists on one side and not the other. An adapter can hide spelling; it cannot make a missing feature appear, and a design that pretends otherwise fails in odd places.</p>
+</div>
+
+<h2>The contract: JSON Schema</h2>
+
+<p>Every dialect describes a function's arguments with <span class="term">JSON Schema</span>, the standard vocabulary for saying what shape a JSON document must have. Only a small subset matters for tools:</p>
+
+<ul>
+  <li><code>type</code>: <code>object</code>, <code>string</code>, <code>integer</code>, <code>number</code>, <code>boolean</code>, <code>array</code>.</li>
+  <li><code>properties</code> and <code>required</code> for objects; <code>items</code> for arrays.</li>
+  <li><code>enum</code> for a closed set of values, and <code>description</code> on every property (<a href="05-tool-design.html">chapter 5</a> explains why that text is the most valuable part).</li>
+  <li><code>additionalProperties: false</code> to forbid fields you did not declare, and numeric bounds such as <code>minimum</code>.</li>
+</ul>
+
+<p>The schema plays two roles, and keeping them apart avoids a lot of confusion. It is <strong>advice to the model</strong>: the model reads it before writing the call. It is also a <strong>specification you can enforce</strong>: your program can check the model's arguments against it before running anything. Nothing makes those two agree automatically. A model can and does produce arguments that violate the schema it was shown, for instance the string <code>"2"</code> where an integer was required, a value outside an enum, or a missing field. Argument validation is therefore your job, in the same way that validating a web form on the server is your job however good the form's JavaScript is (<a href="../../security/chapters/09-injection.html">untrusted input</a>).</p>
+
+<p>The checker below implements the subset in about thirty lines and turns the problems into messages a model can act on. It also shows <code>strictify</code>, which rewrites a schema into the closed form that OpenAI's strict mode requires.</p>
+
+<pre class="terminal" data-title="contract.py"><code>import json
+
+TYPES = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "object": dict, "array": list}
+
+def validate(value, schema, path="$"):
+    """Check a value against the small subset of JSON Schema that tool contracts use."""
+    errs, t = [], schema.get("type")
+    if t and (not isinstance(value, TYPES[t]) or (t in ("integer", "number") and isinstance(value, bool))):
+        return [f"{path}: expected {t}, got {type(value).__name__} {value!r}"]
+    if "enum" in schema and value not in schema["enum"]:
+        errs.append(f"{path}: {value!r} is not one of {schema['enum']}")
+    if "minimum" in schema and isinstance(value, (int, float)) and value &lt; schema["minimum"]:
+        errs.append(f"{path}: {value} is below the minimum {schema['minimum']}")
+    if t == "object":
+        for k in schema.get("required", []):
+            if k not in value:
+                errs.append(f"{path}: missing required field {k!r}")
+        for k, v in value.items():
+            if k in schema.get("properties", {}):
+                errs += validate(v, schema["properties"][k], f"{path}.{k}")
+            elif schema.get("additionalProperties") is False:
+                errs.append(f"{path}: unexpected field {k!r}")
+    if t == "array":
+        for i, v in enumerate(value):
+            errs += validate(v, schema.get("items", {}), f"{path}[{i}]")
+    return errs
+
+def strictify(schema):
+    """Rewrite a schema into the form OpenAI strict mode asks for: closed objects, every field required,
+    optional fields expressed as a union with null."""
+    s = dict(schema)
+    if s.get("type") == "object":
+        props, req = s.get("properties", {}), set(s.get("required", []))
+        s["properties"] = {}
+        for k, v in props.items():
+            v = strictify(v)
+            if k not in req:
+                v = {**v, "type": [v["type"], "null"]} if "enum" not in v else {**v, "type": [v["type"], "null"], "enum": v["enum"] + [None]}
+            s["properties"][k] = v
+        s["required"], s["additionalProperties"] = list(props), False
+    if s.get("type") == "array":
+        s["items"] = strictify(s["items"])
+    return s
+
+FLIGHT = {"type": "object", "properties": {
+    "destination": {"type": "string"}, "departure_date": {"type": "string"},
+    "passengers": {"type": "integer", "minimum": 1}, "cabin": {"type": "string", "enum": ["economy", "business"]}},
+    "required": ["destination", "departure_date"], "additionalProperties": False}
+
+for args in [{"destination": "Tokyo", "departure_date": "2026-06-01", "passengers": 2},
+             {"destination": "Tokyo", "passengers": "2", "cabin": "first", "meal": "veg"},
+             {"destination": "Tokyo", "departure_date": "2026-06-01", "passengers": 0}]:
+    print(json.dumps(args))
+    for e in validate(args, FLIGHT) or ["valid"]:
+        print("   ", e)
+print(json.dumps(strictify(FLIGHT)["properties"]["cabin"]), json.dumps(strictify(FLIGHT)["required"]))</code></pre>
+<pre class="terminal" data-title="output"><code>{"destination": "Tokyo", "departure_date": "2026-06-01", "passengers": 2}
+    valid
+{"destination": "Tokyo", "passengers": "2", "cabin": "first", "meal": "veg"}
+    $: missing required field 'departure_date'
+    $.passengers: expected integer, got str '2'
+    $.cabin: 'first' is not one of ['economy', 'business']
+    $: unexpected field 'meal'
+{"destination": "Tokyo", "departure_date": "2026-06-01", "passengers": 0}
+    $.passengers: 0 is below the minimum 1
+{"type": ["string", "null"], "enum": ["economy", "business", null]} ["destination", "departure_date", "passengers", "cabin"]</code></pre>
+
+<p>In real code you would use a library such as <code>jsonschema</code> in Python or Ajv in JavaScript, but a hand-rolled version makes the point: validation is cheap, local and deterministic. Send the failures back as an <code>is_error</code> tool result, in the style of <a href="05-tool-design.html">chapter 5</a>, and most invalid calls repair themselves on the next turn.</p>
+
+<h3>Strict mode: making the schema binding</h3>
+
+<p>Several providers can go further and constrain the model's output so that the arguments are guaranteed to match the schema. The technique is <span class="term">constrained decoding</span> (also called grammar-constrained sampling): the schema is compiled into a grammar, and at each step the model may only emit tokens that keep the output valid. Anthropic documents it as <code>strict: true</code> on a tool definition and describes the guarantee as inputs that strictly follow <code>input_schema</code> with a valid tool name; the example in its documentation is a booking tool where, without strict mode, <code>passengers</code> might arrive as the string <code>"2"</code>, and with it the value is always the integer 2. OpenAI offers the same idea as <code>"strict": true</code> on a function tool and attaches rules to it. As of the Responses API documentation I read on 14 October 2026:</p>
+
+<ul>
+  <li>every object in <code>parameters</code> must set <code>additionalProperties: false</code>;</li>
+  <li>every key in <code>properties</code> must also appear in <code>required</code>;</li>
+  <li>an optional field is written as a union with null, such as <code>"type": ["string", "null"]</code>.</li>
+</ul>
+
+<p>That is what <code>strictify</code> above does. The same page says that on the Responses API, omitting <code>strict</code> makes the service try to normalise your schema and fall back to non-strict if that fails, whereas Chat Completions tools remain non-strict by default. Both vendors restrict which JSON Schema keywords strict mode supports, so check the current lists before relying on a bound or a pattern.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"With strict mode on, the tool arguments are correct." They are <em>well-formed</em>: the right types, the right fields, a value from the enum. Whether the value is the right one is a different matter. A strict call can still ask to refund the wrong payment, pass yesterday's date as "tomorrow", or choose <code>reason: "goodwill"</code> when the customer said "duplicate". Schema-valid is not the same as sensible, so authorisation, range checks and business rules still belong in your code (<a href="05-tool-design.html">chapter 5</a>), and strict mode also does not stop the model from picking the wrong <em>tool</em> unless you restrict choices as described below.</p>
+</div>
+
+<h2>The wire formats side by side</h2>
+
+<p>Here is one conversation turn in four dialects: the model asks for two weather lookups, and the program answers both. Read the figure by rows: how the request is carried, how the answers are carried, where the schema goes.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 330" role="img" aria-label="Four columns for Anthropic Messages, OpenAI Chat Completions, OpenAI Responses and Gemini generateContent. Three rows: how the model's call is carried, how the program's answers are carried, and where the schema key lives. Anthropic uses tool_use blocks with object input and one user message of tool_result blocks. Chat Completions uses a tool_calls list with string arguments and one tool message per result. Responses uses function_call items with call_id and string arguments plus function_call_output items. Gemini uses functionCall parts with object args and functionResponse parts matched by name.">
+    <text x="12" y="104" class="t-xs t-muted">the model</text>
+    <text x="12" y="120" class="t-xs t-muted">asks</text>
+    <text x="12" y="204" class="t-xs t-muted">you</text>
+    <text x="12" y="220" class="t-xs t-muted">answer</text>
+    <text x="12" y="294" class="t-xs t-muted">schema</text>
+    <text x="170" y="26" text-anchor="middle" class="t-sm t-bold">Anthropic Messages</text>
+    <text x="330" y="26" text-anchor="middle" class="t-sm t-bold">OpenAI Chat</text>
+    <text x="490" y="26" text-anchor="middle" class="t-sm t-bold">OpenAI Responses</text>
+    <text x="650" y="26" text-anchor="middle" class="t-sm t-bold">Gemini generateContent</text>
+
+    <rect x="95" y="40" width="150" height="86" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="170" y="62" text-anchor="middle" class="t-xs t-bold">assistant message</text>
+    <text x="170" y="82" text-anchor="middle" class="t-xs">tool_use blocks</text>
+    <text x="170" y="100" text-anchor="middle" class="t-xs">input is an object</text>
+    <text x="170" y="116" text-anchor="middle" class="t-xs t-muted">id per call</text>
+    <rect x="255" y="40" width="150" height="86" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="330" y="62" text-anchor="middle" class="t-xs t-bold">assistant message</text>
+    <text x="330" y="82" text-anchor="middle" class="t-xs">tool_calls list</text>
+    <text x="330" y="100" text-anchor="middle" class="t-xs">arguments: a string</text>
+    <text x="330" y="116" text-anchor="middle" class="t-xs t-muted">id per call</text>
+    <rect x="415" y="40" width="150" height="86" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="490" y="62" text-anchor="middle" class="t-xs t-bold">function_call items</text>
+    <text x="490" y="82" text-anchor="middle" class="t-xs">one item per call</text>
+    <text x="490" y="100" text-anchor="middle" class="t-xs">arguments: a string</text>
+    <text x="490" y="116" text-anchor="middle" class="t-xs t-muted">call_id</text>
+    <rect x="575" y="40" width="150" height="86" rx="8" class="fs-blue s-blue sw-2"/>
+    <text x="650" y="62" text-anchor="middle" class="t-xs t-bold">model turn</text>
+    <text x="650" y="82" text-anchor="middle" class="t-xs">functionCall parts</text>
+    <text x="650" y="100" text-anchor="middle" class="t-xs">args is an object</text>
+    <text x="650" y="116" text-anchor="middle" class="t-xs t-muted">matched by name</text>
+
+    <rect x="95" y="140" width="150" height="86" rx="8" class="fs-green s-green sw-2"/>
+    <text x="170" y="162" text-anchor="middle" class="t-xs t-bold">ONE user message</text>
+    <text x="170" y="182" text-anchor="middle" class="t-xs">tool_result blocks</text>
+    <text x="170" y="200" text-anchor="middle" class="t-xs">by tool_use_id</text>
+    <text x="170" y="216" text-anchor="middle" class="t-xs t-muted">is_error flag</text>
+    <rect x="255" y="140" width="150" height="86" rx="8" class="fs-green s-green sw-2"/>
+    <text x="330" y="162" text-anchor="middle" class="t-xs t-bold">a "tool" message</text>
+    <text x="330" y="182" text-anchor="middle" class="t-xs">for each result</text>
+    <text x="330" y="200" text-anchor="middle" class="t-xs">by tool_call_id</text>
+    <text x="330" y="216" text-anchor="middle" class="t-xs t-muted">content is text</text>
+    <rect x="415" y="140" width="150" height="86" rx="8" class="fs-green s-green sw-2"/>
+    <text x="490" y="162" text-anchor="middle" class="t-xs t-bold">function_call_output</text>
+    <text x="490" y="182" text-anchor="middle" class="t-xs">item per result</text>
+    <text x="490" y="200" text-anchor="middle" class="t-xs">by call_id</text>
+    <text x="490" y="216" text-anchor="middle" class="t-xs t-muted">output is a string</text>
+    <rect x="575" y="140" width="150" height="86" rx="8" class="fs-green s-green sw-2"/>
+    <text x="650" y="162" text-anchor="middle" class="t-xs t-bold">user turn</text>
+    <text x="650" y="182" text-anchor="middle" class="t-xs">functionResponse parts</text>
+    <text x="650" y="200" text-anchor="middle" class="t-xs">matched by name</text>
+    <text x="650" y="216" text-anchor="middle" class="t-xs t-muted">response is an object</text>
+
+    <rect x="95" y="240" width="150" height="62" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="170" y="264" text-anchor="middle" class="t-xs t-bold">input_schema</text>
+    <text x="170" y="284" text-anchor="middle" class="t-xs t-muted">beside name</text>
+    <rect x="255" y="240" width="150" height="62" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="330" y="264" text-anchor="middle" class="t-xs t-bold">function.parameters</text>
+    <text x="330" y="284" text-anchor="middle" class="t-xs t-muted">nested in "function"</text>
+    <rect x="415" y="240" width="150" height="62" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="490" y="264" text-anchor="middle" class="t-xs t-bold">parameters</text>
+    <text x="490" y="284" text-anchor="middle" class="t-xs t-muted">flat, strict option</text>
+    <rect x="575" y="240" width="150" height="62" rx="8" class="fs-cyan s-cyan sw-2"/>
+    <text x="650" y="264" text-anchor="middle" class="t-xs t-bold">functionDeclarations</text>
+    <text x="650" y="284" text-anchor="middle" class="t-xs t-muted">list of declarations</text>
+  </svg>
+  <figcaption><strong>Same four steps, four spellings.</strong> Blue is the model's request, green is your answer, cyan is the schema. The differences that bite: arguments as an object versus a string you must parse, one message for all results versus one message per result, and matching by id versus by name.</figcaption>
+</figure>
+
+<p>Each box in that figure has a story. Some of the details are worth spelling out.</p>
+
+<dl class="terms">
+  <dt>Anthropic Messages</dt>
+  <dd>The shape this course uses throughout. The assistant message holds <code>text</code> and <code>tool_use</code> blocks. All results go back in a single <code>user</code> message as <code>tool_result</code> blocks, placed before any extra text, each carrying the call's <code>tool_use_id</code> and an optional <code>is_error</code>.</dd>
+  <dt>OpenAI Chat Completions</dt>
+  <dd>The assistant message has a <code>tool_calls</code> array; each entry has an <code>id</code> and a <code>function</code> with a <code>name</code> and <code>arguments</code>, which is a <strong>string</strong> containing JSON. Each result is its own message with <code>role: "tool"</code> and a <code>tool_call_id</code>. This is also the shape that most local servers (vLLM, Ollama, LM Studio) and many third-party hosts imitate, so it is the most widely compatible.</dd>
+  <dt>OpenAI Responses</dt>
+  <dd>The conversation is a list of typed <em>items</em>. A call is an item of type <code>function_call</code> with an <code>id</code>, a <code>call_id</code>, a <code>name</code> and string <code>arguments</code>; your answer is a <code>function_call_output</code> item with the same <code>call_id</code> and an <code>output</code> that is typically a string. Tool definitions are flat (no nested <code>function</code> key). OpenAI's documentation notes that some newer models require this API for tool calling.</dd>
+  <dt>Gemini</dt>
+  <dd>The Gemini function-calling guide I fetched on 14 October 2026 documents the newer Interactions API: tools are declared with <code>type: "function"</code>, <code>name</code>, <code>description</code> and <code>parameters</code>; the model's request is a <code>function_call</code> step with an <code>id</code>, <code>name</code> and <code>arguments</code> object; your reply is a <code>function_result</code> step with a <code>call_id</code>. The long-standing <code>generateContent</code> style, which the adapter below targets, carries <code>functionCall</code> and <code>functionResponse</code> parts inside <code>model</code> and <code>user</code> turns, and matches a response to a call by function <em>name</em>. I wrote that shape from memory of the documentation and did not re-check it, so verify it before use.</dd>
+</dl>
+
+<h3>Converting between them</h3>
+
+<p>The neutral format in this course is the content-block shape of <code>lab-support/llm.py</code>: messages with <code>text</code>, <code>tool_use</code> and <code>tool_result</code> blocks, tools as <code>{name, description, input_schema}</code>. It is the Anthropic shape with the vendor-specific extras left out, which makes the Anthropic adapter the identity function. The other three are translations. This module does them; the script after it translates the weather conversation from the figure and prints the beginning of each entry.</p>
+
+<pre class="terminal" data-title="wire.py"><code>import json
+
+def to_anthropic(messages, tools):                       # our neutral format IS this shape
+    return {"messages": messages, "tools": tools}
+
+def to_openai_chat(messages, tools):
+    out = []
+    for m in messages:
+        if isinstance(m["content"], str):
+            out.append(m)
+            continue
+        calls = [b for b in m["content"] if b["type"] == "tool_use"]
+        results = [b for b in m["content"] if b["type"] == "tool_result"]
+        words = "".join(b["text"] for b in m["content"] if b["type"] == "text")
+        for r in results:                                # each result becomes its own "tool" message
+            out.append({"role": "tool", "tool_call_id": r["tool_use_id"], "content": r["content"]})
+        if calls:
+            out.append({"role": "assistant", "content": words or None, "tool_calls": [
+                {"id": c["id"], "type": "function",
+                 "function": {"name": c["name"], "arguments": json.dumps(c["input"])}} for c in calls]})
+        elif words:
+            out.append({"role": m["role"], "content": words})
+    return {"messages": out, "tools": [{"type": "function", "function": {
+        "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in tools]}
+
+def to_openai_responses(messages, tools):
+    items = []
+    for m in messages:
+        if isinstance(m["content"], str):
+            items.append(m)
+            continue
+        for b in m["content"]:
+            if b["type"] == "text":
+                items.append({"role": m["role"], "content": b["text"]})
+            elif b["type"] == "tool_use":
+                items.append({"type": "function_call", "call_id": b["id"], "name": b["name"],
+                              "arguments": json.dumps(b["input"])})
+            elif b["type"] == "tool_result":
+                items.append({"type": "function_call_output", "call_id": b["tool_use_id"], "output": b["content"]})
+    return {"input": items, "tools": [{"type": "function", "name": t["name"], "description": t["description"],
+                                       "parameters": t["input_schema"]} for t in tools]}
+
+def to_gemini_generate_content(messages, tools):         # results are matched by NAME, so remember id -&gt; name
+    names, contents = {}, []
+    for m in messages:
+        role = "model" if m["role"] == "assistant" else "user"
+        if isinstance(m["content"], str):
+            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+            continue
+        parts = []
+        for b in m["content"]:
+            if b["type"] == "text":
+                parts.append({"text": b["text"]})
+            elif b["type"] == "tool_use":
+                names[b["id"]] = b["name"]
+                parts.append({"functionCall": {"name": b["name"], "args": b["input"]}})
+            elif b["type"] == "tool_result":
+                parts.append({"functionResponse": {"name": names[b["tool_use_id"]], "response": {"result": b["content"]}}})
+        contents.append({"role": role, "parts": parts})
+    return {"contents": contents, "tools": [{"functionDeclarations": [
+        {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]} for t in tools]}]}</code></pre>
+<pre class="terminal" data-title="wire_demo.py"><code>import json
+from wire import *
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for one city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+CONVERSATION = [
+    {"role": "user", "content": "Weather in Leeds and Paris?"},
+    {"role": "assistant", "content": [{"type": "text", "text": "Checking both."},
+        {"type": "tool_use", "id": "ta", "name": "get_weather", "input": {"city": "Leeds"}},
+        {"type": "tool_use", "id": "tb", "name": "get_weather", "input": {"city": "Paris"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "ta", "content": "12C, rain"},
+                                 {"type": "tool_result", "tool_use_id": "tb", "content": "18C, sun"}]},
+]
+for name, fn in [("Anthropic Messages", to_anthropic), ("OpenAI Chat Completions", to_openai_chat),
+                 ("OpenAI Responses", to_openai_responses), ("Gemini generateContent", to_gemini_generate_content)]:
+    req = fn(CONVERSATION, TOOLS)
+    body = req.get("messages") or req.get("input") or req["contents"]
+    print(f"--- {name}: {len(body)} entries in the conversation")
+    print("tool:", json.dumps(req["tools"][0])[:110])
+    for entry in body[1:]:
+        print(" ", json.dumps(entry)[:150])</code></pre>
+<pre class="terminal" data-title="output"><code>--- Anthropic Messages: 3 entries in the conversation
+tool: {"name": "get_weather", "description": "Current weather for one city.", "input_schema": {"type": "object", "pr
+  {"role": "assistant", "content": [{"type": "text", "text": "Checking both."}, {"type": "tool_use", "id": "ta", "name": "get_weather", "input": {"city"
+  {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "ta", "content": "12C, rain"}, {"type": "tool_result", "tool_use_id": "tb", "conte
+--- OpenAI Chat Completions: 4 entries in the conversation
+tool: {"type": "function", "function": {"name": "get_weather", "description": "Current weather for one city.", "para
+  {"role": "assistant", "content": "Checking both.", "tool_calls": [{"id": "ta", "type": "function", "function": {"name": "get_weather", "arguments": "{
+  {"role": "tool", "tool_call_id": "ta", "content": "12C, rain"}
+  {"role": "tool", "tool_call_id": "tb", "content": "18C, sun"}
+--- OpenAI Responses: 6 entries in the conversation
+tool: {"type": "function", "name": "get_weather", "description": "Current weather for one city.", "parameters": {"ty
+  {"role": "assistant", "content": "Checking both."}
+  {"type": "function_call", "call_id": "ta", "name": "get_weather", "arguments": "{\"city\": \"Leeds\"}"}
+  {"type": "function_call", "call_id": "tb", "name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
+  {"type": "function_call_output", "call_id": "ta", "output": "12C, rain"}
+  {"type": "function_call_output", "call_id": "tb", "output": "18C, sun"}
+--- Gemini generateContent: 3 entries in the conversation
+tool: {"functionDeclarations": [{"name": "get_weather", "description": "Current weather for one city.", "parameters"
+  {"role": "model", "parts": [{"text": "Checking both."}, {"functionCall": {"name": "get_weather", "args": {"city": "Leeds"}}}, {"functionCall": {"name"
+  {"role": "user", "parts": [{"functionResponse": {"name": "get_weather", "response": {"result": "12C, rain"}}}, {"functionResponse": {"name": "get_weat</code></pre>
+
+<p>Look at what each translation has to do. For OpenAI Chat, a single neutral user message that holds two results becomes <em>two</em> <code>tool</code> messages, and the assistant's calls move out of the content list into <code>tool_calls</code> with the input serialised to a string. For Responses, one message turns into several flat items. For Gemini, the result must be tagged with the function <em>name</em>, which the neutral format does not carry on the result, so the adapter keeps a dictionary from call id to name as it walks the history. Conversion is a pure function of the history, so you can test it without any network: feed it a conversation and compare with a fixture.</p>
+
+<p>The reverse direction matters just as much, because the model's reply has to come back into the neutral shape. The one subtlety is OpenAI's string arguments: the model writes JSON text, and nothing guarantees it is complete.</p>
+
+<pre class="terminal" data-title="reverse.py"><code>import json
+from llm import Response
+
+STOP = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens"}
+
+def from_openai_chat(choice):
+    """One OpenAI Chat Completions choice -&gt; the neutral Response used everywhere else."""
+    msg, blocks, problems = choice["message"], [], []
+    if msg.get("content"):
+        blocks.append({"type": "text", "text": msg["content"]})
+    for tc in msg.get("tool_calls") or []:
+        raw = tc["function"]["arguments"]
+        try:
+            args = json.loads(raw or "{}")                 # a JSON *string* on the wire, an object for us
+        except json.JSONDecodeError as e:
+            problems.append(f"{tc['function']['name']}: arguments are not valid JSON ({e.msg}): {raw!r}")
+            args = {}
+        blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"], "input": args})
+    return Response(blocks, STOP.get(choice["finish_reason"], "end_turn")), problems
+
+good = {"finish_reason": "tool_calls", "message": {"content": None, "tool_calls": [
+    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Leeds\"}"}}]}}
+cut = {"finish_reason": "length", "message": {"content": None, "tool_calls": [
+    {"id": "call_2", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Le"}}]}}
+
+for choice in (good, cut):
+    resp, problems = from_openai_chat(choice)
+    print(resp.stop_reason, json.dumps(resp.content), problems or "")</code></pre>
+<pre class="terminal" data-title="output"><code>tool_use [{"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Leeds"}}] 
+max_tokens [{"type": "tool_use", "id": "call_2", "name": "get_weather", "input": {}}] ['get_weather: arguments are not valid JSON (Unterminated string starting at): \'{"city": "Le\'']</code></pre>
+
+<p>The second call shows a real failure mode. The reply stopped because it hit the output limit (<code>finish_reason: "length"</code>) in the middle of the arguments, so the JSON is cut off. The adapter does not guess: it records the problem and the stop reason becomes <code>max_tokens</code>. The loop must not run a tool with half its arguments. It should either retry with a larger limit or report the problem to the model, which is the same advice as for any other malformed call. Strict mode and constrained decoding make malformed JSON rarer, but a truncated reply can still occur.</p>
+
+<h2>Parallel tool calls</h2>
+
+<p>A model may answer one turn with several tool calls, as in the weather example. This is useful: when calls are independent, running them together cuts latency to that of the slowest call. It also raises three questions that every dialect answers in roughly the same way.</p>
+
+<p><strong>Who decides the order?</strong> You do. Anthropic's documentation says the API does not prescribe an execution order: run the calls concurrently, sequentially, or any mix that suits the tools. Independent read-only operations are usually safe to run in parallel; calls with side effects, shared state or ordering requirements may need to run one after another. The model cannot know which of your tools are safe to overlap, so the harness decides.</p>
+
+<p><strong>What goes back?</strong> One result for every call, and for Anthropic all in the same <code>user</code> message, matched by id and not by position. If you chose not to run a call, say because an earlier write in the same batch failed, you still return a result for it, with <code>is_error</code> set and a short explanation. A missing result is a malformed history that the API will reject.</p>
+
+<p><strong>How do failures combine?</strong> Independently. One failing call must not throw away the others' results. The script runs three calls both ways, with one deliberate failure.</p>
+
+<pre class="terminal" data-title="parallel.py"><code>import json, time
+from concurrent.futures import ThreadPoolExecutor
+from llm import tool_use, tool_result
+
+def get_weather(city):
+    time.sleep({"Leeds": 0.2, "Paris": 0.3}.get(city, 0.1))
+    if city == "Atlantis":
+        raise KeyError("no such city: 'Atlantis'. Try a real city name.")
+    return f"{city}: 14C"
+
+CALLS = [tool_use("get_weather", {"city": c}, id=f"t{i}") for i, c in enumerate(["Leeds", "Paris", "Atlantis"])]
+
+def run_one(call):
+    try:
+        return tool_result(call["id"], get_weather(**call["input"]))
+    except Exception as e:                                      # one failure must not lose the others
+        return tool_result(call["id"], f"{type(e).__name__}: {e}", is_error=True)
+
+t0 = time.perf_counter()
+sequential = [run_one(c) for c in CALLS]
+t_seq = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+with ThreadPoolExecutor() as pool:
+    concurrent = list(pool.map(run_one, CALLS))                 # map keeps the order of CALLS
+t_con = time.perf_counter() - t0
+
+assert [r["tool_use_id"] for r in concurrent] == [c["id"] for c in CALLS]
+print(f"sequential {t_seq:.1f}s, concurrent {t_con:.1f}s")
+user_message = {"role": "user", "content": concurrent}         # ONE message, one result per call id
+for r in user_message["content"]:
+    print(json.dumps(r))</code></pre>
+<pre class="terminal" data-title="output"><code>sequential 0.6s, concurrent 0.3s
+{"type": "tool_result", "tool_use_id": "t0", "content": "Leeds: 14C", "is_error": false}
+{"type": "tool_result", "tool_use_id": "t1", "content": "Paris: 14C", "is_error": false}
+{"type": "tool_result", "tool_use_id": "t2", "content": "KeyError: \"no such city: 'Atlantis'. Try a real city name.\"", "is_error": true}</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 250" role="img" aria-label="Two timelines of three tool calls with durations 0.2, 0.3 and 0.1 seconds. Run one after another they finish at 0.6 seconds. Run together they finish at 0.3 seconds, the length of the slowest call. The third call fails in both cases.">
+    <text x="20" y="22" class="t-sm t-bold">One after another: 0.6 s</text>
+    <line x1="120" y1="32" x2="720" y2="32" class="line-thin"/>
+    <rect x="120" y="42" width="200" height="22" class="f-blue"/><text x="220" y="58" text-anchor="middle" class="t-xs t-bold t-dark">Leeds 0.2</text>
+    <rect x="320" y="42" width="300" height="22" class="f-blue"/><text x="470" y="58" text-anchor="middle" class="t-xs t-bold t-dark">Paris 0.3</text>
+    <rect x="620" y="42" width="100" height="22" class="f-red"/><text x="670" y="58" text-anchor="middle" class="t-xs t-bold t-dark">fail 0.1</text>
+    <text x="20" y="108" class="t-sm t-bold">Together: 0.3 s</text>
+    <line x1="120" y1="118" x2="720" y2="118" class="line-thin"/>
+    <rect x="120" y="128" width="200" height="22" class="f-blue"/><text x="220" y="144" text-anchor="middle" class="t-xs t-bold t-dark">Leeds 0.2</text>
+    <rect x="120" y="156" width="300" height="22" class="f-blue"/><text x="270" y="172" text-anchor="middle" class="t-xs t-bold t-dark">Paris 0.3</text>
+    <rect x="120" y="184" width="100" height="22" class="f-red"/><text x="170" y="200" text-anchor="middle" class="t-xs t-bold t-dark">fail 0.1</text>
+    <line x1="420" y1="120" x2="420" y2="212" class="line-dash s-orange"/>
+    <text x="428" y="226" class="t-xs tc-orange t-bold">all results ready: 0.3 s</text>
+    <text x="120" y="240" class="t-xs t-muted">time (each 100 px is 0.1 s)</text>
+  </svg>
+  <figcaption><strong>Latency becomes the slowest call.</strong> The bar lengths are the delays in <code>parallel.py</code>. The saving applies only to calls that are safe to overlap; writes that depend on each other should stay sequential.</figcaption>
+</figure>
+
+<p>Every provider also lets you switch parallel calls off when ordering matters or when you want simpler logs: Anthropic's <code>disable_parallel_tool_use</code> option on <code>tool_choice</code> and OpenAI's <code>parallel_tool_calls: false</code>, which the documentation says ensures zero or one call per turn. Gemini's approach, as documented, is to declare several functions and let the response contain several call steps. Because calls arrive in one turn, an idempotency key on writes matters even more than usual (<a href="05-tool-design.html">chapter 5</a>): a retried batch must not repeat its effects.</p>
+
+<h2>Forcing and forbidding tools</h2>
+
+<p>By default the model decides whether to call a tool at all. Each API lets you override that, which is how you build a classifier or extractor out of a tool call, or finish a run with a summary and no more actions. The options map onto four intents.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Intent</th><th>Anthropic</th><th>OpenAI (Responses)</th><th>Gemini</th></tr></thead>
+  <tbody>
+    <tr><td>Model decides (default)</td><td><code>{"type": "auto"}</code></td><td><code>"auto"</code></td><td>mode <code>AUTO</code></td></tr>
+    <tr><td>Must call some tool</td><td><code>{"type": "any"}</code></td><td><code>"required"</code></td><td>mode <code>ANY</code></td></tr>
+    <tr><td>Must call this tool</td><td><code>{"type": "tool", "name": "x"}</code></td><td><code>{"type": "function", "name": "x"}</code></td><td><code>ANY</code> with an allowed-names list of one</td></tr>
+    <tr><td>No tools this turn</td><td><code>{"type": "none"}</code></td><td><code>"none"</code></td><td>mode <code>NONE</code></td></tr>
+  </tbody>
+</table></div>
+
+<p>OpenAI also documents <code>allowed_tools</code>, which restricts the model to a subset of the tools you passed while keeping the full list (and with it the cached prompt prefix) unchanged, and Gemini's guide describes the same restriction through an allowed-tools list and a further mode, <code>validated</code>. Mappings differ in small ways that your adapter should encode in one place, as in this function, which turns a neutral intent into each provider's spelling and then shows what happens when forcing is misused in a loop.</p>
+
+<pre class="terminal" data-title="forcing.py"><code>import json
+from llm import Model, Response, text, tool_use, tool_calls, tool_result
+
+def tool_choice_for(provider, mode, name=None, parallel=True):
+    """Neutral intent -&gt; each provider's spelling. mode: auto | required | tool | none."""
+    if provider == "anthropic":
+        tc = {"auto": {"type": "auto"}, "required": {"type": "any"}, "none": {"type": "none"},
+              "tool": {"type": "tool", "name": name}}[mode]
+        if not parallel and mode != "none":
+            tc["disable_parallel_tool_use"] = True
+        return {"tool_choice": tc}
+    if provider == "openai_responses":
+        tc = {"auto": "auto", "required": "required", "none": "none",
+              "tool": {"type": "function", "name": name}}[mode]
+        return {"tool_choice": tc, "parallel_tool_calls": parallel}
+    if provider == "gemini":
+        cfg = {"auto": {"mode": "AUTO"}, "required": {"mode": "ANY"}, "none": {"mode": "NONE"},
+               "tool": {"mode": "ANY", "allowedFunctionNames": [name]}}[mode]
+        return {"toolConfig": {"functionCallingConfig": cfg}}
+
+for p in ("anthropic", "openai_responses", "gemini"):
+    print(f"{p:17}", json.dumps(tool_choice_for(p, "tool", "extract_invoice", parallel=False)))
+
+class ForcedModel(Model):
+    """Stand-in that obeys tool_choice the way a real API does: forced means a tool call EVERY time."""
+    def complete(self, messages, *, tool_choice="auto", **kw):
+        if tool_choice == "required":
+            return Response([tool_use("extract_invoice", {"text": "..."})], "tool_use")
+        return Response([text("Extracted: total 49.00 GBP.")], "end_turn")
+
+def run(policy, max_iter=4):
+    model, msgs = ForcedModel(), [{"role": "user", "content": "Read this invoice."}]
+    for i in range(1, max_iter + 1):
+        reply = model.complete(msgs, tool_choice=policy(i))
+        msgs.append(reply.as_message())
+        if reply.stop_reason != "tool_use":
+            return f"finished on call {i}"
+        msgs.append({"role": "user", "content": [tool_result(tool_calls(reply)[0]["id"], "{'total': 4900}")]})
+    return f"still calling the tool after {max_iter} calls: budget exhausted"
+
+print("always required      :", run(lambda i: "required"))
+print("required, then auto  :", run(lambda i: "required" if i == 1 else "auto"))</code></pre>
+<pre class="terminal" data-title="output"><code>anthropic         {"tool_choice": {"type": "tool", "name": "extract_invoice", "disable_parallel_tool_use": true}}
+openai_responses  {"tool_choice": {"type": "function", "name": "extract_invoice"}, "parallel_tool_calls": false}
+gemini            {"toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["extract_invoice"]}}}
+always required      : still calling the tool after 4 calls: budget exhausted
+required, then auto  : finished on call 2</code></pre>
+
+<p>The second half is the classic mistake. If you leave a tool forced for every turn of a loop, the model has no way to finish, because "answer in words" is no longer allowed. The loop runs until the iteration budget stops it. The remedy is to force only the first turn (or only the turn that needs structure) and return to <code>auto</code> afterwards. The stand-in model there obeys <code>tool_choice</code> the way a real API does; it is a toy, but the control flow is the real thing.</p>
+
+<p>A few caveats from the documentation I read on 14 October 2026:</p>
+
+<ul>
+  <li>Anthropic: when a tool is forced with <code>any</code> or <code>tool</code>, the API pre-fills the assistant turn, so the model emits no explanatory text before the call, and thinking is skipped. With manual extended thinking enabled, <code>any</code> and <code>tool</code> are errors. Its documentation also lists some current models that return a 400 for forced tool use altogether, recommending <code>auto</code> with strict tool use instead. Changing <code>tool_choice</code> between requests invalidates cached message blocks (tool definitions and system prompt stay cached).</li>
+  <li>OpenAI: <code>"required"</code> means one or more calls; a specific function means exactly that one; <code>"none"</code> behaves as if no functions were supplied.</li>
+</ul>
+
+<p>Forcing is not a safety control. It narrows what the model may emit; it does not make the arguments right, and it should not be the only thing between a prompt injection and a dangerous tool (<a href="19-agent-security.html">chapter 19</a>).</p>
+
+<h2>A provider-neutral adapter</h2>
+
+<p>Put the pieces together and the design is a small version of what the architecture course calls ports and adapters (<a href="../../architecture/chapters/05-hexagonal.html">hexagonal architecture</a>, <a href="../../architecture/chapters/04-design-patterns.html">the adapter pattern</a>). The agent loop talks to one interface, <code>complete(messages, tools, tool_choice)</code>, and every provider hides behind an implementation of it.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="A neutral agent loop box on the left calls a provider-neutral interface in the middle, which has four adapters: Anthropic, OpenAI Chat, OpenAI Responses and Gemini, each connected to its API on the right. A test double and a recorded replay model also plug into the same interface.">
+    <defs><marker id="ahAG06a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="70" width="170" height="130" rx="10" class="fs-blue s-blue sw-2"/>
+    <text x="105" y="98" text-anchor="middle" class="t-sm t-bold">Agent loop</text>
+    <text x="105" y="124" text-anchor="middle" class="t-xs">neutral messages</text>
+    <text x="105" y="142" text-anchor="middle" class="t-xs">neutral tool defs</text>
+    <text x="105" y="160" text-anchor="middle" class="t-xs">validation, budgets</text>
+    <text x="105" y="178" text-anchor="middle" class="t-xs">tool execution</text>
+    <rect x="250" y="20" width="200" height="230" rx="10" class="box"/>
+    <text x="350" y="44" text-anchor="middle" class="t-sm t-bold">complete(...)</text>
+    <text x="350" y="60" text-anchor="middle" class="t-xs t-muted">one interface</text>
+    <rect x="266" y="76" width="168" height="30" rx="6" class="fs-cyan s-cyan sw-2"/><text x="350" y="96" text-anchor="middle" class="t-xs">Anthropic adapter</text>
+    <rect x="266" y="112" width="168" height="30" rx="6" class="fs-cyan s-cyan sw-2"/><text x="350" y="132" text-anchor="middle" class="t-xs">OpenAI Chat adapter</text>
+    <rect x="266" y="148" width="168" height="30" rx="6" class="fs-cyan s-cyan sw-2"/><text x="350" y="168" text-anchor="middle" class="t-xs">OpenAI Responses adapter</text>
+    <rect x="266" y="184" width="168" height="30" rx="6" class="fs-cyan s-cyan sw-2"/><text x="350" y="204" text-anchor="middle" class="t-xs">Gemini adapter</text>
+    <text x="350" y="236" text-anchor="middle" class="t-xs t-muted">+ scripted and replay models</text>
+    <line x1="192" y1="135" x2="248" y2="135" class="line" marker-end="url(#ahAG06a)"/>
+    <rect x="530" y="76" width="210" height="30" rx="6" class="box"/><text x="635" y="96" text-anchor="middle" class="t-xs">api.anthropic.com</text>
+    <rect x="530" y="112" width="210" height="30" rx="6" class="box"/><text x="635" y="132" text-anchor="middle" class="t-xs">chat/completions (any host)</text>
+    <rect x="530" y="148" width="210" height="30" rx="6" class="box"/><text x="635" y="168" text-anchor="middle" class="t-xs">responses</text>
+    <rect x="530" y="184" width="210" height="30" rx="6" class="box"/><text x="635" y="204" text-anchor="middle" class="t-xs">Gemini API</text>
+    <line x1="436" y1="91" x2="528" y2="91" class="line" marker-end="url(#ahAG06a)"/>
+    <line x1="436" y1="127" x2="528" y2="127" class="line" marker-end="url(#ahAG06a)"/>
+    <line x1="436" y1="163" x2="528" y2="163" class="line" marker-end="url(#ahAG06a)"/>
+    <line x1="436" y1="199" x2="528" y2="199" class="line" marker-end="url(#ahAG06a)"/>
+  </svg>
+  <figcaption><strong>Keep the dialect at the edge.</strong> The loop, validation and budgets are written once against neutral shapes. Each adapter owns authentication, URL, request conversion, response parsing and error mapping for one API. The scripted model from the labs is another implementation of the same interface.</figcaption>
+</figure>
+
+<p>Some rules make an adapter layer worth having rather than a source of bugs.</p>
+
+<ol class="steps">
+  <li><strong>Normalise to the richest shape you need and no richer.</strong> The content-block format is enough for text and tool calls. Add fields (such as a cache hint or an image block) only when more than one provider has a real equivalent.</li>
+  <li><strong>Test conversions without the network.</strong> Keep a few recorded conversations as fixtures and assert that each adapter produces the expected request. The lab-support module offers a recorder and replayer for exactly this.</li>
+  <li><strong>Validate on both sides.</strong> Check arguments against the schema before running a tool, whatever the provider promises, and check the shape of your outgoing request (every call has exactly one result) before sending it.</li>
+  <li><strong>Make unsupported features loud.</strong> If a caller asks for strict schemas and an adapter cannot provide them, raise an error or log a clear warning. Silent downgrade is how a "portable" system produces provider-specific bugs.</li>
+  <li><strong>Pass back what the provider needs.</strong> Providers that return reasoning content, such as thinking blocks or reasoning items, document that it should be returned unmodified in later turns of a tool conversation. A neutral format that drops it breaks multi-turn tool use on those models; check each provider's guidance and carry such items through opaquely.</li>
+  <li><strong>Map errors and limits.</strong> Rate limits, overloads and context-length errors have different codes and retry hints per provider. The adapter should present them in one vocabulary, because the retry logic in your loop depends on it (<a href="../../networking/chapters/16-failure.html">failure, timeouts and retries</a>).</li>
+</ol>
+
+<p>Frameworks and gateways offer this layer prepackaged, and <a href="21-frameworks.html">chapter 21</a> discusses when to use one. The advantage of writing the thin version yourself once is that you know exactly what the packaged one is hiding. The shape of HTTP requests, headers and status codes underneath is plain web plumbing (<a href="../../networking/chapters/10-http.html">HTTP</a>, <a href="../../networking/chapters/12-apis.html">APIs and serialisation</a>).</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Everything in this table of dialects is from documentation read on 14 October 2026 and will date. OpenAI steers new work to the Responses API and says some newer models require it; Chat Completions remains widely imitated by other hosts. Anthropic documents <code>strict: true</code> for tool inputs and lists current models that reject forced tool choice. The Gemini guide I fetched describes an Interactions API with <code>function_call</code> and <code>function_result</code> steps rather than the older <code>generateContent</code> parts. MCP (<a href="07-mcp.html">chapter 7</a>) sits one level above all of these: it standardises how tools are described and called between your program and tool servers, while this chapter's dialects are how your program talks to the model. Model names are deliberately absent here; read each provider's current model page.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Adapters are the oldest answer to "many vendors, one interface", and the same advice holds: keep a narrow port, keep translation in one place and test it with fixtures (<a href="../../architecture/chapters/05-hexagonal.html">hexagonal architecture</a>). Schemas that describe messages are the same idea as an API contract, and a model's arguments are untrusted input to your service just as any client's are (<a href="../../security/chapters/09-injection.html">injection and untrusted input</a>). The tool results you return can in turn carry attacker-controlled text, which is the subject of <a href="19-agent-security.html">chapter 19</a>.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <ol class="steps">
+    <li>Run <code>wire_demo.py</code> and add a third tool result that is an error. Check how each adapter would need to carry the error flag. Which dialects have a first-class place for it?</li>
+    <li>In <code>contract.py</code>, add a check for <code>maxLength</code> and make it fail on a 5,000-character string. Why might a tool want that bound?</li>
+    <li>In <code>forcing.py</code>, change the policy to force on iteration 2 as well. What does the transcript look like at that point, and why?</li>
+    <li>Write a fifth adapter for a made-up API of your own (say, tools declared as XML). What parts of <code>wire.py</code> can you reuse?</li>
+  </ol>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 wire_demo.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 forcing.py</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>All providers implement the same loop: describe functions, receive a call, return a result tied to the call. The spellings differ, mostly in where the call lives, whether arguments are an object or a JSON string, and how results are matched.</li>
+    <li>JSON Schema is both advice to the model and a contract you can enforce. Validate arguments yourself and return failures as error results.</li>
+    <li>Strict mode (constrained decoding) guarantees well-formed arguments, not correct ones. Providers attach rules to it, such as closed objects and all fields required.</li>
+    <li>Parallel calls cut latency to the slowest call but you control execution order; return one result per call, and never lose the others when one fails.</li>
+    <li>Forcing a tool is for single-turn structure; leave it on for a whole loop and the run cannot end.</li>
+    <li>A thin neutral adapter keeps dialects at the edge. Test conversions with fixtures, make unsupported features loud, and pass provider-specific reasoning items back unchanged.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools" target="_blank" rel="noopener">Anthropic, "Define tools" (API documentation)</a>. Tool definitions, <code>tool_choice</code> options, forced-tool caveats.</li>
+  <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use" target="_blank" rel="noopener">Anthropic, "Parallel tool use"</a>. Execution semantics, result formatting and how to disable parallel calls.</li>
+  <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use" target="_blank" rel="noopener">Anthropic, "Strict tool use"</a>. What <code>strict: true</code> guarantees and how grammar-constrained sampling is used.</li>
+  <li><a href="https://developers.openai.com/api/docs/guides/function-calling" target="_blank" rel="noopener">OpenAI, "Function calling" guide</a>. Responses API tool definitions, <code>function_call</code> items, <code>tool_choice</code>, <code>parallel_tool_calls</code> and strict mode rules.</li>
+  <li><a href="https://ai.google.dev/gemini-api/docs/function-calling" target="_blank" rel="noopener">Google, "Function calling with the Gemini API"</a>. Declarations, call and result steps and tool choice modes.</li>
+  <li><a href="https://json-schema.org/understanding-json-schema/" target="_blank" rel="noopener">JSON Schema, "Understanding JSON Schema"</a>. The vocabulary every dialect borrows.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">A tool is declared with <code>strict: true</code> and an enum <code>reason</code> of <code>duplicate</code>, <code>service_issue</code>, <code>goodwill</code>. The customer says the charge was a duplicate, but the model calls the tool with <code>reason: "goodwill"</code>. What does strict mode tell you here?</p>
+    <ol class="q-options">
+      <li>This cannot happen: strict mode guarantees correct values.</li>
+      <li>It is a bug in the provider, which should have rejected the call.</li>
+      <li>The call is schema-valid, so strict mode did its job; choosing the right value is a separate problem for descriptions, evaluation and business checks.</li>
+      <li>Strict mode failed because enums are not supported.</li>
+    </ol>
+    <div class="q-explain">Constrained decoding makes the output conform to the schema's shape: right types, declared fields, a value from the enum. It does not know what the customer meant. Fixing wrong-but-valid choices is the job of clearer descriptions, evaluation, and checks in your tool code.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">The model returns three tool calls in one turn. You run them sequentially, and the second fails because its input was invalid, so you skip the third. What should the next request contain?</p>
+    <ol class="q-options">
+      <li>One result for each of the three calls: success for the first, an error result for the second, and an error result for the third saying it was not executed.</li>
+      <li>Only the result for the first call, since the batch was abandoned.</li>
+      <li>Results for the first two calls; the third was never run, so there is nothing to report.</li>
+      <li>Nothing: drop the assistant message and ask the model again.</li>
+    </ol>
+    <div class="q-explain">Every call needs exactly one result, matched by id, or the history is malformed and the API rejects it. Reporting the skipped call as an error with a short explanation keeps the history valid and tells the model what happened. Dropping the turn (fourth) discards work and can loop.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">Your OpenAI Chat adapter receives a tool call whose <code>arguments</code> is the text <code>{"city": "Le</code> with <code>finish_reason: "length"</code>. Which behaviour is correct?</p>
+    <ol class="q-options">
+      <li>Run the tool with an empty argument object and see what happens.</li>
+      <li>Fix the JSON by closing the quote and brace, then run it.</li>
+      <li>Ignore the call and continue the loop as if the model had answered in words.</li>
+      <li>Treat it as a truncated reply: do not run the tool, and retry with a larger output limit or report the problem to the model.</li>
+    </ol>
+    <div class="q-explain">The reply was cut off by the output limit, so the arguments are incomplete, and guessing the rest could run the tool on a wrong city (or worse, a wrong payment). Running with empty arguments (first) or repairing by guesswork (second) both act on invented data. Ignoring the call (third) silently loses it.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">An extraction agent forces a tool on every call with <code>tool_choice</code> set to "required". It never produces a final answer and stops only when it hits the iteration limit. What is the best fix?</p>
+    <ol class="q-options">
+      <li>Increase the iteration limit.</li>
+      <li>Force the tool only on the turn that needs structured output, then return to auto so the model may answer in words.</li>
+      <li>Remove the tool and ask for JSON in the prompt.</li>
+      <li>Lower the temperature so the model stops calling tools.</li>
+    </ol>
+    <div class="q-explain">With a tool forced on every turn, "reply in plain text" is never allowed, so the loop cannot end. Forcing belongs on single turns. A bigger limit only runs the same loop longer; temperature does not override the forced choice; removing the tool (third) loses the schema guarantees that made forcing useful.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">You must support both Anthropic and a local server that speaks the OpenAI Chat style. Where should the translation between the two live?</p>
+    <ol class="q-options">
+      <li>Inside each tool function, which checks which provider is running.</li>
+      <li>In the system prompt, which tells the model to answer in whichever format the provider expects.</li>
+      <li>In the agent loop, with an if-statement on the provider in every step.</li>
+      <li>In one adapter layer behind a single interface, so the loop, validation and budgets are written once against a neutral shape.</li>
+    </ol>
+    <div class="q-explain">Translation is deterministic plumbing and belongs in one tested place at the edge. Scattering provider checks through tools (first) or the loop (third) multiplies the places that must change when an API does, and a prompt (second) cannot change the wire format of a request your own code sends.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">Which of these does a provider-neutral adapter handle <em>least</em> well, and so should be treated as a deliberate, visible exception?</p>
+    <ol class="q-options">
+      <li>A provider-specific feature with no equivalent elsewhere, such as a server-side search tool or a schema-guarantee mode.</li>
+      <li>Renaming <code>input_schema</code> to <code>parameters</code>.</li>
+      <li>Serialising a tool input object to a JSON string.</li>
+      <li>Splitting one message of results into several <code>tool</code> messages.</li>
+    </ol>
+    <div class="q-explain">The last three are mechanical translations a pure function can do and test. A feature that exists on one side only cannot be translated; the adapter can refuse loudly, degrade explicitly, or expose it as a documented provider-specific option, but silent pretence leads to surprises.</div>
+  </div>
+
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

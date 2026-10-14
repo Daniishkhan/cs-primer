@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPO &amp; KL Penalties · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+<link rel="stylesheet" href="../../assets/css/widgets/llm08-clip.css">
+</head>
+<body data-root="../.." data-course="llm" data-chapter="08">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>PPO &amp; KL Penalties</h1>
+  <p class="lede">A policy gradient is only valid for the policy that produced the data, so a careless update can wreck the thing it is improving. This chapter derives the clipped objective of Proximal Policy Optimisation (PPO), explains the trust-region idea behind it, and then adds the second safety rope that language-model training depends on: a KL penalty that keeps the tuned model close to the model it started from.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>PPO was the algorithm inside the first widely used RLHF systems (Stiennon et al., 2020; Ouyang et al., 2022), and its two ideas, <em>limit how far one update can move the policy</em> and <em>charge the policy for drifting from a reference</em>, recur in DPO, GRPO and every reasoning-model recipe you will meet in the next chapters. If you do not understand the ratio, the clip and the KL term, those methods read as lists of arbitrary hyperparameters; if you do, you can read a training log and say which rope is holding. After this chapter you will be able to derive the clipped objective, say what each logged diagnostic means, estimate the memory a PPO run needs, and explain why the optimum of the KL-regularised objective has a closed form.</p>
+</div>
+
+<h2>The problem: one batch, many steps, a moving target</h2>
+
+<p>Chapter 7 derived the policy gradient. Given a <span class="term">policy</span> &pi;<sub>&theta;</sub>(a&nbsp;|&nbsp;s), a distribution over actions <em>a</em> in state <em>s</em> with parameters &theta;, the gradient of the expected return is</p>
+
+<p style="text-align:center">&nabla;<sub>&theta;</sub> J = E<sub>a&sim;&pi;<sub>&theta;</sub></sub> [ &nabla;<sub>&theta;</sub> log &pi;<sub>&theta;</sub>(a|s) &middot; A(s,a) ]</p>
+
+<p>where the <span class="term">advantage</span> A(s,a) says how much better than average the action was (chapter 9 defines it properly; for now, a number that is positive for good actions and negative for bad ones). The expectation is taken over actions sampled from <em>the current policy</em>. That detail is the whole difficulty.</p>
+
+<p>For a language model the policy is the model itself. The state is the prompt plus the tokens written so far, the action is the next token, and a full response is a trajectory of such actions (we make this precise below). Producing a batch of responses is expensive: generation is slow and memory-hungry, as chapter 18 will show. The natural wish is to take <em>several</em> gradient steps on each batch. But after the first step the parameters are no longer the ones that produced the data, so the formula above no longer describes what we are doing. We are estimating a gradient for the new policy with samples from the old one.</p>
+
+<p>Two things can go wrong, and they compound:</p>
+<ul>
+  <li><strong>Stale samples.</strong> The data say "action a was good" under the old policy. If the policy has already moved a long way, that statement may be false for the new one.</li>
+  <li><strong>Step size is not a safe knob.</strong> In supervised learning a too-large step raises the loss and the next step corrects it. In reinforcement learning (RL) a too-large step can produce a <em>worse policy that generates worse data</em>, from which the next gradient is computed. There is no clean recovery. Reward curves that climb for a while and then collapse are the classic symptom.</li>
+</ul>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: walking a foggy hillside</p>
+  <p>You are trying to climb a hill in thick fog. You can feel the slope under your feet but see nothing beyond a few paces. A confident, long stride in the uphill direction might carry you over a ridge into a ravine, because the slope you felt is only valid nearby. A sensible walker takes steps short enough that the local slope is still a fair guide, then re-measures. PPO is a rule for how long a step may be before the slope you measured stops being trusted.</p>
+  <p><em>Where it breaks down:</em> a walker feels the true slope at her feet. A policy-gradient estimate is built from a few hundred noisy samples, so it is a noisy guess about the slope as well as a local one, and the safe step length depends on the noise as much as on the terrain.</p>
+</div>
+
+<h2>Reusing data safely: the importance-sampling ratio</h2>
+
+<p>We can correct for stale samples exactly, in principle. <span class="term">Importance sampling</span> rewrites an expectation under one distribution as an expectation under another by re-weighting each sample. If actions were sampled from the old policy &pi;<sub>old</sub> (the parameters at the start of the iteration) but we want an expectation under the new &pi;<sub>&theta;</sub>:</p>
+
+<p style="text-align:center">E<sub>a&sim;&pi;<sub>&theta;</sub></sub> [ f(a) ] = E<sub>a&sim;&pi;<sub>old</sub></sub> [ <span class="term">r(&theta;)</span> &middot; f(a) ],  where r(&theta;) = &pi;<sub>&theta;</sub>(a|s) / &pi;<sub>old</sub>(a|s).</p>
+
+<p>The weight r is the <span class="term">probability ratio</span>. It is 1 when the new policy gives the sampled action the same probability as the old one, above 1 when the action has become more likely, and below 1 when it has become less likely. In code it is one line, <code>ratio = exp(logp_new - logp_old)</code>, computed from the log-probabilities the model already produces.</p>
+
+<p>Using it, define the <span class="term">surrogate objective</span>, a stand-in for the true objective that can be evaluated on old data:</p>
+
+<p style="text-align:center">L(&theta;) = E<sub>(s,a)&sim;&pi;<sub>old</sub></sub> [ r(&theta;) &middot; A<sub>old</sub>(s,a) ]</p>
+
+<p>Check that this is a sensible thing to maximise. At &theta; = &theta;<sub>old</sub> every ratio equals 1. The gradient of a ratio is &nabla;r = r &middot; &nabla; log &pi;<sub>&theta;</sub>, which at r = 1 is &nabla; log &pi;<sub>old</sub>. So &nabla;L at the starting point is exactly the policy gradient from chapter 7. The surrogate agrees with the true objective to first order at the start and drifts away from it as r moves from 1. The further r wanders, the less the surrogate can be trusted. Everything that follows is a way of keeping r near 1.</p>
+
+<h2>Trust regions: TRPO, and why PPO exists</h2>
+
+<p>Kakade and Langford (2002) showed that the surrogate is a <em>lower bound</em> on the true improvement up to a penalty that grows with how far the policies differ. Schulman et al. (2015, "Trust Region Policy Optimization", TRPO) turned this into an algorithm: maximise L(&theta;) subject to a limit on the average <span class="term">KL divergence</span> between old and new policy,</p>
+
+<p style="text-align:center">maximise L(&theta;)  subject to  E<sub>s</sub> [ KL( &pi;<sub>old</sub>(&middot;|s) &#8214; &pi;<sub>&theta;</sub>(&middot;|s) ) ] &le; &delta;.</p>
+
+<p>The set of policies within &delta; of the current one is the <span class="term">trust region</span>: the neighbourhood in which we believe the surrogate. (KL divergence measures how different two distributions are; chapter 14 of <a href="../../ml-foundations/chapters/14-information-theory.html">A0</a> built it up, and we use it heavily below.) TRPO solves the constrained problem with a second-order method, a conjugate-gradient step followed by a line search. It works, but it needs second-order information about the policy and does not combine easily with architectures that share parameters between policy and value function, or with large batches split across many GPUs.</p>
+
+<p>Schulman et al. (2017), "Proximal Policy Optimization Algorithms", asked whether a first-order method, one that only needs ordinary gradients, could get most of the benefit. Their answer was to build the safety into the objective instead of into a constraint.</p>
+
+<h2>The clipped objective</h2>
+
+<p>Write r<sub>t</sub> for the ratio at step t and A<sub>t</sub> for the advantage there. PPO's clipped objective (equation 7 of the paper) is</p>
+
+<p style="text-align:center">L<sup>CLIP</sup>(&theta;) = E<sub>t</sub> [ min( r<sub>t</sub> A<sub>t</sub>,  clip(r<sub>t</sub>, 1&minus;&epsilon;, 1+&epsilon;) &middot; A<sub>t</sub> ) ]</p>
+
+<p>where clip(r, a, b) forces r into the interval [a, b] and &epsilon; is a small constant. The paper tried 0.1, 0.2 and 0.3 and found 0.2 best on its benchmark; 0.2 has been the default ever since. Read the formula by cases.</p>
+
+<dl class="terms">
+  <dt>A &gt; 0 (a good action)</dt><dd>We want to raise its probability, so we want r to grow. The objective is r&middot;A until r reaches 1+&epsilon;, then it is flat at (1+&epsilon;)&middot;A. Once the action is already 20% more likely than before, <em>there is no further reward for pushing it up</em>, and the gradient is zero.</dd>
+  <dt>A &lt; 0 (a bad action)</dt><dd>We want to lower its probability, so we want r to shrink. The objective is r&middot;A until r falls to 1&minus;&epsilon;, then flat. Once the action is 20% less likely, the gradient is zero.</dd>
+  <dt>Moving the wrong way</dt><dd>If A &gt; 0 but r has <em>fallen</em> below 1&minus;&epsilon;, or A &lt; 0 but r has <em>risen</em> above 1+&epsilon;, the min picks the unclipped term. The gradient is live and corrects the mistake. Clipping never blocks a correction, only an overshoot.</dd>
+</dl>
+
+<p>The min makes the objective a <em>pessimistic</em> bound: it takes whichever of the clipped and unclipped values is lower, so the policy never gets credit for moving further than &epsilon; in the helpful direction. The table below is printed by code, not typed from memory.</p>
+
+<pre class="terminal" data-title="ppo_clip_table.py"><code># Clipped surrogate: per-sample objective and whether it passes gradient.
+eps = 0.2
+def clipped(r, A):
+    unclipped = r * A
+    clip_r = min(max(r, 1 - eps), 1 + eps)
+    obj = min(unclipped, clip_r * A)
+    live = (unclipped &lt;= clip_r * A)  # the unclipped term is the smaller one
+    return obj, live
+
+print(f"eps = {eps}")
+print(f"{'A':&gt;6} {'ratio':&gt;6} {'objective':&gt;10} {'gradient flows?':&gt;16}")
+for A in (+1.0, -1.0):
+    for r in (0.5, 0.8, 1.0, 1.2, 1.5):
+        obj, live = clipped(r, A)
+        print(f"{A:&gt;6.1f} {r:&gt;6.2f} {obj:&gt;10.2f} {'yes' if live else 'no (clipped)':&gt;16}")</code></pre>
+<pre class="terminal" data-title="output"><code>eps = 0.2
+     A  ratio  objective  gradient flows?
+   1.0   0.50       0.50              yes
+   1.0   0.80       0.80              yes
+   1.0   1.00       1.00              yes
+   1.0   1.20       1.20              yes
+   1.0   1.50       1.20     no (clipped)
+  -1.0   0.50      -0.80     no (clipped)
+  -1.0   0.80      -0.80              yes
+  -1.0   1.00      -1.00              yes
+  -1.0   1.20      -1.20              yes
+  -1.0   1.50      -1.50              yes</code></pre>
+
+<p>Read the A = +1 rows: the objective rises with the ratio up to 1.20 and is stuck at 1.20 at ratio 1.50, with the gradient gone. Read the A = &minus;1 rows: the objective falls as the ratio rises (a bad action becoming more likely is punished with a live gradient, even at 1.50), and is stuck at &minus;0.80 for ratio 0.50, where the bad action is already well suppressed.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Two plots of the PPO per-token objective against the probability ratio from 0 to 2. Left, positive advantage: a rising line that becomes flat after ratio 1.2. Right, negative advantage: a flat line before ratio 0.8 that then falls steeply. Dashed lines show the unclipped r times A.">
+    <defs><marker id="ahLT08a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="180" y="20" width="60" height="210" class="f-green" opacity="0.12"/>
+    <rect x="550" y="20" width="60" height="210" class="f-green" opacity="0.12"/>
+    <line x1="60" y1="130" x2="370" y2="130" class="line-thin"/>
+    <line x1="430" y1="130" x2="740" y2="130" class="line-thin"/>
+    <line x1="210" y1="20" x2="210" y2="230" class="line-dash"/>
+    <line x1="580" y1="20" x2="580" y2="230" class="line-dash"/>
+    <polyline points="60,130 180,90 210,80 240,70 360,30" fill="none" class="line-dash s-orange" stroke-width="2"/>
+    <polyline points="60,130 180,90 210,80 240,70 360,70" fill="none" class="s-blue" stroke-width="3"/>
+    <polyline points="430,130 550,170 580,180 610,190 730,230" fill="none" class="line-dash s-orange" stroke-width="2"/>
+    <polyline points="430,170 550,170 580,180 610,190 730,230" fill="none" class="s-blue" stroke-width="3"/>
+    <text x="215" y="14" text-anchor="middle" class="t-sm t-bold">Advantage A = +1</text>
+    <text x="585" y="14" text-anchor="middle" class="t-sm t-bold">Advantage A = &#8722;1</text>
+    <text x="60" y="250" text-anchor="middle" class="t-xs t-muted">0</text>
+    <text x="180" y="250" text-anchor="middle" class="t-xs t-muted">0.8</text>
+    <text x="210" y="262" text-anchor="middle" class="t-xs t-muted">1</text>
+    <text x="240" y="250" text-anchor="middle" class="t-xs t-muted">1.2</text>
+    <text x="360" y="250" text-anchor="middle" class="t-xs t-muted">2</text>
+    <text x="430" y="250" text-anchor="middle" class="t-xs t-muted">0</text>
+    <text x="550" y="250" text-anchor="middle" class="t-xs t-muted">0.8</text>
+    <text x="580" y="262" text-anchor="middle" class="t-xs t-muted">1</text>
+    <text x="610" y="250" text-anchor="middle" class="t-xs t-muted">1.2</text>
+    <text x="730" y="250" text-anchor="middle" class="t-xs t-muted">2</text>
+    <text x="300" y="60" text-anchor="middle" class="t-xs tc-blue t-bold">flat: no more credit</text>
+    <text x="492" y="160" text-anchor="middle" class="t-xs tc-blue t-bold">flat: no more credit</text>
+    <text x="330" y="100" text-anchor="middle" class="t-xs tc-orange">unclipped</text>
+    <text x="700" y="205" text-anchor="middle" class="t-xs tc-orange">unclipped = clipped</text>
+    <text x="215" y="278" text-anchor="middle" class="t-xs t-muted">ratio r (shaded band: 1 &#177; 0.2)</text>
+    <text x="585" y="278" text-anchor="middle" class="t-xs t-muted">ratio r</text>
+  </svg>
+  <figcaption><strong>The clip removes the incentive to overshoot, never the incentive to correct.</strong> Blue is the clipped objective with &epsilon; = 0.2, dashed orange the unclipped r&middot;A. Left: a good action stops earning credit once its probability is 20% above the old one. Right: a bad action stops being punished once it is 20% below; if instead it becomes <em>more</em> likely, the blue line follows the dashed one down and the gradient is live.</figcaption>
+</figure>
+
+<div class="widget" id="llm08-clip">
+  <div class="widget-head"><span class="widget-tag">Try it</span><h4 class="widget-title">Where does the gradient go?</h4></div>
+  <p class="widget-help">Move the ratio and the advantage. The dot is green while a gradient reaches the policy and red once the token is clipped. Try A = +1 and slide r above 1 + &epsilon;, then A = &minus;1 and slide r above 1 + &epsilon; again, and compare.</p>
+  <div class="clip-ctl">
+    <div><label for="clip-eps">Clip range &epsilon;: <output data-act="eps-out">0.20</output></label>
+      <input id="clip-eps" type="range" min="0.05" max="0.5" step="0.05" value="0.2" data-act="eps"></div>
+    <div><label for="clip-adv">Advantage A: <output data-act="adv-out">1.0</output></label>
+      <input id="clip-adv" type="range" min="-2" max="2" step="0.5" value="1" data-act="adv"></div>
+    <div><label for="clip-ratio">Ratio r: <output data-act="ratio-out">1.00</output></label>
+      <input id="clip-ratio" type="range" min="0" max="2.5" step="0.05" value="1" data-act="ratio"></div>
+  </div>
+  <svg class="clip-chart" viewBox="0 0 700 280" role="img" aria-label="Plot of the clipped and unclipped PPO objective against the probability ratio, with a marker at the chosen ratio."></svg>
+  <p class="widget-out clip-out" aria-live="polite"></p>
+</div>
+
+<h3>The full loss</h3>
+
+<p>In practice PPO minimises a sum of terms:</p>
+
+<p style="text-align:center">loss = &minus;L<sup>CLIP</sup> + c<sub>v</sub> &middot; (V<sub>&phi;</sub>(s<sub>t</sub>) &minus; V<sup>target</sup><sub>t</sub>)<sup>2</sup> &minus; c<sub>e</sub> &middot; H[&pi;<sub>&theta;</sub>]</p>
+
+<p>The first term improves the policy. The second trains the <span class="term">value model</span> V<sub>&phi;</sub> (the critic that supplies the advantages; chapter 9) towards observed returns, weighted by a coefficient c<sub>v</sub>. The third is an optional entropy bonus that discourages the policy from collapsing onto one answer. RLHF implementations usually set c<sub>e</sub> to zero and rely on the KL term below to keep the policy from collapsing.</p>
+
+<h3>Why the clip is not a hard constraint</h3>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"The clip keeps the new policy within &epsilon; of the old one." It does not. Clipping only <em>zeroes the gradient</em> of tokens that have already moved far enough. Other tokens in the same minibatch still produce gradients, parameters are shared, and optimiser momentum keeps pushing, so a clipped token's ratio can drift well outside [1&minus;&epsilon;, 1+&epsilon;]. Engstrom et al. (2020, "Implementation Matters in Deep Policy Gradients") found that PPO's ratios routinely leave the clip range and that code-level details contribute as much to its performance as the clip itself. Treat &epsilon; as a soft brake and <em>measure</em> the real drift (the diagnostics below).</p>
+</div>
+
+<h2>Seeing the clip work: a six-armed bandit</h2>
+
+<p>Before language models, a toy where everything can be computed. A policy chooses one of six arms with a softmax over six logits. Arm 4 has the best true reward (1.0); the others pay between 0 and 0.6. Observed rewards carry Gaussian noise (standard deviation 0.5), and each iteration draws a <em>tiny</em> batch of 8 samples, which is deliberately noisy. We reuse each batch for 10 gradient steps, with and without the clip, and repeat the whole training run for 200 seeds. The advantage is the batch reward standardised to mean 0 and standard deviation 1. The gradient of the surrogate with respect to the logits is computed by hand: for a softmax policy &part;&pi;<sub>a</sub>/&part;logit<sub>k</sub> = &pi;<sub>a</sub>(1[k=a] &minus; &pi;<sub>k</sub>), so d r/d logit = r &middot; (onehot(a) &minus; &pi;).</p>
+
+<pre class="terminal" data-title="ppo_bandit.py"><code>import numpy as np
+K = 6
+true_r = np.array([0.0, 0.2, 0.4, 0.6, 1.0, 0.1])   # arm 4 is best
+
+def softmax(z):
+    e = np.exp(z - z.max()); return e / e.sum()
+
+def train(seed, clip, iters=30, N=8, epochs=10, lr=1.0, eps=0.2):
+    rng = np.random.default_rng(seed)
+    th = np.zeros(K)
+    for _ in range(iters):
+        pi_old = softmax(th)
+        a = rng.choice(K, size=N, p=pi_old)
+        R = true_r[a] + rng.normal(0, 0.5, size=N)          # noisy reward
+        A = (R - R.mean()) / (R.std() + 1e-8)
+        for _ in range(epochs):                              # reuse the batch
+            pi = softmax(th)
+            ratio = pi[a] / pi_old[a]
+            live = np.ones(N, bool)
+            if clip:
+                live = ~(((A &gt; 0) &amp; (ratio &gt; 1 + eps)) | ((A &lt; 0) &amp; (ratio &lt; 1 - eps)))
+            g = np.zeros(K)
+            for i in range(N):
+                if live[i]:
+                    oh = np.zeros(K); oh[a[i]] = 1
+                    g += ratio[i] * A[i] * (oh - pi)
+            th = th + lr * g / N
+    return softmax(th)
+
+for clip in (False, True):
+    res = [train(s, clip) for s in range(200)]
+    er = np.array([p @ true_r for p in res])
+    bad = np.mean([(p.max() &gt; 0.9) and (p.argmax() != 4) for p in res])
+    print(f"clip={str(clip):5}  mean E[true reward]={er.mean():.3f}  "
+          f"worst 10%={np.percentile(er, 10):.3f}  runs stuck on a wrong arm={bad*100:.0f}%")</code></pre>
+<pre class="terminal" data-title="output"><code>clip=False  mean E[true reward]=0.890  worst 10%=0.578  runs stuck on a wrong arm=20%
+clip=True   mean E[true reward]=0.982  worst 10%=0.975  runs stuck on a wrong arm=0%</code></pre>
+
+<p>With the same learning rate and the same number of reuses, the unclipped version ends with a mean true reward of 0.890 and gets stuck on a wrong arm in 20% of runs. The clipped version reaches 0.982 and is never stuck. What happened: with eight noisy samples, one lucky draw can make a poor arm look good. Ten unconstrained steps on that batch drive its probability towards 1, and once the policy is nearly deterministic it stops exploring and cannot recover. The clip stops each batch from being <em>over-trusted</em>: the policy moves a little towards what the batch suggests, then the next batch gets a say. That is the trust-region idea doing its job.</p>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>Save the script above as <code>ppo_bandit.py</code> and run it, then change one thing at a time and predict the result before you run it.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 ppo_bandit.py</span></code></pre>
+  <ol>
+    <li>Set <code>eps=0.5</code> in <code>train</code>. Does the clipped run get closer to the unclipped one? Why?</li>
+    <li>Set <code>eps=0.02</code>. What do you lose, and what would you have to raise to get it back (hint: the number of iterations)?</li>
+    <li>Raise <code>N</code> from 8 to 64. The unclipped run improves. Which problem did a bigger batch fix, and which did it leave?</li>
+  </ol>
+</div>
+
+<h2>From bandits to language models</h2>
+
+<p>The bandit has one decision per episode. A language model makes one decision per token. The mapping, to be used for the rest of the course:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>RL term</th><th>In an LLM</th><th>Shape (A2 notation)</th></tr></thead>
+  <tbody>
+    <tr><td>State s<sub>t</sub></td><td>prompt plus the response tokens so far</td><td>B &times; t token ids</td></tr>
+    <tr><td>Action a<sub>t</sub></td><td>the next token, one of V</td><td>B tokens from a vocabulary of V</td></tr>
+    <tr><td>Policy &pi;<sub>&theta;</sub>(a<sub>t</sub>|s<sub>t</sub>)</td><td>the model's softmax over the vocabulary</td><td>B &times; V probabilities per position</td></tr>
+    <tr><td>Episode</td><td>one complete response, ending at the end-of-sequence token</td><td>T tokens long, varying per sample</td></tr>
+    <tr><td>Reward</td><td>a score for the whole response (reward model or checker), plus a per-token KL term</td><td>B &times; T numbers, mostly zero until the last token</td></tr>
+  </tbody>
+</table></div>
+
+<p>The ratio r<sub>t</sub> is computed <em>per token</em>: the log-probability the current model gives to the token that was sampled, minus the log-probability the rollout model gave it. A batch of B responses of length T gives B&times;T ratios, each clipped separately. Because the probabilities come from the same forward pass that the training loss needs, the extra cost of the ratio is negligible. The expensive parts are elsewhere, and the next figure shows them.</p>
+
+<h3>Four models in memory</h3>
+
+<p>PPO for RLHF needs four networks of roughly the size of the model being tuned.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 270" role="img" aria-label="Four boxes: policy and value model are trained, reference model and reward model are frozen. For a 7 billion parameter policy the model states take about 112, 112, 14 and 14 gigabytes, 252 gigabytes in total.">
+    <rect x="20" y="62" width="165" height="104" rx="8" class="fs-blue s-blue sw-3"/>
+    <rect x="205" y="62" width="165" height="104" rx="8" class="fs-blue s-blue sw-2"/>
+    <rect x="390" y="62" width="165" height="104" rx="8" class="fs-purple s-purple sw-2"/>
+    <rect x="575" y="62" width="165" height="104" rx="8" class="fs-purple s-purple sw-2"/>
+    <text x="102" y="92" text-anchor="middle" class="t-sm t-bold">Policy &#960;&#952;</text>
+    <text x="102" y="112" text-anchor="middle" class="t-xs">writes the response</text>
+    <text x="102" y="130" text-anchor="middle" class="t-xs">is being trained</text>
+    <text x="102" y="152" text-anchor="middle" class="t-xs t-bold">112 GB</text>
+    <text x="287" y="92" text-anchor="middle" class="t-sm t-bold">Value model V&#966;</text>
+    <text x="287" y="112" text-anchor="middle" class="t-xs">expected return</text>
+    <text x="287" y="130" text-anchor="middle" class="t-xs">per token, trained</text>
+    <text x="287" y="152" text-anchor="middle" class="t-xs t-bold">112 GB</text>
+    <text x="472" y="92" text-anchor="middle" class="t-sm t-bold">Reference &#960;ref</text>
+    <text x="472" y="112" text-anchor="middle" class="t-xs">frozen copy of the</text>
+    <text x="472" y="130" text-anchor="middle" class="t-xs">SFT model</text>
+    <text x="472" y="152" text-anchor="middle" class="t-xs t-bold">14 GB</text>
+    <text x="657" y="92" text-anchor="middle" class="t-sm t-bold">Reward model</text>
+    <text x="657" y="112" text-anchor="middle" class="t-xs">scores the whole</text>
+    <text x="657" y="130" text-anchor="middle" class="t-xs">response, frozen</text>
+    <text x="657" y="152" text-anchor="middle" class="t-xs t-bold">14 GB</text>
+    <path d="M20,50 H370" class="line s-blue"/><text x="195" y="40" text-anchor="middle" class="t-xs tc-blue t-bold">trained: 16 bytes per parameter</text>
+    <path d="M390,50 H740" class="line s-purple"/><text x="565" y="40" text-anchor="middle" class="t-xs tc-purple t-bold">frozen: 2 bytes per parameter</text>
+    <rect x="130" y="196" width="500" height="50" rx="8" class="box"/>
+    <text x="380" y="218" text-anchor="middle" class="t-sm t-bold">Model states for a 7B policy: 252 GB</text>
+    <text x="380" y="236" text-anchor="middle" class="t-xs">3.1 &#215; one 80 GB GPU, before activations and generation</text>
+  </svg>
+  <figcaption><strong>Why PPO for language models is heavy.</strong> Two of the four networks are trained with Adam, so they cost the 16 bytes per parameter of chapter 2. Assumption: all four are 7B parameters; in practice the reward and value models are often smaller, or share layers with another model, or are LoRA adapters on one shared base (chapter 11).</figcaption>
+</figure>
+
+<pre class="terminal" data-title="ppo_memory.py"><code># Model-state memory for PPO-based RLHF, 7B policy (assumption: 16 bytes/param to train, 2 bytes/param to hold)
+P = 7e9
+train_bytes, hold_bytes = 16, 2
+policy = P * train_bytes
+critic = P * train_bytes        # value model of the same size, trained too
+ref    = P * hold_bytes         # frozen reference policy, bf16
+reward = P * hold_bytes         # frozen reward model, bf16
+for name, v in (("policy (trained)", policy), ("value model (trained)", critic),
+                ("reference (frozen)", ref), ("reward model (frozen)", reward)):
+    print(f"{name:24s} {v/1e9:7.0f} GB")
+tot = policy + critic + ref + reward
+print(f"{'total model states':24s} {tot/1e9:7.0f} GB  = {tot/80e9:.1f} x an 80 GB GPU, before any activations or generation cache")</code></pre>
+<pre class="terminal" data-title="output"><code>policy (trained)             112 GB
+value model (trained)        112 GB
+reference (frozen)            14 GB
+reward model (frozen)         14 GB
+total model states           252 GB  = 3.1 x an 80 GB GPU, before any activations or generation cache</code></pre>
+
+<p>That is the weights-and-optimiser bill only. Add the activations of a training pass (chapter 2), the KV cache of generation (chapter 18), and the fact that the policy must be used in two modes, fast generation and gradient-carrying training, and you see why PPO RLHF at 7B scale was a multi-node job and why critic-free methods (chapter 14) are attractive: dropping the value model removes 112 GB from this table. Tricks exist (sharing a backbone between policy and value with a separate head, keeping the reference as the base model with the adapter disabled), and we return to them at the end of the chapter.</p>
+
+<h3>One PPO iteration, step by step</h3>
+
+<p>An iteration has two phases: <em>rollout</em> (inference with the current weights, no gradients) and <em>optimisation</em> (several passes of training on the collected data). Step through one.</p>
+
+<div class="widget stepper" data-autoplay-ms="4200">
+  <div class="widget-head"><span class="widget-tag">Step through</span><h4 class="widget-title">One PPO iteration for an LLM</h4></div>
+  <svg viewBox="0 0 760 330" role="img" aria-label="Flow of one PPO iteration. Prompts go to the policy, which writes responses. The reward model, reference model and value model all read the responses. Their outputs combine into per-token rewards and advantages, which feed several epochs of clipped updates that produce the next policy.">
+    <defs><marker id="ahLT08b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <text x="20" y="18" class="t-xs t-muted">rollout: inference, no gradients</text>
+    <g data-steps="1-" data-active="1">
+      <rect x="20" y="28" width="200" height="56" rx="8" class="fs-green s-green sw-2"/>
+      <text x="120" y="52" text-anchor="middle" class="t-sm t-bold">Prompts x</text>
+      <text x="120" y="70" text-anchor="middle" class="t-xs">a batch of B prompts</text>
+    </g>
+    <g data-steps="2-" data-active="2">
+      <line x1="220" y1="56" x2="268" y2="56" class="line" marker-end="url(#ahLT08b)"/>
+      <rect x="270" y="28" width="200" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+      <text x="370" y="52" text-anchor="middle" class="t-sm t-bold">Policy &#960;old</text>
+      <text x="370" y="70" text-anchor="middle" class="t-xs">samples a response, logs log p</text>
+      <line x1="470" y1="56" x2="518" y2="56" class="line" marker-end="url(#ahLT08b)"/>
+      <rect x="520" y="28" width="220" height="56" rx="8" class="fs-orange s-orange sw-2"/>
+      <text x="630" y="52" text-anchor="middle" class="t-sm t-bold">Responses y</text>
+      <text x="630" y="70" text-anchor="middle" class="t-xs">T tokens each</text>
+    </g>
+    <g data-steps="3-" data-active="3">
+      <path d="M630,84 V108 H120 V118" class="line-dash" marker-end="url(#ahLT08b)"/>
+      <line x1="370" y1="108" x2="370" y2="118" class="line-dash" marker-end="url(#ahLT08b)"/>
+      <line x1="630" y1="108" x2="630" y2="118" class="line-dash" marker-end="url(#ahLT08b)"/>
+      <rect x="20" y="120" width="200" height="56" rx="8" class="fs-purple s-purple sw-2"/>
+      <text x="120" y="144" text-anchor="middle" class="t-sm t-bold">Reward model</text>
+      <text x="120" y="162" text-anchor="middle" class="t-xs">one score per response</text>
+      <rect x="270" y="120" width="200" height="56" rx="8" class="fs-purple s-purple sw-2"/>
+      <text x="370" y="144" text-anchor="middle" class="t-sm t-bold">Reference &#960;ref</text>
+      <text x="370" y="162" text-anchor="middle" class="t-xs">log p of the same tokens</text>
+      <rect x="520" y="120" width="220" height="56" rx="8" class="fs-blue s-blue sw-2"/>
+      <text x="630" y="144" text-anchor="middle" class="t-sm t-bold">Value model V&#966;</text>
+      <text x="630" y="162" text-anchor="middle" class="t-xs">V(s_t) for every token</text>
+    </g>
+    <text x="20" y="206" class="t-xs t-muted">optimisation: training, with gradients</text>
+    <g data-steps="4-" data-active="4">
+      <path d="M120,176 V218" class="line" marker-end="url(#ahLT08b)"/>
+      <path d="M370,176 V196 H200 V218" class="line" marker-end="url(#ahLT08b)"/>
+      <path d="M630,176 V196 H280 V218" class="line" marker-end="url(#ahLT08b)"/>
+      <rect x="20" y="220" width="340" height="62" rx="8" class="fs-yellow s-yellow sw-2"/>
+      <text x="190" y="244" text-anchor="middle" class="t-sm t-bold t-dark">Rewards and advantages</text>
+      <text x="190" y="262" text-anchor="middle" class="t-xs t-dark">r_t = &#8722;&#946;&#183;KL_t, score added at the end</text>
+    </g>
+    <g data-steps="5-" data-active="5">
+      <line x1="360" y1="251" x2="408" y2="251" class="line" marker-end="url(#ahLT08b)"/>
+      <rect x="410" y="220" width="330" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+      <text x="575" y="244" text-anchor="middle" class="t-sm t-bold">K epochs of clipped updates</text>
+      <text x="575" y="262" text-anchor="middle" class="t-xs">minibatches; ratio r_t = &#960;&#952; / &#960;old per token</text>
+    </g>
+    <g data-steps="6-" data-active="6">
+      <rect x="150" y="296" width="460" height="28" rx="14" class="box"/>
+      <text x="380" y="315" text-anchor="middle" class="t-xs t-bold">New weights become the next &#960;old; collect a fresh batch</text>
+    </g>
+  </svg>
+  <ol class="stepper-captions">
+    <li><strong>A batch of prompts.</strong> Each iteration starts from fresh prompts, for example 512 questions drawn from the training set. The reference model and the reward model are frozen throughout.</li>
+    <li><strong>Rollout.</strong> The current policy, now called &pi;<sub>old</sub> because it will be frozen for the rest of the iteration, writes a response to every prompt, and records the log-probability of each token it chose. This is ordinary generation, with the KV cache and all its costs.</li>
+    <li><strong>Score everything.</strong> The reward model reads each full response and returns one number. The reference model re-reads the same tokens and returns the log-probability <em>it</em> would have given each. The value model returns a predicted return for every token position.</li>
+    <li><strong>Turn scores into per-token learning signals.</strong> Every token gets a small penalty proportional to how much more likely the policy made it than the reference did; the reward-model score is added at the last token. Advantages are computed from these rewards and the value predictions (chapter 9).</li>
+    <li><strong>Optimise on the batch, several times.</strong> The same data is cut into minibatches and used for K epochs (TRL defaults to 4). At each step the ratio against the frozen &pi;<sub>old</sub> is computed and clipped. This is where PPO earns its keep: it is the only reason a batch of expensive rollouts can be reused.</li>
+    <li><strong>Loop.</strong> The updated weights become the next iteration's &pi;<sub>old</sub>. Nothing from the old batch is kept: PPO is <span class="term">on-policy</span>, meaning it only learns from data its current (or almost current) policy generated.</li>
+  </ol>
+</div>
+
+<h2>The KL leash</h2>
+
+<h3>Why the policy needs a second rope</h3>
+
+<p>PPO's clip limits how far the policy moves <em>per iteration</em>. It says nothing about how far it moves in total. After a thousand iterations, each a modest step, the model may be nowhere near where it started. For a game agent that is fine. For a language model it is a problem for two connected reasons.</p>
+
+<ol class="steps">
+  <li><strong>The reward signal is only trustworthy near where it was trained.</strong> A reward model is a neural network fitted to human comparisons of outputs from one model (the SFT model, chapter 10). It is accurate on outputs that look like those it saw, and unreliable on outputs far from them. A policy optimising against it will find and exploit its errors. This is <span class="term">reward over-optimisation</span>, and chapter 13 treats it in depth.</li>
+  <li><strong>The tuned model should stay a competent language model.</strong> The SFT model already writes fluent, grammatical, on-topic text. Pure reward maximisation is free to trade that away for whatever the reward model likes, which in practice can mean repetitive phrases, excessive length or flattery.</li>
+</ol>
+
+<p>The fix used since Ziegler et al. (2019, "Fine-Tuning Language Models from Human Preferences") is to add a penalty for drifting from a fixed <span class="term">reference policy</span> &pi;<sub>ref</sub>, usually the SFT model the run started from. The objective becomes</p>
+
+<p style="text-align:center">maximise  E<sub>x&sim;D, y&sim;&pi;<sub>&theta;</sub>(&middot;|x)</sub> [ R(x,y) ]  &minus;  &beta; &middot; KL( &pi;<sub>&theta;</sub>(&middot;|x) &#8214; &pi;<sub>ref</sub>(&middot;|x) )</p>
+
+<p>where R is the reward-model score for response <em>y</em> to prompt <em>x</em>, and the coefficient &beta; sets the length of the leash. Large &beta;: the model barely moves. Small &beta;: the model chases reward freely.</p>
+
+<h3>Measuring drift: the per-token KL</h3>
+
+<p>KL divergence between the policy and reference over whole responses is the expected log-ratio of their probabilities:</p>
+
+<p style="text-align:center">KL(&pi;<sub>&theta;</sub> &#8214; &pi;<sub>ref</sub>) = E<sub>y&sim;&pi;<sub>&theta;</sub></sub> [ log &pi;<sub>&theta;</sub>(y|x) / &pi;<sub>ref</sub>(y|x) ]</p>
+
+<p>Because the probability of a response is a product of per-token probabilities, the log-ratio of whole responses is a sum over tokens, and a single sampled response gives an unbiased estimate of the KL by summing its token log-ratios. That is why RLHF implementations place the penalty <em>on every token</em> as a reward:</p>
+
+<p style="text-align:center">reward<sub>t</sub> = &minus;&beta; &middot; ( log &pi;<sub>&theta;</sub>(a<sub>t</sub>|s<sub>t</sub>) &minus; log &pi;<sub>ref</sub>(a<sub>t</sub>|s<sub>t</sub>) )  +  1[t is the last token] &middot; R(x,y)</p>
+
+<p>The sum of these rewards over the response is the sequence-level objective above, with the KL estimated from one sample. Token-level placement is not cosmetic: it gives the advantage estimator a learning signal at <em>every</em> position, so a token that wandered far from the reference is penalised at that token, rather than the whole response being blamed through one end-of-sequence score. A worked example, from the code below: a five-token response whose tokens were each a little more likely under the policy than under the reference gets penalties of &minus;0.005, &minus;0.015, &minus;0.005, &minus;0.045 and 0.000, and the reward-model score of 2.4 is added to the last, giving a total of 2.33.</p>
+
+<div class="callout note">
+  <p class="callout-title">Sign convention to watch</p>
+  <p>The penalty is positive when the policy assigns <em>more</em> probability to the sampled token than the reference does. Sampled tokens are, by construction, ones the policy likes, so on average the penalty is positive and the expected reward shrinks. Individual tokens can have a negative KL term (the policy likes them less than the reference does); that is sampling noise, not a bug. We return to it with the estimators below.</p>
+</div>
+
+<h3>Three ways to estimate the same KL</h3>
+
+<p>The exact KL requires summing over the whole vocabulary at every position, which is affordable at one position (V is 32,000 to 200,000) but not as a baseline-free per-token reward in every implementation. A single sample gives an estimator. Schulman (2020, "Approximating KL Divergence") compares three. Let &rho; = &pi;<sub>ref</sub>(a)/&pi;<sub>&theta;</sub>(a) at a token sampled from &pi;<sub>&theta;</sub>:</p>
+
+<ul>
+  <li><strong>k1</strong> = &minus;log &rho;. Unbiased, but can be negative on a single token and so has high variance.</li>
+  <li><strong>k2</strong> = (log &rho;)<sup>2</sup>/2. Always non-negative and low variance, but biased as an estimate of the KL's value.</li>
+  <li><strong>k3</strong> = (&rho; &minus; 1) &minus; log &rho;. Unbiased and always non-negative, because log &rho; &le; &rho; &minus; 1. The blog post concludes it appears to be a strictly better estimator than k1 for reporting and reward use.</li>
+</ul>
+
+<p>A direct experiment: a four-token distribution for the policy, a uniform one for the reference, eight samples per estimate, repeated 20,000 times.</p>
+
+<pre class="terminal" data-title="kl_estimators.py"><code>import numpy as np
+rng = np.random.default_rng(1)
+pi  = np.array([0.50, 0.30, 0.15, 0.05])   # current policy (we sample from it)
+ref = np.array([0.25, 0.25, 0.25, 0.25])   # reference policy
+exact = float(np.sum(pi * np.log(pi / ref)))
+print(f"exact KL(pi || ref) = {exact:.4f}")
+
+def estimates(n):
+    x = rng.choice(4, size=n, p=pi)
+    logr = np.log(ref[x] / pi[x])            # log of ref/pi at the sampled token
+    k1 = -logr
+    k2 = 0.5 * logr ** 2
+    k3 = np.exp(logr) - 1 - logr
+    return k1, k2, k3
+
+reps, n = 20000, 8
+ks = np.array([[e.mean() for e in estimates(n)] for _ in range(reps)])
+print(f"{reps} repeats, {n} samples each")
+print(f"{'estimator':&gt;9} {'mean':&gt;8} {'std':&gt;8} {'min':&gt;8}")
+for name, col in zip(("k1", "k2", "k3"), ks.T):
+    print(f"{name:&gt;9} {col.mean():8.4f} {col.std():8.4f} {col.min():8.4f}")
+
+# per-token shaped reward for one sampled "response" of 5 tokens
+logp_pi  = np.array([-0.9, -1.2, -0.3, -2.1, -0.5])
+logp_ref = np.array([-1.0, -1.5, -0.4, -3.0, -0.5])
+beta, score = 0.05, 2.4
+r = -beta * (logp_pi - logp_ref)
+r[-1] += score
+print("per-token reward:", np.round(r, 3), " sum =", round(float(r.sum()), 3))</code></pre>
+<pre class="terminal" data-title="output"><code>exact KL(pi || ref) = 0.2442
+20000 repeats, 8 samples each
+estimator     mean      std      min
+       k1   0.2443   0.2126  -0.8362
+       k2   0.2091   0.0947   0.0166
+       k3   0.2435   0.1766   0.0157
+per-token reward: [-0.005 -0.015 -0.005 -0.045  2.4  ]  sum = 2.33</code></pre>
+
+<p>The exact KL is 0.2442. The k1 average, 0.2443, is right, but its spread (0.2126) is larger than its mean and its worst case is negative (&minus;0.84), which is nonsense for a divergence. The k2 average, 0.2091, is visibly off (biased), with the smallest spread. The k3 average, 0.2435, is right and never goes negative, with a spread (0.1766) below k1's. This is why TRL's PPO configuration lets you pick k1 (the default) or k3, and reserves k2 for logging.</p>
+
+<div class="callout note">
+  <p class="callout-title">Penalty in the reward, or term in the loss?</p>
+  <p>PPO-style RLHF adds the KL to the <em>reward</em>, so it passes through advantage estimation like any other reward. GRPO-style methods (chapter 14) instead add the KL as a separate term in the loss, which keeps the advantage calculation clean. Both implement the same objective in principle, but they behave differently in practice, and a gradient taken through a sampled-KL estimator needs care: differentiating a k1 or k3 estimate with respect to &theta; does not, in general, give the gradient of the true KL, because the samples themselves depend on &theta;. Check which one your library does before reading a hyperparameter from a paper.</p>
+</div>
+
+<h3>The optimum has a closed form</h3>
+
+<p>The KL-regularised objective can be solved exactly, and the answer is worth knowing because the next chapter's DPO is built on it. Fix a prompt <em>x</em> and drop it from the notation. We want the distribution &pi; over responses that maximises E<sub>&pi;</sub>[R] &minus; &beta; KL(&pi; &#8214; &pi;<sub>ref</sub>).</p>
+
+<details class="deeper"><summary>Go deeper <span class="hint">derivation of the optimal policy</span></summary>
+<p>Write the objective as a sum over responses y, with the constraint that &pi; sums to one:</p>
+<p style="text-align:center">J(&pi;) = &sum;<sub>y</sub> &pi;(y) R(y)  &minus;  &beta; &sum;<sub>y</sub> &pi;(y) log( &pi;(y) / &pi;<sub>ref</sub>(y) )</p>
+<p>Define the normaliser Z = &sum;<sub>y</sub> &pi;<sub>ref</sub>(y) exp(R(y)/&beta;), and the candidate</p>
+<p style="text-align:center">&pi;*(y) = &pi;<sub>ref</sub>(y) exp(R(y)/&beta;) / Z.</p>
+<p>Take the log: log &pi;*(y)/&pi;<sub>ref</sub>(y) = R(y)/&beta; &minus; log Z, so R(y) = &beta; log(&pi;*(y)/&pi;<sub>ref</sub>(y)) + &beta; log Z. Substitute this for R in J:</p>
+<p style="text-align:center">J(&pi;) = &beta; &sum;<sub>y</sub> &pi;(y) log( &pi;*(y)/&pi;<sub>ref</sub>(y) ) + &beta; log Z  &minus;  &beta; &sum;<sub>y</sub> &pi;(y) log( &pi;(y)/&pi;<sub>ref</sub>(y) )</p>
+<p style="text-align:center">= &minus;&beta; &sum;<sub>y</sub> &pi;(y) log( &pi;(y)/&pi;*(y) ) + &beta; log Z = &minus;&beta; KL(&pi; &#8214; &pi;*) + &beta; log Z.</p>
+<p>The term &beta; log Z does not depend on &pi;. KL is non-negative and zero only when its two arguments are equal, so J is maximised exactly at &pi; = &pi;*. This is the whole proof: <strong>maximising reward minus a KL penalty is the same as minimising the KL to the reward-tilted reference</strong>. Two consequences: the optimal policy keeps the reference's probabilities and multiplies each by exp(R/&beta;), so it can only put mass on responses the reference could produce; and as &beta; &rarr; &infin; the exponent vanishes and &pi;* &rarr; &pi;<sub>ref</sub>, while as &beta; &rarr; 0 all mass goes to the highest-reward response.</p>
+</details>
+
+<p>In words: <strong>the best policy re-weights the reference by exp(reward / &beta;)</strong>. A response that scores one unit of reward higher than another becomes e<sup>1/&beta;</sup> times more likely relative to it. This formula lets us simulate the leash exactly, with no training at all.</p>
+
+<h3>What the leash buys: a simulated over-optimisation curve</h3>
+
+<p>Take 400 candidate answers, a uniform reference policy, a hidden "true quality" for each answer (standard normal), and a reward model that sees the truth plus a heavy-tailed error (a Student-t with 3 degrees of freedom, scaled by 0.8): mostly accurate, with a few badly overrated answers, like a real reward model. For each &beta; we compute the exact optimal policy and report the expected proxy reward, the expected true reward and the KL from the reference. The second half of the script runs Ziegler et al.'s adaptive controller, which adjusts &beta; in proportion to how far the measured KL is from a target.</p>
+
+<pre class="terminal" data-title="kl_leash.py"><code>import numpy as np
+rng = np.random.default_rng(7)
+n = 400
+ref = np.full(n, 1.0 / n)                     # reference policy: uniform over 400 candidate answers
+true = rng.normal(0, 1, n)                    # true quality of each answer
+proxy = true + rng.standard_t(3, n) * 0.8     # reward model = true quality + heavy-tailed error
+
+def tilt(r, beta):                            # optimum of  E[r] - beta * KL(pi || ref)
+    w = ref * np.exp((r - r.max()) / beta)
+    return w / w.sum()
+
+def kl(p, q):
+    m = p &gt; 0
+    return float(np.sum(p[m] * np.log(p[m] / q[m])))
+
+print(f"{'beta':&gt;6} {'KL':&gt;7} {'proxy reward':&gt;13} {'true reward':&gt;12}")
+for beta in (50, 5, 2, 1, 0.5, 0.2, 0.05):
+    p = tilt(proxy, beta)
+    print(f"{beta:6.2f} {kl(p, ref):7.3f} {p @ proxy:13.3f} {p @ true:12.3f}")
+
+# Adaptive KL controller (Ziegler et al., 2019): nudge beta so that KL meets a target.
+target, horizon, n_steps = 1.5, 10, 1         # toy settings (assumptions)
+beta = 5.0
+print("\nadaptive controller, target KL =", target)
+for u in range(1, 121):
+    cur = kl(tilt(proxy, beta), ref)          # toy: policy sits at the optimum for this beta
+    if u in (1, 20, 40, 60, 80, 120):
+        print(f"update {u:3d}: beta = {beta:6.3f}, KL = {cur:5.3f}")
+    err = np.clip(cur / target - 1, -0.2, 0.2)
+    beta *= 1 + err * n_steps / horizon</code></pre>
+<pre class="terminal" data-title="output"><code>  beta      KL  proxy reward  true reward
+ 50.00   0.000        -0.110       -0.088
+  5.00   0.051         0.342        0.068
+  2.00   0.427         1.379        0.315
+  1.00   2.723         4.385        0.501
+  0.50   5.632         6.647        0.319
+  0.20   5.988         6.791        0.260
+  0.05   5.991         6.792        0.259
+
+adaptive controller, target KL = 1.5
+update   1: beta =  5.000, KL = 0.051
+update  20: beta =  3.406, KL = 0.119
+update  40: beta =  2.274, KL = 0.308
+update  60: beta =  1.518, KL = 0.900
+update  80: beta =  1.265, KL = 1.497
+update 120: beta =  1.264, KL = 1.500</code></pre>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Two plots against KL from the reference, from 0 to 6 nats. Left: the reward-model score rises steadily and then flattens near 6.8. Right: the true quality rises to a peak of about 0.5 near a KL of 2.7, then falls to about 0.26.">
+    <line x1="60" y1="240" x2="340" y2="240" class="line-thin"/><line x1="60" y1="40" x2="60" y2="240" class="line-thin"/>
+    <line x1="430" y1="240" x2="710" y2="240" class="line-thin"/><line x1="430" y1="40" x2="430" y2="240" class="line-thin"/>
+    <polyline points="60.0,230.2 60.1,227.7 60.6,224.5 62.4,217.5 67.4,206.9 79.9,189.9 103.4,167.0 140.7,138.7 187.1,109.7 250.7,77.1 306.1,54.7 322.8,49.4 332.7,46.8 337.7,45.8 339.4,45.6 339.6,45.6" fill="none" class="s-orange" stroke-width="3"/>
+    <polyline points="430.0,239.1 430.1,229.2 430.6,216.7 432.4,191.9 437.4,159.4 449.9,121.4 473.4,90.4 510.7,71.8 557.1,68.4 620.7,81.9 676.1,108.1 692.8,120.3 702.7,129.7 707.7,135.3 709.4,137.2 709.6,137.3" fill="none" class="s-blue" stroke-width="3"/>
+    <circle cx="557.1" cy="68.4" r="7" class="f-yellow"/>
+    <text x="557" y="52" text-anchor="middle" class="t-xs t-bold">best leash length</text>
+    <text x="200" y="26" text-anchor="middle" class="t-sm t-bold">Reward-model score (what PPO sees)</text>
+    <text x="570" y="26" text-anchor="middle" class="t-sm t-bold">True quality (hidden)</text>
+    <text x="60" y="256" text-anchor="middle" class="t-xs t-muted">0</text><text x="153" y="256" text-anchor="middle" class="t-xs t-muted">2</text><text x="247" y="256" text-anchor="middle" class="t-xs t-muted">4</text><text x="340" y="256" text-anchor="middle" class="t-xs t-muted">6</text>
+    <text x="430" y="256" text-anchor="middle" class="t-xs t-muted">0</text><text x="523" y="256" text-anchor="middle" class="t-xs t-muted">2</text><text x="617" y="256" text-anchor="middle" class="t-xs t-muted">4</text><text x="710" y="256" text-anchor="middle" class="t-xs t-muted">6</text>
+    <text x="200" y="278" text-anchor="middle" class="t-xs t-muted">KL from the reference (nats)</text>
+    <text x="570" y="278" text-anchor="middle" class="t-xs t-muted">KL from the reference (nats)</text>
+    <text x="52" y="244" text-anchor="end" class="t-xs t-muted">0</text><text x="52" y="177" text-anchor="end" class="t-xs t-muted">2</text><text x="52" y="124" text-anchor="end" class="t-xs t-muted">4</text><text x="52" y="71" text-anchor="end" class="t-xs t-muted">6</text>
+    <text x="422" y="244" text-anchor="end" class="t-xs t-muted">0</text><text x="422" y="158" text-anchor="end" class="t-xs t-muted">0.2</text><text x="422" y="101" text-anchor="end" class="t-xs t-muted">0.4</text>
+  </svg>
+  <figcaption><strong>Goodhart in one picture.</strong> Each point is the exact optimum for a different &beta; in the toy above; a longer leash means more KL. The reward model's score keeps rising, and levels off only when the policy has collapsed onto its single favourite answer (KL near log 400 = 5.99). Real quality rises, peaks near a KL of 2.7 and then falls to about half its peak as the policy hunts the reward model's mistakes. Real curves of this shape were measured by Gao, Schulman and Hilton (2022); this one is a simulation with invented numbers.</figcaption>
+</figure>
+
+<p>Three things to take from the table and figure. First, the proxy reward, which is all PPO sees, keeps improving even while the true quality has started to decline; <strong>you cannot detect over-optimisation from the training reward alone</strong>. Second, there is an interior best leash length (here &beta; around 1), which the controller can find only if you give it the right KL target, and that target comes from evaluation against something the reward model did not see. Third, the controller itself is dull and effective: starting with &beta; = 5, it lowers &beta; by a few percent per update while the KL is under target and settles at &beta; = 1.264, where the KL is 1.500, exactly its target.</p>
+
+<h2>Reading a PPO training run</h2>
+
+<p>The loss curve of an RL run is a poor guide. These diagnostics, named as TRL logs them, say more:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Metric</th><th>What it measures</th><th>What to worry about</th></tr></thead>
+  <tbody>
+    <tr><td>objective/kl</td><td>mean KL between current policy and reference</td><td>Growing without bound: the leash is too long or &beta; is too small. Stuck at zero: &beta; too large or learning rate too small.</td></tr>
+    <tr><td>objective/rlhf_reward</td><td>reward-model score minus the KL cost: the quantity actually optimised</td><td>Should rise. The score alone can rise while this falls, which means the model is buying score with drift.</td></tr>
+    <tr><td>val/ratio</td><td>mean of r over the batch</td><td>Should hover near 1. TRL's docs say values like 2 or 1000, or as low as 0.1, mean consecutive policies differ too much.</td></tr>
+    <tr><td>policy/approxkl_avg</td><td>KL between consecutive policies (old to new)</td><td>Spikes mean a step was too big. Not the same as objective/kl, which is distance to the reference.</td></tr>
+    <tr><td>policy/clipfrac_avg</td><td>fraction of tokens whose ratio left the clip range</td><td>Near zero means &epsilon; or the learning rate is too timid; large (say, most tokens) means each iteration moves too far.</td></tr>
+    <tr><td>entropy</td><td>how spread the policy's distributions are</td><td>A steady slide to near zero is collapse onto a few phrasings.</td></tr>
+    <tr><td>response length</td><td>tokens per response</td><td>Steady growth with no quality gain is length hacking (chapter 13).</td></tr>
+  </tbody>
+</table></div>
+
+<p>The names and the TRL guidance come from its PPO documentation (fetched October 2026). The thresholds in the last column are judgement, not law; TRL's own advice is only that the ratio should float around 1.0.</p>
+
+<h3>Practical details that change results</h3>
+
+<p>Huang et al. (2024, "The N+ Implementation Details of RLHF with PPO") reproduced the original OpenAI summarisation pipeline and found that a long list of small implementation choices matters. The ones worth knowing:</p>
+<ul>
+  <li><strong>Normalise advantages per batch</strong> (subtract the mean, divide by the standard deviation), as the bandit script did. It makes the learning rate insensitive to the scale of the reward.</li>
+  <li><strong>The end-of-sequence trick.</strong> Responses that run to the length limit without ending are given a fixed penalty (TRL calls it <code>missing_eos_penalty</code>), so that the policy learns to finish.</li>
+  <li><strong>Initialise the value model from the reward model</strong> (a common choice in the OpenAI pipeline), since it already knows what a good response looks like; a randomly initialised head gives poor advantages for many iterations.</li>
+  <li><strong>Sample at temperature 1.</strong> The ratio assumes you sampled from the policy's actual distribution. Sampling at a lower temperature while computing log-probabilities at temperature 1 silently breaks the importance weights.</li>
+  <li><strong>Make sure &pi;<sub>old</sub> log-probabilities match the trainer's.</strong> If rollouts come from a separate inference engine (chapter 20) and the ratio is recomputed in the training framework, tiny numerical differences make the ratio differ from 1 at the first step. Many pipelines recompute &pi;<sub>old</sub> with the trainer's own forward pass for this reason.</li>
+  <li><strong>Mix in pretraining data.</strong> InstructGPT's "PPO-ptx" variant adds a pretraining language-modelling loss to reduce regressions on ordinary NLP benchmarks (Ouyang et al., 2022).</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>A PPO iteration alternates between two very different workloads on the same weights: bulk generation, which is memory-bandwidth bound and benefits from a serving engine such as those in <a href="20-serving-engines.html">chapter 20</a>, and training, which is compute-bound and limited by the memory arithmetic of <a href="02-gpu-memory.html">chapter 2</a>. Moving weights between the two layouts, and keeping rollouts from idling the training GPUs, is a scheduling problem much like the pipeline-bubble problem in <a href="03-parallelism.html">chapter 3</a>. The same pattern appears in <a href="../../systems/chapters/22-performance-engineering.html">performance engineering</a>: find which phase is the bottleneck before optimising either.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p><strong>Library support.</strong> Hugging Face reported TRL v1.0 on 31 March 2026 (secondary coverage; not checked against the release notes). In the TRL documentation fetched in October 2026, <code>PPOTrainer</code> lives under <code>trl.experimental.ppo</code>; it takes a policy, a <code>ref_model</code>, a <code>reward_model</code> and a <code>value_model</code>. Its defaults include <code>kl_coef=0.05</code>, <code>kl_estimator="k1"</code>, <code>cliprange=0.2</code>, <code>vf_coef=0.1</code>, <code>gamma=1.0</code>, <code>lam=0.95</code>, <code>num_ppo_epochs=4</code> and a learning rate of 3e-6. Secondary coverage lists the GRPO, RLOO, DPO, SFT and reward-model trainers as the stable ones. <strong>Trend.</strong> Critic-free methods such as GRPO and RLOO (chapter 14) have become the usual first choice for new reasoning-focused post-training because they drop the value model, but PPO remains the reference algorithm, and its clip and KL ideas carry over unchanged. Check the current docs before copying defaults; they change between releases.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Policy gradients are valid only for the policy that generated the data. Reusing a batch needs the importance ratio r = &pi;<sub>&theta;</sub>/&pi;<sub>old</sub>, and the surrogate L = E[r&middot;A] is trustworthy only while r stays near 1.</li>
+    <li>TRPO enforces a KL trust region with second-order methods. PPO gets most of the effect with a first-order clip: min(rA, clip(r, 1&plusmn;&epsilon;)A), with &epsilon; = 0.2 as the common default. The clip removes the incentive to overshoot, never the incentive to correct, and is a soft brake rather than a hard constraint.</li>
+    <li>In an LLM the action is a token, the ratio is per token, and the PPO loop needs four networks (policy, value, reference, reward), which is why 7B-scale PPO needs hundreds of gigabytes of model states.</li>
+    <li>The KL penalty, &minus;&beta;&middot;log(&pi;&theta;/&pi;ref) on every token, keeps the model near the SFT model where the reward model can be trusted. The optimum of reward minus &beta;&middot;KL is &pi;ref re-weighted by exp(R/&beta;).</li>
+    <li>Over-optimisation is invisible in the training reward: the proxy keeps climbing after true quality has peaked. Watch KL, clip fraction, ratio, length and entropy, and evaluate on something the reward model did not train on.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">Schulman, Wolski, Dhariwal, Radford, Klimov, "Proximal Policy Optimization Algorithms" (2017)</a>. The PPO paper; the clipped objective is equation 7 and the &epsilon; comparison is in its experiments section.</li>
+  <li><a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">Schulman, Levine, Moritz, Jordan, Abbeel, "Trust Region Policy Optimization" (2015)</a>. The monotonic-improvement bound and the KL-constrained algorithm that PPO simplifies.</li>
+  <li><a href="https://arxiv.org/abs/1909.08593" target="_blank" rel="noopener">Ziegler et al., "Fine-Tuning Language Models from Human Preferences" (2019)</a>. First application of PPO with a KL penalty and an adaptive controller to language models.</li>
+  <li><a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">Ouyang et al., "Training language models to follow instructions with human feedback" (2022)</a>. The InstructGPT paper, including the PPO-ptx variant.</li>
+  <li><a href="http://joschu.net/blog/kl-approx.html" target="_blank" rel="noopener">Schulman, "Approximating KL Divergence" (2020)</a>. A short blog post deriving k1, k2 and k3 and comparing their bias and variance.</li>
+  <li><a href="https://arxiv.org/abs/2403.17031" target="_blank" rel="noopener">Huang et al., "The N+ Implementation Details of RLHF with PPO: A Case Study on TL;DR Summarization" (2024)</a>. The practical details that decide whether a PPO RLHF run works.</li>
+  <li><a href="https://arxiv.org/abs/2210.10760" target="_blank" rel="noopener">Gao, Schulman, Hilton, "Scaling Laws for Reward Model Overoptimization" (2022)</a>. Measured proxy-versus-gold reward curves as a function of KL.</li>
+  <li><a href="https://arxiv.org/abs/2005.12729" target="_blank" rel="noopener">Engstrom et al., "Implementation Matters in Deep Policy Gradients: A Case Study on PPO and TRPO" (2020)</a>. Why PPO's clip is not what keeps it stable by itself.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">In PPO's clipped objective with &epsilon; = 0.2, a token has advantage A = +2 and its ratio is currently 1.35. What does that token contribute to the gradient?</p>
+    <ol class="q-options">
+      <li>A gradient of full size, because the advantage is positive and large</li>
+      <li>Zero gradient: the ratio is already above 1.2 in the direction the positive advantage wanted, so the clipped term is the smaller one</li>
+      <li>A gradient that pushes the ratio back down towards 1</li>
+      <li>Zero gradient, because the ratio exceeds 1 and the token is therefore a mistake</li>
+    </ol>
+    <div class="q-explain">The min picks the clipped value 1.2&times;2 = 2.4 over the unclipped 1.35&times;2 = 2.7, and a clipped value is constant in &theta;. The token has already earned all the credit it can get this iteration. Option 3 confuses clipping with a penalty: PPO does not pull ratios back; it only stops pushing them further. Option 1 forgets the clip, and option 4 invents a rule that ratios above 1 are bad.</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">A token has A = &minus;1 and its ratio has risen to 1.5 (the policy made a bad action more likely). Which statement is correct?</p>
+    <ol class="q-options">
+      <li>It is clipped, so it contributes no gradient, since the ratio is outside [0.8, 1.2]</li>
+      <li>The clip applies only to positive advantages</li>
+      <li>The objective is flat at &minus;1.2 for any ratio above 1.2</li>
+      <li>The min picks the unclipped term &minus;1.5, so the gradient is live and pushes the ratio back down</li>
+    </ol>
+    <div class="q-explain">With A negative, r&middot;A = &minus;1.5 is smaller than the clipped &minus;1.2, so the min selects the unclipped value, whose gradient reduces the ratio. Clipping never blocks a correction of a move in the wrong direction. Option 1 treats "outside the range" as automatically clipped, which ignores the sign of the advantage. Option 3 describes the plateau for the other direction.</div>
+  </div>
+
+  <div class="q" data-answer="0">
+    <p class="q-text">You run PPO RLHF on a 13B policy with a same-size value model, reference and reward model, using the 16-bytes-per-parameter accounting for trained models and 2 bytes for frozen ones. Which is closest to the model-state memory?</p>
+    <ol class="q-options">
+      <li>About 470 GB</li>
+      <li>About 210 GB</li>
+      <li>About 26 GB</li>
+      <li>About 940 GB</li>
+    </ol>
+    <div class="q-explain">Two trained models: 2 &times; 13 &times; 16 = 416 GB. Two frozen models: 2 &times; 13 &times; 2 = 52 GB. Total 468 GB, about 470. Option 4 doubles it; option 2 forgets that the value model is also trained; option 3 is the weights of one model in bf16.</div>
+  </div>
+
+  <div class="q" data-answer="2">
+    <p class="q-text">During a PPO run the reward-model score keeps rising, the KL to the reference grows steadily, and human raters start to say the answers have become repetitive and flattering. What is the most likely explanation and a first response?</p>
+    <ol class="q-options">
+      <li>The clip range is too small; increase &epsilon;</li>
+      <li>The value model is undertrained; train it longer</li>
+      <li>The policy is exploiting reward-model errors far from the reference; raise &beta; or stop earlier, and evaluate against an independent measure</li>
+      <li>The learning rate is too low; raise it to speed up learning</li>
+    </ol>
+    <div class="q-explain">This is the over-optimisation pattern of the simulation: proxy reward up, true quality down, KL growing. The leash is the lever. Raising &epsilon; or the learning rate lets the policy move faster, which makes the drift worse. A weak value model hurts learning efficiency but does not by itself create a gap between reward and quality.</div>
+  </div>
+
+  <div class="q" data-answer="1">
+    <p class="q-text">For a policy and reference over a vocabulary, which sampled estimator of KL(&pi;&#8214;&pi;ref) is both unbiased and never negative on a single sample?</p>
+    <ol class="q-options">
+      <li>k1 = &minus;log(&pi;ref/&pi;)</li>
+      <li>k3 = (&pi;ref/&pi; &minus; 1) &minus; log(&pi;ref/&pi;)</li>
+      <li>k2 = (log(&pi;ref/&pi;))<sup>2</sup>/2</li>
+      <li>None: every single-sample estimator can be negative</li>
+    </ol>
+    <div class="q-explain">k3 uses log &rho; &le; &rho; &minus; 1, so it is non-negative, and its expectation under the policy is the KL. k1 is unbiased but goes negative (the experiment shows a minimum of &minus;0.84). k2 is non-negative but biased (its mean was 0.209 against 0.244).</div>
+  </div>
+
+  <div class="q" data-answer="3">
+    <p class="q-text">The optimal policy for "reward minus &beta; times KL to the reference" is &pi;* proportional to &pi;ref &middot; exp(R/&beta;). If &beta; is doubled, what happens to the relative probability of two responses whose rewards differ by 2?</p>
+    <ol class="q-options">
+      <li>The ratio is unchanged, since only the reference matters</li>
+      <li>The ratio doubles</li>
+      <li>The ratio is squared</li>
+      <li>The ratio shrinks towards 1: from e<sup>2/&beta;</sup> to e<sup>1/&beta;</sup>, so the preferred answer gains less advantage over the other</li>
+    </ol>
+    <div class="q-explain">The odds between two responses are their reference odds times exp(&Delta;R/&beta;). Doubling &beta; halves the exponent, moving the policy back towards the reference, which is the meaning of a shorter leash. If &beta; were halved, the ratio would be squared (option 3's direction). The reference matters, but the reward term is not independent of &beta;.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+<script src="../../assets/js/stepper.js"></script>
+<script src="../../assets/js/widgets/llm08-clip.js"></script>
+</body>
+</html>

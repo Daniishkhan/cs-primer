@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpaca &amp; Self-Instruct &middot; Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-case="C7">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Alpaca &amp; Self-Instruct</h1>
+  <p class="lede">In December 2022 Wang and colleagues published "Self-Instruct: Aligning Language Models with Self-Generated Instructions", a way to have a language model write its own instruction-tuning data starting from 175 human-written tasks. Three months later a Stanford team applied a simplified version of it, with a stronger OpenAI model as the author, and fine-tuned Meta's 7 billion parameter LLaMA on the resulting 52,000 examples. They reported a model that "behaves qualitatively similarly" to its teacher for under $600. This case reads both sources for the mechanism, the costs, the measurement, and the caveat the field drew from it: copying a model's answers is not the same as copying what it knows.</p>
+</header>
+
+<div class="callout note">
+  <p class="callout-title">What I could and could not read</p>
+  <p>I fetched and read the full text of the Self-Instruct paper (arXiv 2212.10560v2, 25 May 2023), including its appendices on cost and prompts, and the Stanford CRFM announcement post "Alpaca: A Strong, Replicable Instruction-Following Model" in full, along with the project's GitHub README (training hyperparameters and the list of changes to the pipeline). For the criticism I read only the abstract of Gudibande et al., "The False Promise of Imitating Proprietary LLMs" (2023), and the dataset card of a community-cleaned version of the Alpaca data; I did not read the full imitation paper, and I treat the dataset card's numbers as a community estimate that I could not verify. The Alpaca post is a blog announcement, not a peer-reviewed paper, and its evaluation is small, as its authors say. The Stanford authors do not report a measurement of their model on standard benchmarks in the post, so I report none. The toys near the end are mine.</p>
+</div>
+
+<div class="callout why">
+  <p class="callout-title">The pattern in one sentence</p>
+  <p><strong>You can bootstrap a small model's instruction-following by training it on the outputs of a stronger model, at a tiny fraction of the cost of collecting human data, but the student mostly inherits the teacher's style and the teacher's mistakes, and it can inherit the teacher's terms of use as well.</strong></p>
+</div>
+
+<h2>Context: the data bottleneck, early 2023</h2>
+<p>By 2022, "instruction-tuned" models such as InstructGPT (<a href="case-01-instructgpt.html">case 1</a>) showed that fine-tuning a pretrained model on demonstrations of tasks made it far easier to use. The Self-Instruct paper points at the obstacle: such models "depend heavily on human-written instruction data that is often limited in quantity, diversity, and creativity". InstructGPT's data was commissioned from labellers and drew on prompts submitted to OpenAI's API; for academics, the Self-Instruct authors write, "their construction process still remains quite opaque". Stanford's post, published in March 2023, adds the second bottleneck: there was "no easily accessible model that comes close in capabilities to closed-source models such as OpenAI's text-davinci-003". Meta's LLaMA models had just been released, under a licence the Alpaca post describes as non-commercial, which supplied a strong pretrained base. What was missing was instruction data, cheaply.</p>
+<p>If you have read <a href="../chapters/10-sft.html">chapter 10 (supervised fine-tuning)</a> and <a href="../chapters/15-distillation.html">chapter 15 (distillation and synthetic data)</a>, this is a worked instance of both: step one of the pipeline is SFT, and the data comes from a stronger model, which is distillation of the sequence-level kind (the student sees the teacher's text, not its probabilities).</p>
+
+<dl class="terms">
+  <dt>Instruction tuning</dt><dd>Fine-tuning a pretrained language model on (instruction, input, output) examples so that it responds to requests instead of continuing text.</dd>
+  <dt>Seed tasks</dt><dd>The small human-written set that starts the bootstrapping: 175 tasks in Self-Instruct, each with one instruction and one instance.</dd>
+  <dt>Bootstrapping</dt><dd>Using a model's own outputs, filtered, as inputs for the next round of generation.</dd>
+  <dt>ROUGE-L</dt><dd>A score of overlap between two texts based on their longest common subsequence of words. Self-Instruct uses it to reject a new instruction that is too similar to one already in the pool.</dd>
+  <dt>Teacher and student</dt><dd>The stronger model that writes the data and the smaller model trained on it. In Alpaca the teacher is OpenAI's text-davinci-003 and the student is LLaMA 7B.</dd>
+  <dt>Imitation model</dt><dd>A model trained on a stronger model's outputs. Gudibande et al. use the term for open models fine-tuned on ChatGPT outputs.</dd>
+</dl>
+
+<h2>The mechanism: Self-Instruct, step by step</h2>
+<p>Self-Instruct is a loop with a filter, and each step is a prompt to the same language model (the GPT-3 "davinci" model in the paper).</p>
+<ol class="steps">
+  <li><strong>Start a task pool</strong> with 175 seed tasks written by the authors and their labmates, one instruction and one instance each.</li>
+  <li><strong>Generate instructions.</strong> Sample 8 tasks from the pool as examples in the prompt: 6 human-written and 2 produced by the model in earlier rounds. Ask the model to continue the list with a new instruction.</li>
+  <li><strong>Classify the task.</strong> Ask the model whether the new instruction is a classification task (a small, fixed set of output labels). The paper uses 12 classification and 19 non-classification instructions as examples for this prompt.</li>
+  <li><strong>Generate instances.</strong> For non-classification tasks, produce an input first and then the output. For classification tasks, produce the output label first and then an input that fits.</li>
+  <li><strong>Filter.</strong> Add an instruction to the pool only if its ROUGE-L similarity to every existing instruction is below 0.7; drop instructions with keywords such as "image" or "graph" that a text model cannot process; drop duplicate instances and ones with the same input but a different output; apply length heuristics.</li>
+  <li><strong>Repeat</strong> until the pool is large, then fine-tune the model on the data.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 760 290" role="img" aria-label="Top row, Self-Instruct: 175 seed tasks start a task pool; the model is prompted with 8 sampled tasks to generate instructions and answers; a filter rejects near-duplicates with ROUGE-L at or above 0.7; accepted tasks join the pool, which loops back. Bottom row, Alpaca: 175 seed pairs, text-davinci-003 generating 20 per request, 52,000 pairs under 500 dollars, fine-tuning LLaMA 7B for 3 hours, and Alpaca 7B for under 100 dollars of compute.">
+<defs><marker id="ahLT-C7a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="18" class="t-sm t-bold">Self-Instruct (Wang et al.)</text>
+<rect x="10" y="30" width="128" height="58" rx="8" class="fs-green s-green sw-2"/>
+<text x="74" y="55" text-anchor="middle" class="t-sm t-bold">175 seed tasks</text><text x="74" y="73" text-anchor="middle" class="t-xs">human-written</text>
+<rect x="163" y="30" width="128" height="58" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="227" y="55" text-anchor="middle" class="t-sm t-bold">Sample 8</text><text x="227" y="73" text-anchor="middle" class="t-xs">6 human, 2 generated</text>
+<rect x="316" y="30" width="128" height="58" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="380" y="55" text-anchor="middle" class="t-sm t-bold">Generate</text><text x="380" y="73" text-anchor="middle" class="t-xs">instructions, answers</text>
+<rect x="469" y="30" width="128" height="58" rx="8" class="fs-red s-red sw-2"/>
+<text x="533" y="55" text-anchor="middle" class="t-sm t-bold">Filter</text><text x="533" y="73" text-anchor="middle" class="t-xs">ROUGE-L below 0.7</text>
+<rect x="622" y="30" width="128" height="58" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="686" y="55" text-anchor="middle" class="t-sm t-bold">Task pool</text><text x="686" y="73" text-anchor="middle" class="t-xs">grows to 52K</text>
+<line x1="138" y1="59" x2="161" y2="59" class="line" marker-end="url(#ahLT-C7a)"/>
+<line x1="291" y1="59" x2="314" y2="59" class="line" marker-end="url(#ahLT-C7a)"/>
+<line x1="444" y1="59" x2="467" y2="59" class="line" marker-end="url(#ahLT-C7a)"/>
+<line x1="597" y1="59" x2="620" y2="59" class="line" marker-end="url(#ahLT-C7a)"/>
+<path d="M686,90 L686,112 L227,112 L227,90" class="line s-orange sw-2" fill="none" marker-end="url(#ahLT-C7a)"/>
+<text x="456" y="128" text-anchor="middle" class="t-xs tc-orange">repeat: sample new examples from the grown pool</text>
+<text x="10" y="170" class="t-sm t-bold">Alpaca (Taori et al.): the same idea, simplified</text>
+<rect x="10" y="182" width="128" height="58" rx="8" class="fs-green s-green sw-2"/>
+<text x="74" y="207" text-anchor="middle" class="t-sm t-bold">175 seed pairs</text><text x="74" y="225" text-anchor="middle" class="t-xs">Self-Instruct set</text>
+<rect x="163" y="182" width="128" height="58" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="227" y="207" text-anchor="middle" class="t-sm t-bold">text-davinci-003</text><text x="227" y="225" text-anchor="middle" class="t-xs">20 per request</text>
+<rect x="316" y="182" width="128" height="58" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="380" y="207" text-anchor="middle" class="t-sm t-bold">52K pairs</text><text x="380" y="225" text-anchor="middle" class="t-xs">under $500 of API</text>
+<rect x="469" y="182" width="128" height="58" rx="8" class="fs-yellow s-yellow sw-2"/>
+<text x="533" y="207" text-anchor="middle" class="t-sm t-bold">Fine-tune</text><text x="533" y="225" text-anchor="middle" class="t-xs">LLaMA 7B, 3 hours</text>
+<rect x="622" y="182" width="128" height="58" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="686" y="207" text-anchor="middle" class="t-sm t-bold">Alpaca 7B</text><text x="686" y="225" text-anchor="middle" class="t-xs">under $100 to train</text>
+<line x1="138" y1="211" x2="161" y2="211" class="line" marker-end="url(#ahLT-C7a)"/>
+<line x1="291" y1="211" x2="314" y2="211" class="line" marker-end="url(#ahLT-C7a)"/>
+<line x1="444" y1="211" x2="467" y2="211" class="line" marker-end="url(#ahLT-C7a)"/>
+<line x1="597" y1="211" x2="620" y2="211" class="line" marker-end="url(#ahLT-C7a)"/>
+<text x="380" y="272" text-anchor="middle" class="t-xs t-muted">Alpaca's training run: 8 A100 80GB GPUs, as stated in the Stanford post.</text>
+</svg>
+  <figcaption><strong>Same loop, stronger author.</strong> Self-Instruct bootstrapped GPT-3 from its own output. Alpaca asked a stronger model, text-davinci-003, to write the data for a smaller one. The box text is from the two sources; the layout is mine.</figcaption>
+</figure>
+
+<h2>What Self-Instruct reports</h2>
+<h3>The data</h3>
+<p>Applied to GPT-3, the paper reports 52,445 instructions (11,584 classification and 40,861 non-classification) with 82,439 instances, of which 35,878 have an empty input. The average instruction is 15.9 words and the average output 18.9 words. Generation cost "around $600" at the then-current price of $0.02 per 1,000 tokens for the davinci model, and fine-tuning GPT-3 on the whole dataset cost $338 via OpenAI's fine-tuning interface (2 epochs, prompt-loss weight 0). The generated instructions are not copies of the seeds: the authors plot each one's highest ROUGE-L overlap with a seed and note that a decent number have little overlap.</p>
+<h3>Honest quality figures</h3>
+<p>Their own quality check is a sample of 200 instructions, one instance each, labelled by one author. The result is the reason to read the rest of this case with care.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 190" role="img" aria-label="Bar chart of the Self-Instruct quality review of 200 sampled instructions: 92 percent of instructions describe a valid task, 79 percent of inputs are appropriate, 58 percent of outputs are correct and acceptable, and 54 percent have all fields valid.">
+<text x="380" y="18" text-anchor="middle" class="t-xs t-bold">Self-Instruct data quality: 200 sampled instructions, one instance each, judged by one author (their Table 2)</text>
+<text x="290" y="51" text-anchor="end" class="t-xs">Instruction describes a valid task</text>
+<rect x="300" y="36" width="386" height="22" rx="3" class="f-green"/>
+<text x="692" y="51" class="t-xs t-bold">92%</text>
+<text x="290" y="85" text-anchor="end" class="t-xs">Input appropriate for the instruction</text>
+<rect x="300" y="70" width="332" height="22" rx="3" class="f-cyan"/>
+<text x="638" y="85" class="t-xs t-bold">79%</text>
+<text x="290" y="119" text-anchor="end" class="t-xs">Output correct and acceptable</text>
+<rect x="300" y="104" width="244" height="22" rx="3" class="f-orange"/>
+<text x="550" y="119" class="t-xs t-bold">58%</text>
+<text x="290" y="153" text-anchor="end" class="t-xs">All fields valid</text>
+<rect x="300" y="138" width="227" height="22" rx="3" class="f-red"/>
+<text x="533" y="153" class="t-xs t-bold">54%</text>
+<line x1="300" y1="32" x2="300" y2="172" class="line"/>
+</svg>
+  <figcaption><strong>Most instructions are fine; only a little over half of the instances are right.</strong> Data from Table 2 of the Self-Instruct paper. The authors comment that generations may contain errors but are mostly in the correct format or partially correct.</figcaption>
+</figure>
+<p>The chain is the point: 92% of instructions describe a valid task, 79% of inputs suit the instruction, 58% of outputs are correct and acceptable, and all three fields are valid for 54%. The authors say this noise "can provide useful guidance for training models to follow instructions", which is a claim about format and intent, not about correctness.</p>
+<h3>The results</h3>
+<p>On SuperNI (a benchmark of existing NLP tasks), GPT-3 scored 6.8 ROUGE-L, and the same model fine-tuned on the self-generated data scored 39.9, an improvement of 33.1 points. The paper puts that against 40.8 for InstructGPT001, which was OpenAI's earliest instruction-tuned GPT-3 and the only InstructGPT version the authors compared on SuperNI, because later ones were likely to have seen its test data. On 252 user-oriented instructions the authors wrote for the purpose, judged by the authors of those instructions on a four-level scale (inter-rater agreement 0.57 on that scale), the self-instructed GPT-3 beat GPT-3 fine-tuned on public datasets (T0, SuperNI) "by a large margin" and, counting responses that were acceptable but imperfect, was "only 5% behind" InstructGPT001. Two scaling observations matter later: performance rose with data size but "almost plateaus after 16K" instructions, and replacing the outputs with ones regenerated by InstructGPT003 improved results by about 10% in their evaluation. The second finding is the idea Alpaca runs with: a better teacher for the answers.</p>
+
+<h2>The mechanism: Alpaca's changes</h2>
+<p>The Stanford post and README list what the team changed. They used text-davinci-003 instead of GPT-3 davinci to write the data; wrote a new prompt; generated 20 instructions per request ("much more aggressive batch decoding"); dropped the classification/non-classification split; and produced one instance per instruction instead of two or three. They report 52,000 unique instructions with outputs for "less than $500" in OpenAI API fees. The README says about 40% of examples have an input and that the output is "as generated by text-davinci-003". Fine-tuning used Hugging Face's training code with Fully Sharded Data Parallel and mixed precision on 8 80 GB A100 GPUs for 3 hours, which the post says costs "less than $100 on most cloud compute providers". The README's 7B recipe: batch size 128, learning rate 2e-5, 3 epochs, maximum length 512, weight decay 0.</p>
+<p>The Stanford post does not claim a new algorithm. Its contribution is a recipe small enough that a lab could rerun it: seed set, API calls, a standard fine-tuning script. The authors thank the Self-Instruct team, Meta for LLaMA and OpenAI "for paving the path".</p>
+
+<h2>What the Alpaca post reports</h2>
+<p>The evaluation is small and the authors say so. Five student authors did a blind pairwise comparison between text-davinci-003 and Alpaca 7B on the inputs of the Self-Instruct evaluation set (user-oriented tasks such as email writing, social media and productivity tools). Alpaca won 90 comparisons to the teacher's 89. "We were quite surprised by this result given the small model size and the modest amount of instruction following data." They add: "We acknowledge that our evaluation may be limited in scale and diversity". The post notes that Alpaca's answers are generally well-written but typically shorter than ChatGPT's, reflecting the teacher's shorter outputs, and that it reflects "the general style of the instruction-following dataset".</p>
+<p>It also lists failures. Alpaca "exhibits several common deficiencies of language models, including hallucination, toxicity, and stereotypes", and "hallucination in particular seems to be a common failure mode for Alpaca, even compared to text-davinci-003." The example given is a confident statement that Dar es Salaam is the capital of Tanzania; the post notes that Dodoma replaced it in 1974. The model can also produce well-written misinformation.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"A 90-to-89 win rate means a small model matches a big one." It means that five people, comparing single-turn answers to user-oriented prompts, found the outputs about equally good. The post itself says that this is a "preliminary" evaluation, and the same post reports that hallucination is a more common failure in Alpaca than in its teacher. A human preference test over fluent text is exactly the test that style can win without substance.</p>
+</div>
+
+<h2>Release, licences and the demo</h2>
+<p>Stanford released the 52K data, the data-generation code and the training code. It said it intended to release model weights "in the future" and had asked Meta for guidance. At launch it also ran a public web demo with a content filter based on OpenAI's moderation API, watermarked outputs (following Kirchenbauer et al., 2023) and terms restricting use to non-commercial purposes. The post states that Alpaca is intended only for academic research and that commercial use is prohibited, for three stated reasons: LLaMA's non-commercial licence, the fact that the instruction data comes from text-davinci-003 "whose terms of use prohibit developing models that compete with OpenAI", and the lack of adequate safety measures. A later update at the top of the post says the demo was disabled, citing "the hosting costs and the inadequacies of our content filters".</p>
+<p>The licence point generalises. Data generated by a model comes with the model provider's terms, and training a competing model on it may be restricted. That is a legal and contractual matter and not something this case can settle: read the current terms of any model you use as a teacher, and ask your counsel. For a wider treatment of data provenance and rights, see <a href="../../security/chapters/12-memory-supply-chain.html">the supply chain chapter</a> for the analogy with dependencies and <a href="../../evals/chapters/22-privacy-data.html">privacy and data handling</a>.</p>
+
+<h2>What the critics and later work said</h2>
+<p>The sharpest follow-up is Gudibande et al., "The False Promise of Imitating Proprietary LLMs" (May 2023). They fine-tuned base models from 1.5 billion to 13 billion parameters on ChatGPT outputs, varying the data source and amount from 0.3 million to 150 million tokens. According to the abstract, the imitation models follow instructions far better than their base models and crowd raters found them competitive with ChatGPT, but targeted automatic evaluations on tasks the imitation data did not cover showed little to no improvement. They say imitation models are "adept at mimicking ChatGPT's style but not its factuality" and conclude that the capability gap can only be closed by much larger imitation sets or stronger base models. I read only the abstract, so I cannot report their methods or tables. The finding fits the Alpaca post's own example: fluent, confident and wrong about a capital city.</p>
+<p>Data quality is the other recurring complaint. A community-maintained cleaned version of the Alpaca data (the "alpaca-cleaned" dataset) lists problems it fixed in the original: hallucinated answers to instructions that reference the internet, merged instructions, empty outputs, outputs of "N/A", instructions to generate images and inconsistent use of the input field. Its card estimates that about 80% of the maths problems had wrong answers. That is a volunteer's estimate on a dataset card, not a published measurement, but it is consistent in direction with Self-Instruct's own finding that only 58% of sampled outputs were correct, and Alpaca's outputs come from a stronger but still fallible model.</p>
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>This case describes the position in early 2023. Since then, open models have improved and many instruction datasets are synthetic, so the practice of distilling from stronger models is now routine; the details of which teachers' terms allow it have changed more than once and I have not re-checked any current licence or terms of use. Treat the licence discussion here as a dated illustration of why you must read the terms, not as current guidance. The method-level lessons, filter for novelty, measure correctness separately from style and check licences, are durable.</p>
+</div>
+
+<h2>Try it yourself: the novelty filter, the cost arithmetic and an imitation toy</h2>
+<p>Three small scripts of mine. The first implements the ROUGE-L filter on hand-written candidates. Two near-copies of existing tasks are dropped, and so is a third that merely reuses a sentence frame; two genuinely new tasks pass. The second repeats the arithmetic from the two sources. The third is a toy in which a student copies a teacher's facts: it shows why accuracy on facts tracks coverage, not fluency. It builds that assumption in, so read it as an illustration of the argument, not as evidence for it.</p>
+<pre class="terminal" data-title="selfinstruct_toy.py"><code>"""Toy: the Self-Instruct novelty filter (ROUGE-L &lt; 0.7 against the pool) on hand-written candidates."""
+def lcs(a, b):
+    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i, x in enumerate(a):
+        for j, y in enumerate(b):
+            dp[i + 1][j + 1] = dp[i][j] + 1 if x == y else max(dp[i][j + 1], dp[i + 1][j])
+    return dp[-1][-1]
+def rouge_l(a, b):                       # F-measure of the longest common subsequence of words
+    a, b = a.lower().split(), b.lower().split()
+    l = lcs(a, b)
+    if l == 0: return 0.0
+    p, r = l / len(a), l / len(b)
+    return 2 * p * r / (p + r)
+pool = ["Write a short email asking my manager for a day off next Friday.",
+        "Convert 72 degrees Fahrenheit to Celsius.",
+        "List three ways to reduce food waste at home."]
+candidates = [
+    "Write a short email asking my manager for a day off next Monday.",      # near-copy of pool[0]
+    "Convert 100 degrees Fahrenheit to Celsius.",                            # template copy of pool[1]
+    "Explain why the sky is blue to a ten year old.",                        # new
+    "List three ways to reduce plastic waste at the office.",                # shares a frame with pool[2]
+    "Summarise the plot of Hamlet in two sentences.",                        # new
+]
+THRESH = 0.7
+for c in candidates:
+    best = max(rouge_l(c, p) for p in pool)
+    verdict = "keep" if best &lt; THRESH else "drop"
+    print(f"{best:.2f} {verdict:4s} {c}")
+    if verdict == "keep": pool.append(c)
+print("pool size", len(pool))</code></pre>
+<pre class="terminal" data-title="output"><code>0.92 drop Write a short email asking my manager for a day off next Monday.
+0.83 drop Convert 100 degrees Fahrenheit to Celsius.
+0.12 keep Explain why the sky is blue to a ten year old.
+0.74 drop List three ways to reduce plastic waste at the office.
+0.11 keep Summarise the plot of Hamlet in two sentences.
+pool size 5</code></pre>
+<p>"List three ways to reduce plastic waste at the office" scored 0.74 against an earlier task and was dropped, but a rewrite with a different frame would pass. Overlap on words is a cheap test of surface similarity, not of meaning, which is why the paper also reports diversity checks.</p>
+<pre class="terminal" data-title="cost.py"><code>"""Back-of-envelope arithmetic from numbers the two sources state. Division and multiplication are mine."""
+import math
+# Stanford Alpaca post and README
+examples, epochs, batch = 52_000, 3, 128          # "52K" examples, 7B recipe from the README
+steps = math.ceil(examples * epochs / batch)
+gpus, hours, spend = 8, 3, 100                    # "3 hours on 8 80GB A100s ... less than $100"
+gpu_hours = gpus * hours
+print(f"optimiser steps for the 7B recipe: about {steps}")
+print(f"GPU-hours: {gpu_hours}; the '&lt;$100' claim implies under ${spend / gpu_hours:.2f} per A100-hour")
+print(f"data generation: under $500 for ~{examples:,} pairs, i.e. under ${500 / examples * 1000:.1f} per 1,000 pairs")
+# Self-Instruct appendix: davinci at $0.02 per 1K tokens, whole dataset about $600
+tokens = 600 / 0.02 * 1000
+print(f"Self-Instruct generation: $600 at $0.02/1K tokens is about {tokens / 1e6:.0f}M tokens processed")
+print(f"Self-Instruct data + fine-tuning of GPT-3: $600 + $338 = ${600 + 338}")</code></pre>
+<pre class="terminal" data-title="output"><code>optimiser steps for the 7B recipe: about 1219
+GPU-hours: 24; the '&lt;$100' claim implies under $4.17 per A100-hour
+data generation: under $500 for ~52,000 pairs, i.e. under $9.6 per 1,000 pairs
+Self-Instruct generation: $600 at $0.02/1K tokens is about 30M tokens processed
+Self-Instruct data + fine-tuning of GPT-3: $600 + $338 = $938</code></pre>
+<p>The $100 training figure implies a rate of under about $4.17 per A100-hour, which is plausible for 2023 cloud prices but is only my division of two numbers the post gives. Note what is absent from every dollar figure: the pretraining of LLaMA and of the teacher, and the human effort to write 175 seeds.</p>
+<pre class="terminal" data-title="imitation_toy.py"><code>"""Toy: a student that imitates a teacher's answers can only reproduce the facts it was shown.
+Style is a few patterns (cheap to copy); facts are thousands of separate items. My construction."""
+import numpy as np
+rng = np.random.default_rng(4)
+FACTS = 2000                                   # the teacher 'knows' 2,000 facts, each a value 0..9
+truth = rng.integers(0, 10, FACTS)
+print(f"{'train examples':&gt;14} {'fact coverage':&gt;14} {'accuracy on fresh questions':&gt;28}")
+for n_train in (50, 200, 1000, 2000):
+    seen = rng.choice(FACTS, n_train, replace=False)
+    memory = {int(i): int(truth[i]) for i in seen}
+    guess = int(np.bincount(truth[seen], minlength=10).argmax())   # best blind guess for unseen facts
+    test = rng.integers(0, FACTS, 5000)                            # fresh questions, same distribution
+    acc = np.mean([memory.get(int(i), guess) == int(truth[i]) for i in test])
+    print(f"{n_train:14d} {len(memory) / FACTS:14.2f} {acc:28.2f}")</code></pre>
+<pre class="terminal" data-title="output"><code></code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 760 270" role="img" aria-label="Bar chart from the toy: accuracy on fresh fact questions is 0.12 after 50 training examples, 0.19 after 200, 0.55 after 1000 and 1.00 after 2000 out of 2000 facts.">
+<text x="380" y="18" text-anchor="middle" class="t-xs t-bold">Toy: accuracy on fresh fact questions as the student sees more of the teacher's 2,000 facts</text>
+<line x1="90" y1="215" x2="690" y2="215" class="line-thin"/><text x="82" y="219" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="90" y1="135" x2="690" y2="135" class="line-thin"/><text x="82" y="139" text-anchor="end" class="t-xs t-muted">0.5</text>
+<line x1="90" y1="55" x2="690" y2="55" class="line-thin"/><text x="82" y="59" text-anchor="end" class="t-xs t-muted">1</text>
+<rect x="130" y="196" width="70" height="19" rx="3" class="f-blue"/>
+<text x="165" y="190" text-anchor="middle" class="t-xs t-bold">0.12</text>
+<text x="165" y="233" text-anchor="middle" class="t-xs">50 examples</text>
+<rect x="280" y="185" width="70" height="30" rx="3" class="f-blue"/>
+<text x="315" y="179" text-anchor="middle" class="t-xs t-bold">0.19</text>
+<text x="315" y="233" text-anchor="middle" class="t-xs">200 examples</text>
+<rect x="430" y="127" width="70" height="88" rx="3" class="f-blue"/>
+<text x="465" y="121" text-anchor="middle" class="t-xs t-bold">0.55</text>
+<text x="465" y="233" text-anchor="middle" class="t-xs">1000 examples</text>
+<rect x="580" y="55" width="70" height="160" rx="3" class="f-blue"/>
+<text x="615" y="49" text-anchor="middle" class="t-xs t-bold">1.00</text>
+<text x="615" y="233" text-anchor="middle" class="t-xs">2000 examples</text>
+<line x1="90" y1="215" x2="690" y2="215" class="line"/>
+<text x="380" y="258" text-anchor="middle" class="t-xs t-muted">Style is a few patterns and is copied quickly; each fact must be seen to be reproduced.</text>
+</svg>
+  <figcaption><strong>Coverage, not fluency, drives factual accuracy.</strong> Output of the toy above. With 2,000 facts, seeing 50 examples leaves 3% of facts covered and 12% accuracy; seeing all of them gives 100%. A real student also generalises, so reality sits between this toy and the Gudibande et al. result.</figcaption>
+</figure>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>In <code>selfinstruct_toy.py</code> add three candidates of your own, one that is a close copy of a pool item, one that is the same task in different words, and one that is genuinely new. Which does the 0.7 threshold admit? Then lower the threshold to 0.5 and see what changes. In a real run, how would you notice that the pool is filling with paraphrases that pass the filter? (Chapter 15 discusses diversity and model collapse for synthetic data.)</p>
+</div>
+
+<h2>The lessons</h2>
+<ol class="steps">
+  <li><strong>Imitation is cheap; knowledge is not.</strong> The $600 bought style, format and instruction-following. It could not buy facts the base model lacked. Compare <a href="../chapters/10-sft.html">chapter 10</a> on what SFT does and does not teach.</li>
+  <li><strong>The student inherits the teacher's errors.</strong> Self-Instruct measured 58% correct outputs; Alpaca's teacher was stronger, yet its data had visible errors. Data quality work, not data volume, is where the effort goes next.</li>
+  <li><strong>Human preference on fluent text flatters imitation.</strong> Use targeted evaluation on what the student must know (<a href="../chapters/23-evaluating-models.html">chapter 23</a>, <a href="../../evals/chapters/03-llm-judges.html">LLM judges</a>, <a href="../../evals/chapters/04-eval-statistics.html">statistics for evals</a>). A 90 to 89 split in a few hundred comparisons has wide error bars.</li>
+  <li><strong>Diversity needs a mechanism.</strong> A similarity filter was the paper's. See <a href="../chapters/15-distillation.html">chapter 15</a> for synthetic data and collapse.</li>
+  <li><strong>Terms of use travel with data.</strong> The Alpaca post named two licence restrictions among its reasons for non-commercial use. Check provenance before shipping.</li>
+  <li><strong>Release decisions are engineering.</strong> The demo, filter and watermark were mitigations; the demo was later taken down for cost and filter inadequacy. See <a href="../../evals/chapters/15-guardrails.html">guardrail classifiers</a> for what filters can and cannot do.</li>
+</ol>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Self-Instruct bootstraps instruction data from 175 seed tasks: sample, generate, filter by ROUGE-L below 0.7, repeat. It produced 52,445 instructions for about $600, with 54% of sampled instances fully valid.</li>
+    <li>Alpaca swapped in a stronger teacher (text-davinci-003) and a LLaMA 7B student: under $500 of data, 3 hours on 8 A100s for under $100, and a 90 to 89 blind win count by five authors.</li>
+    <li>The student copied the teacher's style well and its facts badly: hallucination was a common failure mode.</li>
+    <li>Later work (Gudibande et al.) argues that imitation closes the gap on style, not factuality, and that stronger base models matter more.</li>
+    <li>Terms of use of the teacher and the base model can restrict what you may do with the result.</li>
+  </ul>
+</div>
+
+<h2>Connect it</h2>
+<div class="callout ds">
+  <p class="callout-title">Connections</p>
+  <ul>
+    <li><a href="../chapters/15-distillation.html">Distillation and synthetic data</a>: teachers, students, logit versus text distillation and model collapse.</li>
+    <li><a href="../chapters/10-sft.html">Supervised fine-tuning</a>: instruction data, chat templates, loss masking and data quality.</li>
+    <li><a href="case-02-deepseek-r1.html">DeepSeek-R1</a>: distillation of reasoning into small models, a later and stronger use of the same idea.</li>
+    <li><a href="../chapters/11-lora.html">LoRA, QLoRA and parameter-efficient tuning</a>: fine-tuning cheaply by training small adapters instead of all weights.</li>
+    <li><a href="../../evals/chapters/07-contamination.html">Contamination, saturation and decay</a>: why a small evaluation set drawn from the same distribution can mislead.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">In Self-Instruct, what does the ROUGE-L threshold of 0.7 do?</p>
+    <ol class="q-options">
+      <li>It rejects any instruction the model is less than 70% sure of</li>
+      <li>It adds a new instruction to the pool only if it is less than 0.7 similar to every existing instruction</li>
+      <li>It sets the share of human-written examples in each prompt</li>
+      <li>It filters out incorrect outputs</li>
+    </ol>
+    <div class="q-explain">The filter encourages diversity by rejecting near-duplicates of the pool. It does not check correctness, which is why only 58% of sampled outputs were correct.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">The Self-Instruct quality review found 92% of instructions valid but only 54% of instances with all fields valid. What does this tell you about the data?</p>
+    <ol class="q-options">
+      <li>The task descriptions are mostly wrong</li>
+      <li>The data is unusable for training</li>
+      <li>The errors are all in the formatting</li>
+      <li>Task ideas are mostly sound, but inputs and especially outputs carry much more noise</li>
+    </ol>
+    <div class="q-explain">The validity falls from instruction to input (79%) to output (58%). The authors argued the noisy data was still useful for learning format and intent; it does not show unusability, and the errors are not only formatting.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Alpaca beat text-davinci-003 by 90 comparisons to 89 in the Stanford authors' blind test. What is the right reading?</p>
+    <ol class="q-options">
+      <li>On that prompt set, five evaluators found the two similar; it does not show equal knowledge or reliability</li>
+      <li>Alpaca is more accurate than text-davinci-003</li>
+      <li>Alpaca can be used commercially</li>
+      <li>The result proves imitation matches the teacher on all tasks</li>
+    </ol>
+    <div class="q-explain">The authors themselves call the evaluation limited and report more hallucination in Alpaca than in its teacher. The licence statement is the opposite of option three.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Using only the numbers in the Alpaca post, which is the best estimate of the model's total marginal cost, excluding the pretraining of LLaMA and the seed writing?</p>
+    <ol class="q-options">
+      <li>About $100</li>
+      <li>About $500</li>
+      <li>Under about $600: less than $500 for data and less than $100 for training</li>
+      <li>About $6,000</li>
+    </ol>
+    <div class="q-explain">The post reports data generation for less than $500 and fine-tuning for less than $100, which is the "&lt;600$" in its abstract line. Neither includes the pretraining of the base model or the teacher.</div>
+  </div>
+</section>
+
+<h2>Sources</h2>
+<ul class="sources">
+  <li><a href="https://arxiv.org/abs/2212.10560" target="_blank" rel="noopener">Wang, Kordi, Mishra, Liu, Smith, Khashabi, Hajishirzi, "Self-Instruct: Aligning Language Models with Self-Generated Instructions" (arXiv 2212.10560v2, 25 May 2023)</a>. Fetched and read, including appendices. Source of the pipeline, the filter, the dataset statistics, the quality review, the SuperNI and human-evaluation results, the plateau observation and the cost figures.</li>
+  <li><a href="https://crfm.stanford.edu/2023/03/13/alpaca.html" target="_blank" rel="noopener">Taori et al., Stanford CRFM, "Alpaca: A Strong, Replicable Instruction-Following Model" (13 March 2023, with a later note that the demo is disabled)</a>. Fetched and read in full. Source of the cost figures, the 90 to 89 comparison, the limitations, the release decision and the licence reasoning.</li>
+  <li><a href="https://github.com/tatsu-lab/stanford_alpaca" target="_blank" rel="noopener">tatsu-lab/stanford_alpaca README</a>. Fetched and read. Source of the five changes to the Self-Instruct pipeline, the data format and the fine-tuning hyperparameters.</li>
+  <li><a href="https://arxiv.org/abs/2305.15717" target="_blank" rel="noopener">Gudibande et al., "The False Promise of Imitating Proprietary LLMs" (arXiv 2305.15717, May 2023)</a>. Abstract fetched and read; full text not read.</li>
+  <li><a href="https://huggingface.co/datasets/yahma/alpaca-cleaned" target="_blank" rel="noopener">"alpaca-cleaned" dataset card (community maintained)</a>. Fetched and read. A volunteer's list of problems and a rough estimate, not a peer-reviewed measurement.</li>
+  <li>The three scripts, the figures and statements marked "mine" are my own.</li>
+</ul>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

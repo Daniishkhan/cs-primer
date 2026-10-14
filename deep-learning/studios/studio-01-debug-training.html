@@ -1,0 +1,932 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debug a Training Run That Will Not Learn &middot; Deep Learning &amp; Transformers</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="dl" data-studio="S1">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Debug a Training Run That Will Not Learn</h1>
+  <p class="lede">A teammate's training run shows a flat loss. You fix that, and the loss falls and then spikes. You fix that, and later the loss turns into NaN. Three different causes, found one after another, each with its own evidence. You will work through them on a small model whose three real runs, logs and replays are all on this page.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">How a design studio works</p>
+  <p>This page is a mock debugging session of 60 to 90 minutes, not a chapter. At each stage there is a <strong>Your turn</strong> question. Write your answer in the notes box first (it saves in this browser), <em>then</em> open the worked answer and compare. The worked answer is one strong investigation with its reasoning, not the only right one. The stages follow the order a good on-call engineer works in: say what healthy looks like, rank the suspects by cost, find each cause with evidence that rules the others out, check the fix, then change the process so the same bug is caught in seconds next time. Every number is the output of code that was run for this page, on a deliberately small model, so treat the thresholds as illustrations of a method rather than settings to copy to a large run.</p>
+</div>
+
+<div class="studio-brief">
+  <p class="brief-title">&#128208; The brief</p>
+  <p>A colleague messages you: <em>"The run will not learn. Loss has been stuck for an hour. Can you look?"</em> You get a config, the data-loader code, the training loop and a metrics export (loss every step, held-out loss every 10 steps, gradient norm, update size, loss scale). The model is a character-level language model: an 8-character window is embedded, passed through four ReLU layers of width 128, and mapped to 27 logits (26 letters and a space). The text is the Zipf-law pseudo-word source from <a href="../chapters/18-scaling-laws.html">chapter 18</a>, so the best possible loss is about 0.68 nats per character.</p>
+  <ul>
+    <li>Three independent faults are planted: one in the data pipeline, one in a data shard, one in the numerics. Fixing one reveals the next, as it does in real projects.</li>
+    <li>Any measurement that takes under a minute is allowed. Nothing may be fixed on a hunch: each cause needs evidence that supports it and evidence that rules out its rivals.</li>
+    <li>Builds on <a href="../chapters/03-training-dynamics.html">initialisation and the ln V check (chapter 03)</a>, <a href="../chapters/17-training-stability.html">mixed precision and training stability (chapter 17)</a>, <a href="../chapters/16-resource-accounting.html">resource accounting (chapter 16)</a>, <a href="../../ml-foundations/chapters/10-optimisers.html">Adam (A0 chapter 10)</a> and <a href="../../ml-foundations/chapters/11-numerics.html">floating point (A0 chapter 11)</a>. For the operations side see <a href="../../llm-training/chapters/05-long-runs.html">checkpoints, failures and long runs</a> and <a href="../../reliability/chapters/07-alerting-oncall.html">alerting</a>.</li>
+    <li>You have 60 to 90 minutes. Run the code if you can: everything uses NumPy only and takes seconds.</li>
+  </ul>
+</div>
+
+<h2>Your notes</h2>
+<p>Keep your hypotheses, the measurement you would take for each, and what each result would mean.</p>
+<textarea class="studio-notes" aria-label="Your debugging notes for this studio" placeholder="What healthy looks like (numbers)&#10;Hypotheses, cheapest first&#10;Measurement and what each outcome would mean&#10;Cause found, evidence for, evidence against the rivals"></textarea>
+
+<section class="stage">
+<h2><span class="h-num">1</span>Say what healthy looks like</h2>
+<p class="stage-q">Before opening any log: what would you ask your colleague, and what numbers would a healthy run of this model show at step 1, step 200 and the end? Write them down, so that the logs can contradict you.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<table><thead><tr><th>Question</th><th>Answer in this scenario</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td>What changed since the last good run?</td><td>Nothing: this is the first run of a new loader and a new training script</td><td>With no known-good run there is no diff to bisect, so every layer is a suspect</td></tr>
+<tr><td>What is the chance loss?</td><td>ln 27 = 3.296 nats per character</td><td>A model that knows nothing assigns 1/27 to every character. The initial loss should be close to this (<a href="../chapters/03-training-dynamics.html">chapter 03</a>)</td></tr>
+<tr><td>What is the next-best baseline?</td><td>A model that ignores its input and predicts the letter frequencies reaches about 3.04 nats</td><td>Any loss near 3.0 means the model has learned the alphabet's frequencies and nothing about context</td></tr>
+<tr><td>What is the floor?</td><td>About 0.68 nats, the entropy rate of the source if every word were known</td><td>Tells you when to stop expecting improvement</td></tr>
+<tr><td>Can I reproduce it small?</td><td>Yes: 128 examples per step, 3,000 steps, seconds per run</td><td>Every hypothesis below can be tested by experiment, so there is no reason to guess</td></tr>
+<tr><td>What do I have to see inside the run?</td><td>Per-step loss, gradient norm, update size, loss scale and a held-out loss every 10 steps</td><td>Without a held-out loss you cannot tell "the model is damaged" from "this batch was hard"</td></tr>
+</tbody></table>
+<p>From a healthy control run of this model (the first row of the table in stage 4) the expected curve is: loss 3.30 at step 1, about 1.5 by step 200, about 1.07 held-out by step 600 and about 0.73 by step 3,000 with a cosine learning-rate decay. Write the expected numbers before you look. A run whose step-1 loss is 41 points at initialisation; a run that is at 3.0 after 600 steps is not learning; a run whose loss is 0.0 is leaking its labels.</p>
+<p>One definition: the <span class="term">held-out loss</span> is the cross-entropy on text the model never trains on. It is the number that says whether the model is getting better, because the training loss is measured on whichever batch happened to arrive, which may be easy, hard or corrupt.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">2</span>Rank the suspects</h2>
+<p class="stage-q">List the layers where a "will not learn" bug can live, say how you would test each, and put them in the order you will test them. What principle decides the order?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<figure class="diagram">
+<svg viewBox="0 0 760 250" role="img" aria-label="The triage ladder: five checks from cheapest to most expensive, namely decode a batch, check the initial loss against ln V, check the update to weight ratio, try to memorise one batch, and check numerical headroom. Run 1 was caught by the data check, the spike by the data scan and the NaN by the numerical headroom check.">
+<defs><marker id="ahDLS1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<rect x="20" y="30" width="128" height="62" rx="8" class="fs-green s-green sw-2"/>
+<text x="84" y="56" text-anchor="middle" class="t-sm t-bold">1 Data</text>
+<text x="84" y="74" text-anchor="middle" class="t-xs t-muted">decode a batch</text>
+<rect x="162" y="30" width="128" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="226" y="56" text-anchor="middle" class="t-sm t-bold">2 Start</text>
+<text x="226" y="74" text-anchor="middle" class="t-xs t-muted">loss at step 0 vs ln V</text>
+<rect x="304" y="30" width="128" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="368" y="56" text-anchor="middle" class="t-sm t-bold">3 Optimiser</text>
+<text x="368" y="74" text-anchor="middle" class="t-xs t-muted">update / weight</text>
+<rect x="446" y="30" width="128" height="62" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="510" y="56" text-anchor="middle" class="t-sm t-bold">4 One batch</text>
+<text x="510" y="74" text-anchor="middle" class="t-xs t-muted">can it memorise?</text>
+<rect x="588" y="30" width="128" height="62" rx="8" class="fs-orange s-orange sw-2"/>
+<text x="652" y="56" text-anchor="middle" class="t-sm t-bold">5 Numerics</text>
+<text x="652" y="74" text-anchor="middle" class="t-xs t-muted">headroom, NaNs</text>
+<line x1="148" y1="61" x2="160" y2="61" class="line" marker-end="url(#ahDLS1a)"/>
+<line x1="290" y1="61" x2="302" y2="61" class="line" marker-end="url(#ahDLS1a)"/>
+<line x1="432" y1="61" x2="444" y2="61" class="line" marker-end="url(#ahDLS1a)"/>
+<line x1="574" y1="61" x2="586" y2="61" class="line" marker-end="url(#ahDLS1a)"/>
+<text x="20" y="20" class="t-xs t-muted">cheap and common</text>
+<text x="716" y="20" text-anchor="end" class="t-xs t-muted">costly and rare</text>
+<text x="84" y="116" text-anchor="middle" class="t-xs t-muted">seconds</text>
+<text x="226" y="116" text-anchor="middle" class="t-xs t-muted">one forward pass</text>
+<text x="368" y="116" text-anchor="middle" class="t-xs t-muted">100 steps</text>
+<text x="510" y="116" text-anchor="middle" class="t-xs t-muted">200 steps, 64 examples</text>
+<text x="652" y="116" text-anchor="middle" class="t-xs t-muted">a full run, with logs</text>
+<rect x="20" y="136" width="272" height="44" rx="8" class="fs-red s-red sw-2"/>
+<text x="156" y="156" text-anchor="middle" class="t-sm t-bold">Cause 1 and cause 2</text>
+<text x="156" y="172" text-anchor="middle" class="t-xs t-muted">shuffled labels, junk batches</text>
+<rect x="588" y="136" width="128" height="44" rx="8" class="fs-red s-red sw-2"/>
+<text x="652" y="156" text-anchor="middle" class="t-sm t-bold">Cause 3</text>
+<text x="652" y="172" text-anchor="middle" class="t-xs t-muted">fp16 overflow</text>
+<line x1="84" y1="122" x2="84" y2="134" class="line s-red" marker-end="url(#ahDLS1a)"/>
+<line x1="652" y1="122" x2="652" y2="134" class="line s-red" marker-end="url(#ahDLS1a)"/>
+<text x="380" y="214" text-anchor="middle" class="t-xs t-muted">Checks 2 to 4 rule out initialisation, the optimiser and the model, which is what makes the data suspect.</text>
+</svg>
+<figcaption><strong>The triage ladder.</strong> Work left to right and stop at the first check that fails. Two of the three causes in this studio sit at the cheapest rung; the third needs the logs from a full run.</figcaption>
+</figure>
+<p>Order by <strong>cost to test, then by how often the cause is the culprit</strong>. Experienced practitioners put the data first: Andrej Karpathy's "A Recipe for Training Neural Networks" (2019) begins with "become one with the data", and most silent failures in practice are data bugs, because a data bug trains without any error message. The ladder:</p>
+<table><thead><tr><th>Rung</th><th>Test</th><th>Cost</th><th>What a failure means</th></tr></thead><tbody>
+<tr><td>1 Data</td><td>Decode a few (input, label) pairs by eye and compare with the raw text; scan batches for outliers</td><td>Seconds</td><td>Labels, shards or tokenisation are wrong. The model may be fine</td></tr>
+<tr><td>2 Start</td><td>Loss on the first batch against ln V (<a href="../chapters/03-training-dynamics.html">chapter 03</a>)</td><td>One forward pass</td><td>Far above ln V: logits too large. Exactly 0 or NaN: something is broken before training</td></tr>
+<tr><td>3 Optimiser</td><td>Update-to-weight ratio, ||&Delta;w|| / ||w||, per step. Healthy runs sit near 10<sup>-3</sup> (an empirical heuristic from chapter 17)</td><td>100 steps</td><td>Orders of magnitude below: learning rate, schedule or frozen parameters. Far above: the learning rate is too high</td></tr>
+<tr><td>4 One batch</td><td>Train on one fixed batch of 64 examples until the loss is near zero</td><td>200 steps</td><td>If it cannot memorise 64 examples, the model, the loss or the update is broken. If it can, they are not</td></tr>
+<tr><td>5 Numerics</td><td>Gradient maxima against the number format's limit, loss-scale history, first non-finite value</td><td>A full run, with logs</td><td>Overflow, underflow or a missing safeguard. These appear late and look random</td></tr>
+</tbody></table>
+<p>The logic of the ladder is elimination. Checks 2 to 4 each remove a family of causes, and what remains is what you investigate. Do not skip ahead to the interesting hypothesis (a subtle optimiser interaction) while the boring one (the labels) is untested.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">3</span>Run 1: the loss is flat</h2>
+<p class="stage-q">The export shows held-out loss between 3.0 and 3.3 for 1,000 steps. Which measurements do you take, in what order, and what would each outcome rule out? Then name the cause.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>The orange line in the plot below is run 1. This script takes six measurements on it, each costing seconds. It reads the run's state at step 1,000 and the loader's output.</p>
+<pre class="terminal" data-title="s1_probe.py"><code>"""Studio 1, run 1: cheap checks on a run whose loss will not fall."""
+import numpy as np, warnings
+warnings.filterwarnings("ignore")
+from harness import *
+
+bug = dict(total=3000, scaler="naive", garbage=((700, 719),), labels="shuffled")
+rows, st = train(bug, until=1000)
+H = lambda y: -sum(p * np.log(p) for p in np.bincount(y, minlength=V) / len(y) if p &gt; 0)
+
+print(f"1. initial loss {rows[0]['loss']:.3f}   ln(27) = {np.log(V):.3f}")
+Xe, Ye = windows(make_text(12_000, 999))
+tail = [r["loss"] for r in rows if r["step"] &gt; 400]
+print(f"2. mean train loss, steps 400-1000: {np.mean(tail):.3f}   entropy of the letter frequencies alone: {H(Ye):.3f}")
+print(f"3. update/weight ratio, median over steps 100-1000: {np.median([r['ratio'] for r in rows[100:]]):.1e}")
+
+cache = {}
+xb, yb = get_batch(bug, 1000, cache)
+hs = forward(st["P"], xb, 4)
+_, g = cross_entropy(hs[-1], yb)
+names = ["embedding"] + [f"W{i}" for i in range(1, 6)]
+gr = backward(st["P"], xb, hs, g, 4)[:6]
+print("4. gradient norms by tensor at step 1000: " + "  ".join(f"{n} {np.linalg.norm(q):.3f}" for n, q in zip(names, gr)))
+
+def overfit(labels, steps=300):
+    c = {**DEFAULT, "labels": labels, "warmup": 1, "total": steps, "floor": 1.0}
+    xb, yb = get_batch(c, 1, {})
+    xb, yb = xb[:64], yb[:64]
+    s = new_state(c); P, m, v = s["P"], s["m"], s["v"]
+    for t in range(1, steps + 1):
+        hs = forward(P, xb, 4); loss, g = cross_entropy(hs[-1], yb)
+        for i, q in enumerate(backward(P, xb, hs, g, 4)):
+            m[i] = .9 * m[i] + .1 * q; v[i] = .999 * v[i] + .001 * q * q
+            P[i] -= 2e-3 * (m[i] / (1 - .9 ** t)) / (np.sqrt(v[i] / (1 - .999 ** t)) + 1e-8)
+    return loss
+print(f"5. loss after 300 steps on ONE fixed batch of 64: aligned labels {overfit('aligned'):.3f}, shuffled labels {overfit('shuffled'):.3f}")
+
+text = make_text(SHARD_STEPS * BATCH + K, 100)
+Xs, Ys = windows(text)
+xl, yl = get_batch({**DEFAULT, "labels": "shuffled"}, 1, {})
+dec = lambda x: "".join(CHARS[i] for i in x)
+print("6. five (window -&gt; label) pairs from the loader, beside the real next character:")
+for j in range(5):
+    print(f"   '{dec(xl[j])}' -&gt; '{CHARS[yl[j]]}'   (the text continues with '{CHARS[Ys[j]]}')")
+print(f"   the label is the real next character in {np.mean(yl == Ys[:BATCH]):.0%} of {BATCH} examples (a correct loader gives 100%)")</code></pre>
+<pre class="terminal" data-title="output"><code>1. initial loss 3.332   ln(27) = 3.296
+2. mean train loss, steps 400-1000: 3.069   entropy of the letter frequencies alone: 3.036
+3. update/weight ratio, median over steps 100-1000: 1.9e-03
+4. gradient norms by tensor at step 1000: embedding 0.011  W1 0.070  W2 0.066  W3 0.068  W4 0.068  W5 0.372
+5. loss after 300 steps on ONE fixed batch of 64: aligned labels 0.022, shuffled labels 0.022
+6. five (window -&gt; label) pairs from the loader, beside the real next character:
+   'lm hpbo ' -&gt; 'e'   (the text continues with 'e')
+   'm hpbo e' -&gt; 'q'   (the text continues with 'f')
+   ' hpbo ef' -&gt; 'x'   (the text continues with 'r')
+   'hpbo efr' -&gt; ' '   (the text continues with ' ')
+   'pbo efr ' -&gt; 'u'   (the text continues with 'f')
+   the label is the real next character in 9% of 128 examples (a correct loader gives 100%)</code></pre>
+<p>Reading the evidence, one rung at a time:</p>
+<ul>
+<li><strong>Initialisation is fine.</strong> The first loss is 3.33 against ln 27 = 3.30, so the logits start near zero. This rules out the huge-logit failure of <a href="../chapters/03-training-dynamics.html">chapter 03</a>.</li>
+<li><strong>The plateau is a specific number.</strong> The mean training loss over steps 400 to 1,000 is 3.07, and the entropy of the letter frequencies alone is 3.04. The model has learned exactly "how common is each letter" (the output bias can do that) and nothing that depends on the input. A model that was merely slow would be somewhere between 3.3 and 3.04 and still moving.</li>
+<li><strong>The optimiser is working.</strong> The update-to-weight ratio is 1.9&times;10<sup>-3</sup>, in the healthy range, and every tensor has a non-zero gradient (0.07 in the hidden layers, 0.37 at the output). This rules out a tiny learning rate, a frozen parameter and a dead network.</li>
+<li><strong>The model and the loss can learn.</strong> On one fixed batch of 64 examples the loss falls to 0.022 within 300 steps. This is the memorisation test. It passes for both the real labels and the shuffled ones, which is itself a clue: <em>a network can memorise random labels</em>, so a pass here clears the model and optimiser but says nothing about whether the labels mean anything.</li>
+<li><strong>The labels are wrong.</strong> Decoding the loader's output next to the raw text shows windows like <code>'m hpbo e'</code> labelled <code>q</code> when the text continues with <code>f</code>. The label equals the true next character in 9% of the 128 examples, where a correct loader gives 100%. The 9% is not zero because some letters (and the space) are common enough to match by chance.</li>
+</ul>
+<p><strong>Cause 1: the loader shuffles the labels independently of the inputs.</strong> A refactor that added "shuffle for each epoch" applied the permutation to the label array only. The inputs are real text and the targets are real characters from the same distribution, so nothing crashes and the training loss looks like an ordinary plateau. Fix: shuffle indices once and apply them to both arrays, and add a loader test that compares a batch with the raw text.</p>
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"If the model can overfit one batch, the pipeline is correct." It shows the model and optimiser are capable, not that the data is meaningful: random labels are memorised just as well. The overfit test is a way to rule out the model, and the decoded batch is a way to rule in the data. Use both.</p>
+</div>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">4</span>Four bugs, one symptom</h2>
+<p class="stage-q">Suppose the loader had been correct and the same flat loss appeared. Name two other causes that give a flat curve, and say which cheap measurement would separate each from the shuffled labels.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>A flat loss is a symptom with many causes, and the point of the ladder is that each cause leaves a different fingerprint. The script plants three different faults in the same harness, plus a healthy control, runs each for 600 steps and takes the cheap measurements side by side. "Hidden grad" is the gradient norm of the four hidden weight matrices on one batch at step 600.</p>
+<pre class="terminal" data-title="s1_fingerprints.py"><code>"""Four causes of a flat loss, and the cheap measurements that tell them apart."""
+import numpy as np, warnings
+warnings.filterwarnings("ignore")
+from harness import *
+
+def overfit_one_batch(cfg, steps=300):
+    c = {**DEFAULT, **cfg, "warmup": 1, "floor": 1.0, "total": steps}
+    xb, yb = get_batch({**c, "labels": "aligned"}, 1, {})
+    xb, yb = xb[:64], yb[:64]                      # one fixed batch of 64 real examples
+    s = new_state(c); P, m, v = s["P"], s["m"], s["v"]
+    for t in range(1, steps + 1):
+        hs = forward(P, xb, 4); loss, g = cross_entropy(hs[-1], yb)
+        for i, q in enumerate(backward(P, xb, hs, g, 4)):
+            m[i] = .9 * m[i] + .1 * q; v[i] = .999 * v[i] + .001 * q * q
+            P[i] -= c["lr"] * (m[i] / (1 - .9 ** t)) / (np.sqrt(v[i] / (1 - .999 ** t)) + 1e-8)
+    return loss
+
+variants = {"healthy (control)": {},
+            "labels shuffled": dict(labels="shuffled"),
+            "all-zero weights": dict(init_std=0.0),
+            "learning rate 2e-9": dict(lr=2e-9)}
+print(f"{'variant':&lt;20}{'loss@1':&gt;8}{'eval@600':&gt;10}{'hidden grad':&gt;13}{'upd/weight':&gt;12}{'1-batch fit':&gt;13}{'labels ok':&gt;11}")
+for name, cfg in variants.items():
+    rows, st = train({**cfg, "total": 3000}, until=600)
+    xb, yb = get_batch({**DEFAULT, **cfg}, 600, {})
+    hs = forward(st["P"], xb, 4); _, g = cross_entropy(hs[-1], yb)
+    hid = np.sqrt(sum(float((q ** 2).sum()) for q in backward(st["P"], xb, hs, g, 4)[1:5]))
+    text = make_text(SHARD_STEPS * BATCH + K, 101); _, Ys = windows(text)
+    _, yl = get_batch({**DEFAULT, **cfg}, 501, {})
+    ok = np.mean(yl == Ys[0:BATCH])
+    print(f"{name:&lt;20}{rows[0]['loss']:&gt;8.2f}{[r['eval'] for r in rows if r['step']==600][0]:&gt;10.3f}{hid:&gt;13.2e}"
+          f"{np.median([r['ratio'] for r in rows[100:]]):&gt;12.1e}{overfit_one_batch(cfg):&gt;13.3f}{ok:&gt;10.0%}")</code></pre>
+<pre class="terminal" data-title="output"><code>variant               loss@1  eval@600  hidden grad  upd/weight  1-batch fit  labels ok
+healthy (control)       3.30     1.072     1.10e+00     3.3e-03        0.022      100%
+labels shuffled         3.33     3.030     1.67e-01     2.0e-03        0.022        4%
+all-zero weights        3.30     3.063     0.00e+00     2.6e-04        3.104      100%
+learning rate 2e-9      3.30     3.319     2.46e-01     7.0e-09        3.306      100%</code></pre>
+<table><thead><tr><th>Cause</th><th>Plateau</th><th>Fingerprint</th></tr></thead><tbody>
+<tr><td>Labels shuffled</td><td>3.03 (letter-frequency entropy)</td><td>Healthy update size and gradients; the model memorises one batch; the loader's labels match the text in 4% of examples</td></tr>
+<tr><td>All-zero weights</td><td>3.06 (letter-frequency entropy)</td><td>Hidden gradient exactly 0.0 and update ratio 100 times too small (only the output bias and embeddings move); it cannot memorise one batch (loss 3.10). With zero weights every ReLU unit outputs 0, so no gradient reaches any weight</td></tr>
+<tr><td>Learning rate 2&times;10<sup>-9</sup></td><td>3.32 (barely below ln V)</td><td>Update ratio 7&times;10<sup>-9</sup>, a million times too small, and the one-batch test fails. A schedule that ends at the wrong scale, or a unit slip in the config, looks the same</td></tr>
+<tr><td>Healthy</td><td>1.07 and falling</td><td>Update ratio 3&times;10<sup>-3</sup>, memorises one batch, labels match</td></tr>
+</tbody></table>
+<p>Two further things worth noticing. First, the first two faults plateau near the <em>same</em> value, 3.03 and 3.06, because in both cases the only thing the network can learn is the marginal letter frequencies; the update ratio and the gradient are what tell them apart, not the loss. Second, tiny initial weights are <em>not</em> on the list even though <a href="../chapters/03-training-dynamics.html">chapter 03</a> shows how they shrink the signal. With Adam (<a href="../../ml-foundations/chapters/10-optimisers.html">A0 chapter 10</a>) every parameter moves by roughly the learning rate per step whatever the gradient's size, so a network started from weights of 0.01 began to learn within a few hundred steps when I tried it (slowly, but it learned, and so did a 12-layer version). Optimisers and initialisation interact, so check what the optimiser does with the fault before you blame it.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">5</span>Run 2: the loss falls, then spikes</h2>
+<p class="stage-q">With the loader fixed the loss falls well, then jumps at step 700 and takes about a hundred steps to recover. What do you read off the logs, what are the candidate causes, and what measurement tells you where to look?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-label="Held-out loss against training step for the three runs of the studio. Run 1, in orange, stays between 3.0 and 3.3 for 1,500 steps, close to the chance loss of 3.30. Run 2, in blue, falls to about 1.0, spikes to 3.2 at step 720 after junk batches at steps 700 to 719, recovers by step 800, and ends at step 2,174 when the loss becomes NaN. Run 3, in green, falls smoothly to 0.73 by step 3,000.">
+<g>
+<line x1="70" y1="201.4" x2="730" y2="201.4" class="line-thin"/><text x="62" y="205.4" text-anchor="end" class="t-xs t-muted">1.0</text>
+<line x1="70" y1="130.0" x2="730" y2="130.0" class="line-thin"/><text x="62" y="134.0" text-anchor="end" class="t-xs t-muted">2.0</text>
+<line x1="70" y1="58.6" x2="730" y2="58.6" class="line-thin"/><text x="62" y="62.6" text-anchor="end" class="t-xs t-muted">3.0</text>
+<line x1="70.0" y1="230" x2="70.0" y2="235" class="line"/><text x="70.0" y="249" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="180.0" y1="230" x2="180.0" y2="235" class="line"/><text x="180.0" y="249" text-anchor="middle" class="t-xs t-muted">500</text>
+<line x1="290.0" y1="230" x2="290.0" y2="235" class="line"/><text x="290.0" y="249" text-anchor="middle" class="t-xs t-muted">1000</text>
+<line x1="400.0" y1="230" x2="400.0" y2="235" class="line"/><text x="400.0" y="249" text-anchor="middle" class="t-xs t-muted">1500</text>
+<line x1="510.0" y1="230" x2="510.0" y2="235" class="line"/><text x="510.0" y="249" text-anchor="middle" class="t-xs t-muted">2000</text>
+<line x1="620.0" y1="230" x2="620.0" y2="235" class="line"/><text x="620.0" y="249" text-anchor="middle" class="t-xs t-muted">2500</text>
+<line x1="730.0" y1="230" x2="730.0" y2="235" class="line"/><text x="730.0" y="249" text-anchor="middle" class="t-xs t-muted">3000</text>
+<line x1="70" y1="230" x2="730" y2="230" class="line"/><line x1="70" y1="230" x2="70" y2="30" class="line"/>
+<line x1="70" y1="37.4" x2="730" y2="37.4" class="line-dash"/><text x="730" y="32.4" text-anchor="end" class="t-xs t-muted">chance: ln 27 = 3.30</text>
+<path d="M74.4,47.1 L78.8,53.6 L83.2,53.8 L87.6,54.5 L92.0,54.0 L96.4,54.5 L100.8,53.1 L105.2,54.3 L109.6,53.4 L114.0,53.9 L118.4,54.4 L122.8,56.0 L127.2,56.2 L131.6,54.9 L136.0,54.4 L140.4,55.5 L144.8,55.9 L149.2,55.7 L153.6,55.3 L158.0,54.8 L162.4,55.2 L166.8,54.5 L171.2,54.7 L175.6,55.2 L180.0,55.7 L184.4,55.1 L188.8,54.5 L193.2,54.8 L197.6,55.0 L202.0,56.2 L206.4,55.4 L210.8,55.4 L215.2,56.1 L219.6,55.6 L224.0,55.5 L228.4,42.3 L232.8,54.1 L237.2,55.7 L241.6,54.4 L246.0,55.8 L250.4,54.1 L254.8,55.7 L259.2,56.0 L263.6,54.4 L268.0,54.1 L272.4,55.0 L276.8,55.5 L281.2,55.6 L285.6,55.3 L290.0,55.2 L294.4,55.1 L298.8,55.3 L303.2,55.1 L307.6,54.7 L312.0,54.9 L316.4,55.1 L320.8,55.4 L325.2,55.0 L329.6,55.4 L334.0,54.8 L338.4,55.4 L342.8,55.6 L347.2,55.5 L351.6,55.7 L356.0,55.4 L360.4,55.5 L364.8,55.2 L369.2,54.9 L373.6,55.4 L378.0,55.8 L382.4,55.7 L386.8,55.4 L391.2,55.3 L395.6,55.4 L400.0,55.4" fill="none" class="s-orange sw-2"/>
+<path d="M74.4,49.7 L78.8,73.8 L83.2,107.3 L87.6,124.1 L92.0,135.2 L96.4,144.5 L100.8,152.5 L105.2,156.1 L109.6,162.4 L114.0,165.0 L118.4,168.5 L122.8,170.6 L127.2,173.4 L131.6,175.3 L136.0,177.7 L140.4,180.0 L144.8,180.4 L149.2,183.4 L153.6,183.9 L158.0,185.4 L162.4,186.8 L166.8,188.7 L171.2,188.9 L175.6,190.5 L180.0,192.4 L184.4,192.7 L188.8,193.1 L193.2,194.9 L197.6,196.3 L202.0,196.2 L206.4,195.9 L210.8,198.1 L215.2,199.0 L219.6,199.3 L224.0,195.9 L228.4,46.4 L232.8,128.4 L237.2,174.6 L241.6,187.2 L246.0,192.0 L250.4,195.6 L254.8,197.0 L259.2,198.6 L263.6,200.5 L268.0,200.4 L272.4,201.7 L276.8,202.1 L281.2,204.2 L285.6,203.8 L290.0,204.4 L294.4,204.7 L298.8,206.2 L303.2,205.7 L307.6,206.4 L312.0,207.3 L316.4,206.9 L320.8,207.7 L325.2,207.9 L329.6,208.2 L334.0,208.3 L338.4,208.6 L342.8,208.4 L347.2,209.0 L351.6,209.8 L356.0,209.8 L360.4,210.1 L364.8,210.8 L369.2,210.9 L373.6,211.3 L378.0,211.1 L382.4,211.1 L386.8,211.7 L391.2,212.0 L395.6,212.0 L400.0,212.5 L404.4,212.5 L408.8,212.8 L413.2,212.7 L417.6,213.4 L422.0,213.3 L426.4,213.7 L430.8,213.5 L435.2,214.3 L439.6,214.3 L444.0,214.2 L448.4,215.0 L452.8,215.2 L457.2,214.9 L461.6,215.3 L466.0,215.5 L470.4,215.9 L474.8,215.5 L479.2,215.9 L483.6,215.8 L488.0,216.1 L492.4,216.2 L496.8,216.2 L501.2,216.4 L505.6,216.6 L510.0,216.8 L514.4,216.7 L518.8,216.8 L523.2,217.1 L527.6,217.3 L532.0,217.5 L536.4,217.3 L540.8,217.3 L545.2,217.6" fill="none" class="s-blue sw-2"/>
+<path d="M74.4,49.7 L78.8,73.8 L83.2,107.3 L87.6,124.1 L92.0,135.1 L96.4,144.5 L100.8,152.7 L105.2,155.8 L109.6,162.6 L114.0,165.3 L118.4,168.4 L122.8,170.8 L127.2,172.7 L131.6,174.7 L136.0,177.3 L140.4,179.6 L144.8,180.3 L149.2,183.1 L153.6,183.6 L158.0,185.7 L162.4,187.0 L166.8,189.2 L171.2,189.2 L175.6,190.5 L180.0,192.0 L184.4,192.1 L188.8,193.3 L193.2,195.3 L197.6,196.1 L202.0,196.3 L206.4,195.9 L210.8,198.6 L215.2,198.9 L219.6,199.8 L224.0,200.1 L228.4,201.0 L232.8,201.9 L237.2,202.8 L241.6,203.6 L246.0,202.6 L250.4,203.6 L254.8,203.0 L259.2,204.6 L263.6,205.7 L268.0,204.4 L272.4,206.0 L276.8,206.1 L281.2,207.8 L285.6,207.3 L290.0,207.4 L294.4,207.9 L298.8,208.8 L303.2,208.6 L307.6,209.2 L312.0,210.1 L316.4,208.4 L320.8,209.8 L325.2,210.4 L329.6,210.5 L334.0,210.8 L338.4,211.2 L342.8,211.3 L347.2,211.4 L351.6,211.9 L356.0,212.1 L360.4,212.4 L364.8,212.8 L369.2,212.6 L373.6,213.5 L378.0,213.5 L382.4,213.1 L386.8,213.6 L391.2,214.0 L395.6,213.7 L400.0,214.3 L404.4,214.5 L408.8,214.8 L413.2,215.3 L417.6,215.2 L422.0,215.2 L426.4,215.5 L430.8,215.4 L435.2,215.8 L439.6,216.1 L444.0,215.9 L448.4,216.8 L452.8,216.9 L457.2,216.7 L461.6,217.1 L466.0,217.1 L470.4,217.5 L474.8,217.2 L479.2,217.5 L483.6,217.4 L488.0,217.7 L492.4,217.9 L496.8,217.7 L501.2,217.9 L505.6,218.0 L510.0,218.1 L514.4,218.0 L518.8,218.0 L523.2,218.1 L527.6,218.4 L532.0,218.6 L536.4,218.5 L540.8,218.7 L545.2,218.9 L549.6,219.0 L554.0,219.1 L558.4,219.1 L562.8,219.2 L567.2,219.2 L571.6,219.4 L576.0,219.5 L580.4,219.5 L584.8,219.5 L589.2,219.7 L593.6,219.6 L598.0,219.7 L602.4,219.6 L606.8,219.6 L611.2,219.7 L615.6,219.8 L620.0,220.0 L624.4,220.0 L628.8,220.0 L633.2,220.1 L637.6,220.0 L642.0,220.1 L646.4,220.2 L650.8,220.3 L655.2,220.4 L659.6,220.4 L664.0,220.4 L668.4,220.3 L672.8,220.4 L677.2,220.4 L681.6,220.3 L686.0,220.4 L690.4,220.5 L694.8,220.5 L699.2,220.6 L703.6,220.6 L708.0,220.7 L712.4,220.7 L716.8,220.6 L721.2,220.7 L725.6,220.7 L730.0,220.7" fill="none" class="s-green sw-2"/>
+<text x="400" y="262" text-anchor="middle" class="t-xs t-muted">training step</text>
+<text x="14" y="130" text-anchor="middle" class="t-xs t-muted" transform="rotate(-90 14 130)">held-out loss (nats per character)</text>
+<text x="268" y="75" class="t-xs tc-orange">run 1: labels shuffled, flat near 3.0</text>
+<line x1="228.4" y1="42.4" x2="228.4" y2="28.4" class="line s-red"/>
+<text x="233" y="26" class="t-xs tc-red">run 2, step 700 to 719: junk batches</text>
+<text x="312" y="185" class="t-xs tc-blue">run 2: recovers, then dies</text>
+<text x="600" y="178" class="t-xs tc-green">run 3: all three fixes</text>
+<line x1="542.3" y1="211.9" x2="554.3" y2="223.9" class="line s-red sw-2"/>
+<line x1="542.3" y1="223.9" x2="554.3" y2="211.9" class="line s-red sw-2"/>
+<text x="558" y="208" class="t-xs tc-red">step 2,174: NaN</text>
+</g>
+</svg>
+<figcaption><strong>Three runs, one harness.</strong> Held-out loss every 20 steps from the real runs in this studio. Orange never leaves the neighbourhood of the chance loss; blue learns, takes a hit from 20 junk batches, recovers, and is killed by an overflow at step 2,174; green has all three causes removed.</figcaption>
+</figure>
+<p>Run 2 is the blue line. This script reads its log around the event. "Typical" is the median over the 100 steps before the spike. The eval column is the most recent held-out loss, which is refreshed every 10 steps.</p>
+<pre class="terminal" data-title="s1_spike.py (first half)"><code>"""Studio 1, run 2: the loss was falling, then spiked at step 700."""
+import numpy as np, warnings
+warnings.filterwarnings("ignore")
+from harness import *
+
+cfg = dict(total=3000, scaler="naive", garbage=((700, 719),))
+ck = None
+rows, st = [], new_state({**DEFAULT, **cfg})
+train(cfg, st, until=650, log=rows)
+ck = snapshot(st)                                   # checkpoint at step 650
+train(cfg, st, until=900, log=rows)
+by = {r["step"]: r for r in rows}
+typ_g = np.median([by[s]["gnorm"] for s in range(600, 700)])
+typ_u = np.median([by[s]["ratio"] for s in range(600, 700)])
+print(f"typical (steps 600-699): grad norm {typ_g:.2f}, update/weight {typ_u:.1e}")
+print(f"{'step':&gt;5}{'train loss':&gt;11}{'eval loss':&gt;10}{'grad norm':&gt;10}{'x typical':&gt;10}{'upd/weight':&gt;11}{'max |logit|':&gt;12}")
+for s in (698, 699, 700, 701, 705, 710, 719, 720, 730, 740, 760, 800, 900):
+    r = by[s]; ev = by.get(s - s % 10, {}).get("eval", float("nan"))
+    print(f"{s:&gt;5}{r['loss']:&gt;11.2f}{ev:&gt;10.3f}{r['gnorm']:&gt;10.2f}{r['gnorm']/typ_g:&gt;10.1f}{r['ratio']:&gt;11.1e}{r['maxlogit']:&gt;12.1f}")
+
+# a batch validator: average surprise of each batch under a bigram model fitted to clean reference text
+ref = make_text(200_000, 5)
+counts = np.ones((V, V))                            # add-one smoothing
+for a_, b_ in zip(ref, ref[1:]):
+    counts[IDX[a_], IDX[b_]] += 1
+bigram_nll = -np.log(counts / counts.sum(1, keepdims=True))
+cache, score = {}, []
+for t in range(1, 1001):
+    xb, _ = get_batch({**DEFAULT, **cfg}, t, cache)
+    score.append(float(bigram_nll[xb[:, :-1], xb[:, 1:]].mean()))
+score = np.array(score); med = np.median(score); mad = np.median(abs(score - med))
+flag = np.flatnonzero(score &gt; med + 8 * mad) + 1
+print(f"\nvalidator: typical batch surprise {med:.2f} nats per character pair; flagged (more than 8 MADs above): "
+      f"{len(flag)} batches, steps {flag.min()} to {flag.max()}, surprise {score[flag - 1].min():.2f} to {score[flag - 1].max():.2f}")
+for t in (699, 700):
+    xb, _ = get_batch({**DEFAULT, **cfg}, t, cache)
+    print(f"batch {t}, first three windows:", ["".join(CHARS[i] for i in w) for w in xb[:3]])
+
+print("\nreplays from the step-650 checkpoint (eval loss before the spike: %.3f)" % by[650]["eval"])
+print(f"{'variant':&lt;34}{'peak train':&gt;11}{'peak eval':&gt;10}{'eval@800':&gt;9}{'steps to recover':&gt;17}{'clipped':&gt;9}")
+variants = [("as it ran", cfg), ("junk batches removed", {**cfg, "garbage": ()}),
+            ("clip at 3.0 (about 2x typical)", {**cfg, "clip": 3.0}), ("clip at 1.0 (below typical)", {**cfg, "clip": 1.0}), ("beta2 = 0.95", {**cfg, "beta2": 0.95}),
+            ("peak learning rate halved", {**cfg, "lr": 1e-3}),
+            ("clip at 3.0 + junk removed", {**cfg, "clip": 3.0, "garbage": ()})]
+target = by[650]["eval"] + 0.05
+for name, c in variants:
+    s2, lg = snapshot(ck), []
+    train(c, s2, until=900, log=lg)
+    ev = [(r["step"], r["eval"]) for r in lg if "eval" in r]
+    peak = max(e for _, e in ev)
+    rec = next((s - 700 for s, e in ev if s &gt; 700 and e &lt;= target and s &gt;= 720), None)
+    print(f"{name:&lt;34}{max(r['loss'] for r in lg):&gt;11.2f}{peak:&gt;10.3f}{dict(ev)[800]:&gt;9.3f}{('%d' % rec) if peak &gt; target + 0.05 else 'no spike':&gt;17}{np.mean([r['clipped'] for r in lg]):&gt;9.0%}")</code></pre>
+<pre class="terminal" data-title="output (the first two tables are the timeline and the batch scan)"><code>typical (steps 600-699): grad norm 1.38, update/weight 2.8e-03
+ step train loss eval loss grad norm x typical upd/weight max |logit|
+  698       0.96     1.022      1.38       1.0    2.6e-03        15.8
+  699       1.02     1.022      1.55       1.1    2.6e-03        15.4
+  700       5.30     1.078      6.86       5.0    6.1e-03        10.4
+  701       4.69     1.078      4.15       3.0    7.6e-03        13.2
+  705       3.93     1.078      2.43       1.8    8.1e-03         6.5
+  710       3.40     2.606      0.92       0.7    6.4e-03         2.8
+  719       3.32     2.606      0.39       0.3    2.9e-03         1.0
+  720       3.18     3.171      0.81       0.6    2.6e-03         1.4
+  730       2.79     2.747      1.28       0.9    3.1e-03         8.3
+  740       2.33     2.023      1.29       0.9    4.1e-03         9.3
+  760       1.63     1.376      1.55       1.1    3.0e-03        10.8
+  800       1.05     1.132      1.20       0.9    2.3e-03        13.4
+  900       1.01     1.015      1.32       1.0    2.2e-03        16.2
+
+validator: typical batch surprise 2.14 nats per character pair; flagged (more than 8 MADs above): 20 batches, steps 700 to 719, surprise 4.48 to 4.69
+batch 699, first three windows: ['fidt fui', 'idt fuif', 'dt fuifu']
+batch 700, first three windows: [' mmgbgsd', 'erudfetl', 'exhivsdl']
+
+replays from the step-650 checkpoint (eval loss before the spike: 1.049)
+variant                            peak train peak eval eval@800 steps to recover  clipped
+as it ran                                5.30     3.171    1.132              120       0%
+junk batches removed                     1.70     1.043    0.983         no spike       0%
+clip at 3.0 (about 2x typical)           5.30     3.119    1.091              100       2%
+clip at 1.0 (below typical)              5.32     2.311    1.010               60      92%
+beta2 = 0.95                             5.32     2.868    1.033               70       0%
+peak learning rate halved                5.24     2.732    1.034               70       0%
+clip at 3.0 + junk removed               1.70     1.043    0.983         no spike       0%</code></pre>
+<p>Reading the timeline:</p>
+<ul>
+<li><strong>The gradient moves first, and with the loss.</strong> At step 699 the gradient norm is 1.55, normal. At step 700 it is 6.86, five times typical, and the training loss jumps from 1.02 to 5.30. The cause acts at step 700 itself; nothing was building up before it. That points away from a learning rate that was creeping too high (the gradient norm would drift upwards over hundreds of steps, as <a href="../chapters/17-training-stability.html">chapter 17</a> describes) and towards something that arrived suddenly.</li>
+<li><strong>The update size jumps too.</strong> The update-to-weight ratio goes from 2.6&times;10<sup>-3</sup> to 6.1&times;10<sup>-3</sup> and then 8.1&times;10<sup>-3</sup> a few steps later. That is Adam's response (<a href="../chapters/17-training-stability.html">chapter 17</a>): the first moment reacts to the big gradient at once while the second moment, which averages over about 1,000 steps, has barely moved.</li>
+<li><strong>The damage outlasts the cause.</strong> The training loss during steps 700 to 719 is high partly because the batches are hard. The held-out loss separates that from real damage: it is 1.02 before, and 2.61 at step 710 and 3.17 at step 720, when the model itself has been pushed far from where it was. It is back to 1.13 at step 800 and 1.02 at step 900. Always plot a held-out loss on clean data beside the training loss: it is the instrument that says whether the model was hurt.</li>
+<li><strong>The event has a width.</strong> The gradient is back to normal by step 720 (0.81). Something lasted about twenty steps. That suggests a block of consecutive bad batches, not one stray example.</li>
+</ul>
+<p>The candidate causes, in the order of the ladder: a corrupt block of data; an optimiser setting that makes ordinary batches dangerous (a high learning rate, β<sub>2</sub> = 0.999, no clipping); a numerical event. The data check is the cheapest, so it comes first. The batch scan in the script scores each batch by its average surprise under a bigram model fitted to clean text (a rough validator of the kind a data pipeline can run). Median batch: 2.14 nats per character pair. <strong>Twenty batches, steps 700 to 719 exactly, score 4.48 to 4.69.</strong> Printing them shows why: the window <code>' mmgbgsd'</code> at step 700 is not text. A job that wrote a binary file into the corpus fed uniformly random characters to the loader for twenty steps.</p>
+<p><strong>Cause 2: twenty junk batches in a data shard.</strong> The coincidence of the step range with the validator's flags is the evidence for it. What remains to be shown is that the data, rather than the optimiser settings, is the cause, and that is a replay experiment.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">6</span>Replay: is it the data or the settings?</h2>
+<p class="stage-q">Design the experiment that separates "the data caused it" from "my optimiser settings caused it". Which variants do you run, and what would each result mean? Also: a colleague says "just turn on gradient clipping". Predict what the replay will show.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>The method is the one the PaLM team used for their spikes (<a href="../chapters/17-training-stability.html">chapter 17</a>): restart from a checkpoint shortly before the event and change <em>one</em> thing. The script above saved a checkpoint at step 650 (weights, Adam moments and step count; losing the moments is a bug of its own). It then reruns steps 651 to 900 under six variants. "Steps to recover" counts from step 700 until the held-out loss is within 0.05 of its pre-spike value; "clipped" is the share of steps in which the gradient norm exceeded the threshold.</p>
+<pre class="terminal" data-title="output (the replay table from the same script)"><code>replays from the step-650 checkpoint (eval loss before the spike: 1.049)
+variant                            peak train peak eval eval@800 steps to recover  clipped
+as it ran                                5.30     3.171    1.132              120       0%
+junk batches removed                     1.70     1.043    0.983         no spike       0%
+clip at 3.0 (about 2x typical)           5.30     3.119    1.091              100       2%
+clip at 1.0 (below typical)              5.32     2.311    1.010               60      92%
+beta2 = 0.95                             5.32     2.868    1.033               70       0%
+peak learning rate halved                5.24     2.732    1.034               70       0%
+clip at 3.0 + junk removed               1.70     1.043    0.983         no spike       0%</code></pre>
+<ul>
+<li><strong>Removing the junk batches removes the spike entirely.</strong> Peak held-out loss 1.043, below the pre-spike value, and the run ends better than it started (0.983 at step 800). Same weights, same optimiser, same learning rate: only the data changed. That isolates the cause.</li>
+<li><strong>Every settings change leaves the spike in place.</strong> The training loss peaks at 5.2 to 5.3 in all of them, because the junk batches are junk whatever the optimiser does. What the settings change is the damage afterwards: halving the learning rate cuts the peak held-out loss from 3.17 to 2.73, β<sub>2</sub> = 0.95 to 2.87. These are mitigations of the symptom.</li>
+<li><strong>Clipping is the instructive case.</strong> A clip at 3.0, about twice the typical norm of 1.4, engages on only 2% of steps and barely helps (peak 3.12). A clip at 1.0 helps more (2.31) but engages on 92% of steps: it has become a learning-rate cut applied to everything, so the run learns more slowly all the time to survive twenty bad steps. This is the "clip as a symptom" warning of chapter 17 in numbers. Choose the threshold from the logs (a small multiple of the typical norm), and use the fraction of clipped steps as a health signal.</li>
+</ul>
+<p><strong>The fix has two parts, in this order.</strong> Quarantine the corrupt shard and add the batch validator to the pipeline (the cause). Keep a clip at 3.0 as a safety net for the next surprise (the damage limiter). Do not ship the settings changes alone: they would hide the data problem and cost throughput for ever.</p>
+<div class="callout note">
+  <p class="callout-title">What changes at scale</p>
+  <p>On a large run you cannot replay twenty steps in seconds, and the PaLM authors report that replaying a spike from an earlier checkpoint did not reproduce it (<a href="../chapters/17-training-stability.html">chapter 17</a>). The method survives: keep a checkpoint every few hundred steps, record which data shard each step read, and when a spike comes, rerun from the checkpoint with the suspect batches skipped. The harness here makes the cause deterministic so that the logic is visible.</p>
+</div>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">7</span>Run 2 again: the NaN</h2>
+<p class="stage-q">With the spike behind it, run 2 keeps learning until step 2,174, where the loss is NaN and every weight with it. Where do you look first, what do you expect to find, and what is the fix?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>The first principle for a NaN is to find the <strong>first</strong> non-finite value, in time and in space: which step, and which tensor. The loss is often the second place the problem shows. This script prints the log around the event, then restores the checkpoint from step 2,172, recomputes step 2,173 and checks each tensor's largest gradient against the fp16 limit. The run emulates an fp16 gradient path with a loss scale (<a href="../chapters/17-training-stability.html">chapter 17</a>): the gradients are multiplied by the scale, rounded to 16 bits, and divided again in fp32.</p>
+<pre class="terminal" data-title="s1_nan.py"><code>"""Studio 1, run 2 continued: finding the first NaN."""
+import numpy as np, warnings
+warnings.filterwarnings("ignore")
+from harness import *
+
+cfg = dict(total=3000, scaler="naive", garbage=((700, 719),))     # the label bug is already fixed
+rows, st = train(cfg)
+by = {r["step"]: r for r in rows}
+last = rows[-1]["step"]
+print(f"{'step':&gt;5}{'loss':&gt;8}{'grad norm':&gt;10}{'max |grad|':&gt;11}{'loss scale':&gt;11}{'max |grad| x scale':&gt;19}")
+for s in (1999, 2000, 2100, 2170, 2172, 2173, last):
+    r = by[s]
+    print(f"{s:&gt;5}{r['loss']:&gt;8.3f}{r['gnorm']:&gt;10.3f}{r['gmax']:&gt;11.3f}{r['scale']:&gt;11,.0f}{r['gmax']*r['scale']:&gt;19,.0f}")
+print(f"largest value an fp16 number can hold: 65,504")
+
+# walk back to the last good step and look at each tensor's largest scaled gradient entry
+s2, lg = new_state({**DEFAULT, **cfg}), []
+train(cfg, s2, until=2172, log=lg)
+c = {**DEFAULT, **cfg}
+xb, yb = get_batch(c, 2173, {})
+hs = forward(s2["P"], xb, 4); _, g = cross_entropy(hs[-1], yb)
+names = ["embedding"] + [f"W{i}" for i in range(1, 6)] + [f"b{i}" for i in range(1, 6)]
+print("\nstep 2173, largest |gradient| per tensor times the loss scale %d:" % s2["scale"])
+for n, q in zip(names, backward(s2["P"], xb, hs, g, 4)):
+    big = np.abs(q).max() * s2["scale"]
+    print(f"  {n:&lt;10}{big:&gt;10,.0f}   {'&lt;-- overflows fp16' if big &gt; 65504 else ''}")
+
+print("\nthe same run under three scaler settings:")
+for label, c2 in (("fp32 gradients (no scaler)", dict(scaler="none")), ("naive scaler, doubling every 1000 steps", dict(grow_every=1000)),
+                  ("dynamic scaler (skip + halve)", dict(scaler="dynamic"))):
+    rr, ss = train({**cfg, **c2})
+    nanstep = next((r["step"] for r in rr if not np.isfinite(r["loss"])), None)
+    sk = sum(r["skipped"] for r in rr)
+    print(f"  {label:&lt;42} NaN at step {nanstep}; skipped steps {sk}; final loss scale {ss['scale']:,.0f}; "
+          f"last eval {[r['eval'] for r in rr if 'eval' in r][-1]:.3f}")</code></pre>
+<pre class="terminal" data-title="output"><code> step    loss grad norm max |grad| loss scale max |grad| x scale
+ 1999   0.769     1.124      0.117    131,072             15,296
+ 2000   0.555     0.825      0.152    262,144             39,968
+ 2100   1.024     1.553      0.131    262,144             34,464
+ 2170   0.672     0.748      0.120    262,144             31,456
+ 2172   0.719     1.202      0.234    262,144             61,376
+ 2173   0.864       inf        inf    262,144                inf
+ 2174     nan       nan        nan    262,144                nan
+largest value an fp16 number can hold: 65,504
+
+step 2173, largest |gradient| per tensor times the loss scale 262144:
+  embedding      5,748   
+  W1             7,168   
+  W2             9,318   
+  W3             8,443   
+  W4             8,957   
+  W5            69,137   &lt;-- overflows fp16
+  b1             3,727   
+  b2             2,217   
+  b3             1,649   
+  b4             1,679   
+  b5             8,885   
+
+the same run under three scaler settings:
+  fp32 gradients (no scaler)                 NaN at step None; skipped steps 0; final loss scale 16,384; last eval 0.739
+  naive scaler, doubling every 1000 steps    NaN at step None; skipped steps 0; final loss scale 131,072; last eval 0.743
+  dynamic scaler (skip + halve)              NaN at step None; skipped steps 2; final loss scale 131,072; last eval 0.744</code></pre>
+<ul>
+<li><strong>The loss is fine until the last step.</strong> At step 2,173 the loss is a healthy 0.864, but the gradient norm is <code>inf</code>. The first bad value is in the gradient, one step before the loss shows it. A dashboard that only plots the loss would have seen the run die with no warning; the gradient norm, logged before the update, is the leading indicator.</li>
+<li><strong>The loss scale doubled at step 2,000.</strong> The team's homemade loss scaler doubles the scale every 500 steps and never checks for infinities. At step 2,000 it reached 262,144. Gradient entries of 0.25 or more, multiplied by that, exceed 65,504, the largest number fp16 can hold. In the table, the largest scaled entry was 39,968 at step 2,000, 61,376 at step 2,172 (94% of the limit) and finally over the limit at step 2,173.</li>
+<li><strong>The overflow is in one tensor.</strong> Recomputing step 2,173 shows the output weight matrix W5 at 69,137 after scaling, and every other tensor below 10,000. The last layer sees the largest gradients because it sits next to the loss. One batch whose gradient entry is 0.26 instead of 0.23 was enough.</li>
+<li><strong>The infinity then poisons everything.</strong> The update divides by an infinite second moment or adds an infinite first moment, producing infinities and NaNs in every weight. The next forward pass returns NaN. There is nothing to recover: roll back to a checkpoint.</li>
+</ul>
+<p><strong>Cause 3: a loss scaler that grows on a timer and never backs off.</strong> It is the exact failure the dynamic scaling rule of chapter 17 prevents ("if any gradient contains an infinity or NaN, skip that optimiser step and halve the scale"). The three-way comparison at the bottom of the output shows the fix works and that the original was partly luck: with fp32 gradients there is no NaN; a scaler that doubles every 1,000 steps happens not to overflow within 3,000 steps; the dynamic scaler skips 2 steps over the run, halves the scale twice, and finishes at 0.744. A bug that passes in some configurations and fails in others is the typical shape of a numerical fault.</p>
+<p>The better fix, for a real model, is to avoid loss scaling by training in bf16, which has fp32's range (<a href="../chapters/17-training-stability.html">chapter 17</a>). The dynamic scaler is the fix when you must stay in fp16, and it is the one that fits this harness.</p>
+<details class="deeper"><summary>Go deeper <span class="hint">optional</span></summary>
+<p>Why does the scale matter at all, if gradients are divided by it again? Because the rounding to 16 bits happens in between. A scale that is too low lets small gradients underflow to zero (they stop teaching); a scale that is too high lets large ones overflow to infinity (they poison the step). Dynamic scaling hunts for the largest scale that does not overflow: it grows after a long run of clean steps and halves on the first infinity, which is the pattern in the dynamic row above.</p>
+<p>The same arithmetic shows a design trap. As the scale grows, the safe maximum gradient entry shrinks (65,504 / 262,144 = 0.25), so the bug did not require the model to change: it only required time to pass. A fault whose trigger is "the training counter reached 2,000" will not appear in a 200-step smoke test, which is why the preflight in stage 10 injects an infinity on purpose.</p>
+</details>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">8</span>Check the fix: healthy or lucky?</h2>
+<p class="stage-q">Run 3 has the labels fixed, the corrupt shard quarantined, a clip at 3.0 and a dynamic scaler. It finishes. What evidence would make you confident it is healthy, as opposed to having got past the places where it failed before?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>Finishing is the weakest evidence. Better: check that each fix did its job, that the run matches the expected curve, and that the result is not a one-off. The green line in the plot above is run 3. This table repeats the fixed configuration with three seeds (different initialisations).</p>
+<pre class="terminal" data-title="s1_seeds.py"><code>"""Is run 3 healthy, or lucky? Repeat the fixed configuration with three seeds."""
+import numpy as np, warnings
+warnings.filterwarnings("ignore")
+from harness import *
+
+fixed = dict(total=3000, scaler="dynamic", clip=3.0)
+print(f"{'seed':&gt;4}{'eval@500':&gt;10}{'eval@1000':&gt;10}{'eval@2000':&gt;10}{'eval@3000':&gt;10}{'skipped':&gt;9}{'clipped':&gt;9}{'NaN':&gt;5}")
+for seed in (0, 1, 2):
+    rows, st = train({**fixed, "seed": seed})
+    ev = {r["step"]: r["eval"] for r in rows if "eval" in r}
+    print(f"{seed:&gt;4}{ev[500]:&gt;10.3f}{ev[1000]:&gt;10.3f}{ev[2000]:&gt;10.3f}{ev[3000]:&gt;10.3f}"
+          f"{sum(r['skipped'] for r in rows):&gt;9}{sum(r['clipped'] for r in rows):&gt;9}{'yes' if not np.isfinite(rows[-1]['loss']) else 'no':&gt;5}")</code></pre>
+<pre class="terminal" data-title="output"><code>seed  eval@500 eval@1000 eval@2000 eval@3000  skipped  clipped  NaN
+   0     1.132     0.916     0.767     0.731        2        1   no
+   1     1.132     0.906     0.765     0.730        2        1   no
+   2     1.146     0.927     0.769     0.735        2        0   no</code></pre>
+<table><thead><tr><th>Run</th><th>Faults present</th><th>Outcome</th></tr></thead><tbody>
+<tr><td>1</td><td>Shuffled labels, junk shard, naive scaler</td><td>Flat near 3.0 for 1,500 steps (held-out 3.04)</td></tr>
+<tr><td>2</td><td>Junk shard, naive scaler</td><td>Learns, spikes at 700, recovers, NaN at step 2,174 (best held-out 0.77)</td></tr>
+<tr><td>3</td><td>None. Clip 3.0, dynamic scaler</td><td>Held-out 0.731 at step 3,000; 0.730 and 0.735 with two other seeds</td></tr>
+</tbody></table>
+<ul>
+<li><strong>Each fix shows its own signature.</strong> No spike at step 700 (the batch validator flags nothing), no non-finite value (the dynamic scaler skipped exactly 2 steps and recovered), clipping engaged on at most 1 step in 3,000 (so the safety net is not hiding a problem).</li>
+<li><strong>The result matches the expectation written in stage 1.</strong> About 1.07 by step 600, about 0.73 by step 3,000, against a floor of 0.68 for this source.</li>
+<li><strong>It is repeatable.</strong> Three seeds land within 0.005 of each other at step 3,000. A fix that only works for seed 0 is a coincidence.</li>
+<li><strong>The improvement is measured, not assumed.</strong> At step 2,000, before run 2 died, its held-out loss was 0.785 and run 3's was 0.767: the damage from the junk batches had not fully washed out 1,300 steps later, or the other fixes help slightly. Report each fix with its measured effect, and say which part you did not isolate.</li>
+</ul>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">9</span>Instrument it: alerts that fire before the loss does</h2>
+<p class="stage-q">You will not be watching the next run. Which signals would you alert on, against what baseline, and which of the three failures would each have caught earliest? Beware alerts that cry wolf.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>The principle from <a href="../chapters/17-training-stability.html">chapter 17</a> is to alert against the run's own recent past, as you would on a latency percentile (<a href="../../reliability/chapters/07-alerting-oncall.html">alerting and on-call</a>), not against an absolute number. Five rules cover the three failures. The script runs them on all three runs; a rule is reported at the first step it fires.</p>
+<pre class="terminal" data-title="s1_monitor.py"><code>"""Alert rules for a training run, tried on all three runs of studio 1."""
+import numpy as np, warnings
+warnings.filterwarnings("ignore")
+from harness import *
+
+FP16_MAX = 65_504
+
+def alerts(rows):
+    """Return {rule: first step it fires}. Rules compare each step with the run's own recent past."""
+    first = {}
+    def fire(rule, step): first.setdefault(rule, step)
+    ev = [(r["step"], r["eval"]) for r in rows if "eval" in r]
+    for i, r in enumerate(rows):
+        t = r["step"]
+        if r["skipped"]:
+            continue                                  # the dynamic scaler already handled this step
+        recent = [x["gnorm"] for x in rows[max(0, i - 100):i] if np.isfinite(x["gnorm"])]
+        if len(recent) &gt;= 50 and r["gnorm"] &gt; 4 * np.median(recent):
+            fire("grad norm above 4x its 100-step median", t)
+        if r["gmax"] * r["scale"] &gt; 0.9 * FP16_MAX:
+            fire("fp16 headroom under 10%", t)
+        if t &gt;= 100 and r["ratio"] &gt; 0 and not 1e-4 &lt; r["ratio"] &lt; 1e-2:
+            fire("update/weight ratio outside 1e-4 to 1e-2", t)
+        if "eval" in r and t &gt;= 500 and min(e for _, e in ev if _ &lt;= t) &gt; 0.9 * np.log(V):
+            fire("best eval loss still above 90% of the chance loss ln V after step 500", t)
+        if "eval" in r:
+            prev = [e for s, e in ev if s &lt; t][-3:]
+            if prev and r["eval"] &gt; 1.3 * min(prev):
+                fire("eval loss 30% above its recent best", t)
+        if not np.isfinite(r["loss"]) or not np.isfinite(r["gnorm"]):
+            fire("non-finite loss or gradient", t)
+    return first
+
+runs = {
+ "run 1 (labels shuffled)": train(dict(total=3000, scaler="naive", garbage=((700, 719),), labels="shuffled"), until=1500)[0],
+ "run 2 (labels fixed)":    train(dict(total=3000, scaler="naive", garbage=((700, 719),)))[0],
+ "run 3 (all fixed)":       train(dict(total=3000, scaler="dynamic", clip=3.0))[0],
+}
+for name, rows in runs.items():
+    print(f"{name}: last step {rows[-1]['step']}, last eval {[r['eval'] for r in rows if 'eval' in r][-1]:.3f}")
+    a = alerts(rows)
+    for rule, step in sorted(a.items(), key=lambda kv: kv[1]):
+        print(f"   step {step:&gt;5}  {rule}")
+    if not a: print("   no alerts")</code></pre>
+<pre class="terminal" data-title="output"><code>run 1 (labels shuffled): last step 1500, last eval 3.045
+   step   500  best eval loss still above 90% of the chance loss ln V after step 500
+run 2 (labels fixed): last step 2174, last eval 0.773
+   step   700  grad norm above 4x its 100-step median
+   step   710  eval loss 30% above its recent best
+   step  2055  fp16 headroom under 10%
+   step  2173  non-finite loss or gradient
+run 3 (all fixed): last step 3000, last eval 0.731
+   step  2104  fp16 headroom under 10%</code></pre>
+<ul>
+<li><strong>Run 1</strong> is caught at step 500 by the rule "best held-out loss still above 90% of chance". An hour of waiting becomes minutes. A rule about the learning rate or the gradient would not fire: those were healthy.</li>
+<li><strong>Run 2's spike</strong> is caught at step 700 by the gradient-norm rule, on the first bad batch, and by the held-out rule ten steps later. Neither needs a threshold tuned for this model: "four times the median of the last 100 steps" scales with the run.</li>
+<li><strong>Run 2's NaN</strong> is flagged at step 2,055 by the <strong>fp16 headroom</strong> rule (largest scaled gradient above 90% of 65,504), 118 steps before the infinity at 2,173. This is the leading indicator the loss never gives. The non-finite rule at 2,173 is the last resort.</li>
+<li><strong>Run 3</strong> raises one warning, at step 2,104 (headroom under 10%), and the dynamic scaler then backs off by itself. That is the signal working, not a false alarm: a warning that precedes a handled event is an observation to review, not a page. A "loss has stopped improving" rule that I tried first fired repeatedly on this healthy run, because a cosine schedule slows progress at the end, so I replaced it with the chance-loss rule; running candidate alerts on a known-good run is how you find which ones are noise.</li>
+</ul>
+<p>An alert is only useful if its action is defined. Decide in advance: a gradient spike pages nobody but logs and watches 50 steps; a held-out loss above its recent best by 30% that persists means roll back to the last checkpoint and skip the batches in between; non-finite values stop the job. Deciding the thresholds before the incident is the same discipline as a deployment rollback (<a href="../../reliability/chapters/12-deployments.html">deployment strategies</a>).</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">10</span>Preflight, and what the bugs would have cost</h2>
+<p class="stage-q">Write the smoke test that would have caught all three faults before the long job started. Then estimate, with explicit assumptions, what the three bugs would cost on a real cluster-scale run.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<p>A preflight is the ladder turned into code: five checks, run on the real configuration and the real loader, in under a minute, before the expensive job is submitted. The fifth check injects an infinity on purpose, which is the only way to find out whether the scaler's safety logic exists.</p>
+<pre class="terminal" data-title="preflight.py"><code>"""preflight.py: five checks that run in seconds on the small config, before the big job is launched."""
+import numpy as np, warnings
+warnings.filterwarnings("ignore")
+from harness import *
+
+def preflight(cfg):
+    c = {**DEFAULT, **cfg}
+    out, cache = [], {}
+    # 1. initial loss is about ln V
+    xb, yb = get_batch(c, 1, cache)
+    s = new_state(c); l0 = cross_entropy(forward(s["P"], xb, c["depth"])[-1], yb)[0]
+    out.append(("initial loss within 10% of ln V", abs(l0 / np.log(V) - 1) &lt; 0.10, f"{l0:.2f} vs {np.log(V):.2f}"))
+    # 2. the loader's label is the next character (checked against the raw text of the shard)
+    text = make_text(SHARD_STEPS * BATCH + K, 100); _, Ys = windows(text)
+    agree = np.mean(yb == Ys[:BATCH])
+    out.append(("labels are the next character", agree &gt; 0.99, f"{agree:.0%} agree"))
+    # 3. the model can memorise one batch
+    c1 = {**c, "garbage": (), "warmup": 1, "floor": 1.0, "total": 200, "labels": "aligned"}
+    xb1, yb1 = get_batch(c1, 1, {}); xb1, yb1 = xb1[:64], yb1[:64]
+    s1 = new_state(c1); P, m, v = s1["P"], s1["m"], s1["v"]
+    for t in range(1, 201):
+        hs = forward(P, xb1, c["depth"]); loss, g = cross_entropy(hs[-1], yb1)
+        for i, q in enumerate(backward(P, xb1, hs, g, c["depth"])):
+            m[i] = .9 * m[i] + .1 * q; v[i] = .999 * v[i] + .001 * q * q
+            P[i] -= c["lr"] * (m[i] / (1 - .9 ** t)) / (np.sqrt(v[i] / (1 - .999 ** t)) + 1e-8)
+    out.append(("memorises one batch of 64 in 200 steps", loss &lt; 0.3, f"loss {loss:.2f}"))
+    # 4. the data scan: no batch far more surprising than the rest (first 1,000 steps)
+    ref = make_text(200_000, 5); cnt = np.ones((V, V))
+    for a, b in zip(ref, ref[1:]): cnt[IDX[a], IDX[b]] += 1
+    nll = -np.log(cnt / cnt.sum(1, keepdims=True)); sc = []
+    for t in range(1, 1001):
+        x, _ = get_batch(c, t, cache); sc.append(nll[x[:, :-1], x[:, 1:]].mean())
+    sc = np.array(sc); med = np.median(sc); bad = int((sc &gt; med + 8 * np.median(abs(sc - med))).sum())
+    out.append(("no junk batches in the first 1,000", bad == 0, f"{bad} flagged"))
+    # 5. the loss scaler survives an injected infinity (skips the step instead of poisoning the weights)
+    rows, st = train({**c, "total": 30, "scaler": c["scaler"], "init_scale": 2.0 ** 30}, until=30)
+    survived = all(np.isfinite(r["loss"]) for r in rows) and np.isfinite(st["P"][1]).all()
+    out.append(("scaler skips overflowing steps", survived, "weights finite" if survived else "weights became NaN"))
+    return out
+
+configs = {"run 1 as launched": dict(labels="shuffled", scaler="naive", garbage=((700, 719),)),
+           "run 2 as launched": dict(scaler="naive", garbage=((700, 719),)),
+           "run 3 as launched": dict(scaler="dynamic", clip=3.0)}
+for name, cfg in configs.items():
+    print(name)
+    for what, ok, detail in preflight(cfg):
+        print(f"   {'PASS' if ok else 'FAIL'}  {what:&lt;42} {detail}")</code></pre>
+<pre class="terminal" data-title="output"><code>run 1 as launched
+   PASS  initial loss within 10% of ln V            3.33 vs 3.30
+   FAIL  labels are the next character              9% agree
+   PASS  memorises one batch of 64 in 200 steps     loss 0.02
+   FAIL  no junk batches in the first 1,000         20 flagged
+   FAIL  scaler skips overflowing steps             weights became NaN
+run 2 as launched
+   PASS  initial loss within 10% of ln V            3.30 vs 3.30
+   PASS  labels are the next character              100% agree
+   PASS  memorises one batch of 64 in 200 steps     loss 0.02
+   FAIL  no junk batches in the first 1,000         20 flagged
+   FAIL  scaler skips overflowing steps             weights became NaN
+run 3 as launched
+   PASS  initial loss within 10% of ln V            3.30 vs 3.30
+   PASS  labels are the next character              100% agree
+   PASS  memorises one batch of 64 in 200 steps     loss 0.02
+   PASS  no junk batches in the first 1,000         0 flagged
+   PASS  scaler skips overflowing steps             weights finite</code></pre>
+<p>The three configurations are exactly what was launched in the three runs. Run 1 fails on the labels, the junk shard and the scaler (three faults found in seconds); run 2 passes the labels and fails the other two; run 3 passes all five. Note which checks catch which fault, and that check 3 (memorise one batch) passed even for run 1. It guards against a different set of bugs than the ones this studio planted, and is worth its 200 steps for that reason.</p>
+<p>Now the cost. Take the plan from <a href="../chapters/16-resource-accounting.html">chapter 16</a>: a Llama 3 8B-sized run, 15 trillion tokens, 2,048 H100s at 40% MFU. The price per GPU-hour is an assumption (the chapter uses $2.50); so are the detection delays, which are plausible, not measured.</p>
+<pre class="terminal" data-title="s1_cost.py"><code>"""What do the three bugs cost if they hit a real run? Prices and detection delays are assumptions."""
+PRICE = 2.5                                  # assumed $ per H100-hour (chapter 16 uses the same figure)
+PEAK, MFU = 989e12, 0.40
+N, D = 8.03e9, 15e12                         # a Llama-3-8B-sized plan: 15 trillion tokens
+gpus = 2048
+days = 6 * N * D / (PEAK * MFU * gpus) / 86400
+print(f"plan: {N/1e9:.1f}B parameters, {D/1e12:.0f}T tokens, {gpus:,} GPUs -&gt; {days:.1f} days, {gpus*PRICE:,.0f} dollars per cluster-hour")
+print(f"{'failure':&lt;34}{'noticed after':&gt;14}{'wasted GPU-h':&gt;14}{'cost':&gt;12}   with the alert or preflight")
+cases = [("flat loss (shuffled labels)", 12, "preflight check 2: seconds on 8 GPUs"),
+         ("junk batches, 2 h of work rolled back", 2, "alert on the first bad step + rollback"),
+         ("NaN, last checkpoint 6 h old", 6, "headroom alert, ~118 steps earlier")]
+for name, hours, fix in cases:
+    gh = hours * gpus
+    print(f"{name:&lt;34}{hours:&gt;11} h{gh:&gt;14,}{gh*PRICE:&gt;11,.0f}$   {fix}")
+print(f"\npreflight on 8 GPUs for 10 minutes: {8*10/60:.1f} GPU-hours = ${8*10/60*PRICE:.0f}")</code></pre>
+<pre class="terminal" data-title="output"><code>plan: 8.0B parameters, 15T tokens, 2,048 GPUs -&gt; 10.3 days, 5,120 dollars per cluster-hour
+failure                            noticed after  wasted GPU-h        cost   with the alert or preflight
+flat loss (shuffled labels)                12 h        24,576     61,440$   preflight check 2: seconds on 8 GPUs
+junk batches, 2 h of work rolled back          2 h         4,096     10,240$   alert on the first bad step + rollback
+NaN, last checkpoint 6 h old                6 h        12,288     30,720$   headroom alert, ~118 steps earlier
+
+preflight on 8 GPUs for 10 minutes: 1.3 GPU-hours = $3</code></pre>
+<p>Every hour of an unnoticed fault on this cluster costs about $5,000. A flat loss noticed after a night is $61,000 of electricity producing a model that is no better than a letter-frequency table; the preflight that would have caught it costs about $3. The intended lesson is not the exact dollar figures but the ratio: the checks cost minutes on one node, the failures cost hours on the whole cluster. The same logic is why <a href="../chapters/16-resource-accounting.html">chapter 16</a> suggests running one step at the largest planned microbatch first.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">11</span>When the symptom is different</h2>
+<p class="stage-q">Production symptoms rarely match a tutorial. For each symptom in your notes, what is your first hypothesis and your first measurement? Which of this studio's techniques transfer to a 1B-parameter Transformer, and which do not?</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<div class="table-wrap"><table><thead><tr><th>Symptom</th><th>First hypothesis</th><th>First measurement</th></tr></thead><tbody>
+<tr><td>Loss at step 0 is 40, not ln V</td><td>Logits too large: output layer not scaled down, or embeddings too large</td><td>Logit standard deviation at initialisation; <a href="../chapters/03-training-dynamics.html">chapter 03</a></td></tr>
+<tr><td>Loss is exactly 0.0 or implausibly low</td><td>Labels leaked into the input (the target is also in the window), or a mask lets the model see the future</td><td>Change one future token and check whether the prediction at that position changes</td></tr>
+<tr><td>Loss falls, then plateaus well above the expected floor</td><td>Learning-rate schedule too low or decayed too early; a capacity or data limit</td><td>Learning rate against step in the log; the resource and scaling numbers of <a href="../chapters/18-scaling-laws.html">chapter 18</a></td></tr>
+<tr><td>Training loss falls, held-out does not</td><td>Overfitting or a train/eval leak or mismatch</td><td>Held-out loss on data that is certainly unseen; <a href="../../ml/chapters/14-leakage.html">leakage</a></td></tr>
+<tr><td>Loss spikes every N steps</td><td>Something periodic: a bad shard, a learning-rate restart, evaluation code touching the weights</td><td>Plot the step numbers of spikes against shard boundaries and checkpoint steps</td></tr>
+<tr><td>Spikes get larger over thousands of steps</td><td>Attention logits or output logits growing without bound</td><td>Log max attention logit and max output logit; QK-norm or a z-loss (<a href="../chapters/17-training-stability.html">chapter 17</a>)</td></tr>
+<tr><td>NaN at step 1</td><td>Division by zero in a normalisation, log of zero, or an unseen token index</td><td>Run the first batch in fp32 with anomaly detection on and find the first layer that goes non-finite</td></tr>
+<tr><td>Throughput falls part-way through</td><td>A failing node or a data-loader stall, not a modelling bug</td><td>Tokens per second per GPU and MFU against the plan; <a href="../../llm-training/chapters/05-long-runs.html">long runs</a></td></tr>
+</tbody></table></div>
+<p><strong>What transfers.</strong> The ladder, the held-out loss beside the training loss, the update-to-weight ratio, the replay-from-a-checkpoint method, the headroom indicator and the preflight all transfer to a Transformer in PyTorch with no change in logic. <strong>What does not:</strong> the numeric thresholds (a clip of 3.0, the 4&times; median rule) were read off this model's logs; read yours off your own. And at scale there are failure classes the harness cannot show: hardware faults, silent data corruption on one GPU, and distributed-training bugs where ranks disagree. Their first step is the same (find the first bad value, in time and in space), but the tooling is a cluster's (<a href="../../llm-training/chapters/05-long-runs.html">chapter 5 of A3</a>). Case study 7 (<a href="../cases/case-07-opt-logbook.html">the OPT-175B logbook</a>) shows what the diary of such an investigation looks like.</p>
+<p>Finally, a note on method. Here the three causes were planted and independent, so each fix revealed the next one cleanly. Real runs have interacting causes: a learning rate that is too high makes a data fault look like an optimiser fault. Change one thing at a time, write down the result, and be willing to revert.</p>
+</details>
+</section>
+
+<section class="stage">
+<h2><span class="h-num">12</span>Say it out loud: the incident summary</h2>
+<p class="stage-q">Give a two-minute spoken incident summary for the team, then compare with the model summary.</p>
+<details class="reveal">
+  <summary>Compare with a worked answer</summary>
+<div class="callout mentor">
+  <p class="callout-title">How a senior engineer would summarise this</p>
+  <p>"The run had three independent faults, found in order, and each fix exposed the next. First, the loss sat at 3.07 against a letter-frequency entropy of 3.04: the model had learned the alphabet's frequencies and nothing about context. The initial loss was right, the update-to-weight ratio was healthy, and the model could memorise one batch, so initialisation, optimiser and model were cleared. Decoding a batch showed the labels matched the true next character 9% of the time: a refactor shuffled the labels on their own. Second, after the fix the loss fell, then at step 700 the gradient norm went to five times typical, and the held-out loss climbed from 1.0 to 3.2 and took a hundred steps to recover. A batch validator flagged exactly twenty batches, steps 700 to 719, which were random characters from a binary file in the shard. A replay from the step 650 checkpoint with those batches removed has no spike at all; halving the learning rate, lowering beta2 or clipping only reduced the damage, and a clip at 1.0 worked by engaging on 92% of steps, which is a learning-rate cut, so we keep a clip at 3.0 as a safety net only. Third, the run died at step 2,174. The loss was healthy at step 2,173 but the gradient norm was infinite: a homemade loss scaler had doubled to 262,144 at step 2,000, and the output layer's largest scaled gradient, 69,137, exceeded the fp16 maximum of 65,504. The fix is the standard one, skip the step and halve the scale on an infinity, or train in bf16. The final run reaches 0.73 held-out on three seeds. For the process: a five-check preflight that catches all three faults in under a minute, and alerts on gradient norm against its own median, held-out loss against its recent best, and fp16 headroom, which would have fired 118 steps before the NaN. At 2,048 GPUs an unnoticed night costs about $60,000, and the preflight costs about three dollars."</p>
+  <p>Notice the shape: <strong>healthy numbers first → cheapest check first → each cause with evidence for it and against its rivals → a replay that changes one thing → a fix that removes the cause, not the symptom → process change with a cost comparison.</strong></p>
+</div>
+</details>
+</section>
+
+<details class="deeper"><summary>The training harness <span class="hint">harness.py, so you can rerun everything</span></summary>
+<p>Every script on this page imports this file. It trains the model in NumPy with a hand-written backward pass, logs one row of metrics per step and can plant each fault through the config. Save it next to the scripts and run them with <code>python3</code>. Runs take from a few seconds to about 15 seconds each on a laptop.</p>
+<pre class="terminal" data-title="harness.py"><code>"""harness.py: a small character-level language model in NumPy, with the faults of studio 1 as config switches.
+Model: 8-character window -&gt; 12-d embeddings -&gt; 4 ReLU layers of width 128 -&gt; 27 logits. Trained with AdamW-style Adam."""
+import copy
+import numpy as np
+
+CHARS = "abcdefghijklmnopqrstuvwxyz "
+V, K, E_DIM, BATCH, SHARD_STEPS = len(CHARS), 8, 12, 128, 500
+IDX = {c: i for i, c in enumerate(CHARS)}
+
+
+def make_text(n_chars, seed):
+    """Zipf-distributed pseudo-words (the same source as the chapter 18 experiment)."""
+    vr = np.random.default_rng(12345)
+    letters = np.array(list("abcdefghijklmnopqrstuvwxyz"))
+    words = ["".join(vr.choice(letters, vr.integers(2, 9))) for _ in range(400)]
+    p = 1 / np.arange(1, 401) ** 1.1
+    p /= p.sum()
+    rng, out, n = np.random.default_rng(seed), [], 0
+    while n &lt; n_chars:
+        out.append(words[rng.choice(400, p=p)])
+        n += len(out[-1]) + 1
+    return " ".join(out)[:n_chars]
+
+
+def windows(text):
+    a = np.array([IDX[c] for c in text])
+    n = len(a) - K
+    return np.stack([a[i:n + i] for i in range(K)], 1), a[K:K + n]      # (n, 8) inputs, (n,) next characters
+
+
+def init_params(hidden, depth, std, seed):
+    r = np.random.default_rng(seed)
+    dims = [K * E_DIM] + [hidden] * depth + [V]
+    Ws = [r.normal(0, np.sqrt(2 / a) if std is None else std, (a, b)) for a, b in zip(dims[:-1], dims[1:])]
+    Ws[-1] *= 0.1                                  # small output layer: initial logits near 0, initial loss near ln V
+    return [r.normal(0, 1.0, (V, E_DIM))] + Ws + [np.zeros(b) for b in dims[1:]]
+
+
+def forward(P, X, depth):
+    h = P[0][X].reshape(len(X), -1)
+    hs = [h]
+    for i, (W, b) in enumerate(zip(P[1:2 + depth], P[2 + depth:])):
+        z = h @ W + b
+        h = np.maximum(z, 0) if i &lt; depth else z
+        hs.append(h)
+    return hs                                      # hs[-1] = logits, shape (B, 27)
+
+
+def backward(P, X, hs, g, depth):
+    Ws, gW, gb = P[1:2 + depth], [None] * (depth + 1), [None] * (depth + 1)
+    for i in reversed(range(depth + 1)):
+        gW[i], gb[i] = hs[i].T @ g, g.sum(0)
+        g = g @ Ws[i].T
+        if i &gt; 0:
+            g = g * (hs[i] &gt; 0)
+    ge = np.zeros_like(P[0])
+    np.add.at(ge, X, g.reshape(len(X), K, E_DIM))
+    return [ge] + gW + gb
+
+
+def cross_entropy(z, y):
+    s = z - z.max(1, keepdims=True)                # subtract the row maximum (A0 chapter 11)
+    p = np.exp(s) / np.exp(s).sum(1, keepdims=True)
+    g = p.copy()
+    g[np.arange(len(y)), y] -= 1
+    return float(-np.log(p[np.arange(len(y)), y]).mean()), g / len(y)
+
+
+DEFAULT = dict(depth=4, hidden=128, init_std=None, lr=2e-3, warmup=100, total=3000, floor=0.1,
+               beta2=0.999, clip=None, labels="aligned", garbage=(), seed=0,
+               scaler="none", init_scale=2.0 ** 14, grow_every=500)    # scaler: "none", "naive" or "dynamic"
+
+
+def lr_at(c, t):
+    if t &lt;= c["warmup"]:
+        return c["lr"] * t / c["warmup"]
+    prog = min(1, (t - c["warmup"]) / (c["total"] - c["warmup"]))
+    return c["lr"] * (c["floor"] + (1 - c["floor"]) * 0.5 * (1 + np.cos(np.pi * prog)))
+
+
+def get_batch(c, t, cache):
+    shard, pos = divmod(t - 1, SHARD_STEPS)
+    if shard not in cache:
+        X, Y = windows(make_text(SHARD_STEPS * BATCH + K, 100 + shard))
+        if c["labels"] == "shuffled":              # the refactor bug: labels shuffled on their own
+            Y = Y[np.random.default_rng(7 + shard).permutation(len(Y))]
+        cache[shard] = (X, Y)
+    X, Y = cache[shard]
+    xb, yb = X[pos * BATCH:(pos + 1) * BATCH], Y[pos * BATCH:(pos + 1) * BATCH]
+    if any(a &lt;= t &lt;= b for a, b in c["garbage"]):  # a binary file read as text: uniformly random characters
+        r = np.random.default_rng(10_000 + t)
+        xb, yb = r.integers(0, V, xb.shape), r.integers(0, V, yb.shape)
+    return xb, yb
+
+
+def new_state(c):
+    P = init_params(c["hidden"], c["depth"], c["init_std"], c["seed"])
+    return dict(P=P, m=[np.zeros_like(p) for p in P], v=[np.zeros_like(p) for p in P], t=0,
+                scale=c["init_scale"], clean=0)
+
+
+def train(cfg, state=None, until=None, log=None):
+    """Train from state['t'] + 1 to `until`. Returns (rows, state); one row of metrics per step."""
+    c = {**DEFAULT, **cfg}
+    st, depth = state or new_state(c), c["depth"]
+    P, m, v = st["P"], st["m"], st["v"]
+    Xe, Ye = windows(make_text(12_000, 999))       # clean held-out text, never trained on
+    cache, rows = {}, [] if log is None else log
+    for t in range(st["t"] + 1, (until or c["total"]) + 1):
+        xb, yb = get_batch(c, t, cache)
+        hs = forward(P, xb, depth)
+        loss, g = cross_entropy(hs[-1], yb)
+        grads = backward(P, xb, hs, g, depth)
+        skipped = False
+        if c["scaler"] != "none":                  # emulate fp16 gradients: scale up, round to 16 bits, scale back
+            with np.errstate(over="ignore"):
+                grads = [(q * st["scale"]).astype(np.float16).astype(np.float32) / st["scale"] for q in grads]
+            if c["scaler"] == "dynamic":
+                if not all(np.isfinite(q).all() for q in grads):
+                    st["scale"] /= 2; st["clean"] = 0; skipped = True       # overflow: skip the step, halve the scale
+                else:
+                    st["clean"] += 1
+                    if st["clean"] &gt;= c["grow_every"]:
+                        st["scale"] *= 2; st["clean"] = 0
+            elif t % c["grow_every"] == 0:
+                st["scale"] *= 2                   # the homemade scaler: doubles on a timer, never checks for inf
+        gmax = max(float(np.abs(q).max()) for q in grads)
+        gn = float(np.sqrt(sum(float((q.astype(np.float64) ** 2).sum()) for q in grads)))
+        clipped = bool(c["clip"] and np.isfinite(gn) and gn &gt; c["clip"])
+        if clipped:
+            grads = [q * c["clip"] / gn for q in grads]
+        lr, dsq, wsq = lr_at(c, t), 0.0, 0.0
+        if not skipped:
+            for i in range(len(P)):
+                m[i] = .9 * m[i] + .1 * grads[i]
+                v[i] = c["beta2"] * v[i] + (1 - c["beta2"]) * grads[i] ** 2
+                step = lr * (m[i] / (1 - .9 ** t)) / (np.sqrt(v[i] / (1 - c["beta2"] ** t)) + 1e-8)
+                P[i] -= step
+                dsq += float((step.astype(np.float64) ** 2).sum()); wsq += float((P[i].astype(np.float64) ** 2).sum())
+        st["t"] = t
+        row = dict(step=t, loss=loss, gnorm=gn, gmax=gmax, clipped=clipped, skipped=skipped, lr=lr,
+                   ratio=float(np.sqrt(dsq / wsq)) if wsq else 0.0, maxlogit=float(np.abs(hs[-1]).max()), scale=st["scale"])
+        if t % 10 == 0 or t == 1:                  # held-out loss every 10 steps
+            z = forward(P, Xe, depth)[-1]
+            row["eval"] = cross_entropy(z, Ye)[0]
+        rows.append(row)
+        if not np.isfinite(loss):
+            break                                  # stop once the loss itself is NaN
+    return rows, st
+
+
+def snapshot(st):
+    return copy.deepcopy(st)</code></pre>
+</details>
+
+<h2>Self-check rubric</h2>
+<p>Tick what your own investigation (before reading the answers) covered. The first items are what a solid mid-level answer has; the later ones separate a senior answer.</p>
+<ul class="rubric">
+  <li>Wrote down the <strong>expected numbers first</strong>: initial loss ln V, the letter-frequency baseline, the floor and the shape of a healthy curve.</li>
+  <li>Ranked the suspects <strong>cheapest and most common first</strong>, with the data before the model.</li>
+  <li>Used the <strong>initial loss against ln V</strong> and the <strong>update-to-weight ratio</strong> to clear initialisation and the optimiser.</li>
+  <li>Ran the <strong>one-batch memorisation test</strong> and knew what it does and does not prove (random labels can be memorised).</li>
+  <li>Identified the flat loss as a specific number (the <strong>letter-frequency entropy</strong>) and decoded a batch beside the raw text to find the label bug.</li>
+  <li>Plotted a <strong>held-out loss on clean data</strong> beside the training loss to separate hard batches from model damage.</li>
+  <li>Used the <strong>timing of the gradient norm</strong> relative to the loss to decide between a sudden cause and a slow drift.</li>
+  <li>Ran a <strong>replay from a checkpoint changing one thing</strong> to separate data from optimiser settings, and read the result honestly.</li>
+  <li>Recognised that <strong>clipping and learning-rate cuts mitigate</strong> a spike without removing its cause, and that a clip engaging on most steps is a symptom.</li>
+  <li>Found the <strong>first non-finite value</strong> in time (the gradient, one step before the loss) and in space (one tensor), and linked it to the fp16 limit of 65,504.</li>
+  <li>Chose between a <strong>dynamic loss scaler and bf16</strong> and explained why a fault that depends on the step counter evades short tests.</li>
+  <li>Verified the fix with <strong>repeat seeds</strong> and the expected curve, not just "it finished".</li>
+  <li>Proposed <strong>alerts against the run's own baseline</strong> with a defined action, including a leading indicator for the NaN.</li>
+  <li>Turned the ladder into a <strong>preflight</strong> and compared its cost with the cost of an unnoticed failure on a cluster.</li>
+</ul>
+<p class="studio-status" id="studio-status"></p>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+<ul><li>Write down what healthy looks like before reading a log: the initial loss should be about ln V, and a loss stuck at the entropy of the letter frequencies means the model ignores its input.</li><li>Debug by elimination, cheapest and most common first: data, then initial loss, then update-to-weight ratio, then one-batch memorisation, then numerics. Each check clears a family of causes.</li><li>A flat loss has many causes with different fingerprints: shuffled labels leave healthy gradients, zero weights leave a zero gradient, a tiny learning rate leaves a tiny update ratio.</li><li>Plot a held-out loss on clean data beside the training loss; it separates a hard batch from a damaged model.</li><li>To separate data from settings, replay from a checkpoint changing one thing. Removing the cause removes the spike; clipping, a lower learning rate and a lower &beta;<sub>2</sub> only soften it, and a clip that engages on most steps is a symptom.</li><li>The first non-finite value is usually in the gradient, a step before the loss. A loss scaler must skip the step and back off on an infinity, or bf16 avoids the need.</li><li>Turn each lesson into a preflight check and an alert against the run's own baseline: minutes on one node against hours on a cluster.</li></ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">Karpathy, "A Recipe for Training Neural Networks" (2019)</a>. The source of "become one with the data", overfit one batch, and verify the loss at initialisation; the method this studio follows.</li>
+  <li><a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Micikevicius et al., "Mixed Precision Training" (2017)</a>. Loss scaling and fp32 master weights, the basis of the scaler in stage 7.</li>
+  <li><a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">Chowdhery et al., "PaLM: Scaling Language Modeling with Pathways" (2022)</a>. Section 5.1 describes loss spikes and the restart-and-skip-batches remedy used in stage 6.</li>
+  <li><a href="https://arxiv.org/abs/2205.01068" target="_blank" rel="noopener">Zhang et al., "OPT: Open Pre-trained Transformer Language Models" (2022)</a>. Divergences, loss-scale collapse and the public logbook of a large run.</li>
+  <li><a href="https://arxiv.org/abs/2309.14322" target="_blank" rel="noopener">Wortsman et al., "Small-scale proxies for large-scale Transformer training instabilities" (2023)</a>. Reproducing large-run instabilities in small models, the same idea as this studio's harness.</li>
+  <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">Llama Team, "The Llama 3 Herd of Models" (2024)</a>. Describes a large run's monitoring and its interruptions.</li>
+</ul>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/studio.js"></script>
+</body>
+</html>

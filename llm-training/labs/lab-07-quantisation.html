@@ -1,0 +1,893 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 7: Quantise a Model · Training, Post-training &amp; Serving LLMs</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="llm" data-lab="L7">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Lab 7: Quantise a Model</h1>
+  <p class="lede"><a href="../chapters/19-quantisation.html">Chapter 19</a> explained how a weight is squeezed into a few bits, why one large number spoils the grid for its neighbours, and how SmoothQuant and AWQ move that difficulty somewhere harmless. It showed numbers from a handful of scripts; this lab makes you build every piece and measure it. You write symmetric and asymmetric quantisers, the three scale granularities, a real int4 packer with a byte count, the activation fixes (mixed precision and SmoothQuant) and an AWQ-style scale search that uses calibration data. All of it runs on one small synthetic layer in plain Python, and every step is scored with the same three numbers: relative output error, top-1 agreement and bits per weight.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Quantisation is the cheapest large win in serving: a 4-bit model needs about a quarter of the memory and, in the memory-bound decode regime of <a href="../chapters/18-kv-cache.html">chapter 18</a>, reads about a quarter of the bytes per token. It is also the optimisation most likely to be applied by pulling a checkpoint off a hub without looking inside, and the failures are quiet. Nothing crashes. The model answers a little worse, on the inputs you did not test. Writing the quantiser yourself teaches the things a library hides: that the "4-bit" model is really 4.125 bits because the scales have to live somewhere, that a symmetric grid wastes half its levels on one-sided data, that two loud activation channels can make an int8 layer five to ten times worse than it needs to be, that an AWQ exponent is a hyperparameter you tune on data and that tuning on the wrong data is worse than not tuning. The lab also teaches the habit that makes quantisation safe to ship: never trust the average error, and always evaluate on tokens the search did not see (<a href="../chapters/23-evaluating-models.html">chapter 23</a>).</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Deterministic, small, standard library only</p>
+  <p>There is no real model, no GPU and no NumPy. The layer is generated from fixed seeds (<code>make_weights()</code>, <code>make_activations(seed)</code>), every random test input comes from a seeded <code>random.Random</code>, and a failure prints the seed so you can replay it (<code>python3 check.py solution 2 17</code> runs milestone 2 with seed 17 only). Python 3.9 or newer. The whole check takes a couple of seconds. Quantisation here is <em>simulated</em> ("fake quantisation"): a value is rounded to its integer and immediately multiplied back by its scale, so every matrix stays a matrix of floats. That is how research code measures accuracy, and it gives the same answer as a real integer kernel up to float rounding; what it cannot show is speed. The sizes (48 &times; 256 weights, 64 tokens, outlier channels 40 times larger) are illustrative assumptions chosen to reproduce the pattern in chapter 19, not measurements of any real model.</p>
+</div>
+
+<h2>What you'll build</h2>
+<figure class="diagram">
+<svg viewBox="0 0 760 240" role="img" aria-label="The six milestones in order: symmetric quantisation, asymmetric quantisation, granularity of scales, packing to real bytes, activation outliers, and AWQ-style calibration. The first four concern the weights, the fifth the activations and the sixth uses calibration data. All are scored by relative output error, top-1 agreement and bits per weight.">
+<defs><marker id="ahLT-L7a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="20" text-anchor="start" class="t-sm t-bold">One layer, Y = X W^T, squeezed six ways</text>
+<rect x="3" y="44" width="114" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="60" y="70" text-anchor="middle" class="t-sm t-bold">1 symmetric</text>
+<text x="60" y="90" text-anchor="middle" class="t-xs t-muted">absmax / qmax</text>
+<line x1="119" y1="75" x2="129" y2="75" class="line sw-2" marker-end="url(#ahLT-L7a)"/>
+<rect x="131" y="44" width="114" height="62" rx="8" class="fs-blue s-blue sw-2"/>
+<text x="188" y="70" text-anchor="middle" class="t-sm t-bold">2 asymmetric</text>
+<text x="188" y="90" text-anchor="middle" class="t-xs t-muted">a zero point</text>
+<line x1="247" y1="75" x2="257" y2="75" class="line sw-2" marker-end="url(#ahLT-L7a)"/>
+<rect x="259" y="44" width="114" height="62" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="316" y="70" text-anchor="middle" class="t-sm t-bold">3 granularity</text>
+<text x="316" y="90" text-anchor="middle" class="t-xs t-muted">tensor, row, group</text>
+<line x1="375" y1="75" x2="385" y2="75" class="line sw-2" marker-end="url(#ahLT-L7a)"/>
+<rect x="387" y="44" width="114" height="62" rx="8" class="fs-purple s-purple sw-2"/>
+<text x="444" y="70" text-anchor="middle" class="t-sm t-bold">4 real bytes</text>
+<text x="444" y="90" text-anchor="middle" class="t-xs t-muted">pack int4, count</text>
+<line x1="503" y1="75" x2="513" y2="75" class="line sw-2" marker-end="url(#ahLT-L7a)"/>
+<rect x="515" y="44" width="114" height="62" rx="8" class="fs-green s-green sw-2"/>
+<text x="572" y="70" text-anchor="middle" class="t-sm t-bold">5 outliers</text>
+<text x="572" y="90" text-anchor="middle" class="t-xs t-muted">mixed, SmoothQuant</text>
+<line x1="631" y1="75" x2="641" y2="75" class="line sw-2" marker-end="url(#ahLT-L7a)"/>
+<rect x="643" y="44" width="114" height="62" rx="8" class="fs-cyan s-cyan sw-2"/>
+<text x="700" y="70" text-anchor="middle" class="t-sm t-bold">6 AWQ search</text>
+<text x="700" y="90" text-anchor="middle" class="t-xs t-muted">calibrate exponent</text>
+<line x1="3" y1="120" x2="473" y2="120" class="line-thin"/><text x="238" y="138" text-anchor="middle" class="t-xs t-muted">weights: a grid of integers and the scales that place it</text>
+<line x1="515" y1="120" x2="601" y2="120" class="line-thin"/><text x="558" y="138" text-anchor="middle" class="t-xs t-muted">activations</text>
+<line x1="643" y1="120" x2="757" y2="120" class="line-thin"/><text x="700" y="138" text-anchor="middle" class="t-xs t-muted">calibration data</text>
+<rect x="3" y="160" width="754" height="64" rx="8" class="fs-yellow s-yellow sw-2"/>
+<text x="380" y="184" text-anchor="middle" class="t-sm t-bold">every milestone is scored the same way</text>
+<text x="380" y="204" text-anchor="middle" class="t-xs t-muted">relative error ||Yq - Y|| / ||Y||, top-1 agreement of the D outputs, bits per weight including scales</text>
+</svg>
+<figcaption><strong>Six steps, one yardstick.</strong> Blue is the arithmetic of a grid, purple the stored form, green the activations, cyan the calibration data. Each step gets a number from the same measurement, so you can see what it bought.</figcaption>
+</figure>
+<p>Six milestones, each building on the last:</p>
+<ol class="steps">
+  <li><strong>Symmetric quantisation:</strong> <code>qmax</code>, the absmax scale, rounding and clamping to the grid &minus;qmax to +qmax, and dequantising. Chapter 19's eight example weights must come out exactly.</li>
+  <li><strong>Asymmetric quantisation:</strong> an unsigned grid with a zero point, so that one-sided data uses all of its levels and real zero is still exact.</li>
+  <li><strong>Granularity and what scales cost:</strong> one scale per tensor, per output channel or per group, and the effective bits per weight once the scales are counted.</li>
+  <li><strong>Real bytes:</strong> pack int4 values two per byte, unpack them, count the bytes of a quantised model and work out what fits on a 24 GB card.</li>
+  <li><strong>Activation outliers:</strong> quantise activations per tensor or per token, find outlier channels, compute the LLM.int8()-style mixed-precision product and the SmoothQuant rewrite.</li>
+  <li><strong>AWQ-style scales:</strong> scale weight columns by activation magnitude raised to an exponent, search the exponent on calibration data, and test it on held-out tokens, including what happens when the calibration data is wrong.</li>
+</ol>
+
+<h2>Before you start</h2>
+<p>Check your Python with <code>python3 --version</code>. The lab's files are in <code>llm-training/labs/code/lab07/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab07/starter.py"><code>starter.py</code></a></td><td>Your file. The synthetic layer, the measurements and the final report are given; every function you write has a docstring and raises <code>NotImplementedError("TODO milestone N: name")</code>.</td></tr>
+    <tr><td><a href="code/lab07/check.py"><code>check.py</code></a></td><td>The self-check: hand-computed cases, seeded property tests against plain reference implementations, and scenarios on the layer.</td></tr>
+    <tr><td><a href="code/lab07/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+    <tr><td><code>exp_*.py</code></td><td>Small experiments used on this page (<a href="code/lab07/exp_levels.py"><code>exp_levels</code></a>, <a href="code/lab07/exp_bits.py"><code>exp_bits</code></a>, <a href="code/lab07/exp_outlier_sweep.py"><code>exp_outlier_sweep</code></a>, <a href="code/lab07/exp_alpha_awq.py"><code>exp_alpha_awq</code></a>). They import from <code>solution</code>; change that line to <code>starter</code> to run them on your own code.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Everything is unimplemented, and it says so cleanly:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py</span>
+<span class="out">Lab 7 checks against starter.py
+
+  … Milestone 1: symmetric quantisation: not implemented yet (TODO milestone 1: qmax)
+  … Milestone 2: asymmetric quantisation and the zero point: not implemented yet (TODO milestone 2: quantise_asym)
+  … Milestone 3: per-tensor, per-channel and per-group scales: not implemented yet (TODO milestone 3: fake_quantise_matrix)
+  … Milestone 4: packing int4 and counting bytes: not implemented yet (TODO milestone 4: pack_int4)
+  … Milestone 5: activation outliers, mixed precision and SmoothQuant: not implemented yet (TODO milestone 5: fake_quantise_activations)
+  … Milestone 6: AWQ-style scaling, calibration and the report: not implemented yet (TODO milestone 6: awq_scales)
+
+0/6 milestones passing  (0.0 s)</span></code></pre>
+<p>The check prints which milestone, and which function inside it, it ran into first. Work in order: later milestones call the earlier functions, and milestone 6's report uses almost everything.</p>
+
+<h2>The setting: one layer, two kinds of trouble</h2>
+<p>A transformer is mostly stacked linear layers, and a linear layer is a matrix multiplication. Following <a href="../chapters/19-quantisation.html">chapter 19</a> and A2, call the activations <code>X</code> (T tokens by C input channels) and store the weights output-first as <code>W</code> (D rows, one per output, by C columns). The layer computes <code>Y = X W<sup>T</sup></code>, a T &times; D matrix. <span class="term">Per-channel</span> quantisation means one scale per row of <code>W</code>, that is per output channel. In this lab a matrix is a list of rows and a row is a list of floats.</p>
+<p>The given code builds a layer that has both of the troubles chapter 19 described:</p>
+<pre class="terminal" data-title="solution.py (given, excerpt)"><code>ROWS, COLS, TOKENS = 48, 256, 64          # D, C, T
+LOUD_ROWS = {5: 12.0, 30: 20.0}           # output channels whose weights are 12x and 20x larger
+SPIKES = [(2, 40, 8.0), (17, 130, 8.0), (41, 200, 8.0), (44, 7, 8.0)]   # single weights 8x larger
+OUTLIER_CHANNELS = (11, 201)              # input channels that are huge in the activations
+OUTLIER_FACTOR = 40.0
+
+
+def make_weights(seed=7):
+    """D x C weights: N(0, 0.02^2), two loud rows and four spikes (all sizes illustrative)."""
+    rng = random.Random(seed)
+    W = [[rng.gauss(0.0, 0.02) for _ in range(COLS)] for _ in range(ROWS)]
+    for r, f in LOUD_ROWS.items():
+        W[r] = [v * f for v in W[r]]
+    for r, c, f in SPIKES:
+        W[r][c] *= f
+    return W
+
+
+def make_activations(seed, channels=OUTLIER_CHANNELS, factor=OUTLIER_FACTOR, tokens=TOKENS):
+    """T x C activations: N(0, 1) with the given input channels multiplied by `factor`."""
+    rng = random.Random(seed)
+    X = [[rng.gauss(0.0, 1.0) for _ in range(COLS)] for _ in range(tokens)]
+    for row in X:
+        for c in channels:
+            row[c] *= factor
+    return X
+</code></pre>
+<ul>
+  <li><strong>The weights</strong> are Gaussian with standard deviation 0.02, except that two output rows are 12 and 20 times larger ("loud" rows) and four single weights are 8 times larger (spikes). A loud row ruins a per-tensor scale; a spike ruins the scale of whatever group contains it.</li>
+  <li><strong>The activations</strong> are standard normal, except that input channels 11 and 201 are 40 times larger in every token. This is the pattern Dettmers et al. (2022) found in large transformers: a few channels with systematically huge values.</li>
+</ul>
+<p>Three measurements are given, so that every milestone is judged by the same yardstick. <code>rel_error(approx, ref)</code> is &#8214;approx &minus; ref&#8214; / &#8214;ref&#8214; (the same measure chapter 19 prints). <code>matmul_nt(X, W)</code> computes <code>X W<sup>T</sup></code>. And <code>top1_agreement(Yq, Y)</code> treats the D outputs as logits and returns the fraction of tokens whose argmax is unchanged, a crude stand-in for "the model said the same thing". Average error can be small while the answer flips; seeing both numbers side by side is part of the point.</p>
+
+<h2>Milestone 1: symmetric quantisation</h2>
+<p>Pick a signed integer format with <code>bits</code> bits. The largest value on the symmetric grid is <code>qmax = 2<sup>bits&minus;1</sup> &minus; 1</code>: 127 for int8, 7 for int4. (Two's complement also has &minus;128 and &minus;8, but the symmetric scheme leaves them unused so that the grid is balanced around zero; int4 therefore has 15 levels, not 16.) The recipe from chapter 19:</p>
+<p style="text-align:center">scale <em>s</em> = max|<em>w</em>| / qmax,&nbsp;&nbsp;&nbsp; <em>q</em> = clamp(round(<em>w</em> / <em>s</em>), &minus;qmax, qmax),&nbsp;&nbsp;&nbsp; <em>w&#770;</em> = <em>q</em> &times; <em>s</em></p>
+<p>The largest-magnitude value lands exactly on &plusmn;qmax and comes back exactly; every other value is off by at most <em>s</em>/2, half a step. So the whole game is keeping <em>s</em> small, and <em>s</em> is set by the single largest number in the group. Two details bite. Python's <code>round</code> rounds halves to the nearest even integer (<code>round(2.5)</code> is 2), which is fine as long as you use it consistently. And an all-zero group has absmax 0, so its scale would be 0 and the division would fail; the contract is scale 1.0 in that case.</p>
+<p>Here is the effect of one large number, on chapter 19's eight weights, run with your code. In the second run one weight is 3.1 instead of 0.31:</p>
+<pre class="terminal" data-title="exp_levels.py"><code>"""Why one large number costs so much: the same eight weights, with and without one outlier (int4, symmetric)."""
+from solution import *
+
+w = [0.02, -0.11, 0.07, 0.31, -0.05, 0.00, 0.13, -0.28]
+for name, vals in [("as given", w), ("one weight is 3.1", w[:3] + [3.1] + w[4:])]:
+    ints, s = quantise_sym(vals, 4)
+    back = dequantise_sym(ints, s)
+    print(f"{name:&lt;18} scale {s:.4f}  ints {ints}")
+    print(f"{'':&lt;18} error per weight {[round(abs(a - b), 3) for a, b in zip(back, vals)]}")</code></pre>
+<pre class="terminal" data-title="output"><code>as given           scale 0.0443  ints [0, -2, 2, 7, -1, 0, 3, -6]
+                   error per weight [0.02, 0.021, 0.019, 0.0, 0.006, 0.0, 0.003, 0.014]
+one weight is 3.1  scale 0.4429  ints [0, 0, 0, 7, 0, 0, 0, -1]
+                   error per weight [0.02, 0.11, 0.07, 0.0, 0.05, 0.0, 0.13, 0.163]</code></pre>
+<p>With the outlier the scale is ten times larger (0.443 instead of 0.044), six of the eight integers are zero, and &minus;0.28 comes back as &minus;0.44, an error of 0.16 on a weight that was fine a moment ago. That is the mechanism behind everything else in this lab.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>qmax(bits)</code>, <code>scale_sym(values, bits)</code>, <code>quantise_sym(values, bits)</code> (returning <code>(ints, scale)</code>) and <code>dequantise_sym(ints, scale)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks <code>qmax</code> for 2, 3, 4 and 8 bits; chapter 19's eight weights at int4 (<code>[0, -2, 2, 7, -1, 0, 3, -6]</code>, scale 0.31/7); a negative absmax; the all-zero list; and then forty seeded random lists of random length, bit width (2 to 8) and spread, checking that integers stay within the grid, that the scale is absmax/qmax, that no value is off by more than half a step, that the largest value round-trips exactly and that quantising an already-quantised list changes nothing. Finally it measures relative error at int4 and int8 on 4,000 Gaussian values: the ratio should be near qmax(8)/qmax(4) = 18.</p>
+  <details class="deeper"><summary>Hints <span class="hint">try without first</span></summary><ul>
+    <li><code>qmax</code> is a one-liner; the rest of the milestone is built on it.</li>
+    <li>Clamp after rounding: <code>max(-q, min(q, round(v / s)))</code>. For absmax-derived scales the clamp never fires, but it protects you once milestone 6 changes the scales.</li>
+    <li>The returned integers must be Python <code>int</code>s: <code>round(x)</code> with one argument returns an int.</li>
+    <li>Do not compute <code>1 / s</code> once and multiply: keep <code>v / s</code>, so you round exactly what the reference rounds.</li>
+  </ul></details>
+  <details class="deeper"><summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> qmax(bits):
+    <span class="str">"""The largest integer of a signed `bits`-bit symmetric grid: 7 for 4 bits, 127 for 8. (The grid is -qmax..qmax.)"""</span>
+    <span class="kw">return</span> <span class="num">2</span> ** (bits - <span class="num">1</span>) - <span class="num">1</span>
+
+<span class="kw">def</span> scale_sym(values, bits):
+    <span class="str">"""absmax / qmax(bits). An all-zero list has scale 1.0, so that nothing divides by zero."""</span>
+    m = max(abs(v) <span class="kw">for</span> v <span class="kw">in</span> values)
+    <span class="kw">return</span> m / qmax(bits) <span class="kw">if</span> m &gt; <span class="num">0</span> <span class="kw">else</span> <span class="num">1.0</span>
+
+<span class="kw">def</span> quantise_sym(values, bits):
+    <span class="str">"""Return (ints, scale): ints[i] = clamp(round(values[i] / scale), -qmax, +qmax), using Python's round()."""</span>
+    s = scale_sym(values, bits)
+    q = qmax(bits)
+    <span class="kw">return</span> [max(-q, min(q, round(v / s))) <span class="kw">for</span> v <span class="kw">in</span> values], s
+
+<span class="kw">def</span> dequantise_sym(ints, scale):
+    <span class="str">"""ints * scale, as floats."""</span>
+    <span class="kw">return</span> [q * scale <span class="kw">for</span> q <span class="kw">in</span> ints]</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: asymmetric quantisation and the zero point</h2>
+<p>A symmetric grid spends half its levels on negative numbers. That is right for weights, which are close to symmetric around zero, and wasteful for data that is all positive, such as the output of a ReLU. <span class="term">Asymmetric quantisation</span> places the grid over the actual interval [lo, hi] of the data. The integers are now unsigned, 0 to 2<sup>bits</sup>&minus;1, and a <span class="term">zero point</span> <em>z</em> says which integer stands for real zero:</p>
+<p style="text-align:center"><em>s</em> = (hi &minus; lo) / (2<sup>bits</sup> &minus; 1),&nbsp;&nbsp;&nbsp; <em>z</em> = round(&minus;lo / <em>s</em>),&nbsp;&nbsp;&nbsp; <em>q</em> = clamp(round(<em>w</em> / <em>s</em>) + <em>z</em>, 0, 2<sup>bits</sup>&minus;1),&nbsp;&nbsp;&nbsp; <em>w&#770;</em> = (<em>q</em> &minus; <em>z</em>) &times; <em>s</em></p>
+<p>One rule makes the scheme usable: <strong>real zero must be inside the range</strong>, so take lo = min(min(values), 0) and hi = max(max(values), 0). Zero padding, masked positions and ReLU outputs are exactly zero in a model, and the zero point is rounded to an integer precisely so that they stay exactly zero after quantisation. A grid that cannot represent 0.0 would add a small constant error to every padded position.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 260" role="img" aria-label="Two number lines for 3-bit quantisation of data between 0 and 6. The symmetric grid has seven levels from minus 6 to 6 in steps of 2, and the three negative levels are never used, leaving four usable levels in the data region. The asymmetric grid places eight levels from 0 to 6 in steps of 0.857, all in the data region.">
+<defs><marker id="ahLT-L7b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="20" text-anchor="start" class="t-sm t-bold">Three bits, data in 0 to 6 (a ReLU output, say): where do the levels land?</text>
+<text x="10" y="48" text-anchor="start" class="t-xs t-bold">symmetric: scale 6/3 = 2.00, levels -6 to 6</text>
+<rect x="380.0" y="68" width="295.4" height="48" rx="4" class="fs-green"/>
+<line x1="60" y1="92" x2="700" y2="92" class="line-thin"/>
+<circle cx="84.6" cy="92" r="6" class="box"/>
+<circle cx="183.1" cy="92" r="6" class="box"/>
+<circle cx="281.5" cy="92" r="6" class="box"/>
+<circle cx="380.0" cy="92" r="6" class="f-blue"/>
+<circle cx="478.5" cy="92" r="6" class="f-blue"/>
+<circle cx="576.9" cy="92" r="6" class="f-blue"/>
+<circle cx="675.4" cy="92" r="6" class="f-blue"/>
+<line x1="84.6" y1="102" x2="84.6" y2="107" class="line-thin"/><text x="84.6" y="120" text-anchor="middle" class="t-xs t-muted">-6</text>
+<line x1="183.1" y1="102" x2="183.1" y2="107" class="line-thin"/><text x="183.1" y="120" text-anchor="middle" class="t-xs t-muted">-4</text>
+<line x1="281.5" y1="102" x2="281.5" y2="107" class="line-thin"/><text x="281.5" y="120" text-anchor="middle" class="t-xs t-muted">-2</text>
+<line x1="380.0" y1="102" x2="380.0" y2="107" class="line-thin"/><text x="380.0" y="120" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="478.5" y1="102" x2="478.5" y2="107" class="line-thin"/><text x="478.5" y="120" text-anchor="middle" class="t-xs t-muted">2</text>
+<line x1="576.9" y1="102" x2="576.9" y2="107" class="line-thin"/><text x="576.9" y="120" text-anchor="middle" class="t-xs t-muted">4</text>
+<line x1="675.4" y1="102" x2="675.4" y2="107" class="line-thin"/><text x="675.4" y="120" text-anchor="middle" class="t-xs t-muted">6</text>
+<text x="10" y="166" text-anchor="start" class="t-xs t-bold">asymmetric: scale 6/7 = 0.857, zero point 0, levels 0 to 6</text>
+<rect x="380.0" y="186" width="295.4" height="48" rx="4" class="fs-green"/>
+<line x1="60" y1="210" x2="700" y2="210" class="line-thin"/>
+<circle cx="380.0" cy="210" r="6" class="f-blue"/>
+<circle cx="422.2" cy="210" r="6" class="f-blue"/>
+<circle cx="464.4" cy="210" r="6" class="f-blue"/>
+<circle cx="506.6" cy="210" r="6" class="f-blue"/>
+<circle cx="548.8" cy="210" r="6" class="f-blue"/>
+<circle cx="591.0" cy="210" r="6" class="f-blue"/>
+<circle cx="633.2" cy="210" r="6" class="f-blue"/>
+<circle cx="675.4" cy="210" r="6" class="f-blue"/>
+<line x1="84.6" y1="220" x2="84.6" y2="225" class="line-thin"/><text x="84.6" y="238" text-anchor="middle" class="t-xs t-muted">-6</text>
+<line x1="183.1" y1="220" x2="183.1" y2="225" class="line-thin"/><text x="183.1" y="238" text-anchor="middle" class="t-xs t-muted">-4</text>
+<line x1="281.5" y1="220" x2="281.5" y2="225" class="line-thin"/><text x="281.5" y="238" text-anchor="middle" class="t-xs t-muted">-2</text>
+<line x1="380.0" y1="220" x2="380.0" y2="225" class="line-thin"/><text x="380.0" y="238" text-anchor="middle" class="t-xs t-muted">0</text>
+<line x1="478.5" y1="220" x2="478.5" y2="225" class="line-thin"/><text x="478.5" y="238" text-anchor="middle" class="t-xs t-muted">2</text>
+<line x1="576.9" y1="220" x2="576.9" y2="225" class="line-thin"/><text x="576.9" y="238" text-anchor="middle" class="t-xs t-muted">4</text>
+<line x1="675.4" y1="220" x2="675.4" y2="225" class="line-thin"/><text x="675.4" y="238" text-anchor="middle" class="t-xs t-muted">6</text>
+<text x="232.3" y="76" text-anchor="middle" class="t-xs t-muted">3 levels never used</text>
+<text x="527.7" y="62" text-anchor="middle" class="t-xs tc-green">data live here: 4 usable levels</text>
+<text x="527.7" y="180" text-anchor="middle" class="t-xs tc-green">same data: 8 usable levels</text>
+</svg>
+<figcaption><strong>Symmetric wastes half the grid on one-sided data.</strong> Filled dots are levels the data can reach; the hollow ones are not. The asymmetric grid halves the step (2.00 to 0.86) by spending its levels where the values are, at the price of one stored zero point.</figcaption>
+</figure>
+<p>The price of the extra flexibility is one more stored number per group and an extra subtraction in the arithmetic (the zero-point term in the integer matrix multiply). That is why weights, which gain almost nothing, are usually symmetric, and why asymmetric schemes appear mostly for activations and for the key-value cache, where the values really are lopsided.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>quantise_asym(values, bits)</code> (returning <code>(ints, scale, zero_point)</code>) and <code>dequantise_asym(ints, scale, zero_point)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. Hand cases first: <code>[-1.0, 0.0, 3.0]</code> at 3 bits gives ints <code>[0, 2, 7]</code>, scale 4/7, zero point 2; <code>0..7</code> at 3 bits is already on the grid; <code>[1.0, 2.0, 5.0]</code> at 4 bits has zero point 0 (zero is forced into the range). Then forty seeded lists, some shifted away from zero, each containing an exact 0.0 that must come back as exactly 0.0, with every integer in range and every error at most half a step. Last, a comparison at int4: on ReLU-like data asymmetric must be under 0.6 times the symmetric error, and on zero-centred data the two must be within 25% of each other.</p>
+  <details class="deeper"><summary>Hints <span class="hint">try without first</span></summary><ul>
+    <li>The all-zero case again: <code>hi == lo</code> means a zero range; return <code>([0, ...], 1.0, 0)</code>.</li>
+    <li>The zero point is an <code>int</code>, and it can be anywhere from 0 (all-positive data) to 2<sup>bits</sup>&minus;1 (all-negative data).</li>
+    <li>The clamp matters here: rounding the zero point can push the maximum one step past the top of the grid.</li>
+    <li>If the exact-zero test fails, you probably rounded <code>-lo / scale</code> in one place and recomputed it differently in another. Return the same <code>z</code> you subtract on the way back.</li>
+  </ul></details>
+  <details class="deeper"><summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> quantise_asym(values, bits):
+    <span class="str">"""Return (ints, scale, zero_point) on the UNSIGNED grid 0 .. 2**bits - 1."""</span>
+    top = <span class="num">2</span> ** bits - <span class="num">1</span>
+    lo, hi = min(min(values), <span class="num">0.0</span>), max(max(values), <span class="num">0.0</span>)
+    <span class="kw">if</span> hi == lo:
+        <span class="kw">return</span> [<span class="num">0</span>] * len(values), <span class="num">1.0</span>, <span class="num">0</span>
+    s = (hi - lo) / top
+    z = round(-lo / s)
+    <span class="kw">return</span> [max(<span class="num">0</span>, min(top, round(v / s) + z)) <span class="kw">for</span> v <span class="kw">in</span> values], s, z
+
+<span class="kw">def</span> dequantise_asym(ints, scale, zero_point):
+    <span class="str">"""(ints - zero_point) * scale, as floats."""</span>
+    <span class="kw">return</span> [(q - zero_point) * scale <span class="kw">for</span> q <span class="kw">in</span> ints]</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 3: per-tensor, per-channel and per-group scales</h2>
+<p>So far one scale covered the list you gave it. A weight matrix offers a choice of which weights share a scale, and chapter 19's lesson is that the choice matters more as bits fall:</p>
+<dl class="terms">
+  <dt>Per-tensor</dt><dd>One scale for the whole matrix. Cheapest, and one loud row sets the step for all of it.</dd>
+  <dt>Per-channel</dt><dd>One scale per row of <code>W</code> (per output channel). The dot product that produces output <em>d</em> uses a single scale, so applying it costs almost nothing.</dd>
+  <dt>Per-group</dt><dd>One scale per run of <em>g</em> consecutive weights within a row, with <em>g</em> typically 32, 64 or 128. It confines a spike to its group, and it costs one scale per <em>g</em> weights.</dd>
+</dl>
+<p>Scales are numbers that must be stored, usually in 16 bits. So the real storage per weight is <code>bits + scale_bits &times; (number of scales) / (number of weights)</code>. With groups of 128 and a 16-bit scale that is 16/128 = 0.125 extra bits, and the 4-bit model is a 4.125-bit model; with groups of 32 it would be 4.5. Per-channel on a 4096 &times; 4096 matrix adds only 16/4096 bits, which is why it is the default for int8.</p>
+<p>Here is what the three choices do to the lab's layer as the number of bits falls (the experiment uses your <code>fake_quantise_matrix</code>):</p>
+<pre class="terminal" data-title="exp_bits.py"><code>"""Error against bit width, for per-tensor, per-channel and group-128 scales on the synthetic layer."""
+from solution import *
+
+W = make_weights()
+print(f"{'bits':&gt;4}{'per-tensor':&gt;12}{'per-channel':&gt;13}{'group 128':&gt;11}   levels")
+for bits in (8, 6, 5, 4, 3, 2):
+    row = [rel_error(fake_quantise_matrix(W, bits, g, 128), W) for g in ("tensor", "channel", "group")]
+    print(f"{bits:&gt;4}" + "".join(f"{e:&gt;{w}.4f}" for e, w in zip(row, (12, 13, 11))) + f"   {2 * qmax(bits) + 1}")</code></pre>
+<pre class="terminal" data-title="output"><code>bits  per-tensor  per-channel  group 128   levels
+   8      0.0409       0.0075     0.0066   255
+   6      0.1676       0.0309     0.0277   63
+   5      0.2716       0.0636     0.0553   31
+   4      0.3154       0.1353     0.1216   15
+   3      0.4485       0.2937     0.2622   7
+   2      0.8854       0.8025     0.7599   3</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 760 264" role="img" aria-label="A log-scale line chart of relative weight error against bit width for three scale granularities. At int8 the errors are 0.041 per tensor, 0.0075 per channel and 0.0066 per group. At int4 they are 0.315, 0.135 and 0.122. At int2 all three exceed 0.75.">
+<defs><marker id="ahLT-L7c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="20" text-anchor="start" class="t-sm t-bold">Relative weight error of the 48 x 256 layer, by bit width (log scale)</text>
+<line x1="80" y1="203.8" x2="700" y2="203.8" class="line-thin"/><text x="72" y="207.8" text-anchor="end" class="t-xs t-muted">0.01</text>
+<line x1="80" y1="116.9" x2="700" y2="116.9" class="line-thin"/><text x="72" y="120.9" text-anchor="end" class="t-xs t-muted">0.1</text>
+<line x1="80" y1="30.0" x2="700" y2="30.0" class="line-thin"/><text x="72" y="34.0" text-anchor="end" class="t-xs t-muted">1</text>
+<line x1="80" y1="230" x2="80" y2="236" class="line-thin"/><text x="80" y="252" text-anchor="middle" class="t-xs t-muted">int8</text>
+<line x1="328" y1="230" x2="328" y2="236" class="line-thin"/><text x="328" y="252" text-anchor="middle" class="t-xs t-muted">int6</text>
+<line x1="452" y1="230" x2="452" y2="236" class="line-thin"/><text x="452" y="252" text-anchor="middle" class="t-xs t-muted">int5</text>
+<line x1="576" y1="230" x2="576" y2="236" class="line-thin"/><text x="576" y="252" text-anchor="middle" class="t-xs t-muted">int4</text>
+<line x1="700" y1="230" x2="700" y2="236" class="line-thin"/><text x="700" y="252" text-anchor="middle" class="t-xs t-muted">int3</text>
+<line x1="824" y1="230" x2="824" y2="236" class="line-thin"/><text x="824" y="252" text-anchor="middle" class="t-xs t-muted">int2</text>
+<polyline points="80,150.7 328,97.4 452,79.2 576,73.6 700,60.3 824,34.6" class="line s-orange" style="stroke-width:2.5"/>
+<circle cx="80" cy="150.7" r="4" class="f-orange"/>
+<circle cx="328" cy="97.4" r="4" class="f-orange"/>
+<circle cx="452" cy="79.2" r="4" class="f-orange"/>
+<circle cx="576" cy="73.6" r="4" class="f-orange"/>
+<circle cx="700" cy="60.3" r="4" class="f-orange"/>
+<circle cx="824" cy="34.6" r="4" class="f-orange"/>
+<polyline points="80,214.6 328,161.3 452,134.0 576,105.5 700,76.3 824,38.3" class="line s-blue" style="stroke-width:2.5"/>
+<circle cx="80" cy="214.6" r="4" class="f-blue"/>
+<circle cx="328" cy="161.3" r="4" class="f-blue"/>
+<circle cx="452" cy="134.0" r="4" class="f-blue"/>
+<circle cx="576" cy="105.5" r="4" class="f-blue"/>
+<circle cx="700" cy="76.3" r="4" class="f-blue"/>
+<circle cx="824" cy="38.3" r="4" class="f-blue"/>
+<polyline points="80,219.5 328,165.4 452,139.3 576,109.5 700,80.5 824,40.4" class="line s-teal" style="stroke-width:2.5"/>
+<circle cx="80" cy="219.5" r="4" class="f-teal"/>
+<circle cx="328" cy="165.4" r="4" class="f-teal"/>
+<circle cx="452" cy="139.3" r="4" class="f-teal"/>
+<circle cx="576" cy="109.5" r="4" class="f-teal"/>
+<circle cx="700" cy="80.5" r="4" class="f-teal"/>
+<circle cx="824" cy="40.4" r="4" class="f-teal"/>
+<line x1="100" y1="44" x2="128" y2="44" class="line s-orange" style="stroke-width:2.5"/><circle cx="114" cy="44" r="4" class="f-orange"/><text x="138" y="48" class="t-xs" text-anchor="start">per-tensor</text>
+<line x1="100" y1="62" x2="128" y2="62" class="line s-blue" style="stroke-width:2.5"/><circle cx="114" cy="62" r="4" class="f-blue"/><text x="138" y="66" class="t-xs" text-anchor="start">per-channel</text>
+<line x1="100" y1="80" x2="128" y2="80" class="line s-teal" style="stroke-width:2.5"/><circle cx="114" cy="80" r="4" class="f-teal"/><text x="138" y="84" class="t-xs" text-anchor="start">group of 128</text>
+</svg>
+<figcaption><strong>Finer scales are worth most when bits are scarce, and no scale rescues two bits.</strong> The per-tensor line sits a whole bit or two above the others because two loud rows set its step. The numbers are from <code>exp_bits.py</code> below; the gap between per-channel and group scales is small here because the spikes are few.</figcaption>
+</figure>
+<p>At int8 a per-tensor scale costs a factor of five in error; at int4 it is a factor of 2.3 over per-channel and 2.6 over groups. Groups beat rows by only 10 to 15% here because there are just four spikes. The numbers differ from chapter 19's 1,024 &times; 1,024 matrix (0.8146, 0.1404 and 0.1168 at int4) because this layer is smaller and has spikes; the ordering is the point. And at 2 bits no granularity helps: the grid is {&minus;1, 0, +1} &times; scale and most of the information is gone.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>fake_quantise_matrix(W, bits, granularity, group=128)</code> (symmetric; granularity is <code>"tensor"</code>, <code>"channel"</code> or <code>"group"</code>; raise <code>ValueError</code> for anything else; return a new matrix and leave <code>W</code> alone), <code>n_scales(rows, cols, granularity, group=128)</code> and <code>bits_per_weight(bits, rows, cols, granularity, group=128, scale_bits=16)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It checks a 2 &times; 2 matrix by hand for all three granularities (a group of size 1 must reproduce the matrix exactly), that the input is not modified, <code>n_scales</code> (including a short last group: 300 columns in groups of 128 is three groups), <code>bits_per_weight(4, 4096, 4096, "group", 128) = 4.125</code>, twelve seeded random matrices against a plain reference implementation, and then the scenario on the lab's layer: per-tensor must be more than twice as bad as per-channel at both int8 and int4, groups must beat rows, and int4 must be more than five times worse than int8 for every granularity.</p>
+  <details class="deeper"><summary>Hints <span class="hint">try without first</span></summary><ul>
+    <li>Reuse <code>quantise_sym</code> and <code>dequantise_sym</code> from milestone 1: per-channel is one call per row, per-tensor is one call on the flattened matrix (<code>flatten</code> is given) that you reshape afterwards.</li>
+    <li>Groups run along a row, <code>row[i:i + group]</code> for <code>i</code> in <code>range(0, len(row), group)</code>; the slice at the end is allowed to be short.</li>
+    <li>Ceiling division without <code>math</code>: <code>-(-cols // group)</code>.</li>
+    <li>Build a new matrix; <code>[v * 2 for v in row]</code> style comprehensions never touch the input.</li>
+  </ul></details>
+  <details class="deeper"><summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> fake_quantise_matrix(W, bits, granularity, group=<span class="num">128</span>):
+    <span class="str">"""Quantise then dequantise a matrix (symmetric), so the result shows what the integers mean."""</span>
+    <span class="kw">if</span> granularity == <span class="str">"tensor"</span>:
+        ints, s = quantise_sym(flatten(W), bits)
+        flat = dequantise_sym(ints, s)
+        c = len(W[<span class="num">0</span>])
+        <span class="kw">return</span> [flat[i * c:(i + <span class="num">1</span>) * c] <span class="kw">for</span> i <span class="kw">in</span> range(len(W))]
+    out = []
+    <span class="kw">for</span> row <span class="kw">in</span> W:
+        <span class="kw">if</span> granularity == <span class="str">"channel"</span>:
+            ints, s = quantise_sym(row, bits)
+            out.append(dequantise_sym(ints, s))
+        <span class="kw">elif</span> granularity == <span class="str">"group"</span>:
+            new = []
+            <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">0</span>, len(row), group):
+                ints, s = quantise_sym(row[i:i + group], bits)
+                new.extend(dequantise_sym(ints, s))
+            out.append(new)
+        <span class="kw">else</span>:
+            <span class="kw">raise</span> ValueError(<span class="str">f"unknown granularity {granularity!r}"</span>)
+    <span class="kw">return</span> out
+
+<span class="kw">def</span> n_scales(rows, cols, granularity, group=<span class="num">128</span>):
+    <span class="str">"""How many scale numbers a rows x cols matrix needs: 1, rows, or rows * ceil(cols / group)."""</span>
+    <span class="kw">if</span> granularity == <span class="str">"tensor"</span>:
+        <span class="kw">return</span> <span class="num">1</span>
+    <span class="kw">if</span> granularity == <span class="str">"channel"</span>:
+        <span class="kw">return</span> rows
+    <span class="kw">if</span> granularity == <span class="str">"group"</span>:
+        <span class="kw">return</span> rows * -(-cols // group)
+    <span class="kw">raise</span> ValueError(<span class="str">f"unknown granularity {granularity!r}"</span>)
+
+<span class="kw">def</span> bits_per_weight(bits, rows, cols, granularity, group=<span class="num">128</span>, scale_bits=<span class="num">16</span>):
+    <span class="str">"""Effective storage per weight: bits + scale_bits * n_scales / (rows * cols)."""</span>
+    <span class="kw">return</span> bits + scale_bits * n_scales(rows, cols, granularity, group) / (rows * cols)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: real bytes</h2>
+<p>Until now every quantised value has been a Python float standing in for an integer. A deployed model stores the integers themselves, and for 4-bit weights that means two values per byte. <span class="term">Packing</span> puts the first value in the low four bits and the second in the high four. A negative value is stored as its 4-bit two's complement, <code>v &amp; 0xF</code> (so &minus;2 is <code>0xE</code> and &minus;8 is <code>0x8</code>), and unpacking sign-extends: a nibble of 8 or more means <em>nibble &minus; 16</em>. An odd number of values leaves a zero nibble of padding. Real file formats differ in the order they pack in and in how they interleave values to suit their kernels, so treat this as the idea rather than any one format.</p>
+<p>With packing you can count bytes honestly. For <em>n</em> weights at <em>b</em> bits with one 16-bit scale per group of <em>g</em>: <code>ceil(n &middot; b / 8) + ceil(n / g) &middot; 2</code> bytes. That is the whole memory story of a weight-only model, and it is the first line of every capacity plan. With the shapes of Llama 3 8B from the Llama 3 report (Dubey et al., 2024), which the given <code>llama_params("8B")</code> turns into 8.03 billion parameters, and the assumptions of chapter 19 (a 24 GB card, 2 GB set aside for the CUDA context and activations, a bf16 KV cache of 128 KiB per token, so exactly 1 GiB for an 8,192-token sequence), the question "how many conversations can this card hold?" becomes arithmetic:</p>
+<p style="text-align:center">sequences = floor((24 GB &minus; 2 GB &minus; weight bytes) / 1 GiB)</p>
+<p>The 24 GB figure is the memory of consumer-class cards such as NVIDIA's RTX 4090; the 2 GB of overhead is an assumption, and real overhead depends on the engine and batch shape.</p>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026: block-scaled 4-bit floating-point formats</p>
+  <p>This lab uses integer grids with a 16-bit scale per group of 128. A newer family keeps small groups but makes both the element and the scale cheaper. The Open Compute Project's Microscaling (MX) specification, version 1.0 of September 2023, defines blocks of 32 elements that share one 8-bit power-of-two scale; with 4-bit floating-point (E2M1) elements that is about 4.25 bits per weight, against this lab's 4.125 for int4 with 16-bit scales and groups of 128. NVIDIA's NVFP4 is described as using blocks of 16 elements with an FP8 (E4M3) scale. I read these figures in secondary sources and did not fetch the specifications themselves, and hardware support and library defaults move quickly, so check the current documentation before relying on any of them. The accounting you write in this milestone applies unchanged: bits per element plus the scale bits divided by the block size.</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>pack_int4(ints)</code> (returns <code>bytes</code>; raise <code>ValueError</code> for a value outside &minus;8..7), <code>unpack_int4(data, n)</code>, <code>weight_bytes(n_weights, bits, group=None, scale_bits=16)</code> and <code>sequences_that_fit(weights_bytes, gpu_bytes=24e9, overhead_bytes=2e9, kv_bytes_per_sequence=...)</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. <code>pack_int4([1, -2, 7, -8, 3])</code> must be the three bytes <code>e1 87 03</code>; out-of-range values must raise; thirty seeded lists (length 0 to 120) must round-trip and take ceil(n/2) bytes; <code>weight_bytes(1_000_000, 4, 128)</code> must be 515,626; the formula must match the length of the really packed 48 &times; 256 layer plus its scales; and chapter 19's table must come out exactly: Llama 3 8B holds 5, 13, 16 and 17 sequences at bf16, int8, int4 and int3 (group 128), while the 70B model at int4 holds none (the answer is 0, never negative).</p>
+  <details class="deeper"><summary>Hints <span class="hint">try without first</span></summary><ul>
+    <li>Turn every value into a nibble first (<code>v &amp; 0xF</code>), pad to an even count, then combine pairs: <code>lo | (hi &lt;&lt; 4)</code>.</li>
+    <li>Unpacking a byte <code>b</code> gives <code>b &amp; 0xF</code> then <code>b &gt;&gt; 4</code>; truncate to <code>n</code> at the end so the padding nibble is dropped.</li>
+    <li>For <code>weight_bytes</code> use integer ceiling division (<code>-(-x // y)</code>) rather than floats: 7,812.5 groups does not exist.</li>
+    <li>The floor in <code>sequences_that_fit</code> is on the number of whole sequences; clamp negative room to zero.</li>
+  </ul></details>
+  <details class="deeper"><summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> pack_int4(ints):
+    <span class="str">"""Pack signed 4-bit integers (-8 .. 7) two per byte, as `bytes`."""</span>
+    nibbles = []
+    <span class="kw">for</span> v <span class="kw">in</span> ints:
+        <span class="kw">if</span> <span class="kw">not</span> -<span class="num">8</span> &lt;= v &lt;= <span class="num">7</span>:
+            <span class="kw">raise</span> ValueError(<span class="str">f"{v} does not fit in a signed 4-bit integer"</span>)
+        nibbles.append(v &amp; 0xF)
+    <span class="kw">if</span> len(nibbles) % <span class="num">2</span>:
+        nibbles.append(<span class="num">0</span>)
+    <span class="kw">return</span> bytes(nibbles[i] | (nibbles[i + <span class="num">1</span>] &lt;&lt; <span class="num">4</span>) <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">0</span>, len(nibbles), <span class="num">2</span>))
+
+<span class="kw">def</span> unpack_int4(data, n):
+    <span class="str">"""Inverse of pack_int4: the first n signed values (sign-extend each nibble)."""</span>
+    out = []
+    <span class="kw">for</span> b <span class="kw">in</span> data:
+        <span class="kw">for</span> nib <span class="kw">in</span> (b &amp; 0xF, b &gt;&gt; <span class="num">4</span>):
+            out.append(nib - <span class="num">16</span> <span class="kw">if</span> nib &gt;= <span class="num">8</span> <span class="kw">else</span> nib)
+    <span class="kw">return</span> out[:n]
+
+<span class="kw">def</span> weight_bytes(n_weights, bits, group=<span class="kw">None</span>, scale_bits=<span class="num">16</span>):
+    <span class="str">"""Bytes to store n_weights at `bits` bits each, plus one `scale_bits` scale per `group` weights (none if group is None)."""</span>
+    total = -(-n_weights * bits // <span class="num">8</span>)
+    <span class="kw">if</span> group:
+        total += -(-n_weights // group) * scale_bits // <span class="num">8</span>
+    <span class="kw">return</span> total
+
+<span class="kw">def</span> sequences_that_fit(weights_bytes, gpu_bytes=<span class="num">24e9</span>, overhead_bytes=<span class="num">2e9</span>, kv_bytes_per_sequence=KV_BYTES_PER_SEQUENCE_8B):
+    <span class="str">"""How many whole sequences' KV caches fit beside the weights: floor((gpu - overhead - weights) / kv), at least 0."""</span>
+    room = gpu_bytes - overhead_bytes - weights_bytes
+    <span class="kw">return</span> max(<span class="num">0</span>, int(room // kv_bytes_per_sequence))</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: activation outliers</h2>
+<p>Weights are the easy half: known in advance, close to symmetric, quantised once. <span class="term">Activations</span> are computed fresh for every input, and a few input channels are huge in every token. For a layer to run on fast integer hardware (W8A8: 8-bit weights and 8-bit activations) the activations need a scale too, and the scale cannot be per input channel, because the integer matrix multiplication sums over input channels and the scales would have to sit inside that sum. A per-tensor scale is set by the largest value in the matrix, which is an outlier channel, so every other channel is crushed onto a few levels. A scale per token (per row of <code>X</code>) helps a little, but the outlier channels are in every row.</p>
+<p>The lab's activations have two such channels at 40 times the usual size. Two remedies from chapter 19 are yours to implement.</p>
+<p><strong>Mixed precision (LLM.int8(), Dettmers et al., 2022).</strong> Find the outlier channels, multiply those in full precision, and do the rest in int8: <code>Y = X<sub>normal</sub> W<sub>normal</sub><sup>T</sup> (int8) + X<sub>outlier</sub> W<sub>outlier</sub><sup>T</sup> (float)</code>. The paper detects outliers with an absolute magnitude threshold; the lab uses a relative one, a channel whose absmax is more than 6 times the <em>median</em> channel absmax, because the synthetic scale is arbitrary.</p>
+<p><strong>SmoothQuant (Xiao et al., 2022).</strong> Divide input channel <em>c</em> of <code>X</code> by a factor <em>s<sub>c</sub></em> and multiply column <em>c</em> of <code>W</code> by the same factor. The product is unchanged, because (<em>x<sub>c</sub></em>/<em>s<sub>c</sub></em>)(<em>s<sub>c</sub></em> <em>w<sub>c</sub></em>) = <em>x<sub>c</sub></em><em>w<sub>c</sub></em>, but the outlier has moved from the activations (hard to scale) to the weights (where per-channel scales absorb it). The factor balances the two sides:</p>
+<p style="text-align:center"><em>s<sub>c</sub></em> = max|<em>X<sub>c</sub></em>|<sup>&alpha;</sup> / max|<em>W<sub>c</sub></em>|<sup>1&minus;&alpha;</sup></p>
+<p>where &alpha; (usually 0.5) sets how much of the difficulty to migrate. At &alpha; = 0.5, after smoothing, channel <em>c</em> has the same absmax, &radic;(max|<em>X<sub>c</sub></em>| &middot; max|<em>W<sub>c</sub></em>|), on both sides; at &alpha; = 1 all of it moves and X's channels all have absmax 1.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-label="Four bar panels for input channels 0, 2, 11 and 201. Before smoothing, the activation absmax of channels 11 and 201 is about 100 while the other channels are about 2.7, and the weight absmax is 0.1 to 0.4 everywhere. After smoothing at alpha 0.5, the activation absmax is 0.55 to 5.55 for all four channels and the weight absmax for channels 11 and 201 has grown to 4.78 and 5.55.">
+<defs><marker id="ahLT-L7d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="20" text-anchor="start" class="t-sm t-bold">SmoothQuant at alpha = 0.5 moves the outlier from X into W (absmax per input channel)</text>
+<text x="10" y="50" text-anchor="start" class="t-xs t-bold">X before (axis 0 to 110)</text>
+<text x="44" y="73" text-anchor="end" class="t-xs mono">c0</text>
+<rect x="50" y="60" width="5.5" height="18" rx="3" class="f-green"/>
+<text x="61.5" y="73" text-anchor="start" class="t-xs">2.6</text>
+<text x="44" y="97" text-anchor="end" class="t-xs mono">c2</text>
+<rect x="50" y="84" width="5.7" height="18" rx="3" class="f-green"/>
+<text x="61.7" y="97" text-anchor="start" class="t-xs">2.7</text>
+<text x="44" y="121" text-anchor="end" class="t-xs mono">c11</text>
+<rect x="50" y="108" width="211.9" height="18" rx="3" class="f-green"/>
+<text x="267.9" y="121" text-anchor="start" class="t-xs">101.3</text>
+<text x="44" y="145" text-anchor="end" class="t-xs mono">c201</text>
+<rect x="50" y="132" width="207.1" height="18" rx="3" class="f-green"/>
+<text x="263.1" y="145" text-anchor="start" class="t-xs">99.0</text>
+<text x="390" y="50" text-anchor="start" class="t-xs t-bold">X after, divided by s (same axis)</text>
+<text x="424" y="73" text-anchor="end" class="t-xs mono">c0</text>
+<rect x="430" y="60" width="2.1" height="18" rx="3" class="f-green"/>
+<text x="438.1" y="73" text-anchor="start" class="t-xs">1.02</text>
+<text x="424" y="97" text-anchor="end" class="t-xs mono">c2</text>
+<rect x="430" y="84" width="2.0" height="18" rx="3" class="f-green"/>
+<text x="438.0" y="97" text-anchor="start" class="t-xs">0.55</text>
+<text x="424" y="121" text-anchor="end" class="t-xs mono">c11</text>
+<rect x="430" y="108" width="10.0" height="18" rx="3" class="f-green"/>
+<text x="446.0" y="121" text-anchor="start" class="t-xs">4.78</text>
+<text x="424" y="145" text-anchor="end" class="t-xs mono">c201</text>
+<rect x="430" y="132" width="11.6" height="18" rx="3" class="f-green"/>
+<text x="447.6" y="145" text-anchor="start" class="t-xs">5.55</text>
+<text x="10" y="180" text-anchor="start" class="t-xs t-bold">W before (axis 0 to 6)</text>
+<text x="44" y="203" text-anchor="end" class="t-xs mono">c0</text>
+<rect x="50" y="190" width="15.1" height="18" rx="3" class="f-purple"/>
+<text x="71.1" y="203" text-anchor="start" class="t-xs">0.39</text>
+<text x="44" y="227" text-anchor="end" class="t-xs mono">c2</text>
+<rect x="50" y="214" width="4.3" height="18" rx="3" class="f-purple"/>
+<text x="60.3" y="227" text-anchor="start" class="t-xs">0.11</text>
+<text x="44" y="251" text-anchor="end" class="t-xs mono">c11</text>
+<rect x="50" y="238" width="8.7" height="18" rx="3" class="f-purple"/>
+<text x="64.7" y="251" text-anchor="start" class="t-xs">0.23</text>
+<text x="44" y="275" text-anchor="end" class="t-xs mono">c201</text>
+<rect x="50" y="262" width="11.9" height="18" rx="3" class="f-purple"/>
+<text x="67.9" y="275" text-anchor="start" class="t-xs">0.31</text>
+<text x="390" y="180" text-anchor="start" class="t-xs t-bold">W after, times s (same axis)</text>
+<text x="424" y="203" text-anchor="end" class="t-xs mono">c0</text>
+<rect x="430" y="190" width="39.1" height="18" rx="3" class="f-purple"/>
+<text x="475.1" y="203" text-anchor="start" class="t-xs">1.02</text>
+<text x="424" y="227" text-anchor="end" class="t-xs mono">c2</text>
+<rect x="430" y="214" width="21.1" height="18" rx="3" class="f-purple"/>
+<text x="457.1" y="227" text-anchor="start" class="t-xs">0.55</text>
+<text x="424" y="251" text-anchor="end" class="t-xs mono">c11</text>
+<rect x="430" y="238" width="183.2" height="18" rx="3" class="f-purple"/>
+<text x="619.2" y="251" text-anchor="start" class="t-xs">4.78</text>
+<text x="424" y="275" text-anchor="end" class="t-xs mono">c201</text>
+<rect x="430" y="262" width="212.8" height="18" rx="3" class="f-purple"/>
+<text x="648.8" y="275" text-anchor="start" class="t-xs">5.55</text>
+</svg>
+<figcaption><strong>The difficulty moves; the product does not.</strong> Channels 11 and 201 are the outliers. After dividing X by s and multiplying W by s, every channel of X has an absmax within a factor of ten (0.55 to 5.55 instead of 2.7 to 101), at the cost of two heavy columns in W, which per-channel scales on W absorb. Values are from the lab's own layer with scales calibrated on seed 100.</figcaption>
+</figure>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>fake_quantise_activations(X, bits, granularity)</code> (<code>"tensor"</code> or <code>"token"</code>), <code>find_outlier_channels(x_absmax, ratio=6.0)</code>, <code>mixed_int8_output(X, W, outliers)</code> (X per tensor and W per channel at 8 bits for the normal channels, floats for the outliers), <code>smooth_scales(x_absmax, w_absmax, alpha=0.5)</code> and <code>apply_smoothing(X, W, s)</code> (returns <code>(X', W')</code>). The column statistics <code>col_absmax</code> and <code>col_absmean</code> are given.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. Hand cases: per-tensor and per-token int4 on a 2 &times; 2 matrix; outlier detection with a median over an odd and an even count, and the strict inequality at the boundary; <code>smooth_scales([4, 1], [1, 4], 0.5) = [2, 0.5]</code> and the &alpha; = 0 and 1 extremes; zero absmax keeps scale 1. Eight seeded random layers: smoothing must leave <code>X W<sup>T</sup></code> unchanged to 10<sup>&minus;9</sup>, and at &alpha; = 0.5 the per-channel absmax of X' and W' must be equal. Scenario: on the lab's layer, per-tensor W8A8 must have error above 0.05, per-token must be better, mixed precision must be under 0.02 (and must reduce to plain W8A8 with no outliers and to the exact answer with all channels as outliers), and SmoothQuant must at least halve the per-tensor error.</p>
+  <details class="deeper"><summary>Hints <span class="hint">try without first</span></summary><ul>
+    <li>Per-tensor activations are the same shape of code as per-tensor weights; per-token is one scale per row of <code>X</code>.</li>
+    <li>For the median, sort a copy: the middle element for an odd count, the mean of the two middle ones for an even count. Compare with <code>&gt;</code>, not <code>&gt;=</code>.</li>
+    <li>In <code>mixed_int8_output</code> build the two sub-matrices by selecting columns of both <code>X</code> and <code>W</code> with the same index list, then add the two T &times; D products. If <em>every</em> channel is an outlier there is nothing left to quantise: skip that half.</li>
+    <li>In <code>apply_smoothing</code> the same <code>s[c]</code> divides column <em>c</em> of <code>X</code> and multiplies column <em>c</em> of <code>W</code>. Dividing both, or multiplying both, changes the product.</li>
+    <li>Do not compute <code>smooth_scales</code> from the test activations in your experiments: the report calibrates on one set of tokens and evaluates on another.</li>
+  </ul></details>
+  <details class="deeper"><summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> fake_quantise_activations(X, bits, granularity):
+    <span class="str">"""Quantise then dequantise activations X (T x C), symmetric."""</span>
+    <span class="kw">if</span> granularity == <span class="str">"tensor"</span>:
+        ints, s = quantise_sym(flatten(X), bits)
+        flat = dequantise_sym(ints, s)
+        c = len(X[<span class="num">0</span>])
+        <span class="kw">return</span> [flat[i * c:(i + <span class="num">1</span>) * c] <span class="kw">for</span> i <span class="kw">in</span> range(len(X))]
+    <span class="kw">if</span> granularity == <span class="str">"token"</span>:
+        out = []
+        <span class="kw">for</span> row <span class="kw">in</span> X:
+            ints, s = quantise_sym(row, bits)
+            out.append(dequantise_sym(ints, s))
+        <span class="kw">return</span> out
+    <span class="kw">raise</span> ValueError(<span class="str">f"unknown granularity {granularity!r}"</span>)
+
+<span class="kw">def</span> find_outlier_channels(x_absmax, ratio=<span class="num">6.0</span>):
+    <span class="str">"""Indices of input channels whose absmax exceeds `ratio` times the MEDIAN absmax, in increasing order."""</span>
+    s = sorted(x_absmax)
+    n = len(s)
+    med = s[n // <span class="num">2</span>] <span class="kw">if</span> n % <span class="num">2</span> <span class="kw">else</span> <span class="num">0.5</span> * (s[n // <span class="num">2</span> - <span class="num">1</span>] + s[n // <span class="num">2</span>])
+    <span class="kw">return</span> [c <span class="kw">for</span> c, v <span class="kw">in</span> enumerate(x_absmax) <span class="kw">if</span> v &gt; ratio * med]
+
+<span class="kw">def</span> mixed_int8_output(X, W, outliers):
+    <span class="str">"""LLM.int8()-style decomposition. Y = X_normal W_normal^T (int8) + X_outlier W_outlier^T (float)."""</span>
+    out_set = set(outliers)
+    keep = [c <span class="kw">for</span> c <span class="kw">in</span> range(len(X[<span class="num">0</span>])) <span class="kw">if</span> c <span class="kw">not</span> <span class="kw">in</span> out_set]
+    Xn = [[row[c] <span class="kw">for</span> c <span class="kw">in</span> keep] <span class="kw">for</span> row <span class="kw">in</span> X]
+    Wn = [[row[c] <span class="kw">for</span> c <span class="kw">in</span> keep] <span class="kw">for</span> row <span class="kw">in</span> W]
+    <span class="kw">if</span> keep:
+        Y = matmul_nt(fake_quantise_activations(Xn, <span class="num">8</span>, <span class="str">"tensor"</span>), fake_quantise_matrix(Wn, <span class="num">8</span>, <span class="str">"channel"</span>))
+    <span class="kw">else</span>:                                    <span class="cmt"># every channel is an outlier: nothing left to quantise</span>
+        Y = [[<span class="num">0.0</span>] * len(W) <span class="kw">for</span> _ <span class="kw">in</span> X]
+    <span class="kw">if</span> out_set:
+        idx = sorted(out_set)
+        Xo = [[row[c] <span class="kw">for</span> c <span class="kw">in</span> idx] <span class="kw">for</span> row <span class="kw">in</span> X]
+        Wo = [[row[c] <span class="kw">for</span> c <span class="kw">in</span> idx] <span class="kw">for</span> row <span class="kw">in</span> W]
+        Yo = matmul_nt(Xo, Wo)
+        Y = [[a + b <span class="kw">for</span> a, b <span class="kw">in</span> zip(r1, r2)] <span class="kw">for</span> r1, r2 <span class="kw">in</span> zip(Y, Yo)]
+    <span class="kw">return</span> Y
+
+<span class="kw">def</span> smooth_scales(x_absmax, w_absmax, alpha=<span class="num">0.5</span>):
+    <span class="str">"""SmoothQuant factors s[c] = x_absmax[c]**alpha / w_absmax[c]**(1 - alpha); s[c] = 1.0 if either is 0."""</span>
+    <span class="kw">return</span> [(x ** alpha) / (w ** (<span class="num">1</span> - alpha)) <span class="kw">if</span> x &gt; <span class="num">0</span> <span class="kw">and</span> w &gt; <span class="num">0</span> <span class="kw">else</span> <span class="num">1.0</span> <span class="kw">for</span> x, w <span class="kw">in</span> zip(x_absmax, w_absmax)]
+
+<span class="kw">def</span> apply_smoothing(X, W, s):
+    <span class="str">"""Return (X', W') with X'[t][c] = X[t][c] / s[c] and W'[d][c] = W[d][c] * s[c]. X' W'^T equals X W^T."""</span>
+    <span class="kw">return</span> ([[v / s[c] <span class="kw">for</span> c, v <span class="kw">in</span> enumerate(row)] <span class="kw">for</span> row <span class="kw">in</span> X],
+            [[v * s[c] <span class="kw">for</span> c, v <span class="kw">in</span> enumerate(row)] <span class="kw">for</span> row <span class="kw">in</span> W])</code></pre>
+  </details>
+</div>
+
+<p>With the milestone done, sweep the outlier size from 1 to 100 times and compare the four ways of handling activations (the scales and the outlier channels are found on one set of 64 tokens and the error measured on another):</p>
+<pre class="terminal" data-title="exp_outlier_sweep.py"><code>"""Output error of W8A8 as the activation outlier grows: per-tensor, per-token, mixed precision and SmoothQuant."""
+from solution import *
+
+W = make_weights()
+Wc = fake_quantise_matrix(W, 8, "channel")
+cal_w = col_absmax(W)
+print(f"{'outlier x':&gt;9}{'per-tensor':&gt;12}{'per-token':&gt;11}{'mixed':&gt;9}{'smooth':&gt;9}")
+for f in (1, 5, 20, 40, 100):
+    Xc = make_activations(100, factor=f)
+    X = make_activations(200, factor=f)
+    Y = matmul_nt(X, W)
+    e_t = rel_error(matmul_nt(fake_quantise_activations(X, 8, "tensor"), Wc), Y)
+    e_k = rel_error(matmul_nt(fake_quantise_activations(X, 8, "token"), Wc), Y)
+    outs = find_outlier_channels(col_absmax(Xc))
+    e_m = rel_error(mixed_int8_output(X, W, outs), Y)
+    Xs, Ws = apply_smoothing(X, W, smooth_scales(col_absmax(Xc), cal_w))
+    e_s = rel_error(matmul_nt(fake_quantise_activations(Xs, 8, "tensor"), fake_quantise_matrix(Ws, 8, "channel")), Y)
+    print(f"{f:&gt;9}{e_t:&gt;12.4f}{e_k:&gt;11.4f}{e_m:&gt;9.4f}{e_s:&gt;9.4f}   outlier channels found: {outs}")</code></pre>
+<pre class="terminal" data-title="output"><code>outlier x  per-tensor  per-token    mixed   smooth
+        1      0.0103     0.0084   0.0103   0.0136   outlier channels found: []
+        5      0.0250     0.0142   0.0250   0.0133   outlier channels found: []
+       20      0.0651     0.0328   0.0073   0.0143   outlier channels found: [11, 201]
+       40      0.0920     0.0428   0.0047   0.0125   outlier channels found: [11, 201]
+      100      0.0901     0.0425   0.0021   0.0090   outlier channels found: [11, 201]</code></pre>
+<p>Three things to read from the table. With no outliers (1 times) every method is about equal, and per-token is the best: a scale per token follows each token's own range. As the outlier grows the per-tensor error grows with it and then plateaus near 0.09 once the outlier dominates the scale entirely. Mixed precision gets <em>better</em> as the outlier grows (0.0021 at 100 times), because the outlier channels are exactly the ones it removes from the int8 path, leaving a clean, outlier-free remainder; but at 5 times the median-ratio detector finds nothing (an outlier that small is hidden inside the natural spread of the channels' absmax), so the row equals plain per-tensor. SmoothQuant is steady throughout because it rescales every channel rather than detecting any.</p>
+
+<h2>Milestone 6: AWQ-style scales and calibration</h2>
+<p>Weight-only int4 has no activation to quantise, yet the activations still decide where the error hurts. Output <em>d</em> is a sum of terms <em>x<sub>c</sub> w<sub>dc</sub></em>; rounding error in weight <em>w<sub>dc</sub></em> is multiplied by <em>x<sub>c</sub></em>, so error on the weights in columns where the activations are large costs the most. Lin et al. (2023) ("AWQ: Activation-aware Weight Quantization") protect those columns by scaling: multiply column <em>c</em> of <code>W</code> by <em>s<sub>c</sub></em> before rounding, and divide by it afterwards. A weight scaled up by <em>s</em> is rounded on the same grid (the group scale is set by the group maximum, which has not changed if the scaled weight stays below it), so its relative rounding error falls by about <em>s</em>. The cost appears when <em>s</em> is large enough to raise a group's maximum: the step grows for every other weight in that group. Hence an optimum in between. The scales come from the activations' average magnitude raised to an exponent <em>a</em>:</p>
+<p style="text-align:center"><em>s<sub>c</sub></em> = (mean|<em>x<sub>c</sub></em>|)<sup><em>a</em></sup> / &radic;(max<sub>c</sub> <em>s</em> &middot; min<sub>c</sub> <em>s</em>)</p>
+<p>The division by &radic;(max &middot; min) only centres the scales around 1. You search <em>a</em> on a grid from 0 to 1 and keep the value with the lowest output error on <span class="term">calibration data</span>: a few hundred (here, 64) representative inputs used to measure activation statistics and nothing else. Exponent 0 is plain round-to-nearest (RTN), the baseline.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 264" role="img" aria-label="A line chart of held-out output error against the AWQ exponent from 0 to 1. With matching calibration data the error falls from 0.192 at exponent 0 to 0.063 at exponent 0.4 and then rises to 0.276 at exponent 1, with the best point at 0.4 ringed. With calibration data whose outlier channels are in the wrong place the error stays near 0.19 up to exponent 0.2 and then climbs to 0.91.">
+<defs><marker id="ahLT-L7e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+<text x="10" y="20" text-anchor="start" class="t-sm t-bold">AWQ-style exponent a against held-out output error (int4, group 128)</text>
+<line x1="80" y1="230.0" x2="700" y2="230.0" class="line-thin"/><text x="72" y="234.0" text-anchor="end" class="t-xs t-muted">0</text>
+<line x1="80" y1="180.0" x2="700" y2="180.0" class="line-thin"/><text x="72" y="184.0" text-anchor="end" class="t-xs t-muted">0.25</text>
+<line x1="80" y1="130.0" x2="700" y2="130.0" class="line-thin"/><text x="72" y="134.0" text-anchor="end" class="t-xs t-muted">0.5</text>
+<line x1="80" y1="80.0" x2="700" y2="80.0" class="line-thin"/><text x="72" y="84.0" text-anchor="end" class="t-xs t-muted">0.75</text>
+<line x1="80" y1="30.0" x2="700" y2="30.0" class="line-thin"/><text x="72" y="34.0" text-anchor="end" class="t-xs t-muted">1</text>
+<line x1="80.0" y1="230" x2="80.0" y2="236" class="line-thin"/><text x="80.0" y="252" text-anchor="middle" class="t-xs t-muted">0.0</text>
+<line x1="142.0" y1="230" x2="142.0" y2="236" class="line-thin"/><text x="142.0" y="252" text-anchor="middle" class="t-xs t-muted">0.1</text>
+<line x1="204.0" y1="230" x2="204.0" y2="236" class="line-thin"/><text x="204.0" y="252" text-anchor="middle" class="t-xs t-muted">0.2</text>
+<line x1="266.0" y1="230" x2="266.0" y2="236" class="line-thin"/><text x="266.0" y="252" text-anchor="middle" class="t-xs t-muted">0.3</text>
+<line x1="328.0" y1="230" x2="328.0" y2="236" class="line-thin"/><text x="328.0" y="252" text-anchor="middle" class="t-xs t-muted">0.4</text>
+<line x1="390.0" y1="230" x2="390.0" y2="236" class="line-thin"/><text x="390.0" y="252" text-anchor="middle" class="t-xs t-muted">0.5</text>
+<line x1="452.0" y1="230" x2="452.0" y2="236" class="line-thin"/><text x="452.0" y="252" text-anchor="middle" class="t-xs t-muted">0.6</text>
+<line x1="514.0" y1="230" x2="514.0" y2="236" class="line-thin"/><text x="514.0" y="252" text-anchor="middle" class="t-xs t-muted">0.7</text>
+<line x1="576.0" y1="230" x2="576.0" y2="236" class="line-thin"/><text x="576.0" y="252" text-anchor="middle" class="t-xs t-muted">0.8</text>
+<line x1="638.0" y1="230" x2="638.0" y2="236" class="line-thin"/><text x="638.0" y="252" text-anchor="middle" class="t-xs t-muted">0.9</text>
+<line x1="700.0" y1="230" x2="700.0" y2="236" class="line-thin"/><text x="700.0" y="252" text-anchor="middle" class="t-xs t-muted">1.0</text>
+<line x1="80" y1="191.5" x2="700" y2="191.5" class="line-dash"/><text x="700" y="185.5" text-anchor="end" class="t-xs t-muted">plain rounding (a = 0): 0.192</text>
+<polyline points="80.0,191.5 142.0,210.3 204.0,207.9 266.0,216.0 328.0,217.5 390.0,213.7 452.0,211.2 514.0,200.8 576.0,192.6 638.0,183.4 700.0,174.8" class="line s-green" style="stroke-width:2.5"/>
+<circle cx="80.0" cy="191.5" r="3.5" class="f-green"/>
+<circle cx="142.0" cy="210.3" r="3.5" class="f-green"/>
+<circle cx="204.0" cy="207.9" r="3.5" class="f-green"/>
+<circle cx="266.0" cy="216.0" r="3.5" class="f-green"/>
+<circle cx="328.0" cy="217.5" r="3.5" class="f-green"/>
+<circle cx="390.0" cy="213.7" r="3.5" class="f-green"/>
+<circle cx="452.0" cy="211.2" r="3.5" class="f-green"/>
+<circle cx="514.0" cy="200.8" r="3.5" class="f-green"/>
+<circle cx="576.0" cy="192.6" r="3.5" class="f-green"/>
+<circle cx="638.0" cy="183.4" r="3.5" class="f-green"/>
+<circle cx="700.0" cy="174.8" r="3.5" class="f-green"/>
+<polyline points="80.0,191.5 142.0,191.6 204.0,191.4 266.0,190.6 328.0,173.4 390.0,160.2 452.0,157.5 514.0,137.8 576.0,72.8 638.0,46.8 700.0,47.9" class="line s-red" style="stroke-width:2.5"/>
+<circle cx="80.0" cy="191.5" r="3.5" class="f-red"/>
+<circle cx="142.0" cy="191.6" r="3.5" class="f-red"/>
+<circle cx="204.0" cy="191.4" r="3.5" class="f-red"/>
+<circle cx="266.0" cy="190.6" r="3.5" class="f-red"/>
+<circle cx="328.0" cy="173.4" r="3.5" class="f-red"/>
+<circle cx="390.0" cy="160.2" r="3.5" class="f-red"/>
+<circle cx="452.0" cy="157.5" r="3.5" class="f-red"/>
+<circle cx="514.0" cy="137.8" r="3.5" class="f-red"/>
+<circle cx="576.0" cy="72.8" r="3.5" class="f-red"/>
+<circle cx="638.0" cy="46.8" r="3.5" class="f-red"/>
+<circle cx="700.0" cy="47.9" r="3.5" class="f-red"/>
+<circle cx="328.0" cy="217.5" r="8" class="s-green sw-2" style="fill:none"/>
+<line x1="100" y1="44" x2="128" y2="44" class="line s-green" style="stroke-width:2.5"/><text x="138" y="48" class="t-xs" text-anchor="start">calibrated on the right outlier channels</text>
+<line x1="100" y1="62" x2="128" y2="62" class="line s-red" style="stroke-width:2.5"/><text x="138" y="66" class="t-xs" text-anchor="start">calibrated on the wrong outlier channels</text>
+</svg>
+<figcaption><strong>The method is a scale search, and it is only as good as its calibration data.</strong> The ring marks the best exponent, a = 0.4 (0.063). Green: scales built from activations that share the deployment's outlier channels, error 0.192 down to 0.063 and back up as the weights are over-scaled. Red: scales built from activations whose outlier channels are elsewhere (60 and 150), which protect the wrong columns and wreck the right ones.</figcaption>
+</figure>
+<p>The curve shows the two things you will check. It falls and then rises: a = 0.4 is best at 0.063 (RTN is 0.192) and a = 1.0 (0.276) is worse than plain rounding (0.192), because the scaled outlier columns raise their groups' maxima. And the red curve is the danger of <span class="term">calibration data that does not match deployment</span>: scales built from the wrong activation statistics protect the wrong columns, and the damage grows with the exponent. The search cannot warn you, because on its own calibration data it still finds an improvement; only held-out data from the real traffic shows the harm.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>awq_scales(x_absmean, a)</code>, <code>awq_effective_weights(W, x_absmean, a, bits=4, group=128)</code> (scale columns up, fake-quantise per group, scale columns back down) and <code>search_awq(X_cal, W, bits=4, group=128, grid=11)</code>, which returns <code>(best_a, best_error, errors)</code>. Use only the calibration data inside the search.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. Hand cases: <code>awq_scales([4, 1], 0.5)</code> and <code>1.0</code>, exponent 0 gives all ones, a zero mean does not break it. Exponent 0 must reproduce plain group-128 RTN exactly; at 16 bits the effective weights must be within 10<sup>&minus;3</sup> of <code>W</code>; the first grid error must equal RTN's; the best exponent must be strictly inside (0, 1) and at least halve the RTN error on calibration data and on held-out tokens with the same outlier channels. Calibrated on the wrong outlier channels (60 and 150), the held-out error must be at least 1.2 times RTN's. Finally the given <code>report()</code> runs, and the checker verifies its ordering of the seven recipes.</p>
+  <details class="deeper"><summary>Hints <span class="hint">try without first</span></summary><ul>
+    <li><code>awq_scales</code>: clamp each mean to at least 1e-12 before raising it to the power, then divide the whole list by <code>math.sqrt(max(s) * min(s))</code>.</li>
+    <li><code>awq_effective_weights</code>: three steps in order, <code>W * s</code> by column, <code>fake_quantise_matrix(..., "group", group)</code> from milestone 3, then divide by <code>s</code> by column. The result is a D &times; C matrix you can plug straight into <code>matmul_nt</code>.</li>
+    <li><code>search_awq</code>: the reference output is <code>matmul_nt(X_cal, W)</code>; grid point <em>i</em> has exponent <code>i / (grid - 1)</code>. Pick the minimum with a tie going to the smaller exponent: <code>min(range(grid), key=lambda i: (errors[i], i))</code>.</li>
+    <li>If the wrong-calibration check fails because your AWQ does <em>not</em> hurt, you are probably peeking at the test activations somewhere. Statistics must come from <code>X_cal</code> only.</li>
+  </ul></details>
+  <details class="deeper"><summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> awq_scales(x_absmean, a):
+    <span class="str">"""s[c] = x_absmean[c]**a, then divided by sqrt(max(s) * min(s)) so the scales are centred around 1."""</span>
+    s = [max(v, <span class="num">1e-12</span>) ** a <span class="kw">for</span> v <span class="kw">in</span> x_absmean]
+    norm = math.sqrt(max(s) * min(s))
+    <span class="kw">return</span> [v / norm <span class="kw">for</span> v <span class="kw">in</span> s]
+
+<span class="kw">def</span> awq_effective_weights(W, x_absmean, a, bits=<span class="num">4</span>, group=<span class="num">128</span>):
+    <span class="str">"""The weights the layer effectively uses after AWQ scaling: scale column c of W up by s[c], fake-quantise"""</span>
+    s = awq_scales(x_absmean, a)
+    Ws = [[v * s[c] <span class="kw">for</span> c, v <span class="kw">in</span> enumerate(row)] <span class="kw">for</span> row <span class="kw">in</span> W]
+    Wq = fake_quantise_matrix(Ws, bits, <span class="str">"group"</span>, group)
+    <span class="kw">return</span> [[v / s[c] <span class="kw">for</span> c, v <span class="kw">in</span> enumerate(row)] <span class="kw">for</span> row <span class="kw">in</span> Wq]
+
+<span class="kw">def</span> search_awq(X_cal, W, bits=<span class="num">4</span>, group=<span class="num">128</span>, grid=<span class="num">11</span>):
+    <span class="str">"""Grid-search the exponent a in linspace(0, 1, grid) on calibration data X_cal."""</span>
+    Y = matmul_nt(X_cal, W)
+    mean = col_absmean(X_cal)
+    errors = []
+    <span class="kw">for</span> i <span class="kw">in</span> range(grid):
+        a = i / (grid - <span class="num">1</span>)
+        errors.append(rel_error(matmul_nt(X_cal, awq_effective_weights(W, mean, a, bits, group)), Y))
+    best = min(range(grid), key=<span class="kw">lambda</span> i: (errors[i], i))
+    <span class="kw">return</span> best / (grid - <span class="num">1</span>), errors[best], errors</code></pre>
+  </details>
+</div>
+
+<h2>Run it all</h2>
+<p>The given <code>report()</code> quantises the layer seven ways and measures each on 64 held-out tokens (calibration statistics come from a different set of 64):</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution</span>
+<span class="out">Lab 7 checks against solution.py
+
+  ✔ Milestone 1: symmetric quantisation
+      chapter 19's eight weights: ints [0, -2, 2, 7, -1, 0, 3, -6], scale 0.31/7; 40 seeded lists: error never above scale/2, idempotent;
+      4000 Gaussian values: relative error int4 0.1466, int8 0.00804 (ratio 18.2)
+  ✔ Milestone 2: asymmetric quantisation and the zero point
+      hand cases and 40 seeded lists (real 0.0 round-trips exactly); int4 on ReLU-like data: relative error symmetric 0.1305, asymmetric 0.0606;
+      on zero-centred data: symmetric 0.1496, asymmetric 0.1269
+  ✔ Milestone 3: per-tensor, per-channel and per-group scales
+      relative weight error ||W - Wq|| / ||W|| on the 48 x 256 layer (loud rows 5, 30; four spikes):
+          int8: per-tensor 0.0409, per-channel 0.0075, group-128 0.0066
+          int4: per-tensor 0.3154, per-channel 0.1353, group-128 0.1216
+      cost: per-channel 4.0625, group-128 4.1250 bits per int4 weight
+  ✔ Milestone 4: packing int4 and counting bytes
+      Llama 3 8B on one 24 GB card (2 GB overhead, 8,192-token sequences):
+          bf16              16.06 GB  -&gt;   5 sequences
+          int8               8.03 GB  -&gt;  13 sequences
+          int4, group 128    4.14 GB  -&gt;  16 sequences
+          int3, group 128    3.14 GB  -&gt;  17 sequences
+  ✔ Milestone 5: activation outliers, mixed precision and SmoothQuant
+      int8 weights per-channel; output error on held-out tokens: activations per-tensor 0.0920, per-token 0.0428, SmoothQuant (alpha 0.5) 0.0125,
+      mixed precision with channels [11, 201] in float 0.0047
+  ✔ Milestone 6: AWQ-style scaling, calibration and the report
+      search over 11 exponents on 64 calibration tokens: best a = 0.4; RTN error 0.1862 -&gt; 0.0586 on calibration, 0.1925 -&gt; 0.0627 on held-out tokens;
+      calibrated on the WRONG outlier channels: held-out error 0.1925 -&gt; 0.2832 (worse than doing nothing)
+      recipe                                      output error  top-1 agree  bits/weight
+      int8 W per-channel, A per-tensor                  0.0920        0.938        8.062
+      int8 W per-channel, A per-token                   0.0428        0.984        8.062
+      int8 mixed (outlier channels in float)            0.0047        1.000        8.062
+      int8 SmoothQuant (alpha 0.5)                      0.0125        0.984        8.062
+      int4 weights, per-tensor                          0.4510        0.625        4.001
+      int4 weights, group 128 (RTN)                     0.1925        0.906        4.125
+      int4 group 128 + AWQ (a = 0.4)                    0.0627        0.953        4.125
+
+6/6 milestones passing  (1.4 s)</span></code></pre>
+<p>Every milestone shows a tick. The last milestone's note includes the report table, which is worth reading as a whole:</p>
+<ul>
+  <li><strong>Activations dominate int8.</strong> With perfectly good int8 weights, a per-tensor activation scale gives 0.092 output error, and the choice among per-token (0.043), SmoothQuant (0.013) and mixed precision (0.005) spans a factor of twenty. The weight grid was never the problem.</li>
+  <li><strong>Error and answers are different things.</strong> Output error 0.043 agrees with the reference's top choice on 98.4% of tokens, 0.19 on 90.6%, 0.45 on 62.5%. The relation is not linear and depends on how close the top two outputs usually are, which is why the report prints both and why the chapter's advice is to measure the task, not the tensor.</li>
+  <li><strong>Calibrated 4-bit beats naive 4-bit by 3 times at the same size.</strong> RTN with groups (0.1925) and AWQ-style scaling (0.0627) both cost 4.125 bits per weight; the second just spent some arithmetic once, offline.</li>
+</ul>
+
+<h2>Look under the hood</h2>
+<ul>
+  <li><strong>What fake quantisation hides.</strong> A real W4A16 kernel reads the packed nibbles, multiplies by the group scale in registers and accumulates in 16- or 32-bit floats; a real W8A8 kernel accumulates integer products in 32 bits and applies the scales to the sum. Neither writes a dequantised copy to memory, which is where the speed comes from (<a href="../chapters/19-quantisation.html">chapter 19</a> on fused kernels). The values are the same as in your simulation up to rounding order. The speed is not simulated here at all: do not read "4.125 bits" as "3.9 times faster".</li>
+  <li><strong>Why per-token scales do not fix outlier channels.</strong> A scale per token fits each token's range but the outlier channels are in every token, so each token's scale is still set by them. Per-token helps when the range varies <em>between tokens</em>, not when it varies between channels.</li>
+  <li><strong>What GPTQ adds.</strong> AWQ changes the grid by scaling and then rounds to nearest. GPTQ keeps the grid and changes the <em>rounding</em>: after rounding one weight it adjusts the not-yet-rounded weights in the row to compensate, using second-order information from the calibration inputs. The lab's <code>search_awq</code> and the stretch goal below are the entry point; the full method needs a Cholesky factorisation of the input covariance.</li>
+  <li><strong>Why the exponent is so sensitive.</strong> The best exponent is a trade between two errors, one that falls as protected columns get finer and one that rises as their groups get coarser. Both depend on which columns share a group with the protected ones, and the curve is not smooth (the chart has a bump at 0.2). With two calibration tokens the chosen exponent is mostly noise, as the experiment below shows.</li>
+  <li><strong>What a real evaluation adds.</strong> The report measures a layer. A model has dozens, and error compounds: a rounding error in layer 3 changes the input to layer 4. Perplexity and task accuracy on held-out data, with an interval, are the measures that matter (<a href="../chapters/23-evaluating-models.html">chapter 23</a>), and they should include the behaviours you care about most (long chains of arithmetic, tool-call formats, rare languages), because the damage is uneven.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"If the average error is small, the quantised model is fine." The report above shows average relative error and top-1 agreement moving at different rates, and neither is a task metric. Worse, the error is concentrated: in this layer the two loud rows hold about 92% of the weights' squared magnitude, so a single relative-error figure is dominated by them and says little about the other 46 rows. A 4-bit model can look indistinguishable on a general benchmark and fail on exactly the rare, important behaviour you shipped it for. You get the model you measured, so measure the cases you care about, on data the calibration never saw.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself: four experiments</p>
+  <ol>
+    <li><strong>Move the migration strength.</strong> Run <code>exp_alpha_awq.py</code> (below). Which &alpha; minimises the SmoothQuant error? Change <code>OUTLIER_FACTOR</code> to 200 in the lab and see whether the best &alpha; moves.</li>
+    <li><strong>Shrink the calibration set.</strong> The same script searches AWQ exponents with 2, 8 and 64 calibration tokens. How small can the set get before the held-out error is worse than the 64-token one by a factor of two? How does that compare with the few hundred samples real methods use?</li>
+    <li><strong>Break the zero point.</strong> In <code>quantise_asym</code>, drop the "zero inside the range" rule (let lo be the plain minimum) and run the milestone 2 check on shifted data. Which test fails first, and what would a padded batch of zeros look like after dequantising?</li>
+    <li><strong>Change the group size.</strong> Call <code>fake_quantise_matrix(W, 4, "group", g)</code> for g = 256, 128, 64, 32, 16. Plot error against <code>bits_per_weight</code>. At which group size does the next halving stop being worth its bits?</li>
+  </ol>
+</div>
+<pre class="terminal" data-title="exp_alpha_awq.py"><code>"""The SmoothQuant migration strength alpha, and the AWQ exponent curve with its calibration-set size."""
+from solution import *
+
+W = make_weights()
+X, Xc = make_activations(200), make_activations(100)
+Y = matmul_nt(X, W)
+print("SmoothQuant alpha, int8 weights and activations (activations per tensor):")
+for alpha in (0.0, 0.25, 0.5, 0.75, 1.0):
+    Xs, Ws = apply_smoothing(X, W, smooth_scales(col_absmax(Xc), col_absmax(W), alpha))
+    e = rel_error(matmul_nt(fake_quantise_activations(Xs, 8, "tensor"), fake_quantise_matrix(Ws, 8, "channel")), Y)
+    print(f"  alpha {alpha:.2f}: output error {e:.4f}")
+print("\nAWQ-style exponent search, int4 group 128; error on 64 held-out tokens:")
+for tokens in (2, 8, 64):
+    cal = make_activations(300 + tokens, tokens=tokens)
+    a, e_cal, errs = search_awq(cal, W)
+    e_test = rel_error(matmul_nt(X, awq_effective_weights(W, col_absmean(cal), a)), Y)
+    print(f"  {tokens:&gt;2} calibration tokens: best exponent {a:.1f}, calibration error {e_cal:.4f}, held-out error {e_test:.4f}")</code></pre>
+<pre class="terminal" data-title="output"><code>SmoothQuant alpha, int8 weights and activations (activations per tensor):
+  alpha 0.00: output error 0.0668
+  alpha 0.25: output error 0.0263
+  alpha 0.50: output error 0.0125
+  alpha 0.75: output error 0.0157
+  alpha 1.00: output error 0.0311
+
+AWQ-style exponent search, int4 group 128; error on 64 held-out tokens:
+   2 calibration tokens: best exponent 0.5, calibration error 0.0583, held-out error 0.1039
+   8 calibration tokens: best exponent 0.3, calibration error 0.0698, held-out error 0.0699
+  64 calibration tokens: best exponent 0.4, calibration error 0.0596, held-out error 0.0606</code></pre>
+<p>At &alpha; = 0.5 the SmoothQuant error is lowest on this layer (0.0125), with a rise on either side: the balanced setting the paper suggests as a default is also a good one here. The AWQ rows show the calibration-size effect: with 2 tokens the search chooses 0.5 and the held-out error is 0.104, with 8 tokens it chooses 0.3 and the held-out error is 0.070, and at 64 tokens 0.4 and 0.061. A search that is too small fits its noise.</p>
+
+<h2>Stretch goals</h2>
+<ul>
+  <li><strong>Clipping search.</strong> Instead of absmax, choose each group's scale to minimise the squared weight error (try clip ratios from 0.7 to 1.0 times absmax). Rounding a clipped outlier costs error on that one weight but shrinks the step for all the others. How much of AWQ's gain does clipping alone recover?</li>
+  <li><strong>A greedy GPTQ-lite.</strong> Quantise a row one column at a time, and after each rounding distribute the error onto the remaining columns in proportion to the correlation of the calibration inputs (start with a diagonal approximation). Compare with RTN at int4 and with AWQ on held-out error.</li>
+  <li><strong>NF4.</strong> Replace the uniform int4 grid with the sixteen quantiles of a normal distribution (<a href="../chapters/11-lora.html">chapter 11</a>'s base for QLoRA) and compare the weight error on the Gaussian bulk with and without the loud rows.</li>
+  <li><strong>Two-layer error compounding.</strong> Stack two layers with a ReLU between them. Quantise both with the same recipe and compare the end-to-end error with the sum of the per-layer errors. Does the second layer see the first layer's error as a different distribution of outliers?</li>
+  <li><strong>KV-cache quantisation.</strong> Treat the keys of <a href="../chapters/18-kv-cache.html">chapter 18</a> as an activation matrix, quantise them per token and per channel and measure the attention-score error. Which axis do outliers sit on in your synthetic keys, and which scale granularity matches it?</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>The byte count in milestone 4 is a capacity plan, and its consequences run through the serving stack: memory freed from weights becomes KV cache, which becomes concurrent sequences in the batch, which is what <a href="../chapters/20-serving-engines.html">serving engines</a> convert into throughput and <a href="../chapters/22-token-economics.html">token economics</a> converts into price per million tokens. The memory-bound argument is the roofline reasoning of <a href="../../systems/chapters/21-parallelism-gpus.html">GPUs and memory bandwidth</a> and <a href="../../systems/chapters/22-performance-engineering.html">performance engineering</a>: measure the bytes moved before you believe a speed-up. And a third-party quantised checkpoint is an artefact you did not build, from calibration data you cannot see, with a scheme that may not match your kernel; it belongs under the same provenance and review as any other dependency (<a href="../../security/chapters/12-memory-supply-chain.html">the supply chain</a>), and a quantised release deserves the regression gate of any model change, on the cases that matter to your users.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>A scale is set by the largest number that shares it, so error is controlled by <em>who shares a scale</em>: one outlier costs every neighbour its resolution.</li>
+    <li>Symmetric grids suit zero-centred weights; asymmetric grids with a zero point suit one-sided data, and real zero must stay exact.</li>
+    <li>"4-bit" is 4.125 bits or more once scales are stored; count bytes, then count what fits.</li>
+    <li>Activation outliers, not weight grids, dominate int8 error: mixed precision and SmoothQuant fix them in different ways (detect and set aside, or rescale and migrate).</li>
+    <li>AWQ-style scaling is a hyperparameter search. It needs calibration data that looks like deployment, and held-out tokens to prove it worked.</li>
+    <li>Report relative error, an answer-level metric and bits per weight together; one number can hide the damage.</li>
+  </ul>
+</div>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">A group of 128 weights quantised to symmetric int4 contains one weight about 10 times larger than the rest. What happens to the other 127?</p>
+    <ol class="q-options">
+      <li>Nothing: the maximum itself is quantised exactly, so the others are unaffected</li>
+      <li>They are clamped to the largest level, because the grid cannot represent the outlier</li>
+      <li>They share a step about 10 times coarser than they need, so most round to zero or &plusmn;1 level</li>
+      <li>They get an asymmetric zero point automatically that compensates</li>
+    </ol>
+    <div class="q-explain">The scale is absmax/qmax, so a 10 times larger maximum makes the step 10 times larger for everyone in the group; weights that used to span the 15 levels now use two or three. The first option is the tempting one: the outlier is indeed exact, but the cost lands on its neighbours. Nothing is clamped, because the scale is derived from the maximum.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">At int4 on ReLU outputs (all values between 0 and 6), why does an asymmetric quantiser beat a symmetric one at the same bit width?</p>
+    <ol class="q-options">
+      <li>It puts all 16 levels on [0, 6] instead of spending the negative half of its grid on values that never occur, so the step is about half as large</li>
+      <li>It stores more bits per value through the zero point</li>
+      <li>It rounds more accurately, because it uses ceiling instead of round-to-nearest</li>
+      <li>It removes the need for a scale</li>
+    </ol>
+    <div class="q-explain">The symmetric grid spans &minus;6 to 6 with 15 levels, so only the non-negative ones are reachable; the asymmetric grid spans 0 to 6 with 16. The zero point is a stored integer but does not widen the values (second option). Both use round-to-nearest, and asymmetric still has a scale.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">An int4 model uses groups of 32 weights, each with a 16-bit scale. Roughly how many bits does each weight really cost, and how many bytes is a 7-billion-parameter model?</p>
+    <ol class="q-options">
+      <li>4 bits and 3.5 GB, since scales are negligible</li>
+      <li>4.125 bits and 3.6 GB</li>
+      <li>4.25 bits and 3.7 GB</li>
+      <li>4.5 bits and 3.9 GB</li>
+    </ol>
+    <div class="q-explain">16/32 = 0.5 extra bits gives 4.5 bits per weight, and 7 billion &times; 4.5 / 8 = 3.94 GB. The second option is the right answer for groups of 128 (16/128 = 0.125), which is the tempting figure because it is the common default. Smaller groups buy accuracy at exactly this price.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">SmoothQuant divides activation channel <em>c</em> by <em>s<sub>c</sub></em> and multiplies weight column <em>c</em> by <em>s<sub>c</sub></em>. Why does this not change the layer's output, and why does it help?</p>
+    <ol class="q-options">
+      <li>The two changes cancel only on average, and the improvement comes from the rounding error cancelling too</li>
+      <li>The product <em>x<sub>c</sub></em><em>w<sub>c</sub></em> is unchanged term by term, and it moves the outlier from activations (which need one shared scale) to weights (which have per-channel scales)</li>
+      <li>It makes the weights smaller, so fewer bits are needed</li>
+      <li>It removes the outlier channels entirely, so the output no longer depends on them</li>
+    </ol>
+    <div class="q-explain">(x/s)(s w) = x w exactly, for every term, so the output is identical before quantisation. Quantisation then happens on better-balanced matrices. The weights actually get larger in the outlier columns (the difficulty moved there), and nothing is removed.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">In the AWQ-style search, the error is 0.192 at exponent 0, 0.063 at 0.4 and 0.276 at 1.0. Why does it rise again at large exponents?</p>
+    <ol class="q-options">
+      <li>The activation statistics become inaccurate at high exponents</li>
+      <li>Dividing by the scale at the end adds rounding error of its own</li>
+      <li>Large scales push the protected columns' weights above their group's old maximum, which coarsens the grid for every other weight in the group</li>
+      <li>The search grid has too few points to see the minimum</li>
+    </ol>
+    <div class="q-explain">Scaling a column up helps while the group maximum is unchanged: that weight's relative rounding error shrinks. Past that point the group scale grows and the step increases for all the group's other weights. Dividing back is exact in floating point; the activation statistics do not depend on the exponent; and the grid has eleven points, which resolves a minimum at 0.4 easily.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">You calibrate AWQ on 64 tokens from a benchmark whose activations have outliers in different channels from your production traffic. The search reports a clear improvement. What should you expect on production traffic?</p>
+    <ol class="q-options">
+      <li>Possibly worse than plain rounding: the scales protect the wrong columns, and the search's own improvement was measured on the data it was fitted to</li>
+      <li>The same improvement, because quantisation error depends only on the weights</li>
+      <li>A smaller but still positive improvement, because the method is robust by construction</li>
+      <li>No change, because calibration only affects activations, which are not quantised</li>
+    </ol>
+    <div class="q-explain">Quantisation error in the output depends on weights <em>and</em> on which input channels are large, and the scales are built from the calibration activations. In the lab the mismatched calibration gives held-out error 0.283 against 0.192 for plain rounding. Always test on data that looks like deployment, and keep it disjoint from the calibration set.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

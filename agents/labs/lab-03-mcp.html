@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 3: An MCP Server &amp; Client · Agents, Tools &amp; Protocols</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="agt" data-lab="L3">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+<header class="chapter-head">
+  <h1>Lab 3: An MCP Server &amp; Client</h1>
+  <p class="lede">Chapter 7 showed you the messages of the Model Context Protocol and a hundred-line server that spoke them. Reading a protocol is not the same as implementing one: the interesting failures live in the details, such as a reply with no newline, an <code>id</code> of the wrong type, a validation error returned the wrong way, or a client that waits for an answer to a notification. In this lab you write both ends of an MCP connection over stdio, a server for an order desk and a client that drives it, and a checker feeds the server raw JSON lines and compares every reply field by field. The last milestone teaches the same server the stateless style of the 2026-07-28 revision, so that it answers old and new clients from one process.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this lab matters</p>
+  <p>Most people meet MCP as a line in a configuration file: a command, some arguments, and tools that appear in a host. When it breaks, the symptoms are vague (a server that "does not connect", a tool that never shows up, a host that hangs) and the cause is one of a small number of wire-level mistakes. You will make each of those mistakes' opposites on purpose: logging to the wrong stream, answering a notification, using a protocol error where the model needed a tool error, or remembering something between requests that the protocol says you must not. After this lab the <a href="../chapters/07-mcp.html">message layer</a> is a program you wrote rather than a diagram you read, and the <a href="../chapters/08-mcp-production.html">production chapter's</a> argument about sessions and statelessness is something you have implemented twice, once each way. The same skill transfers to every protocol of this shape: the Language Server Protocol, the Debug Adapter Protocol and most JSON-RPC services speak in the same envelopes.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">Deterministic, offline, standard library only</p>
+  <p>No network, no real model and no clock. The server and client talk through real operating-system pipes (<code>subprocess</code>), but everything they say is fixed, so a run gives the same result every time. The only randomness is in <em>property checks</em> (random ids, random message sequences, every truncation of a valid line); a failure prints the seed, and <code>python3 check.py solution 2 17</code> replays milestone 2 with seed 17 alone. The whole check takes well under a second. Python 3.9 or newer. <code>llm.py</code> is the shared stand-in model module, copied unchanged; the client milestone uses it to feed MCP results to a scripted model.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026: which specification this follows</p>
+  <p>Milestones 1 to 5 follow revision <strong>2025-11-25</strong> of the MCP specification (the handshake-based protocol most SDKs and servers still speak, and the one <a href="../chapters/07-mcp.html">chapter 7</a> uses). Milestone 6 follows revision <strong>2026-07-28</strong>. I read its changelog and the pages on versioning, base protocol and discovery at modelcontextprotocol.io on 14 October 2026 and implemented what they state for stdio: no <code>initialize</code> handshake, <code>io.modelcontextprotocol/protocolVersion</code> and <code>io.modelcontextprotocol/clientCapabilities</code> required in every request's <code>_meta</code>, a mandatory <code>server/discover</code>, a required <code>resultType</code>, <code>ttlMs</code> and <code>cacheScope</code> on list and read results, <code>UnsupportedProtocolVersion</code> as code -32022 with a <code>supported</code> list, resource-not-found moving from -32002 to -32602, and <code>ping</code> removed. A dual-era server, which the versioning page explicitly allows, picks its behaviour from how the client opens: modern <code>_meta</code> means stateless, an <code>initialize</code> request means the old session.</p>
+  <p><strong>Not implemented, on purpose:</strong> the HTTP-only parts (the <code>Mcp-Method</code> and <code>Mcp-Name</code> headers, <code>Origin</code> checks), multi round-trip requests (<code>input_required</code>), the tasks extension, <code>subscriptions/listen</code>, logging, and the <code>MissingRequiredClientCapability</code> error (-32021). The pages I read did not label the revision a draft, but the changelog text still says "this draft" in one place, so check the status at <a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" target="_blank" rel="noopener">the changelog</a> before relying on any detail. One choice is mine, not the specification's: <code>supportedVersions</code> lists only <code>2026-07-28</code>, because the legacy versions are reached through <code>initialize</code>, not through per-request <code>_meta</code>.</p>
+</div>
+
+<h2>What you'll build</h2>
+<figure class="diagram">
+<svg viewBox="0 0 760 312" role="img" aria-label="A client and a server joined by two pipes. The client holds the agent loop's tool calls and sends one JSON line per request on the server's standard input. The server, a Python process, has four layers: handle_line parses and wraps errors, process applies the handshake gate, dispatch serves tools and resources, and process_modern serves stateless requests. Replies return on standard output; logs go to standard error."><defs><marker id="ahAG-L3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+  <rect x="20" y="16" width="190" height="50" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="115" y="38" text-anchor="middle" class="t-sm t-bold">agent loop + model</text>
+  <text x="115" y="55" text-anchor="middle" class="t-xs t-muted">tool_use / tool_result</text>
+  <line x1="115" y1="68" x2="115" y2="108" class="line sw-2" marker-end="url(#ahAG-L3a)"/>
+  <rect x="20" y="110" width="190" height="120" rx="8" class="fs-green s-green sw-2"/>
+  <text x="115" y="138" text-anchor="middle" class="t-sm t-bold">McpClient</text>
+  <text x="115" y="160" text-anchor="middle" class="t-xs t-muted">request, notify, connect</text>
+  <text x="115" y="176" text-anchor="middle" class="t-xs t-muted">call_tool, close</text>
+  <text x="115" y="214" text-anchor="middle" class="t-xs t-bold">milestone 5</text>
+  <line x1="212" y1="150" x2="358" y2="150" class="line s-orange sw-2" marker-end="url(#ahAG-L3a)"/>
+  <text x="285" y="142" text-anchor="middle" class="t-xs">stdin: requests</text>
+  <line x1="358" y1="196" x2="212" y2="196" class="line s-orange sw-2" marker-end="url(#ahAG-L3a)"/>
+  <text x="285" y="188" text-anchor="middle" class="t-xs">stdout: replies</text>
+  <text x="285" y="222" text-anchor="middle" class="t-xs t-muted">one message per line</text>
+  <rect x="360" y="16" width="380" height="262" rx="10" class="box"/>
+  <text x="380" y="38" text-anchor="start" class="t-sm t-bold">Server  (python3 solution.py)</text>
+  <rect x="380" y="50" width="340" height="46" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="550" y="70" text-anchor="middle" class="t-sm t-bold">handle_line: parse, classify, wrap</text>
+  <text x="550" y="86" text-anchor="middle" class="t-xs t-muted">milestone 1</text>
+  <rect x="380" y="104" width="340" height="46" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="550" y="124" text-anchor="middle" class="t-sm t-bold">process: handshake gate, versions</text>
+  <text x="550" y="140" text-anchor="middle" class="t-xs t-muted">milestone 2</text>
+  <rect x="380" y="158" width="340" height="46" rx="8" class="fs-purple s-purple sw-2"/>
+  <text x="550" y="178" text-anchor="middle" class="t-sm t-bold">dispatch: tools and resources</text>
+  <text x="550" y="194" text-anchor="middle" class="t-xs t-muted">milestones 3 and 4</text>
+  <rect x="380" y="212" width="340" height="46" rx="8" class="fs-cyan s-cyan sw-2"/>
+  <text x="550" y="232" text-anchor="middle" class="t-sm t-bold">process_modern: no handshake</text>
+  <text x="550" y="248" text-anchor="middle" class="t-xs t-muted">milestone 6</text>
+  <line x1="550" y1="280" x2="550" y2="294" class="line-dash"/>
+  <text x="380" y="306" text-anchor="start" class="t-xs t-muted">stderr: logs only, because stdout is the protocol</text>
+</svg>
+  <figcaption><strong>Two programs, two pipes.</strong> Green is the client, blue the protocol layers, purple the data the server owns, cyan the stateless path added at the end. The agent loop never sees JSON-RPC: it sees tool definitions and tool results, and the client translates.</figcaption>
+</figure>
+
+<p>The server offers an order desk (the same five orders as <a href="lab-01-agent-loop.html">Lab 1</a>) as two <span class="term">tools</span> (functions the model may call) and five <span class="term">resources</span> (read-only data identified by a URI). Here is what talking to it looks like. This is a real run of your finished client against your finished server; long lines are shortened for display only.</p>
+<pre class="terminal" data-title="transcript"><code>--&gt; {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clien...
+&lt;-- {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{},"resources":{}},"se...
+--&gt; {"jsonrpc":"2.0","method":"notifications/initialized"}
+--&gt; {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+&lt;-- {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"order_lookup","description":"Look up one order by id. Retur...
+--&gt; {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"order_lookup","arguments":{"order_id":"A-1001"}}}
+&lt;-- {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"A-1001: shipped, 4250 cents, carrier UPS"}]...
+--&gt; {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"orders_search","arguments":{"status":"shipped",...
+&lt;-- {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"Invalid arguments for orders_search: 'limit...
+--&gt; {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"refund_order","arguments":{}}}
+&lt;-- {"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Unknown tool: refund_order"}}
+--&gt; {"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"order://A-1002"}}
+&lt;-- {"jsonrpc":"2.0","id":6,"result":{"contents":[{"uri":"order://A-1002","mimeType":"text/plain","text":"A-1002: p...
+--&gt; {"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"order://Z-9"}}
+&lt;-- {"jsonrpc":"2.0","id":7,"error":{"code":-32002,"message":"Resource not found","data":{"uri":"order://Z-9"}}}
+exit code 0, stderr 0 lines</code></pre>
+<p>Read the transcript as the whole protocol in miniature. Ids 1 to 7 pair each request with its reply. The <code>notifications/initialized</code> line has no id and gets no reply. Request 4 is a successful JSON-RPC response whose content is an error (<code>isError</code> is true, because the model passed <code>limit: 0</code> and can fix it); request 5 is a JSON-RPC error response (a tool that does not exist is the caller's fault, not the model's). The resource that is missing comes back as code -32002 with the URI in <code>data</code>. The server wrote nothing to stderr and exited with code 0 when its input closed.</p>
+
+<p>Six milestones, each adding a layer:</p>
+<ol class="steps">
+  <li><strong>Messages on a line:</strong> build and parse JSON-RPC envelopes, classify requests, notifications and responses, answer every kind of malformed input with the right error, and run the read-reply loop with correct framing.</li>
+  <li><strong>The handshake:</strong> <code>initialize</code>, version negotiation, <code>notifications/initialized</code>, and the rule that nothing else is served before the handshake completes.</li>
+  <li><strong>Tools:</strong> <code>tools/list</code> and <code>tools/call</code>, with the split between errors the <em>client program</em> must handle (JSON-RPC errors) and errors the <em>model</em> can read and fix (<code>isError</code>).</li>
+  <li><strong>Resources:</strong> <code>resources/list</code> and <code>resources/read</code>, then a sweep that sends every kind of mistake to a live server and checks every code.</li>
+  <li><strong>The client:</strong> a subprocess client with id matching and failure handling, tested against a separate fixture server, then end to end against yours, and a bridge that lets a model loop call MCP tools.</li>
+  <li><strong>The stateless style:</strong> answer requests that carry their own version and capabilities, with no handshake, <code>server/discover</code>, caching hints and the new error codes, beside the old protocol on the same process.</li>
+</ol>
+
+<h2>Before you start</h2>
+
+<p>Check your Python with <code>python3 --version</code>. The lab's files are in <code>agents/labs/code/lab03/</code>:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><a href="code/lab03/starter.py"><code>starter.py</code></a></td><td>Your file, and also your server: <code>python3 starter.py</code> reads stdin and writes stdout once it works. The constants, the order desk, the two tool functions, the argument checker and the method table are given; every function you write has a docstring and a <code>TODO</code>.</td></tr>
+    <tr><td><a href="code/lab03/check.py"><code>check.py</code></a></td><td>The self-check: exact raw-line tests of the server, seeded property tests, a real subprocess run of your client and server, and the stateless scenarios.</td></tr>
+    <tr><td><a href="code/lab03/fixture_server.py"><code>fixture_server.py</code></a></td><td>A tiny separate server (one <code>echo</code> tool, and modes that misbehave on purpose) used only to test your client, so a server bug cannot hide a client bug.</td></tr>
+    <tr><td><a href="code/lab03/solution.py"><code>solution.py</code></a></td><td>A complete reference answer. Try not to peek until you have had a real go.</td></tr>
+    <tr><td><a href="code/lab03/llm.py"><code>llm.py</code></a></td><td>The shared stand-in model module. Do not edit it.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Open a terminal in that folder and run the check straight away. Everything is unimplemented, and it says so cleanly:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">cd agents/labs/code/lab03 &amp;&amp; python3 check.py</span>
+<span class="out">Lab 3 checks against starter.py
+
+  … Milestone 1: messages on a line, framing and error envelopes: not implemented yet (TODO milestone 1: Server.handle_line)
+  … Milestone 2: the handshake and version negotiation: not implemented yet (TODO milestone 1: Server.handle_line)
+  … Milestone 3: tools, and the two kinds of error: not implemented yet (TODO milestone 1: Server.handle_line)
+  … Milestone 4: resources, and an error-code sweep: not implemented yet (TODO milestone 1: Server.handle_line)
+  … Milestone 5: the client, and the bridge to a model: not implemented yet (TODO milestone 5: McpClient.connect)
+  … Milestone 6: the stateless 2026-07-28 style: not implemented yet (TODO milestone 1: Server.handle_line)
+
+0/6 milestones passing  (0.0 s)</span></code></pre>
+<p>Milestones 2, 3, 4 and 6 report "milestone 1" because they all need <code>handle_line</code>; as soon as it works the real first gap appears. The client milestone reports its own first gap. Work in order.</p>
+
+<h2>Milestone 1: messages on a line</h2>
+
+<p>Over stdio, MCP sends <span class="term">JSON-RPC 2.0</span> messages (a small standard for calling procedures with JSON) one per line. There are exactly three kinds of message, told apart by which members they have:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Kind</th><th>Has</th><th>Reply?</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><span class="term">request</span></td><td><code>method</code> and <code>id</code></td><td>exactly one response, with the same id</td><td><code>{"jsonrpc":"2.0","id":1,"method":"ping"}</code></td></tr>
+    <tr><td><span class="term">notification</span></td><td><code>method</code>, no <code>id</code></td><td>never, not even an error</td><td><code>{"jsonrpc":"2.0","method":"notifications/initialized"}</code></td></tr>
+    <tr><td><span class="term">response</span></td><td><code>result</code> or <code>error</code>, and <code>id</code></td><td>never (it answers something you sent)</td><td><code>{"jsonrpc":"2.0","id":1,"result":{}}</code></td></tr>
+  </tbody>
+</table></div>
+<p>MCP adds rules on top of JSON-RPC: an id is a string or an integer and, unlike base JSON-RPC, must not be null; and the 2025-06-18 revision removed JSON-RPC batching, so an array is not a valid message. A server that cannot make sense of a line still has to answer in kind, using the standard codes:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Code</th><th>Name</th><th>When this lab uses it</th><th>id in the response</th></tr></thead>
+  <tbody>
+    <tr><td>-32700</td><td>Parse error</td><td>the line is not JSON (a truncated message, a stray banner)</td><td>null</td></tr>
+    <tr><td>-32600</td><td>Invalid Request</td><td>JSON, but not one valid message: an array, wrong or missing <code>jsonrpc</code>, bad id, <code>method</code> not a string; also "not initialised"</td><td>the id if it could be read, else null</td></tr>
+    <tr><td>-32601</td><td>Method not found</td><td>a valid request for a method the server does not have</td><td>the request's id</td></tr>
+    <tr><td>-32602</td><td>Invalid params</td><td>the method exists but its parameters are wrong (unknown tool, no <code>uri</code>)</td><td>the request's id</td></tr>
+    <tr><td>-32603</td><td>Internal error</td><td>your code raised an exception it did not expect</td><td>the request's id</td></tr>
+  </tbody>
+</table></div>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 252" role="img" aria-label="Flow of one input line through handle_line. The line goes to parse_line; on failure it becomes a minus 32700 or minus 32600 error line. Otherwise classify sorts it: a request goes to process and becomes a result or error reply line; a notification goes to on_notification and gets no reply; a response from the peer is ignored."><defs><marker id="ahAG-L3b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker><marker id="ahAG-L3c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead f-red"/></marker></defs>
+  <rect x="10" y="95" width="110" height="50" rx="8" class="fs-green s-green sw-2"/>
+  <text x="65" y="117" text-anchor="middle" class="t-sm t-bold">one line</text>
+  <text x="65" y="134" text-anchor="middle" class="t-xs t-muted">from stdin</text>
+  <line x1="122" y1="120" x2="150" y2="120" class="line sw-2" marker-end="url(#ahAG-L3b)"/>
+  <rect x="152" y="95" width="120" height="50" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="212" y="117" text-anchor="middle" class="t-sm t-bold">parse_line</text>
+  <text x="212" y="134" text-anchor="middle" class="t-xs t-muted">JSON? one message?</text>
+  <line x1="274" y1="120" x2="302" y2="120" class="line sw-2" marker-end="url(#ahAG-L3b)"/>
+  <rect x="304" y="95" width="100" height="50" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="354" y="117" text-anchor="middle" class="t-sm t-bold">classify</text>
+  <text x="354" y="134" text-anchor="middle" class="t-xs t-muted">method? id?</text>
+  <line x1="406" y1="110" x2="438" y2="52" class="line sw-2" marker-end="url(#ahAG-L3b)"/>
+  <line x1="406" y1="120" x2="438" y2="122" class="line sw-2" marker-end="url(#ahAG-L3b)"/>
+  <line x1="406" y1="130" x2="438" y2="192" class="line sw-2" marker-end="url(#ahAG-L3b)"/>
+  <rect x="440" y="26" width="190" height="50" rx="8" class="fs-blue s-blue sw-2"/>
+  <text x="535" y="48" text-anchor="middle" class="t-sm t-bold">request: process()</text>
+  <text x="535" y="65" text-anchor="middle" class="t-xs t-muted">result, or RpcError</text>
+  <rect x="440" y="96" width="190" height="50" rx="8" class="box"/>
+  <text x="535" y="118" text-anchor="middle" class="t-sm t-bold">notification</text>
+  <text x="535" y="135" text-anchor="middle" class="t-xs t-muted">on_notification, no reply</text>
+  <rect x="440" y="166" width="190" height="50" rx="8" class="box"/>
+  <text x="535" y="188" text-anchor="middle" class="t-sm t-bold">response from peer</text>
+  <text x="535" y="205" text-anchor="middle" class="t-xs t-muted">ignored, no reply</text>
+  <line x1="632" y1="51" x2="658" y2="51" class="line sw-2" marker-end="url(#ahAG-L3b)"/>
+  <rect x="660" y="26" width="90" height="50" rx="8" class="fs-green s-green sw-2"/>
+  <text x="705" y="48" text-anchor="middle" class="t-sm t-bold">reply line</text>
+  <text x="705" y="65" text-anchor="middle" class="t-xs t-muted">then flush</text>
+  <line x1="212" y1="147" x2="212" y2="186" class="line s-red sw-2" marker-end="url(#ahAG-L3c)"/>
+  <rect x="62" y="188" width="300" height="46" rx="8" class="fs-red s-red sw-2"/>
+  <text x="212" y="208" text-anchor="middle" class="t-sm t-bold">-32700 or -32600 error line</text>
+  <text x="212" y="224" text-anchor="middle" class="t-xs t-muted">id echoed when it could be read</text>
+</svg>
+  <figcaption><strong>One line in, at most one line out, never an exception.</strong> The red path is every kind of garbage; the middle path is the only one that stays silent on purpose.</figcaption>
+</figure>
+
+<p>Two details decide whether a client can talk to your server at all. First, <strong>framing</strong>: the reply must be one line, so it is encoded with no spaces after separators and no raw newline (<code>json.dumps</code> escapes any newline inside a string as <code>\n</code>, so one message is always one line). Second, <strong>flushing</strong>: a pipe is buffered, so a reply written but not flushed sits in your process while the client waits for it for ever. That is the most common reason an MCP server "hangs", and the check counts your flushes.</p>
+<p>A third rule is about trust. When your own code fails with an exception you did not expect, the client gets <code>-32603</code> and a fixed message; the exception text goes to <em>stderr</em> (see <code>log</code>), not to the wire, because internal messages tell an attacker how your server is built (<a href="../../security/chapters/09-injection.html">untrusted input</a> works in both directions).</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>result_message</code>, <code>error_message</code>, <code>encode</code>, <code>parse_line</code>, <code>classify</code>, <code>serve</code> and <code>Server.handle_line</code>. <code>handle_line(line)</code> takes one input line and returns one output line or <code>None</code>; it never raises. It calls <code>self.process(method, params)</code> for requests (milestone 2 writes that) and <code>self.on_notification(method, params)</code> for notifications.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It uses a probe server whose <code>process</code> is fixed, so only your envelope is under test: <code>{"jsonrpc":"2.0","id":1,"method":"ping"}</code> must give exactly <code>{"jsonrpc":"2.0","id":1,"result":{}}</code>; string and integer ids come back with their type; notifications, blank lines and client responses get no reply; a truncated line gives -32700 with a null id; twelve kinds of invalid request give -32600 with the id when it is readable; an <code>RpcError</code> keeps its code and data; a stray <code>RuntimeError</code> becomes -32603 without leaking its text and the server carries on; <code>serve</code> writes one newline-terminated line per reply and flushes. Then two property checks: forty random ids echo unchanged, and <em>every</em> truncation of a valid line gives a clean -32700 and never an exception.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>json.dumps(msg, separators=(",", ":"))</code> is compact. Do not pass <code>indent</code>.</li>
+      <li>In Python <code>True</code> is an <code>int</code>. An id of <code>true</code> must be rejected, so test <code>isinstance(x, bool)</code> first (or exclude it explicitly).</li>
+      <li><code>"id" in msg</code> and <code>msg.get("id") is not None</code> are different questions. A message with <code>"id": null</code> is an invalid request (-32600), not a notification. A message with no <code>id</code> member at all is a notification.</li>
+      <li>Put the readable id on the exception: <code>raise RpcError(-32600, "...", id=msg_id)</code>, and send <code>e.id</code> in the error response. The client uses the id to match the error to its request.</li>
+      <li>Catch <code>RpcError</code> and <code>Exception</code> separately around <code>process</code>. Log the second with <code>log(...)</code> and send a fixed message.</li>
+      <li><code>for line in infile</code> reads lines lazily from a pipe. Write <code>reply + "\n"</code> and call <code>outfile.flush()</code> after every reply.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> result_message(id: Any, result: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""A JSON-RPC success response."""</span>
+    <span class="kw">return</span> {<span class="str">"jsonrpc"</span>: <span class="str">"2.0"</span>, <span class="str">"id"</span>: id, <span class="str">"result"</span>: result}
+
+<span class="kw">def</span> error_message(id: Any, code: int, message: str, data: Any = <span class="kw">None</span>) -&gt; Dict[str, Any]:
+    <span class="str">"""A JSON-RPC error response; `data` is included only when it is not None."""</span>
+    err: Dict[str, Any] = {<span class="str">"code"</span>: code, <span class="str">"message"</span>: message}
+    <span class="kw">if</span> data <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        err[<span class="str">"data"</span>] = data
+    <span class="kw">return</span> {<span class="str">"jsonrpc"</span>: <span class="str">"2.0"</span>, <span class="str">"id"</span>: id, <span class="str">"error"</span>: err}
+
+<span class="kw">def</span> encode(msg: Dict[str, Any]) -&gt; str:
+    <span class="str">"""One message as one line: compact JSON, and no newline inside (json.dumps escapes them)."""</span>
+    <span class="kw">return</span> json.dumps(msg, separators=(<span class="str">","</span>, <span class="str">":"</span>))
+
+<span class="kw">def</span> parse_line(line: str) -&gt; Dict[str, Any]:
+    <span class="str">"""Parse one line into a message dict, or raise RpcError.
+
+    -32700 if the line is not JSON. -32600 if it is JSON but not a valid single message: an array
+    (MCP does not allow batches), not an object, "jsonrpc" not "2.0", a "method" that is not a
+    string, an "id" that is null, boolean, float or anything but a string or integer, "params"
+    that is not an object, or an object with neither "method" nor "result" nor "error".
+    When the id could be read, put it on the RpcError (id=...), otherwise leave it None.
+    """</span>
+    <span class="kw">try</span>:
+        msg = json.loads(line)
+    <span class="kw">except</span> json.JSONDecodeError:
+        <span class="kw">raise</span> RpcError(PARSE_ERROR, <span class="str">"Parse error"</span>) <span class="kw">from</span> <span class="kw">None</span>
+    <span class="kw">if</span> isinstance(msg, list):
+        <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Invalid Request: batches are not supported"</span>)
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(msg, dict):
+        <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Invalid Request: a message must be a JSON object"</span>)
+    mid = msg.get(<span class="str">"id"</span>)
+    readable = mid <span class="kw">if</span> isinstance(mid, (str, int)) <span class="kw">and</span> <span class="kw">not</span> isinstance(mid, bool) <span class="kw">else</span> <span class="kw">None</span>
+    <span class="kw">if</span> msg.get(<span class="str">"jsonrpc"</span>) != <span class="str">"2.0"</span>:
+        <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">'Invalid Request: "jsonrpc" must be "2.0"'</span>, id=readable)
+    <span class="kw">if</span> <span class="str">"id"</span> <span class="kw">in</span> msg <span class="kw">and</span> readable <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Invalid Request: id must be a string or an integer"</span>)
+    <span class="kw">if</span> <span class="str">"method"</span> <span class="kw">in</span> msg:
+        <span class="kw">if</span> <span class="kw">not</span> isinstance(msg[<span class="str">"method"</span>], str):
+            <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Invalid Request: method must be a string"</span>, id=readable)
+        <span class="kw">if</span> <span class="str">"params"</span> <span class="kw">in</span> msg <span class="kw">and</span> <span class="kw">not</span> isinstance(msg[<span class="str">"params"</span>], dict):
+            <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Invalid Request: params must be an object"</span>, id=readable)
+    <span class="kw">elif</span> <span class="str">"result"</span> <span class="kw">not</span> <span class="kw">in</span> msg <span class="kw">and</span> <span class="str">"error"</span> <span class="kw">not</span> <span class="kw">in</span> msg:
+        <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Invalid Request: no method"</span>, id=readable)
+    <span class="kw">return</span> msg
+
+<span class="kw">def</span> classify(msg: Dict[str, Any]) -&gt; str:
+    <span class="str">"""'request' (method and id), 'notification' (method, no id) or 'response' (no method)."""</span>
+    <span class="kw">if</span> <span class="str">"method"</span> <span class="kw">not</span> <span class="kw">in</span> msg:
+        <span class="kw">return</span> <span class="str">"response"</span>
+    <span class="kw">return</span> <span class="str">"request"</span> <span class="kw">if</span> <span class="str">"id"</span> <span class="kw">in</span> msg <span class="kw">else</span> <span class="str">"notification"</span>
+
+<span class="kw">def</span> serve(server: <span class="str">"Server"</span>, infile, outfile) -&gt; <span class="kw">None</span>:
+    <span class="str">"""The stdio transport: one reply line per request line, flushed at once, until input ends."""</span>
+    <span class="kw">for</span> line <span class="kw">in</span> infile:
+        reply = server.handle_line(line)
+        <span class="kw">if</span> reply <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+            outfile.write(reply + <span class="str">"\n"</span>)
+            outfile.flush()
+
+<span class="kw">def</span> handle_line(self, line: str) -&gt; Optional[str]:
+    <span class="str">"""One input line in, one output line (or None) out. Never raises.
+
+    Blank lines and client responses get no reply. Notifications go to on_notification and
+    get no reply. Requests go to process(method, params): its dict becomes a success response,
+    an RpcError an error response (keeping code, message and data), and any other exception a
+    -32603 "Internal error" response, with the server still alive for the next line.
+    """</span>
+    <span class="kw">if</span> <span class="kw">not</span> line.strip():
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">try</span>:
+        msg = parse_line(line)
+    <span class="kw">except</span> RpcError <span class="kw">as</span> e:
+        <span class="kw">return</span> encode(error_message(e.id, e.code, e.message, e.data))
+    kind = classify(msg)
+    <span class="kw">if</span> kind == <span class="str">"response"</span>:
+        <span class="kw">return</span> <span class="kw">None</span>
+    method, params = msg[<span class="str">"method"</span>], msg.get(<span class="str">"params"</span>) <span class="kw">or</span> {}
+    <span class="kw">if</span> kind == <span class="str">"notification"</span>:
+        <span class="kw">try</span>:
+            self.on_notification(method, params)
+        <span class="kw">except</span> Exception <span class="kw">as</span> e:                   <span class="cmt"># a notification has nobody to tell</span>
+            log(<span class="str">"error in notification"</span>, method, repr(e))
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">try</span>:
+        <span class="kw">return</span> encode(result_message(msg[<span class="str">"id"</span>], self.process(method, params)))
+    <span class="kw">except</span> RpcError <span class="kw">as</span> e:
+        <span class="kw">return</span> encode(error_message(msg[<span class="str">"id"</span>], e.code, e.message, e.data))
+    <span class="kw">except</span> Exception <span class="kw">as</span> e:
+        log(<span class="str">"internal error in"</span>, method, repr(e))
+        <span class="kw">return</span> encode(error_message(msg[<span class="str">"id"</span>], INTERNAL_ERROR, <span class="str">"Internal error"</span>))</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 2: the handshake</h2>
+
+<p>In every revision up to 2025-11-25 an MCP connection begins with a short negotiation (the <a href="../chapters/07-mcp.html">lifecycle</a> of chapter 7). The client sends <code>initialize</code>, naming the newest protocol version it supports, its <span class="term">capabilities</span> (optional features it offers, such as answering questions from the server) and its identity. The server answers with the version it will use, its own capabilities and its identity. Then the client sends the notification <code>notifications/initialized</code>, and only then does normal work begin.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 230" role="img" aria-label="The server's handshake states. A new server serves initialize and ping. After a good initialize it is initialising and serves ping only. After the notifications/initialized notification it is ready and serves everything. Initialize again is minus 32600 in the later states. Modern requests with their own metadata never touch this machine."><defs><marker id="ahAG-L3d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+  <rect x="20" y="62" width="150" height="60" rx="10" class="fs-purple s-purple sw-2"/>
+  <text x="95" y="88" text-anchor="middle" class="t-sm t-bold">new</text>
+  <text x="95" y="106" text-anchor="middle" class="t-xs t-muted">state = "new"</text>
+  <rect x="305" y="62" width="150" height="60" rx="10" class="fs-purple s-purple sw-2"/>
+  <text x="380" y="88" text-anchor="middle" class="t-sm t-bold">initialising</text>
+  <text x="380" y="106" text-anchor="middle" class="t-xs t-muted">reply sent, no ack yet</text>
+  <rect x="590" y="62" width="150" height="60" rx="10" class="fs-green s-green sw-2"/>
+  <text x="665" y="88" text-anchor="middle" class="t-sm t-bold">ready</text>
+  <text x="665" y="106" text-anchor="middle" class="t-xs t-muted">normal operation</text>
+  <line x1="172" y1="92" x2="303" y2="92" class="line sw-2" marker-end="url(#ahAG-L3d)"/>
+  <text x="237" y="82" text-anchor="middle" class="t-xs">initialize (ok)</text>
+  <line x1="457" y1="92" x2="588" y2="92" class="line sw-2" marker-end="url(#ahAG-L3d)"/>
+  <text x="522" y="70" text-anchor="middle" class="t-xs">notifications/</text>
+  <text x="522" y="83" text-anchor="middle" class="t-xs">initialized</text>
+  <text x="95" y="146" text-anchor="middle" class="t-xs">serves: initialize, ping</text>
+  <text x="95" y="162" text-anchor="middle" class="t-xs tc-red">anything else: -32600</text>
+  <text x="380" y="146" text-anchor="middle" class="t-xs">serves: ping</text>
+  <text x="380" y="162" text-anchor="middle" class="t-xs tc-red">the rest, and initialize: -32600</text>
+  <text x="665" y="146" text-anchor="middle" class="t-xs">serves: everything</text>
+  <text x="665" y="162" text-anchor="middle" class="t-xs tc-red">initialize again: -32600</text>
+  <rect x="20" y="182" width="720" height="38" rx="8" class="fs-yellow s-yellow sw-2"/>
+  <text x="380" y="206" text-anchor="middle" class="t-xs">A bad initialize changes nothing. Modern requests (milestone 6) never touch this machine.</text>
+</svg>
+  <figcaption><strong>A three-state machine.</strong> The gate is a few lines, but it is the part of the old protocol that forces a server to remember each client, which is why the 2026 revision removed it.</figcaption>
+</figure>
+
+<p><strong>Version negotiation</strong> is a counter-offer, not a refusal. If the client asks for a version the server speaks, the server answers with that version. If not, it answers with the newest version it does speak, and the client decides whether it can live with that or must disconnect. Versions are date strings (<code>2025-06-18</code>, <code>2025-11-25</code>), so equality is the right comparison and <code>"latest"</code> is just an unknown version.</p>
+<p>The specification tells <em>clients</em> not to send anything but pings before the server has answered, and not to send requests before the <code>initialized</code> notification, but it does not say how a <em>server</em> must treat early requests. This lab's rule, which is a design choice and the same one chapter 7's server makes, is: before the handshake completes, serve only <code>initialize</code> and <code>ping</code>; reject the rest with -32600 and a message that says what to do. A second <code>initialize</code> is also -32600. Making the rules explicit and testable is the point: a server that quietly accepts anything is a server whose clients are never told they are wrong.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>Server.on_initialize</code>, <code>Server.on_notification</code> and <code>Server.process</code>. <code>on_initialize</code> validates (<code>protocolVersion</code> a string, <code>capabilities</code> and <code>clientInfo</code> objects, else -32602 with no state change), negotiates, moves the server to <code>"initialising"</code> and returns the result: <code>protocolVersion</code>, <code>capabilities</code> (the given <code>CAPABILITIES</code>) and <code>serverInfo</code> (the given <code>SERVER_INFO</code>). <code>process</code> applies the gate and then calls the given <code>dispatch</code>. Leave the stateless branch for milestone 6.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It replaces <code>dispatch</code> by a stub so only the lifecycle is tested: <code>ping</code> works at any time; <code>tools/list</code> is -32600 before <code>initialize</code> <em>and</em> between <code>initialize</code> and the notification; the <code>initialize</code> result matches field by field; asking for <code>2025-06-18</code> gets <code>2025-06-18</code>, while <code>2024-11-05</code>, <code>9999-01-01</code> and <code>latest</code> get <code>2025-11-25</code>; a second <code>initialize</code> is -32600 and does not break the ready state; four malformed <code>initialize</code> requests are -32602 and leave no trace; <code>notifications/initialized</code> before <code>initialize</code> does nothing; unknown notifications are ignored; and thirty seeded random message sequences must agree with a plain state machine that the checker implements independently.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>A string state (<code>"new"</code>, <code>"initialising"</code>, <code>"ready"</code>) is easier to get right than two booleans.</li>
+      <li>Validate <em>before</em> touching <code>self.state</code>. Otherwise a malformed <code>initialize</code> half-starts the handshake.</li>
+      <li>The notification must only advance the state from <code>"initialising"</code>. Receiving it in state <code>"new"</code> must not make the server ready.</li>
+      <li>In <code>process</code>, check <code>initialize</code> first (already initialised?), then everything except <code>initialize</code> and <code>ping</code> (not ready?).</li>
+      <li><code>LEGACY_VERSIONS[0]</code> is the newest version this server speaks.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> on_initialize(self, params: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""Validate, negotiate and answer `initialize`.
+
+    protocolVersion must be a string, capabilities and clientInfo objects, else -32602 (and no
+    state change). Answer with the client's version if it is in LEGACY_VERSIONS, otherwise the
+    newest one. Result: protocolVersion, capabilities (CAPABILITIES), serverInfo (SERVER_INFO).
+    """</span>
+    ver = params.get(<span class="str">"protocolVersion"</span>)
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(ver, str) <span class="kw">or</span> <span class="kw">not</span> isinstance(params.get(<span class="str">"capabilities"</span>), dict) \
+            <span class="kw">or</span> <span class="kw">not</span> isinstance(params.get(<span class="str">"clientInfo"</span>), dict):
+        <span class="kw">raise</span> RpcError(INVALID_PARAMS, <span class="str">"initialize needs protocolVersion, capabilities and clientInfo"</span>)
+    self.client_info = params[<span class="str">"clientInfo"</span>]
+    self.state = <span class="str">"initialising"</span>
+    <span class="kw">return</span> {<span class="str">"protocolVersion"</span>: ver <span class="kw">if</span> ver <span class="kw">in</span> LEGACY_VERSIONS <span class="kw">else</span> LEGACY_VERSIONS[<span class="num">0</span>],
+            <span class="str">"capabilities"</span>: CAPABILITIES, <span class="str">"serverInfo"</span>: SERVER_INFO}
+
+<span class="kw">def</span> on_notification(self, method: str, params: Dict[str, Any]) -&gt; <span class="kw">None</span>:
+    <span class="str">"""notifications/initialized completes the handshake (only after a good initialize).
+    Every other notification, known or not, is ignored."""</span>
+    <span class="kw">if</span> method == <span class="str">"notifications/initialized"</span> <span class="kw">and</span> self.state == <span class="str">"initialising"</span>:
+        self.state = <span class="str">"ready"</span>
+
+<span class="kw">def</span> process(self, method: str, params: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""Apply the lifecycle rules, then dispatch.
+
+    Modern requests (milestone 6) are handled first. For handshake-era requests: `initialize`
+    when already initialised is -32600 "Already initialised"; anything except `initialize` and
+    `ping` before the handshake has completed is -32600 "Server not initialised ...".
+    """</span>
+    meta = params.get(<span class="str">"_meta"</span>)
+    <span class="kw">if</span> isinstance(meta, dict) <span class="kw">and</span> (K_VERSION <span class="kw">in</span> meta <span class="kw">or</span> K_CAPS <span class="kw">in</span> meta):
+        <span class="kw">return</span> self.process_modern(method, params, meta)
+    <span class="kw">if</span> method == <span class="str">"initialize"</span> <span class="kw">and</span> self.state != <span class="str">"new"</span>:
+        <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Already initialised"</span>)
+    <span class="kw">if</span> method <span class="kw">not</span> <span class="kw">in</span> (<span class="str">"initialize"</span>, <span class="str">"ping"</span>) <span class="kw">and</span> self.state != <span class="str">"ready"</span>:
+        <span class="kw">raise</span> RpcError(INVALID_REQUEST, <span class="str">"Server not initialised: send initialize, then notifications/initialized"</span>)
+    <span class="kw">return</span> self.dispatch(method, params)</code></pre>
+<p>The solution's <code>process</code> already has the first three lines of milestone 6 (the branch to <code>process_modern</code>); with the starter you add them later.</p>
+  </details>
+</div>
+
+<h2>Milestone 3: tools</h2>
+
+<p>A <span class="term">tool</span> is a function the model can ask the host to run. <code>tools/list</code> returns each tool's <code>name</code>, <code>description</code> and <code>inputSchema</code> (a JSON Schema object, in the camel case MCP uses; the model-facing shape in <a href="../chapters/06-function-calling.html">chapter 6</a> spells it <code>input_schema</code>). <code>tools/call</code> takes a name and <code>arguments</code> and returns <code>content</code> blocks and an <code>isError</code> flag. The part that needs care is what happens when something is wrong, because MCP has <strong>two error channels</strong> with different audiences:</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>Protocol error</th><th>Tool execution error</th></tr></thead>
+  <tbody>
+    <tr><td>Shape</td><td>JSON-RPC <code>error</code> object: code, message, optional data</td><td>an ordinary <code>result</code> with <code>isError: true</code></td></tr>
+    <tr><td>Who reads it</td><td>the client <em>program</em>, which has a bug or a version problem</td><td>the <em>model</em>, which can read the text and try again</td></tr>
+    <tr><td>In this lab</td><td>unknown tool name, <code>name</code> missing or not a string, <code>arguments</code> not an object, a crash inside your own code (-32603)</td><td>arguments that fail the schema, a <code>ToolError</code> raised by the tool (such as "no such order")</td></tr>
+    <tr><td>Test question</td><td>"Could a model have avoided this by choosing differently?" No.</td><td>"Could the model fix this on its next turn?" Yes, so tell it how.</td></tr>
+  </tbody>
+</table></div>
+<p>The 2025-11-25 revision states the second rule explicitly: input validation errors should be reported as tool execution errors, specifically so the model can correct itself. It is the MCP form of the actionable error from <a href="../chapters/05-tool-design.html">tool design</a>. The given <code>check_arguments</code> produces the sentences (<code>'limit' must be an integer, got str</code>; <code>'status' must be one of shipped, processing, delivered, cancelled; got 'lost'</code>); your job is the routing. Two more details: look tools up in <code>TOOL_FUNCS</code> <em>when the call arrives</em> (the checker swaps in a tool that crashes, to see that the server survives), and never hand out the module's own <code>TOOLS</code> list, because a caller who mutates the result would be editing your server.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>Server.list_tools</code> (the tools sorted by name, as <code>{"tools": [...]}</code>) and <code>Server.call_tool</code>. A success is <code>{"content": [{"type": "text", "text": ...}], "isError": False}</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. It skips the handshake gate (so you can do this milestone before milestone 2) and checks: the list is sorted, names obey the spec's naming rule, and mutating a reply does not change <code>TOOLS</code>; <code>order_lookup</code> and <code>orders_search</code> give exact texts; a missing argument, a wrong type, a value outside the enum, an unknown order and absent <code>arguments</code> are all <code>isError: true</code> with a message that names the problem (and, for the unknown order, the tool's own advice); an unknown tool is -32602 naming the tool; a missing name, a non-string name and non-object arguments are -32602; a tool that crashes gives -32603 and one that raises <code>ToolError</code> gives its message verbatim. Last, sixty seeded random argument sets for <code>orders_search</code> must be classified correctly and never produce a JSON-RPC error.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>sorted(TOOLS, key=lambda t: t["name"])</code> returns a new list, so the module's own list is never reordered or handed out.</li>
+      <li><code>params.get("arguments", {})</code> handles an absent <code>arguments</code>. A present value that is not a dict is -32602.</li>
+      <li>Join the problems with <code>"; "</code> into one message that begins with the tool's name.</li>
+      <li>Only <code>ToolError</code> becomes <code>isError</code>. Do not write <code>except Exception</code> here: a <code>ZeroDivisionError</code> in a tool is your bug, not the model's, and hiding it in a tool result would stop you ever seeing it.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> list_tools(self, params: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""{"tools": [...]}: TOOLS sorted by name (a stable order helps caches)."""</span>
+    <span class="kw">return</span> {<span class="str">"tools"</span>: sorted(TOOLS, key=<span class="kw">lambda</span> t: t[<span class="str">"name"</span>])}
+
+<span class="kw">def</span> call_tool(self, params: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""Run a tool. Protocol faults are RpcErrors (-32602: name missing or not a string, unknown
+    tool, arguments not an object). Everything the model can fix is a normal result with
+    isError true: arguments that fail check_arguments, or a ToolError from the tool. Any other
+    exception from the tool propagates (it becomes -32603). Look tools up in TOOL_FUNCS at call
+    time. Success: {"content": [{"type": "text", "text": ...}], "isError": False}.
+    """</span>
+    name = params.get(<span class="str">"name"</span>)
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(name, str):
+        <span class="kw">raise</span> RpcError(INVALID_PARAMS, <span class="str">"tools/call needs a string 'name'"</span>)
+    tool = next((t <span class="kw">for</span> t <span class="kw">in</span> TOOLS <span class="kw">if</span> t[<span class="str">"name"</span>] == name), <span class="kw">None</span>)
+    <span class="kw">if</span> tool <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">raise</span> RpcError(INVALID_PARAMS, <span class="str">f"Unknown tool: {name}"</span>)
+    args = params.get(<span class="str">"arguments"</span>, {})
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(args, dict):
+        <span class="kw">raise</span> RpcError(INVALID_PARAMS, <span class="str">"'arguments' must be an object"</span>)
+
+    <span class="kw">def</span> block(text: str, is_error: bool) -&gt; Dict[str, Any]:
+        <span class="kw">return</span> {<span class="str">"content"</span>: [{<span class="str">"type"</span>: <span class="str">"text"</span>, <span class="str">"text"</span>: text}], <span class="str">"isError"</span>: is_error}
+
+    problems = check_arguments(tool[<span class="str">"inputSchema"</span>], args)
+    <span class="kw">if</span> problems:
+        <span class="kw">return</span> block(<span class="str">f"Invalid arguments for {name}: "</span> + <span class="str">"; "</span>.join(problems), <span class="kw">True</span>)
+    <span class="kw">try</span>:
+        <span class="kw">return</span> block(TOOL_FUNCS[name](args), <span class="kw">False</span>)
+    <span class="kw">except</span> ToolError <span class="kw">as</span> e:
+        <span class="kw">return</span> block(str(e), <span class="kw">True</span>)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 4: resources, and a sweep of every mistake</h2>
+
+<p>A <span class="term">resource</span> is data identified by a URI that the <em>application</em> (rather than the model) chooses to put in context: a file, a record, a schema. <code>resources/list</code> returns descriptors (<code>uri</code>, <code>name</code>, <code>title</code>, <code>mimeType</code>); <code>resources/read</code> takes a URI and returns <code>contents</code>, each with <code>text</code> (or a base64 <code>blob</code>). This server publishes one resource per order, at <code>order://A-1001</code> and so on, and the text is exactly what <code>order_lookup</code> returns, so the two features always agree (the check asserts it).</p>
+<p>Errors again split in two. A URI that is not a string, or is missing, is a malformed request: -32602. A well-formed URI that names nothing is "resource not found": in the 2025-11-25 text the recommended code is <strong>-32002</strong>, with the URI in <code>data</code> so the client can say which one. Remember that number, because milestone 6 changes it.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>Server.list_resources</code> and <code>Server.read_resource</code>.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. The first resource descriptor must match field for field and there must be one per order, in the order of <code>ORDERS</code>; reading <code>order://A-1002</code> gives the exact <code>contents</code>; <code>order://Z-9</code>, a URL of another scheme and <code>order://</code> with nothing after it are -32002 with <code>data</code> <code>{"uri": ...}</code>; a missing or non-string <code>uri</code> is -32602. Then the <strong>sweep</strong>: a handshaken server receives fifteen different mistakes (garbage, a truncation, a batch, a null id, unknown methods, an unknown tool, a missing resource, a second <code>initialize</code>, two kinds of model mistake and one good call) and every reply must carry exactly one of <code>result</code> and <code>error</code>, with the code the table above prescribes. This is the milestone that asks all earlier ones to agree with each other.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li><code>uri.startswith("order://")</code> and then <code>uri[len("order://"):]</code> gives the id. A prefix test is more honest than <code>.replace</code>, which would also edit the middle of a string.</li>
+      <li>Do not re-implement the order text. <code>describe_order(oid)</code> is the single source, for the tool and the resource.</li>
+      <li>The error's <code>data</code> is the dictionary <code>{"uri": uri}</code> (the uri that was asked for, not the id you parsed out of it).</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> list_resources(self, params: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""{"resources": [{uri, name, title, mimeType}]}, one per order, in ORDERS order:
+    uri "order://A-1001", name "order-A-1001", title "Order A-1001", mimeType "text/plain"."""</span>
+    <span class="kw">return</span> {<span class="str">"resources"</span>: [{<span class="str">"uri"</span>: <span class="str">f"order://{i}"</span>, <span class="str">"name"</span>: <span class="str">f"order-{i}"</span>, <span class="str">"title"</span>: <span class="str">f"Order {i}"</span>,
+                           <span class="str">"mimeType"</span>: <span class="str">"text/plain"</span>} <span class="kw">for</span> i <span class="kw">in</span> ORDERS]}
+
+<span class="kw">def</span> read_resource(self, params: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""{"contents": [{uri, mimeType, text}]} with text from describe_order. A uri that is
+    missing or not a string is -32602; a string that names no order is -32002 with data {"uri": uri}."""</span>
+    uri = params.get(<span class="str">"uri"</span>)
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(uri, str):
+        <span class="kw">raise</span> RpcError(INVALID_PARAMS, <span class="str">"resources/read needs a string 'uri'"</span>)
+    oid = uri[len(<span class="str">"order://"</span>):] <span class="kw">if</span> uri.startswith(<span class="str">"order://"</span>) <span class="kw">else</span> <span class="kw">None</span>
+    <span class="kw">if</span> oid <span class="kw">not</span> <span class="kw">in</span> ORDERS:
+        <span class="kw">raise</span> RpcError(RESOURCE_NOT_FOUND, <span class="str">"Resource not found"</span>, {<span class="str">"uri"</span>: uri})
+    <span class="kw">return</span> {<span class="str">"contents"</span>: [{<span class="str">"uri"</span>: uri, <span class="str">"mimeType"</span>: <span class="str">"text/plain"</span>, <span class="str">"text"</span>: describe_order(oid)}]}</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 5: the client</h2>
+
+<p>The client is the mirror image: it starts the server as a subprocess, writes one line per message, and reads one line per reply. The class gives you the constructor (which starts the process with pipes on stdin, stdout and stderr) and <code>_send</code>; you write <code>request</code>, <code>notify</code>, <code>connect</code>, <code>list_tools</code>, <code>call_tool</code> and <code>close</code>. A good client is mostly careful about what can go wrong, and there are four things:</p>
+<ul>
+  <li><strong>The server writes something that is not JSON.</strong> The classic case is a <code>print("ready")</code> in the server: a banner on stdout, the protocol channel. The client reads one line, cannot parse it, and should say so plainly (<code>ValueError</code>, "server wrote non-JSON to stdout") instead of hanging or crashing with a bare <code>JSONDecodeError</code>.</li>
+  <li><strong>The server dies.</strong> <code>readline()</code> returns an empty string at end of file. Treat that as <code>ConnectionError</code>, not as an empty reply.</li>
+  <li><strong>The reply has the wrong id.</strong> Replies are matched to requests by id. This client has one request in flight at a time, so a mismatch means a protocol bug, and you should raise rather than hand back someone else's answer.</li>
+  <li><strong>The server answers with an error.</strong> That is a normal event, not a crash. <code>request</code> raises <code>McpError(code, message, data)</code> so calling code can branch on <code>e.code</code>, and the client stays usable afterwards.</li>
+</ul>
+<p>The client also has to decide when a connection is good. <code>connect()</code> sends <code>initialize</code> with the newest version it speaks, reads the reply, and checks that the server's chosen version is one of the client's: a server that counter-offers <code>1999-01-01</code> is a server you cannot use, and the right response is to close the process and raise. Then it sends the notification and does <em>not</em> wait for a reply, because there will not be one (a client that waits for the answer to a notification hangs for ever). Shutdown over stdio is polite and has no message: close the server's stdin, wait for it to exit, and kill it only if it does not.</p>
+
+<p>Finally the bridge. The model never speaks MCP (<a href="../chapters/07-mcp.html">chapter 7</a>): the host translates. <code>to_model_tools</code> turns MCP tool definitions into the shape of <a href="../chapters/02-tool-loop.html">the agent loop</a> (<code>inputSchema</code> becomes <code>input_schema</code>), and <code>run_tool_use</code> routes one <code>tool_use</code> block through <code>tools/call</code> and builds the <code>tool_result</code> block for the model. A tool failure arrives as data (<code>is_error</code> true) because the model can act on it; a protocol error becomes an <code>is_error</code> result reading <code>MCP error -32602: Unknown tool: ...</code> so that even then the model sees something instead of the loop crashing. Which errors to show a model is a host policy; this one is the safe default.</p>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>McpClient.request</code>, <code>notify</code>, <code>connect</code>, <code>list_tools</code>, <code>call_tool</code> (returning <code>(text, is_error)</code>) and <code>close</code> (returning the server's stderr), then <code>to_model_tools</code> and <code>run_tool_use</code>. Keep <code>self.trace</code> up to date: <code>_send</code> adds the outgoing lines; you add each raw reply as <code>"&lt;-- "</code> plus the line.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. First against <code>fixture_server.py</code>: <code>connect</code> sends exactly <code>initialize</code> (id 1, version 2025-11-25, empty capabilities, a <code>clientInfo</code>) and then a notification without an id, and the trace shows no reply read for it; ids run 1, 2, 3; <code>call_tool</code> returns <code>(text, False)</code>, a tool failure returns <code>(message, True)</code> and an unknown tool raises <code>McpError</code> with code, message and data; the client still works afterwards; <code>close</code> exits the fixture with code 0 and returns its stderr. Then four misbehaving fixtures (a stdout banner, a wrong id, a hang-up, an unusable version), a scripted model loop through your bridge (a good call, then a protocol error, then a final answer), and last a <strong>real end-to-end run</strong> of your client against <em>your</em> server through real pipes.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Increment the id <em>before</em> sending, and keep the value you sent for the comparison: <code>mid, self.next_id = self.next_id, self.next_id + 1</code>.</li>
+      <li>Add the trace line before parsing, so the trace shows the offending line when the parse fails.</li>
+      <li>An error reply has no <code>result</code>: test <code>"error" in reply</code> first.</li>
+      <li>In <code>close</code>, read stderr only <em>after</em> the process has exited, otherwise <code>read()</code> blocks waiting for more.</li>
+      <li><code>run_tool_use</code> returns <code>tool_result(block["id"], text, is_error=...)</code> from <code>llm.py</code>; the id you echo is the model's <code>tool_use</code> id, not a JSON-RPC id.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> request(self, method: str, params: Optional[Dict[str, Any]] = <span class="kw">None</span>) -&gt; Dict[str, Any]:
+    <span class="str">"""Send a request with the next id, read ONE line, and return its result.
+
+    - no line (end of file): ConnectionError
+    - a line that is not JSON: ValueError mentioning "non-JSON"
+    - a reply whose id differs from the request's: ValueError mentioning "id"
+    - an error reply: McpError(code, message, data)
+    Add "&lt;-- " plus the raw line (stripped) to self.trace.
+    """</span>
+    mid, self.next_id = self.next_id, self.next_id + <span class="num">1</span>
+    msg: Dict[str, Any] = {<span class="str">"jsonrpc"</span>: <span class="str">"2.0"</span>, <span class="str">"id"</span>: mid, <span class="str">"method"</span>: method}
+    <span class="kw">if</span> params <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        msg[<span class="str">"params"</span>] = params
+    self._send(msg)
+    line = self.proc.stdout.readline()
+    <span class="kw">if</span> <span class="kw">not</span> line:
+        <span class="kw">raise</span> ConnectionError(<span class="str">f"server closed its output before answering {method}"</span>)
+    self.trace.append(<span class="str">"&lt;-- "</span> + line.strip())
+    <span class="kw">try</span>:
+        reply = json.loads(line)
+    <span class="kw">except</span> json.JSONDecodeError:
+        <span class="kw">raise</span> ValueError(<span class="str">f"server wrote non-JSON to stdout: {line.strip()!r}"</span>) <span class="kw">from</span> <span class="kw">None</span>
+    <span class="kw">if</span> reply.get(<span class="str">"id"</span>) != mid:
+        <span class="kw">raise</span> ValueError(<span class="str">f"reply has id {reply.get('id')!r} but the request had id {mid}"</span>)
+    <span class="kw">if</span> <span class="str">"error"</span> <span class="kw">in</span> reply:
+        e = reply[<span class="str">"error"</span>]
+        <span class="kw">raise</span> McpError(e[<span class="str">"code"</span>], e[<span class="str">"message"</span>], e.get(<span class="str">"data"</span>))
+    <span class="kw">return</span> reply[<span class="str">"result"</span>]
+
+<span class="kw">def</span> notify(self, method: str, params: Optional[Dict[str, Any]] = <span class="kw">None</span>) -&gt; <span class="kw">None</span>:
+    <span class="str">"""Send a notification: no id, and no reply is read."""</span>
+    msg: Dict[str, Any] = {<span class="str">"jsonrpc"</span>: <span class="str">"2.0"</span>, <span class="str">"method"</span>: method}
+    <span class="kw">if</span> params <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        msg[<span class="str">"params"</span>] = params
+    self._send(msg)
+
+<span class="kw">def</span> connect(self) -&gt; Dict[str, Any]:
+    <span class="str">"""The handshake: initialize (newest of CLIENT_VERSIONS, empty capabilities, clientInfo),
+    then notifications/initialized. If the server's protocolVersion is not one of CLIENT_VERSIONS,
+    close and raise ValueError. Return the initialize result."""</span>
+    result = self.request(<span class="str">"initialize"</span>, {<span class="str">"protocolVersion"</span>: CLIENT_VERSIONS[<span class="num">0</span>], <span class="str">"capabilities"</span>: {},
+                                         <span class="str">"clientInfo"</span>: {<span class="str">"name"</span>: <span class="str">"lab-client"</span>, <span class="str">"version"</span>: <span class="str">"0.1.0"</span>}})
+    <span class="kw">if</span> result.get(<span class="str">"protocolVersion"</span>) <span class="kw">not</span> <span class="kw">in</span> CLIENT_VERSIONS:
+        self.close()
+        <span class="kw">raise</span> ValueError(<span class="str">f"server chose protocol version {result.get('protocolVersion')!r}, which this client does not speak"</span>)
+    self.notify(<span class="str">"notifications/initialized"</span>)
+    <span class="kw">return</span> result
+
+<span class="kw">def</span> list_tools(self) -&gt; List[Dict[str, Any]]:
+    <span class="str">"""The server's tool definitions."""</span>
+    <span class="kw">return</span> self.request(<span class="str">"tools/list"</span>)[<span class="str">"tools"</span>]
+
+<span class="kw">def</span> call_tool(self, name: str, arguments: Dict[str, Any]) -&gt; Tuple[str, bool]:
+    <span class="str">"""tools/call; return (the text blocks joined with newlines, isError). McpError passes through."""</span>
+    res = self.request(<span class="str">"tools/call"</span>, {<span class="str">"name"</span>: name, <span class="str">"arguments"</span>: arguments})
+    text = <span class="str">"\n"</span>.join(b[<span class="str">"text"</span>] <span class="kw">for</span> b <span class="kw">in</span> res[<span class="str">"content"</span>] <span class="kw">if</span> b.get(<span class="str">"type"</span>) == <span class="str">"text"</span>)
+    <span class="kw">return</span> text, bool(res.get(<span class="str">"isError"</span>, <span class="kw">False</span>))
+
+<span class="kw">def</span> close(self) -&gt; str:
+    <span class="str">"""Polite stdio shutdown: close the server's stdin, wait up to 5 s (then kill), return its stderr."""</span>
+    <span class="kw">try</span>:
+        self.proc.stdin.close()
+    <span class="kw">except</span> OSError:
+        <span class="kw">pass</span>
+    <span class="kw">try</span>:
+        self.proc.wait(timeout=<span class="num">5</span>)
+    <span class="kw">except</span> subprocess.TimeoutExpired:
+        self.proc.kill()
+        self.proc.wait()
+    <span class="kw">return</span> self.proc.stderr.read()
+
+<span class="kw">def</span> to_model_tools(mcp_tools: List[Dict[str, Any]]) -&gt; List[Dict[str, Any]]:
+    <span class="str">"""MCP tool definitions to the model-facing shape of llm.py: name, description, input_schema."""</span>
+    <span class="kw">return</span> [{<span class="str">"name"</span>: t[<span class="str">"name"</span>], <span class="str">"description"</span>: t.get(<span class="str">"description"</span>, <span class="str">""</span>), <span class="str">"input_schema"</span>: t[<span class="str">"inputSchema"</span>]}
+            <span class="kw">for</span> t <span class="kw">in</span> mcp_tools]
+
+<span class="kw">def</span> run_tool_use(client: McpClient, block: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""Route one model tool_use block through MCP and return the tool_result block for the model.
+    A protocol error (McpError) becomes an is_error result reading "MCP error &lt;code&gt;: &lt;message&gt;"."""</span>
+    <span class="kw">try</span>:
+        text, is_error = client.call_tool(block[<span class="str">"name"</span>], block[<span class="str">"input"</span>])
+    <span class="kw">except</span> McpError <span class="kw">as</span> e:
+        <span class="kw">return</span> tool_result(block[<span class="str">"id"</span>], <span class="str">f"MCP error {e.code}: {e.message}"</span>, is_error=<span class="kw">True</span>)
+    <span class="kw">return</span> tool_result(block[<span class="str">"id"</span>], text, is_error=is_error)</code></pre>
+  </details>
+</div>
+
+<h2>Milestone 6: the stateless style</h2>
+
+<p>Everything so far remembers. After the handshake the server knows which version was agreed and which capabilities the client has; a pending state of "initialising" lives in a Python attribute. Chapter 8 showed what that costs once a server runs on <a href="../chapters/08-mcp-production.html">several machines behind a balancer</a>: half the requests land on a replica that never saw the handshake. The 2026-07-28 revision removes the memory. Every request says who it is and what it needs, and the server keeps nothing between two requests. Here is the change, as verified against the published changelog and base-protocol pages (see the dated note at the top):</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 316" role="img" aria-label="Two sequence diagrams. On the left, revision 2025-11-25: the client sends initialize, the server replies with its version and capabilities, the client sends the initialized notification, then tools/call and the server replies; the server now holds session state. On the right, revision 2026-07-28: the client sends one tools/call whose _meta carries the protocol version and client capabilities, the server replies with a result including resultType complete and its server info; no state is kept between requests."><defs><marker id="ahAG-L3e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+  <text x="20" y="20" text-anchor="start" class="t-sm t-bold">2025-11-25: state lives in the server</text>
+  <text x="400" y="20" text-anchor="start" class="t-sm t-bold">2026-07-28: state lives in the request</text>
+  <line x1="385" y1="8" x2="385" y2="306" class="line-thin"/>
+  <rect x="10" y="34" width="60" height="24" rx="6" class="fs-green s-green sw-2"/>
+  <text x="40" y="51" text-anchor="middle" class="t-xs t-bold">client</text>
+  <rect x="300" y="34" width="60" height="24" rx="6" class="fs-blue s-blue sw-2"/>
+  <text x="330" y="51" text-anchor="middle" class="t-xs t-bold">server</text>
+  <line x1="40" y1="58" x2="40" y2="300" class="line-dash"/>
+  <line x1="330" y1="58" x2="330" y2="300" class="line-dash"/>
+  <line x1="42" y1="88" x2="328" y2="88" class="line sw-2" marker-end="url(#ahAG-L3e)"/>
+  <text x="185" y="82" text-anchor="middle" class="t-xs">initialize (version, capabilities)</text>
+  <line x1="328" y1="120" x2="42" y2="120" class="line sw-2" marker-end="url(#ahAG-L3e)"/>
+  <text x="185" y="114" text-anchor="middle" class="t-xs">result (version, capabilities)</text>
+  <line x1="42" y1="152" x2="328" y2="152" class="line s-orange sw-2" marker-end="url(#ahAG-L3e)"/>
+  <text x="185" y="146" text-anchor="middle" class="t-xs">notifications/initialized</text>
+  <line x1="42" y1="200" x2="328" y2="200" class="line sw-2" marker-end="url(#ahAG-L3e)"/>
+  <text x="185" y="194" text-anchor="middle" class="t-xs">tools/call</text>
+  <line x1="328" y1="232" x2="42" y2="232" class="line sw-2" marker-end="url(#ahAG-L3e)"/>
+  <text x="185" y="226" text-anchor="middle" class="t-xs">result</text>
+  <rect x="190" y="252" width="168" height="34" rx="8" class="fs-purple s-purple sw-2"/>
+  <text x="274" y="273" text-anchor="middle" class="t-xs t-bold">session kept: ready</text>
+  <rect x="405" y="34" width="60" height="24" rx="6" class="fs-green s-green sw-2"/>
+  <text x="435" y="51" text-anchor="middle" class="t-xs t-bold">client</text>
+  <rect x="690" y="34" width="60" height="24" rx="6" class="fs-blue s-blue sw-2"/>
+  <text x="720" y="51" text-anchor="middle" class="t-xs t-bold">server</text>
+  <line x1="435" y1="58" x2="435" y2="300" class="line-dash"/>
+  <line x1="720" y1="58" x2="720" y2="300" class="line-dash"/>
+  <line x1="437" y1="120" x2="718" y2="120" class="line sw-2" marker-end="url(#ahAG-L3e)"/>
+  <text x="578" y="102" text-anchor="middle" class="t-xs">tools/call + _meta:</text>
+  <text x="578" y="114" text-anchor="middle" class="t-xs">version, capabilities</text>
+  <line x1="718" y1="170" x2="437" y2="170" class="line sw-2" marker-end="url(#ahAG-L3e)"/>
+  <text x="578" y="152" text-anchor="middle" class="t-xs">result + resultType + serverInfo</text>
+  <rect x="440" y="214" width="276" height="56" rx="8" class="fs-yellow s-yellow sw-2"/>
+  <text x="578" y="238" text-anchor="middle" class="t-xs t-bold">nothing kept between requests</text>
+  <text x="578" y="256" text-anchor="middle" class="t-xs">any replica, any order, same answer</text>
+</svg>
+  <figcaption><strong>The handshake becomes metadata.</strong> The left server must remember a session; the right one reads everything it needs from each request, so the checker can replay requests in any order, on any fresh server, and demand identical replies.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Concern</th><th>Through 2025-11-25</th><th>2026-07-28 (as implemented here)</th></tr></thead>
+  <tbody>
+    <tr><td>Opening</td><td><code>initialize</code>, then <code>notifications/initialized</code></td><td>no handshake; <code>params._meta</code> carries <code>io.modelcontextprotocol/protocolVersion</code> and <code>io.modelcontextprotocol/clientCapabilities</code>, both required</td></tr>
+    <tr><td>Learning about a server</td><td>the <code>initialize</code> result</td><td><code>server/discover</code> (mandatory for servers): <code>supportedVersions</code>, <code>capabilities</code>, and server identity in the result's <code>_meta</code></td></tr>
+    <tr><td>Missing required <code>_meta</code></td><td>not applicable</td><td>-32602 Invalid params</td></tr>
+    <tr><td>Version the server does not speak</td><td>counter-offer in the <code>initialize</code> result</td><td>per request: -32022 <code>UnsupportedProtocolVersion</code>, with <code>data</code> <code>{"supported": [...], "requested": "..."}</code>; the client retries</td></tr>
+    <tr><td>Results</td><td>no marker</td><td>every result has <code>resultType</code>: <code>"complete"</code> here</td></tr>
+    <tr><td>Caching</td><td>none</td><td>list and read results (and discover) carry <code>ttlMs</code> and <code>cacheScope</code> (<code>public</code> or <code>private</code>)</td></tr>
+    <tr><td>Resource not found</td><td>-32002</td><td>-32602 (the standard invalid-params code)</td></tr>
+    <tr><td><code>ping</code>, <code>initialize</code></td><td>exist</td><td><code>ping</code> removed; <code>initialize</code> is not a modern method, so both are -32601 if sent with modern <code>_meta</code></td></tr>
+  </tbody>
+</table></div>
+
+<p>A <strong>dual-era server</strong> serves both worlds from one process, and the versioning page says how it chooses: a request carrying modern <code>_meta</code> is served statelessly; an <code>initialize</code> request selects the old session. That is how you write a server today that works with the clients that exist and with the ones that are coming. The matching client behaviour on stdio is a probe: send <code>server/discover</code> first, and if the answer is not a recognised modern reply or modern error, fall back to <code>initialize</code> (a stretch goal below).</p>
+<p>The property that matters is that the modern path <strong>touches no state</strong>. Nothing in <code>process_modern</code> reads or writes <code>self.state</code>. The check verifies it the strong way: it generates random mixes of modern requests, runs them on one long-lived server, on a brand-new server per request, and in shuffled order on a third server that sometimes receives a legacy handshake in between, and demands that every reply is identical across all three. A single remembered fact anywhere in your code shows up as a difference.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Stateless means the server stores nothing." It means the <em>protocol</em> stores nothing between requests. If a tool genuinely needs memory (a basket, a draft, a long-running job), the state moves to an explicit handle that the server mints and the model passes back as an ordinary argument, exactly as it passes an order id. The server is free to keep that state in a database; what it may not do is infer it from "this connection" or "this process". The point is that any replica can pick up the next request.</p>
+</div>
+
+<div class="milestone">
+  <p class="milestone-title">Your task</p>
+  <p>Write <code>Server.process_modern(method, params, meta)</code> and add the branch at the top of <code>process</code> that calls it when <code>_meta</code> contains either modern key. The docstring lists the rules: required fields (-32602), version check (-32022 with <code>data</code>), the five methods, the result decoration (<code>resultType</code>, server info in <code>_meta</code>, and <code>ttlMs</code> and <code>cacheScope</code> from the given <code>CACHE</code> table), resource-not-found as -32602, and -32601 for everything else.</p>
+  <p class="checkpoint"><code>python3 check.py</code> shows this milestone as &#10004;. On a brand-new server with no handshake: the <code>server/discover</code> result matches field by field; modern <code>tools/list</code> equals the legacy tool list plus the new fields; <code>tools/call</code> works (and has no cache fields); an unknown order is still a complete result with <code>isError</code>; a missing resource is -32602 with the URI in <code>data</code>; a missing version, a missing capabilities object and a non-string version are -32602; versions <code>2025-11-25</code>, <code>1900-01-01</code> and <code>2026-07-29</code> are -32022 with the exact <code>data</code>; <code>ping</code>, <code>initialize</code> and <code>logging/setLevel</code> are -32601; extra <code>_meta</code> keys such as <code>traceparent</code> are accepted. Then the twenty random request mixes described above, a check that a modern request never completes a legacy handshake and vice versa, and a real subprocess exchange that probes with <code>server/discover</code>, makes a modern call and then still answers a legacy <code>initialize</code> on the same process.</p>
+  <details class="deeper">
+    <summary>Hints <span class="hint">try without first</span></summary>
+    <ul>
+      <li>Decide the era by looking only at <code>params["_meta"]</code> (a dict containing either key). A request without it must behave exactly as in milestones 2 to 4.</li>
+      <li>Reuse <code>self.dispatch</code> for tools and resources rather than copying the logic, then add the new members around its result. Copy the dictionary first (<code>dict(result)</code>) so you do not modify a shared object.</li>
+      <li>The not-found translation is one <code>except</code>: catch your <code>RpcError</code>, and if its code is -32002 raise a -32602 with the same data.</li>
+      <li>Do not put <code>clientCapabilities</code> or <code>protocolVersion</code> in the reply. The server describes itself, not the client.</li>
+      <li><code>server/discover</code> is not in the method table. Handle it in <code>process_modern</code>, because it exists only in this era.</li>
+    </ul>
+  </details>
+  <details class="deeper">
+    <summary>Solution <span class="hint">spoiler</span></summary>
+<pre><code><span class="kw">def</span> process_modern(self, method: str, params: Dict[str, Any], meta: Dict[str, Any]) -&gt; Dict[str, Any]:
+    <span class="str">"""Serve one 2026-07-28 request. It touches no state: nothing here reads or writes self.state.
+
+    - version (K_VERSION) must be a string and capabilities (K_CAPS) an object, else -32602
+      "Missing required _meta fields".
+    - a version not in MODERN_VERSIONS is -32022 "Unsupported protocol version" with
+      data {"supported": MODERN_VERSIONS, "requested": version}.
+    - methods: server/discover, tools/list, tools/call, resources/list, resources/read. Anything
+      else (initialize and ping included) is -32601.
+    - every result gets "resultType": "complete" and "_meta": {K_SERVER: SERVER_INFO}; the list and
+      read results and server/discover also carry "ttlMs" and "cacheScope" (see CACHE).
+    - a resource that does not exist is -32602 in this era (data still {"uri": uri}).
+    - server/discover result: supportedVersions (MODERN_VERSIONS) and capabilities (CAPABILITIES).
+    """</span>
+    version, caps = meta.get(K_VERSION), meta.get(K_CAPS)
+    <span class="kw">if</span> <span class="kw">not</span> isinstance(version, str) <span class="kw">or</span> <span class="kw">not</span> isinstance(caps, dict):
+        <span class="kw">raise</span> RpcError(INVALID_PARAMS, <span class="str">"Missing required _meta fields"</span>, {<span class="str">"required"</span>: [K_VERSION, K_CAPS]})
+    <span class="kw">if</span> version <span class="kw">not</span> <span class="kw">in</span> MODERN_VERSIONS:
+        <span class="kw">raise</span> RpcError(UNSUPPORTED_VERSION, <span class="str">"Unsupported protocol version"</span>,
+                       {<span class="str">"supported"</span>: MODERN_VERSIONS, <span class="str">"requested"</span>: version})
+    <span class="kw">if</span> method == <span class="str">"server/discover"</span>:
+        result: Dict[str, Any] = {<span class="str">"supportedVersions"</span>: MODERN_VERSIONS, <span class="str">"capabilities"</span>: CAPABILITIES}
+    <span class="kw">elif</span> method <span class="kw">in</span> CACHE <span class="kw">or</span> method == <span class="str">"tools/call"</span>:
+        <span class="kw">try</span>:
+            result = dict(self.dispatch(method, params))
+        <span class="kw">except</span> RpcError <span class="kw">as</span> e:
+            <span class="kw">if</span> e.code == RESOURCE_NOT_FOUND:
+                <span class="kw">raise</span> RpcError(INVALID_PARAMS, e.message, e.data) <span class="kw">from</span> <span class="kw">None</span>
+            <span class="kw">raise</span>
+    <span class="kw">else</span>:
+        <span class="kw">raise</span> RpcError(METHOD_NOT_FOUND, <span class="str">f"Method not found: {method}"</span>)
+    <span class="kw">if</span> method <span class="kw">in</span> CACHE:
+        result[<span class="str">"ttlMs"</span>], result[<span class="str">"cacheScope"</span>] = CACHE[method]
+    <span class="kw">return</span> {<span class="str">"resultType"</span>: <span class="str">"complete"</span>, **result, <span class="str">"_meta"</span>: {K_SERVER: SERVER_INFO}}</code></pre>
+  </details>
+</div>
+<p>Here is the same server answering the new style, from a real run (five lines in, five out): a discovery probe, a call, a missing resource that is now -32602, a request for an old version in a modern envelope, and a legacy request on a process that has had no handshake.</p>
+<pre class="terminal" data-title="transcript"><code>--&gt; {"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"20...
+&lt;-- {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools...
+--&gt; {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"order_lookup","arguments":{"order_id":"A-1004"},"_m...
+&lt;-- {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"A-1004: shipped, 800 ce...
+--&gt; {"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"order://Z-9","_meta":{"io.modelcontextprotocol/p...
+&lt;-- {"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Resource not found","data":{"uri":"order://Z-9"}}}
+--&gt; {"jsonrpc":"2.0","id":4,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11...
+&lt;-- {"jsonrpc":"2.0","id":4,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-...
+--&gt; {"jsonrpc":"2.0","id":5,"method":"tools/list"}
+&lt;-- {"jsonrpc":"2.0","id":5,"error":{"code":-32600,"message":"Server not initialised: send initialize, then notificatio...</code></pre>
+
+<h2>Run it all</h2>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution</span>
+<span class="out">Lab 3 checks against solution.py
+
+  ✔ Milestone 1: messages on a line, framing and error envelopes
+      framing, envelopes, id echo, notifications and every truncation of a valid line behave
+  ✔ Milestone 2: the handshake and version negotiation
+      handshake order, version negotiation, refusals and 30 random message sequences match a plain state machine
+  ✔ Milestone 3: tools, and the two kinds of error
+      list, call, both error routes, a crashing tool, and 60 random argument sets behave
+  ✔ Milestone 4: resources, and an error-code sweep
+      every kind of mistake gets the right code:
+      garbage                 -32700
+      truncated               -32700
+      batch                   -32600
+      no jsonrpc              -32600
+      ...
+  ✔ Milestone 5: the client, and the bridge to a model
+      handshake, ids, errors, three failure modes, the model bridge, and a real end-to-end run pass
+  ✔ Milestone 6: the stateless 2026-07-28 style
+      stateless requests, version errors, caching hints, era isolation and 20 random request mixes agree
+
+6/6 milestones passing  (0.2 s)</span></code></pre>
+<p>Now see what the checker does when something is wrong. This is a real run of <code>python3 check.py solution 3</code> against a copy of the solution whose <code>call_tool</code> reports a failed validation as a JSON-RPC error instead of an <code>isError</code> result. The server still answers, the id is right and the message is helpful, so a human skimming a transcript might call it fine; but the model never sees the message, and the agent cannot recover:</p>
+<pre class="terminal" data-title="terminal"><code><span class="prompt">$ </span><span class="cmd">python3 check.py solution 3   # with validation errors raised as protocol errors</span>
+<span class="out">Lab 3 checks against solution.py
+
+  ✘ Milestone 3: tools, and the two kinds of error: missing argument: expected a success response, got {'jsonrpc': '2.0', 'id': 7, 'error': {'code': -32602, 'message': "Invalid arguments for order_lookup: missing required argument 'order_id'"}}
+
+0/1 milestones passing  (0.0 s)</span></code></pre>
+<p>Every failure message says what was expected, what was received and which rule applies. For the property checks it also prints the seed, so <code>python3 check.py solution 2 17</code> replays exactly the failing case.</p>
+
+<h2>Try it with a real host</h2>
+<p>When all six pass, <code>python3 starter.py</code> (or your finished file) is a real MCP server for the 2025-11-25 protocol. Many MCP-capable hosts and inspector tools accept a command and arguments for a stdio server, which is all the configuration it needs: the command is <code>python3</code> and the argument is the absolute path of your file. Hosts differ in where that goes and how they display tools, so follow your host's documentation; I did not run your server in any specific host here. What to look for: the host should list <code>order_lookup</code> and <code>orders_search</code> with your descriptions, a call with a bad <code>limit</code> should show the model your <code>isError</code> text and let it retry, and your stderr (if you log) should appear in the host's server log rather than corrupting the session. If a host reports a parse error immediately, something wrote to stdout.</p>
+<p>To drive a real model through the same bridge, set <code>LAB_MODEL</code> as described at the top of <code>llm.py</code> (for example <code>LAB_MODEL=ollama:&lt;model&gt;</code> for a local server), build the model with <code>llm.get_model()</code>, and run the agent loop of <a href="lab-01-agent-loop.html">Lab 1</a> with <code>to_model_tools(client.list_tools())</code> as its tools and <code>run_tool_use</code> as its executor. The checker never does this. What to look for is whether the model's first call passes arguments the schema accepts, and whether, after an <code>isError</code> result, its next call is better or merely different.</p>
+
+<h2>Going further</h2>
+<ul>
+  <li><strong>A stdio compatibility probe.</strong> Write <code>connect_any()</code> that sends <code>server/discover</code> with modern <code>_meta</code> first; on a result it stays modern, on <code>UnsupportedProtocolVersion</code> it retries with a version from <code>data.supported</code>, and on any other error it falls back to <code>initialize</code>. Test it against both your dual-era server and <code>fixture_server.py</code> (which is legacy-only).</li>
+  <li><strong>A real prompts feature.</strong> Add <code>prompts/list</code> and <code>prompts/get</code> (a slash-command-style template with a declared argument, as in chapter 7), declare <code>"prompts": {}</code> in the capabilities, and extend both eras.</li>
+  <li><strong>Pagination.</strong> Make <code>tools/list</code> return at most two tools and a <code>nextCursor</code>, and teach the client to follow it. What should the cursor be, given that a stateless server may not remember the previous page?</li>
+  <li><strong>A destructive tool.</strong> Add <code>refund_order</code> with the <code>destructiveHint</code> annotation, and put an approval step in the client's bridge. Then read the security note in chapter 7 on why annotations from an untrusted server are hints only.</li>
+  <li><strong>A concurrent client.</strong> The client here has one request in flight. Allow several, with a reader thread and a dictionary of pending ids, and check what happens when replies arrive out of order. (This is why ids exist at all.)</li>
+  <li><strong>Break it on purpose.</strong> Make the server write a banner to stdout and watch the client's error. Then make it write 70 kilobytes to stderr without anyone reading it, and see where the client blocks (the OS pipe buffer fills). Which of the two is a bug in the server and which in the client?</li>
+</ul>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>Everything in this lab is a classic systems idea in new clothes. A parent process talking to a child through pipes, one message per line, is the oldest remote-procedure shape there is (<a href="../../systems/chapters/05-processes.html">processes</a>). The split between "the call failed" and "the call succeeded and the answer is an error" is the discipline of <a href="../../networking/chapters/12-apis.html">API design</a> and <a href="../../networking/chapters/16-failure.html">timeouts and retries</a>: a client that retries a <code>tools/call</code> after a timeout needs the same idempotency key that any other retried write needs (<a href="../../distributed/chapters/17-logs-exactly-once.html">exactly-once</a>). The move from sessions to stateless requests is the argument for stateless services behind a <a href="../../networking/chapters/14-load-balancers.html">load balancer</a>. And every string a server returns is input to a model, so the boundary between host and server is one of the trust boundaries a <a href="../../security/chapters/01-threat-modeling.html">threat model</a> draws, with <a href="../../security/chapters/09-injection.html">injection</a> as the attack and chapter 19 of this course as the defence.</p>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">What you learned</p>
+  <ul>
+    <li>MCP over stdio is JSON-RPC 2.0, one message per line: requests (method and id, one reply), notifications (no id, never a reply) and responses. Framing and flushing are protocol rules, and logs belong on stderr.</li>
+    <li>A server answers every malformed line with the right code (-32700, -32600, -32601, -32602, -32603), echoes the id when it can read one, and never lets an exception escape or leak its text.</li>
+    <li>The 2025-11-25 lifecycle is a three-state machine: <code>initialize</code>, a version counter-offer, the <code>initialized</code> notification, and nothing else served before it. A bad <code>initialize</code> must change nothing.</li>
+    <li>Errors have two audiences. Protocol errors are for the client program; failures the model can fix (bad arguments, a missing order) are normal results with <code>isError</code> and a message that says how to recover.</li>
+    <li>A client must handle a non-JSON line, end of file, a wrong id and error replies without hanging, and it never waits for the answer to a notification.</li>
+    <li>The 2026-07-28 style carries version and capabilities in every request, adds <code>server/discover</code>, <code>resultType</code>, cache hints and -32022, and moves resource-not-found to -32602. A dual-era server picks its behaviour from the shape of the request, and its modern path keeps no state.</li>
+  </ul>
+</div>
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">A client sends the line <code>{"jsonrpc":"2.0","id":null,"method":"ping"}</code>. What should an MCP server do?</p>
+    <ol class="q-options">
+      <li>Answer with an empty result and id null, because null is a valid JSON-RPC id</li>
+      <li>Answer with error -32600 and id null, because an MCP request id must be a string or an integer</li>
+      <li>Say nothing, because a null id marks the message as a notification</li>
+      <li>Answer with error -32700, because null cannot be parsed</li>
+    </ol>
+    <div class="q-explain">MCP tightens JSON-RPC: request ids must not be null. The line parses fine, so it is not -32700; it is JSON but not a valid MCP request, which is -32600. A notification is a message with <em>no</em> id member, not one whose id is null, which is why <code>"id" in msg</code> and <code>msg.get("id") is None</code> must not be confused.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">Which of these should be reported as a JSON-RPC error rather than as a tool result with <code>isError: true</code>?</p>
+    <ol class="q-options">
+      <li>The model passed <code>limit: "many"</code> where an integer is required</li>
+      <li>The model asked for order A-9999, which does not exist</li>
+      <li>The model called a tool named <code>refund_order</code>, which the server does not have</li>
+      <li>The model passed <code>status: "lost"</code>, which is not in the enum</li>
+    </ol>
+    <div class="q-explain">The test is whether the model can fix it on its next turn. A wrong type, a missing order and a value outside the enum all have a recovery the model can read in the message. A call to a tool that is not in the list means the host and server disagree about what exists, which is a fault in the client program, so it is -32602. (The model can also be the cause, but nothing it says in a tool result can add a tool.)</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Your client sends <code>initialize</code> and waits for ever. The server process is running and its stderr shows it received the message. What is the most likely cause?</p>
+    <ol class="q-options">
+      <li>The server wrote the reply to stdout but did not flush it (or omitted the trailing newline), so the line is still buffered in the server process</li>
+      <li>The server correctly answered the notification and the client is waiting for a second reply</li>
+      <li>The server chose a different protocol version, which blocks the connection</li>
+      <li>JSON-RPC requires the client to send its id as a string</li>
+    </ol>
+    <div class="q-explain">The client reads one line per reply, and a pipe is buffered: an unflushed or newline-less reply never arrives. The second option is backwards (notifications must not be answered), a different version is a counter-offer that arrives as a normal reply, and ids may be integers or strings.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">A modern (2026-07-28) server runs on two replicas. A client has been talking only to replica A and now sends a <code>tools/call</code> that reaches replica B for the first time. What should happen?</p>
+    <ol class="q-options">
+      <li>B replies -32600 "not initialised", and the client must perform the handshake again</li>
+      <li>B asks the client to resend its capabilities in a separate message</li>
+      <li>B may reply differently from A, because capabilities are negotiated per connection</li>
+      <li>B replies exactly as A would, because the request itself carries the protocol version and client capabilities</li>
+    </ol>
+    <div class="q-explain">Removing the handshake and the session is the point of the revision: the required <code>_meta</code> fields give any replica everything it needs. The first option is the 2025 behaviour and the reason sticky routing or shared session storage was needed; the checker's strongest test replays requests on fresh servers to catch exactly that.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">A client sends <code>tools/list</code> with modern <code>_meta</code> declaring protocol version <code>2025-11-25</code> to the dual-era server of this lab. What does it get?</p>
+    <ol class="q-options">
+      <li>The tool list, because 2025-11-25 is a version the server speaks</li>
+      <li>Error -32022 with <code>data.supported</code> listing <code>2026-07-28</code> and <code>data.requested</code> naming 2025-11-25, so the client can retry</li>
+      <li>Error -32602, because the version is not a string</li>
+      <li>Error -32601, because tools/list does not exist in the modern era</li>
+    </ol>
+    <div class="q-explain">The server does speak 2025-11-25, but through <code>initialize</code>, not through per-request metadata, so in the modern envelope that version is unsupported and the error says which versions would work. <code>tools/list</code> does exist in the modern era, and the version is a perfectly good string.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A client asks a 2026-07-28 server for <code>resources/read</code> of a URI that does not exist. Which error code does the revision specify?</p>
+    <ol class="q-options">
+      <li>-32002, as in 2025-11-25</li>
+      <li>-32601, method not found</li>
+      <li>-32602, invalid params</li>
+      <li>No error: a result with <code>isError: true</code></li>
+    </ol>
+    <div class="q-explain">The 2026-07-28 changelog moves resource-not-found from -32002 to the standard -32602, and tells implementations of that version not to emit -32002 (clients should still accept it from older servers). The method exists, so -32601 is wrong, and <code>isError</code> belongs to <code>tools/call</code> results, not to resource reads.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>
