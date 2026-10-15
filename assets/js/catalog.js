@@ -655,7 +655,7 @@
       warmup: ["mlf:20", "mlf:21", "mlf:22", "oe:19", "oe:02"],
       before: ["mlf:04", "mlf:15", "mlf:17", "dl:12", "dl:14", "dl:16", "dl:17", "dl:18", "re:00", "re:01", "re:02", "re:03", "re:04", "re:05", "re:06"],
       while: ["mlf:16", "mlf:18", "dl:03", "dl:13", "llm:02", "llm:05", "llm:22", "evl:04"],
-      build: ["mlf:L6", "mlf:L5", "dl:L4", "re:L1", "dl:W2", "re:W1", "dl:C4", "dl:C7", "re:C1"],
+      build: ["mlf:L5", "mlf:L6", "dl:L4", "re:L1", "dl:W2", "re:W1", "dl:C4", "dl:C7", "re:C1"],
       read: [["autoresearch README and program.md", "https://github.com/karpathy/autoresearch"], ["modded-nanogpt record log", "https://github.com/KellerJordan/modded-nanogpt"], ["Hoffmann et al., Training Compute-Optimal Large Language Models (Chinchilla)", "https://arxiv.org/abs/2203.15556"], ["Yang et al., Tensor Programs V (μTransfer)", "https://arxiv.org/abs/2203.03466"]],
       open: [["METR's RE-Bench tasks, including the scaling-law task", "https://github.com/METR/ai-rd-tasks"]] },
     { id: "A2", num: 2, title: "mini-FML search study", short: "Search versus greedy",

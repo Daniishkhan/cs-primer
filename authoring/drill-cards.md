@@ -28,9 +28,9 @@ Optional, only when it saves words: one small inline SVG (`<figure class="diagra
 
 ```html
 <p>A packing heuristic is a tiny function that looks at one item and one open bin and returns a number: the higher, the more it wants that bin. Online bin packing then takes items one at a time, asks the heuristic about every bin with room, and puts the item in the bin with the highest answer, or opens a new bin if none fit.</p>
-<p><code>pack(items, priority)</code> runs that loop and returns the number of bins used. <code>score(src, instances)</code> compiles a candidate with <code>make_heuristic</code> (already written) and packs every instance; its result must always be a number, so anything that goes wrong (an exception, a non-number, running out of fuel) scores <code>PENALTY</code> instead of raising. The checker counts how often <code>priority</code> is called: once per feasible bin, in bin order.</p>
+<p><code>pack(priority, items)</code> runs that loop and returns the number of bins used. <code>score(src, instances)</code> compiles a candidate with <code>make_heuristic</code> (already written) and packs every instance; its result must always be a number, so anything that goes wrong (an exception, a non-number, running out of fuel) scores <code>PENALTY</code> instead of raising. The checker counts how often <code>priority</code> is called: once per feasible bin, in bin order.</p>
 <pre><code>items 20, 30, 60, 20, 50 into bins of 100
-first fit:  [20 30] [60 20] [50]      -> 3 bins
+first fit:  [20 30 20] [60] [50]      -> 3 bins
 best fit:   [20 30 50] [60 20]        -> 2 bins</code></pre>
-<p>Read more: <a href="ml-foundations/chapters/22-running-candidates.html#every-outcome-is-a-number">A0 chapter 22, every outcome is a number</a>.</p>
+<p>Read more: <a href="ml-foundations/chapters/22-running-candidates.html#a-search-loop-is-a-factory">A0 chapter 22, every outcome is a number</a>.</p>
 ```
