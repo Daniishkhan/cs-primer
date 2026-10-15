@@ -125,7 +125,7 @@ Part 6: Modern Architectures
 - deep-learning/chapters/21-vision-language.html · ch 21 · core · Vision-Language Models: Patches, image encoders, projectors and how a language model learns to read a picture.
 - deep-learning/chapters/22-beyond-attention.html · ch 22 · intro · Beyond Attention: State-space models, linear attention and hybrids, and what they trade away.
 - deep-learning/chapters/23-interpretability-basics.html · ch 23 · intro · Interpretability Basics: Reading what a network computes: probes, the residual stream, attention patterns and sparse features, as reading.
-- deep-learning/chapters/24-learned-optimisers.html · ch 24 · intro · Learned Optimisers & In-Context Learning: Optimisers that are themselves trained, and in-context learning read as a learned learning algorithm. (not written yet)
+- deep-learning/chapters/24-learned-optimisers.html · ch 24 · intro · Learned Optimisers & In-Context Learning: Optimisers that are themselves trained, and in-context learning read as a learned learning algorithm.
 
 Labs
 - deep-learning/labs/lab-01-mlp.html · L1 · Lab 1: A Neural Network from Scratch
@@ -377,7 +377,7 @@ Part 2: Open-Endedness
 - open-ended/chapters/05-open-ended-algorithms.html · ch 05 · core · Open-Ended Algorithms: POET and co-evolving problems with solutions, and what 'open-ended' means.
 - open-ended/chapters/06-interestingness.html · ch 06 · core · Models of Interestingness: Using foundation models to judge what is new and worth learning: OMNI and successors.
 - open-ended/chapters/07-lifelong-agents.html · ch 07 · core · Lifelong Agents & Skill Libraries: Voyager's curriculum, skills as code and agents that accumulate abilities.
-- open-ended/chapters/22-coevolution-pbt.html · ch 22 · intro · Co-evolution & Population-Based Training: Populations that train each other: co-evolution, POET-style curricula and population-based training. (not written yet)
+- open-ended/chapters/22-coevolution-pbt.html · ch 22 · intro · Co-evolution & Population-Based Training: Populations that train each other: co-evolution, POET-style curricula and population-based training.
 
 Part 3: LLMs as Search Operators
 - open-ended/chapters/08-inference-time-search.html · ch 08 · deep · Inference-Time Search: Best-of-n, self-consistency, tree search over answers, verifiers and adaptive branching.
@@ -425,111 +425,111 @@ Studios
 
 ## A9 · Research Engineering on Small Proxies  (id "re", folder research-eng/)
 
-- research-eng/index.html · course roadmap (not written yet)
-- research-eng/toolbox.html · toolbox (not written yet)
+- research-eng/index.html · course roadmap
+- research-eng/toolbox.html · toolbox
 
 Part 0: Orientation
-- research-eng/chapters/00-start-here.html · ch 00 · intro · Start Here: Four artifacts instead of a finished curriculum, Artifact 1's gate, and which chapters to open when. (not written yet)
+- research-eng/chapters/00-start-here.html · ch 00 · intro · Start Here: Four artifacts instead of a finished curriculum, Artifact 1's gate, and which chapters to open when.
 
 Part 1: The Loop
-- research-eng/chapters/01-research-loop.html · ch 01 · deep · The Research Loop as a Program: autoresearch's program.md, train.py and run store, and keep-or-revert as a state machine under a fixed time budget. (not written yet)
-- research-eng/chapters/05-rust-runner.html · ch 05 · core · A Runner in Rust, Read from Python: Why the runner, sandbox and run store move to Rust, and enough Rust to read and change them. (not written yet)
+- research-eng/chapters/01-research-loop.html · ch 01 · deep · The Research Loop as a Program: autoresearch's program.md, train.py and run store, and keep-or-revert as a state machine under a fixed time budget.
+- research-eng/chapters/05-rust-runner.html · ch 05 · core · A Runner in Rust, Read from Python: Why the runner, sandbox and run store move to Rust, and enough Rust to read and change them.
 
 Part 2: Measurement
-- research-eng/chapters/02-proxies-noise.html · ch 02 · deep · Proxies, Noise Floors & Seeds: How much a five-minute score moves on its own, paired tests over seeds, and the gap between the proxy and held-out data. (not written yet)
-- research-eng/chapters/03-scaling-mup.html · ch 03 · core · Scaling Laws & μP Transfer for Proxies: What a tiny run predicts about a big one, compute-optimal sizing, and why μP lets hyperparameters transfer. (not written yet)
-- research-eng/chapters/04-ablations-tracking.html · ch 04 · core · Ablation Design & Run Tracking: One change at a time, factorial designs, a run-store schema and deterministic replay. (not written yet)
+- research-eng/chapters/02-proxies-noise.html · ch 02 · deep · Proxies, Noise Floors & Seeds: How much a five-minute score moves on its own, paired tests over seeds, and the gap between the proxy and held-out data.
+- research-eng/chapters/03-scaling-mup.html · ch 03 · core · Scaling Laws & μP Transfer for Proxies: What a tiny run predicts about a big one, compute-optimal sizing, and why μP lets hyperparameters transfer.
+- research-eng/chapters/04-ablations-tracking.html · ch 04 · core · Ablation Design & Run Tracking: One change at a time, factorial designs, a run-store schema and deterministic replay.
 
 Part 3: Shipping
-- research-eng/chapters/06-write-up.html · ch 06 · core · The Write-Up: A two-to-six-page report with one claim, its number and its budget, negative results and a one-command reproduction. (not written yet)
+- research-eng/chapters/06-write-up.html · ch 06 · core · The Write-Up: A two-to-six-page report with one claim, its number and its budget, negative results and a one-command reproduction.
 
 Labs
-- research-eng/labs/lab-01-keep-or-revert.html · L1 · Lab 1: A Keep-or-Revert Research Loop (not written yet)
+- research-eng/labs/lab-01-keep-or-revert.html · L1 · Lab 1: A Keep-or-Revert Research Loop
 
 Workbenchs
-- research-eng/workbench/w01-autoresearch-cpu.html · W1 · Workbench 1: autoresearch on a CPU Proxy (not written yet)
+- research-eng/workbench/w01-autoresearch-cpu.html · W1 · Workbench 1: autoresearch on a CPU Proxy
 
 Cases
-- research-eng/cases/case-01-modded-nanogpt.html · C1 · Case 1: modded-nanogpt: a Speedrun as a Research Record (not written yet)
+- research-eng/cases/case-01-modded-nanogpt.html · C1 · Case 1: modded-nanogpt: a Speedrun as a Research Record
 
 ## A10 · Harness & Evaluator Engineering  (id "he", folder harness-eng/)
 
-- harness-eng/index.html · course roadmap (not written yet)
-- harness-eng/toolbox.html · toolbox (not written yet)
+- harness-eng/index.html · course roadmap
+- harness-eng/toolbox.html · toolbox
 
 Part 0: Orientation
-- harness-eng/chapters/00-start-here.html · ch 00 · intro · Start Here: Artifacts 2 and 3, what they need from this course, and what it borrows from A6. (not written yet)
+- harness-eng/chapters/00-start-here.html · ch 00 · intro · Start Here: Artifacts 2 and 3, what they need from this course, and what it borrows from A6.
 
 Part 1: Harnesses
-- harness-eng/chapters/01-harness-engineering.html · ch 01 · deep · Harness Engineering as Research: The ladder from context engineering to workflows to self-improving harnesses, with the systems on each rung. (not written yet)
-- harness-eng/chapters/02-aide-tree-search.html · ch 02 · deep · Tree Search over Experiments: AIDE: Draft, debug and improve nodes, a selection rule, and when tree search beats greedy hill-climbing. (not written yet)
+- harness-eng/chapters/01-harness-engineering.html · ch 01 · deep · Harness Engineering as Research: The ladder from context engineering to workflows to self-improving harnesses, with the systems on each rung.
+- harness-eng/chapters/02-aide-tree-search.html · ch 02 · deep · Tree Search over Experiments: AIDE: Draft, debug and improve nodes, a selection rule, and when tree search beats greedy hill-climbing.
 
 Part 2: Evaluators
-- harness-eng/chapters/03-splits-attestation.html · ch 03 · deep · Public & Private Splits: An evaluator outside the agent's reach, hidden splits, typed and attested results, and hacking rate as a metric. (not written yet)
-- harness-eng/chapters/04-kernels-for-agents.html · ch 04 · core · Kernel Engineering for Agents: Triton first and CUDA at reading level, and how to check that an agent's claimed speed-up is real. (not written yet)
+- harness-eng/chapters/03-splits-attestation.html · ch 03 · deep · Public & Private Splits: An evaluator outside the agent's reach, hidden splits, typed and attested results, and hacking rate as a metric.
+- harness-eng/chapters/04-kernels-for-agents.html · ch 04 · core · Kernel Engineering for Agents: Triton first and CUDA at reading level, and how to check that an agent's claimed speed-up is real.
 
 Part 3: Benchmarks
-- harness-eng/chapters/05-research-benchmarks.html · ch 05 · core · Benchmarks for Research Agents: MLE-bench, PaperBench, RE-Bench, FML-Bench and KernelBench: what each measures and its Lite subset. (not written yet)
+- harness-eng/chapters/05-research-benchmarks.html · ch 05 · core · Benchmarks for Research Agents: MLE-bench, PaperBench, RE-Bench, FML-Bench and KernelBench: what each measures and its Lite subset.
 
 Labs
-- harness-eng/labs/lab-01-greedy-vs-tree.html · L1 · Lab 1: Greedy versus Tree Search (not written yet)
+- harness-eng/labs/lab-01-greedy-vs-tree.html · L1 · Lab 1: Greedy versus Tree Search
 
 Workbenchs
-- harness-eng/workbench/w01-aide-one-task.html · W1 · Workbench 1: AIDE on One Task, CPU-Sized (not written yet)
+- harness-eng/workbench/w01-aide-one-task.html · W1 · Workbench 1: AIDE on One Task, CPU-Sized
 
 Cases
-- harness-eng/cases/case-01-fml-bench-aide.html · C1 · Case 1: FML-Bench and AIDE²: When Search Beats Greedy (not written yet)
+- harness-eng/cases/case-01-fml-bench-aide.html · C1 · Case 1: FML-Bench and AIDE²: When Search Beats Greedy
 
 ## A11 · AI Control & Sandbox Security  (id "ctl", folder control/)
 
-- control/index.html · course roadmap (not written yet)
-- control/toolbox.html · toolbox (not written yet)
+- control/index.html · course roadmap
+- control/toolbox.html · toolbox
 
 Part 0: Orientation
-- control/chapters/00-start-here.html · ch 00 · intro · Start Here: Artifact 3's evaluator-hardening kit, and the control ideas it rests on. (not written yet)
+- control/chapters/00-start-here.html · ch 00 · intro · Start Here: Artifact 3's evaluator-hardening kit, and the control ideas it rests on.
 
 Part 1: Boundaries
-- control/chapters/01-threat-model.html · ch 01 · core · The Threat Model of a Research Loop: Proposer against evaluator, the write boundary, and everything an agent with a key and a box can reach. (not written yet)
-- control/chapters/02-egress-sandbox.html · ch 02 · deep · Deny-by-Default Egress & Sandboxes: Allowlists, an egress proxy, filesystem and resource limits, applied to a loop that runs for days. (not written yet)
-- control/chapters/03-attested-results.html · ch 03 · deep · Attested Tool Results: Typed result envelopes, hashes and signatures, the evaluator as a separate principal, and tamper-evident logs. (not written yet)
+- control/chapters/01-threat-model.html · ch 01 · core · The Threat Model of a Research Loop: Proposer against evaluator, the write boundary, and everything an agent with a key and a box can reach.
+- control/chapters/02-egress-sandbox.html · ch 02 · deep · Deny-by-Default Egress & Sandboxes: Allowlists, an egress proxy, filesystem and resource limits, applied to a loop that runs for days.
+- control/chapters/03-attested-results.html · ch 03 · deep · Attested Tool Results: Typed result envelopes, hashes and signatures, the evaluator as a separate principal, and tamper-evident logs.
 
 Part 2: Monitoring
-- control/chapters/04-transcript-monitor.html · ch 04 · deep · Monitoring Transcripts Offline: Trusted and untrusted monitors, audit budgets, and the edits to flag: tests, logs and timeouts. (not written yet)
-- control/chapters/05-incident-playbook.html · ch 05 · core · Incident Playbooks for Autonomous Loops: Kill switches, budget caps, rollback and disclosure, written before you need them. (not written yet)
+- control/chapters/04-transcript-monitor.html · ch 04 · deep · Monitoring Transcripts Offline: Trusted and untrusted monitors, audit budgets, and the edits to flag: tests, logs and timeouts.
+- control/chapters/05-incident-playbook.html · ch 05 · core · Incident Playbooks for Autonomous Loops: Kill switches, budget caps, rollback and disclosure, written before you need them.
 
 Labs
-- control/labs/lab-01-attest-and-monitor.html · L1 · Lab 1: Attest and Monitor a Research Loop (not written yet)
+- control/labs/lab-01-attest-and-monitor.html · L1 · Lab 1: Attest and Monitor a Research Loop
 
 Workbenchs
-- control/workbench/w01-locked-down-sandbox.html · W1 · Workbench 1: A Locked-Down Research Sandbox (not written yet)
+- control/workbench/w01-locked-down-sandbox.html · W1 · Workbench 1: A Locked-Down Research Sandbox
 
 Cases
-- control/cases/case-01-hugging-face-incident.html · C1 · Case 1: The OpenAI and Hugging Face Incident (not written yet)
+- control/cases/case-01-hugging-face-incident.html · C1 · Case 1: The OpenAI and Hugging Face Incident
 
 ## A12 · Measuring Recursive Self-Improvement  (id "rsi", folder rsi-measurement/)
 
-- rsi-measurement/index.html · course roadmap (not written yet)
+- rsi-measurement/index.html · course roadmap
 
 Part 0: Orientation
-- rsi-measurement/chapters/00-start-here.html · ch 00 · intro · Start Here: Artifact 4, the ignition test, and the standards every artifact is held to. (not written yet)
+- rsi-measurement/chapters/00-start-here.html · ch 00 · intro · Start Here: Artifact 4, the ignition test, and the standards every artifact is held to.
 
 Part 1: Criteria
-- rsi-measurement/chapters/01-level-one.html · ch 01 · deep · What Counts as Self-Improvement: A fair baseline, a sustained trend, generalisation and a fixed budget: four conditions and how to test each. (not written yet)
-- rsi-measurement/chapters/02-automation-levels.html · ch 02 · core · Automation Levels for AI Research: Taxonomies of how much of AI research is automated, the published estimates, and how to score your own loop. (not written yet)
-- rsi-measurement/chapters/04-reading-claims.html · ch 04 · core · Reading Self-Improvement Claims: An audit checklist for papers and posts, applied to the systems of 2025 and 2026. (not written yet)
+- rsi-measurement/chapters/01-level-one.html · ch 01 · deep · What Counts as Self-Improvement: A fair baseline, a sustained trend, generalisation and a fixed budget: four conditions and how to test each.
+- rsi-measurement/chapters/02-automation-levels.html · ch 02 · core · Automation Levels for AI Research: Taxonomies of how much of AI research is automated, the published estimates, and how to score your own loop.
+- rsi-measurement/chapters/04-reading-claims.html · ch 04 · core · Reading Self-Improvement Claims: An audit checklist for papers and posts, applied to the systems of 2025 and 2026.
 
 Part 2: Economics
-- rsi-measurement/chapters/03-loop-economics.html · ch 03 · deep · The Economics of a Loop: Cost per accepted improvement, returns that diminish or compound, and the elasticities that decide which. (not written yet)
-- rsi-measurement/chapters/05-reading-pack.html · ch 05 · intro · Reading Pack: Meta-Learning & Beyond: Learned optimisers, in-context learning as meta-learning, interpretability and co-evolution, as reading. (not written yet)
+- rsi-measurement/chapters/03-loop-economics.html · ch 03 · deep · The Economics of a Loop: Cost per accepted improvement, returns that diminish or compound, and the elasticities that decide which.
+- rsi-measurement/chapters/05-reading-pack.html · ch 05 · intro · Reading Pack: Meta-Learning & Beyond: Learned optimisers, in-context learning as meta-learning, interpretability and co-evolution, as reading.
 
 Labs
-- rsi-measurement/labs/lab-01-level-one-checker.html · L1 · Lab 1: The Level-1 Checker (not written yet)
+- rsi-measurement/labs/lab-01-level-one-checker.html · L1 · Lab 1: The Level-1 Checker
 
 Workbenchs
-- rsi-measurement/workbench/w01-improver-elasticity.html · W1 · Workbench 1: An Improver's Elasticity, Measured (not written yet)
+- rsi-measurement/workbench/w01-improver-elasticity.html · W1 · Workbench 1: An Improver's Elasticity, Measured
 
 Cases
-- rsi-measurement/cases/case-01-weco-aide2.html · C1 · Case 1: Weco's Claim of Recursive Self-Improvement (not written yet)
+- rsi-measurement/cases/case-01-weco-aide2.html · C1 · Case 1: Weco's Claim of Recursive Self-Improvement
 
 ## The artifact track (CS_ARTIFACTS)
 
