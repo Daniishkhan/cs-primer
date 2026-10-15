@@ -667,7 +667,7 @@
       before: ["oe:01", "agt:02", "agt:04", "agt:10", "agt:18", "agt:20", "he:00", "he:01", "he:02", "he:05", "evl:04", "evl:06", "oe:08", "oe:11", "oe:16"],
       while: ["agt:05", "agt:11", "agt:23", "oe:12", "evl:03", "evl:07", "llm:14", "dl:23", "dl:24"],
       build: ["oe:L1", "agt:L1", "oe:L4", "he:L1", "evl:L1", "agt:W1", "he:W1", "agt:C2", "he:C1", "oe:C4", "evl:C6", "oe:S1"],
-      read: [["FML-Bench repository and paper", "https://github.com/qrzou/FML-bench"], ["Jiang et al., AIDE: AI-Driven Exploration in the Space of Code", "https://arxiv.org/abs/2502.13138"], ["Harness engineering for self-improvement (as linked in the roadmap)", "https://lilithai.dev/radar/harness-engineering-for-self-improvement?lang=en"]],
+      read: [["FML-Bench repository and paper", "https://github.com/qrzou/FML-bench"], ["Jiang et al., AIDE: AI-Driven Exploration in the Space of Code", "https://arxiv.org/abs/2502.13138"], ["Lilian Weng, Harness Engineering for Self-Improvement (2026)", "https://lilianweng.github.io/posts/2026-07-04-harness/"]],
       open: [["Agentic Context Engineering (ACE), Meta-Harness and STOP; see A10 chapter 1", ""]] },
     { id: "A3", num: 3, title: "evaluator-hardening kit", short: "Hardened evaluators",
       replicates: { text: "visible-versus-held-out test gaps and hidden-test hardening on kernel benchmarks", href: "https://scalingintelligence.stanford.edu/pubs/kernelbench.pdf" },

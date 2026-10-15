@@ -20,7 +20,7 @@ Dated claims the artifact track leans on. Re-check each from its primary source 
 ## Unverified at the October 2026 rewrite
 
 - OpenAI's post on the Hugging Face incident and its research-intern milestone returned HTTP 403 to authors; pages say so and do not rely on them.
-- Lilian Weng's harness-engineering post was read only through a summary page (lilithai.dev); find the original.
+- Lilian Weng's harness-engineering post: the roadmap linked a lilithai.dev write-up; the original is lilianweng.github.io/posts/2026-07-04-harness/.
 
 ## Log
 
