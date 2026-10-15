@@ -68,9 +68,9 @@
     t.textContent = entry[0];
     if (entry[4]) {
       var b = document.createElement("span");
-      b.className = "gl-spine";
-      b.textContent = "spine";
-      b.title = "Taught in a builder-spine chapter";
+      b.className = "gl-track";
+      b.textContent = "artifact " + entry[4].split(" ").map(function (a) { return a.slice(1); }).join(", ");
+      b.title = "Taught in a chapter the artifact track uses";
       t.appendChild(b);
     }
     var d = document.createElement("p");

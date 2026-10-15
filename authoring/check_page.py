@@ -99,7 +99,7 @@ class Page(HTMLParser):
             self.text_parts.append(d)
 
 
-# Plain-English checks for the AI path (builder spine audit, October 2026).
+# Plain-English checks for the AI path (readability audit, October 2026).
 # Acronyms every reader of the path already knows; anything else must be
 # expanded on the page: "Monte Carlo tree search (MCTS)" or "MCTS (Monte ...)".
 KNOWN_ACRONYMS = set("""AI ML LLM LLMs GPU GPUs CPU CPUs API APIs JSON CSV HTML CSS URL URLs HTTP HTTPS SQL PDF PDFs

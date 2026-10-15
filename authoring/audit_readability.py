@@ -2,12 +2,13 @@
 
     python3 authoring/audit_readability.py              # per course
     python3 authoring/audit_readability.py --chapters   # per chapter, worst first
-    python3 authoring/audit_readability.py --spine      # builder-spine chapters only
+    python3 authoring/audit_readability.py --track       # chapters some artifact needs
+    python3 authoring/audit_readability.py --track A1    # chapters Artifact 1 needs
 
 Measures prose only (no code, SVG, quiz or sources): words, average sentence
 length, the share of sentences over 35 words, an approximate Flesch-Kincaid
 grade, defined terms per 1,000 words, and whether the chapter has an analogy.
-Targets for the builder spine: average sentence 17 words or fewer, grade 9.5
+Targets for the artifact track: average sentence 17 words or fewer, grade 9.5
 or lower, and an analogy in every deep or core chapter.
 """
 import json
@@ -19,8 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from check_page import ROOT, prose_text, sentences  # noqa: E402
 
-AI = ["ml-foundations", "ml", "deep-learning", "llm-training", "agents",
-      "retrieval", "evals", "open-ended", "ai-delivery"]
+# Courses come from the catalog (track "ai"), in catalog order.
 
 
 def syllables(word):
@@ -50,20 +50,25 @@ def measure(path):
 
 
 def catalog():
-    js = ("global.window={};require(%r);console.log(JSON.stringify(window.CS_COURSES.map(c=>({dir:c.dir,"
-          "spine:c.spine||null,chapters:c.chapters.map(x=>({id:x.id,file:x.file,depth:x.depth}))}))))"
+    js = ("global.window={};require(%r);const T={},R={};for(const a of window.CS_ARTIFACTS||[]){for(const k of [\"warmup\",\"before\",\"while\"])for(const id of a[k]||[]){(T[id]=T[id]||[]).includes(a.id)||T[id].push(a.id);if(k!==\"while\")R[id]=1}};"
+          "console.log(JSON.stringify(window.CS_COURSES.filter(c=>c.track==='ai').map(c=>({dir:c.dir,"
+          "chapters:c.chapters.map(x=>({id:x.id,file:x.file,depth:x.depth,tracks:T[c.id+':'+x.id]||[],required:!!R[c.id+':'+x.id]}))}))))"
           % os.path.join(ROOT, "assets/js/catalog.js"))
-    return {c["dir"]: c for c in json.loads(subprocess.check_output(["node", "-e", js]))}
+    return {c["dir"]: c for c in json.loads(subprocess.check_output(["node", "-e", js]))}  # insertion order = catalog order
 
 
 def main(argv):
     cat = catalog()
-    spine_only = "--spine" in argv
+    want = None
+    if "--track" in argv:
+        i = argv.index("--track")
+        want = argv[i + 1] if i + 1 < len(argv) and argv[i + 1].startswith("A") else "required"
     rows = []
-    for d in AI:
-        co = cat[d]
+    for d, co in cat.items():
         for ch in co["chapters"]:
-            if spine_only and not (co["spine"] and ch["id"] in co["spine"]):
+            if want == "required" and not ch["required"]:
+                continue
+            if want and want != "required" and want not in ch["tracks"]:
                 continue
             path = os.path.join(ROOT, d, "chapters", ch["file"])
             if not os.path.exists(path):
@@ -79,7 +84,7 @@ def main(argv):
                   f"{r['grade']:>7.1f}{r['terms']:>9.1f}  {'yes' if r['analogy'] else '-'}")
         return
     print(f"{'course':16}{'ch':>4}{'words':>8}{'w/sent':>8}{'>35w':>6}{'grade':>7}{'terms/1k':>9}{'no analogy':>11}")
-    for d in AI:
+    for d in cat:
         rs = [r for r in rows if r["course"] == d]
         if not rs:
             continue

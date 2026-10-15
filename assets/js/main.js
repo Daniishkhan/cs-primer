@@ -32,15 +32,30 @@
       (k[1] || []).forEach(function (c) { c.kind = k[0]; c.dir = KIND_DIR[k[0]]; c.course = co; });
     });
   });
-  /* Builder spine (AI path): a course may list its spine chapter ids; every
-     other chapter of that course is an elective. "Spine only" hides electives
-     and makes prev/next walk the spine across courses. */
+  /* Artifact track (CS_ARTIFACTS in catalog.js). Each chapter is read
+     "before" an artifact, opened "while" building one, or is "reading":
+     kept, never required. Choosing a track hides what that artifact does
+     not use and makes prev/next walk its reading list across courses. */
+  var ARTIFACTS = window.CS_ARTIFACTS || [];
+  var KIND_LIST = { L: "labs", W: "workbenches", C: "cases", S: "studios" };
   COURSES.forEach(function (co) {
-    if (!co.spine) return;
-    (co.chapters || []).forEach(function (c) { c.spine = co.spine.indexOf(c.id) !== -1; });
+    (co.chapters || []).forEach(function (c) { c.tracks = []; c.role = "reading"; });
   });
-  var spineOnly = load("cs-spine-only", false) === true;
-  document.documentElement.classList.toggle("spine-only", spineOnly);
+  ARTIFACTS.forEach(function (a) {
+    var seen = [];
+    a.path = (a.warmup || []).concat(a.before || []).map(function (id) { return itemById(id); })
+      .filter(function (c) { if (!c || c.kind !== "chapter" || seen.indexOf(c) !== -1) return false; seen.push(c); return true; });
+    a.path.forEach(function (c) { c.role = "before"; if (c.tracks.indexOf(a.id) === -1) c.tracks.push(a.id); });
+    (a["while"] || []).forEach(function (id) {
+      var c = itemById(id);
+      if (!c || c.kind !== "chapter") return;
+      if (c.role === "reading") c.role = "while";
+      if (c.tracks.indexOf(a.id) === -1) c.tracks.push(a.id);
+    });
+  });
+  var track = load("cs-track", "all");
+  if (!ARTIFACTS.some(function (a) { return a.id === track; })) track = "all";
+  document.documentElement.dataset.track = track;
   var course = COURSES.find(function (co) { return co.id === body.dataset.course; }) || null;
   var CHAPTERS = course ? course.chapters : [];
   var PARTS = course ? course.parts : [];
@@ -51,7 +66,7 @@
   var COLLECTION = { chapter: CHAPTERS, lab: LABS, "case": CASES, studio: STUDIOS, workbench: BENCHES };
   var NOUN = { chapter: "chapter", lab: "lab", "case": "case study", studio: "design studio", workbench: "workbench" };
   // Workbenches: real tools on a real machine. The machine decides the badge.
-  var MACHINE = { laptop: "Your laptop", linux: "A Linux VM", gpu: "A GPU box" };
+  var MACHINE = { vm: "The lab VM", gpu: "A GPU box" };
   var currentKind = body.dataset.lab ? "lab" : body.dataset["case"] ? "case" : body.dataset.studio ? "studio"
     : body.dataset.workbench ? "workbench" : body.dataset.chapter ? "chapter" : null;
   var currentId = body.dataset.chapter || body.dataset.lab || body.dataset["case"] || body.dataset.studio || body.dataset.workbench || null;
@@ -109,11 +124,26 @@
     else s = chapterNum(ch) + ". " + ch.title;
     return ch.course !== course ? ch.course.title + ", " + s : s;
   }
-  /* "05" = chapter 5 of this course; "net:05" = chapter 5 of another course. */
-  function chapterById(id) {
-    var co = course, m = /^(\w+):(.+)$/.exec(id);
+  /* "05" = chapter 5 of this course; "oe:05" = chapter 5 of course oe;
+     "oe:L3", "oe:W1", "oe:C6", "oe:S2" = a lab, workbench, case or studio. */
+  function itemById(id, home) {
+    var co = home || course, m = /^(\w+):(.+)$/.exec(id);
     if (m) { co = COURSES.find(function (x) { return x.id === m[1]; }); id = m[2]; }
-    return co ? (co.chapters || []).find(function (c) { return c.id === id; }) : null;
+    if (!co) return null;
+    var list = /^[LWCS]\d/.test(id) ? co[KIND_LIST[id[0]]] : co.chapters;
+    return (list || []).find(function (c) { return c.id === id; }) || null;
+  }
+  function chapterById(id) {
+    var c = itemById(id);
+    return c && c.kind === "chapter" ? c : null;
+  }
+  function artifactNums(ids) {
+    return ids.map(function (id) { return id.slice(1); }).join(", ");
+  }
+  function roleText(c) {
+    if (c.role === "before") return "Artifact" + (c.tracks.length > 1 ? "s " : " ") + artifactNums(c.tracks) + ": read before starting";
+    if (c.role === "while") return "Artifact" + (c.tracks.length > 1 ? "s " : " ") + artifactNums(c.tracks) + ": open while building";
+    return "Reading: not needed for any artifact";
   }
   function slug(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); }
 
@@ -181,17 +211,16 @@
       var list = el("ul", { class: "nav-list" });
       var inPart = CHAPTERS.filter(function (c) { return c.part === p; });
       inPart.forEach(function (c) {
-        var tip = DEPTH[c.depth] + (c.spine === false ? ", elective" : "") + ": " + c.blurb;
-        var a = el("a", { href: href(c), "data-id": c.id, title: tip, class: c.spine === false ? "elective" : "" }, [
+        var tip = DEPTH[c.depth] + ". " + roleText(c) + ". " + c.blurb;
+        var a = el("a", { href: href(c), "data-id": c.id, title: tip, class: "role-" + c.role }, [
           el("span", { class: "nav-num", html: "<span>" + chapterNum(c) + "</span>" }),
           el("span", { class: "nav-title", text: c.title }),
           el("span", { class: "nav-depth " + c.depth, "aria-hidden": "true" })
         ]);
         if (c.id === currentId) { a.classList.add("active"); a.setAttribute("aria-current", "page"); }
-        list.appendChild(el("li", { class: c.spine === false ? "elective" : "" }, [a]));
+        list.appendChild(el("li", { class: "role-" + c.role, "data-tracks": c.tracks.join(" ") }, [a]));
       });
-      var allElective = inPart.length && inPart.every(function (c) { return c.spine === false; });
-      side.appendChild(el("nav", { class: "nav-part" + (allElective ? " elective-part" : ""), "aria-label": part.title }, [
+      side.appendChild(el("nav", { class: "nav-part", "aria-label": part.title, "data-tracks": tracksOf(inPart) }, [
         el("p", { class: "nav-part-title", text: "Part " + p + " · " + part.title }),
         list
       ]));
@@ -230,7 +259,7 @@
       '<span><span class="nav-depth deep" style="display:inline-block"></span> Deep dive</span>' +
       '<span><span class="nav-depth core" style="display:inline-block"></span> Core</span>' +
       '<span><span class="nav-depth intro" style="display:inline-block"></span> Quick intro</span>' +
-      (course && course.spine ? '<span class="legend-elective">Dimmed: elective, off the builder spine</span>' : "") });
+      (course && CHAPTERS.some(function (c) { return c.role === "reading"; }) ? '<span class="legend-reading">Dimmed: reading only, not needed for any artifact</span>' : "") });
 
     var foot = [course ? legend : null];
     if (course && (course.tools || []).length) {
@@ -333,28 +362,37 @@
     return b;
   }
 
-  /* ---------- builder spine toggle ---------- */
+  /* ---------- artifact track ---------- */
 
-  function applySpine(on) {
-    spineOnly = on;
-    save("cs-spine-only", on);
-    document.documentElement.classList.toggle("spine-only", on);
+  function tracksOf(list) {
+    var out = [];
+    list.forEach(function (c) { (c.tracks || []).forEach(function (t) { if (out.indexOf(t) === -1) out.push(t); }); });
+    return out.join(" ");
+  }
+  function artifactById(id) { return ARTIFACTS.find(function (a) { return a.id === id; }) || null; }
+  // The chosen artifact's chapters in reading order, across courses.
+  function trackPath(id) {
+    var a = artifactById(id);
+    return a ? a.path : [];
+  }
+  // Hide every element whose data-tracks does not include the chosen track.
+  function markOffTrack() {
+    document.querySelectorAll("[data-tracks]").forEach(function (n) {
+      var on = track === "all" || (" " + n.dataset.tracks + " ").indexOf(" " + track + " ") !== -1;
+      n.classList.toggle("off-track", !on);
+    });
+  }
+  function applyTrack(id) {
+    track = artifactById(id) ? id : "all";
+    save("cs-track", track);
+    document.documentElement.dataset.track = track;
+    markOffTrack();
     syncSettings();
     var pager = document.querySelector("nav.pager");
     if (pager) pager.replaceWith(buildPager());
     refreshProgress();
     updateContinue();
-  }
-  /* Every spine chapter of the AI path, in reading order. */
-  function spinePath() {
-    var out = [];
-    COURSES.forEach(function (co) {
-      if (!co.spine) return;
-      co.parts.forEach(function (part, p) {
-        co.chapters.forEach(function (c) { if (c.part === p && c.spine) out.push(c); });
-      });
-    });
-    return out;
+    document.querySelectorAll(".artifact").forEach(function (s) { s.classList.toggle("chosen", s.dataset.artifact === track); });
   }
 
   /* Hub and glossary: the sidebar lists the courses instead of chapters. */
@@ -397,12 +435,12 @@
         return g[0] + " " + g[1].filter(function (c) { return done.has(c.id); }).length + "/" + g[1].length;
       });
       if (extra.length) card.appendChild(el("div", { class: "progress-extra", text: extra.join(" · ") }));
-      if (course.spine) {
-        var sp = CHAPTERS.filter(function (c) { return c.spine; });
-        card.appendChild(el("div", { class: "progress-extra", text: sp.length
-          ? "Builder spine " + sp.filter(function (c) { return done.has(c.id); }).length + "/" + sp.length
-          : "Elective course: off the builder spine" }));
-      }
+      ARTIFACTS.forEach(function (a) {
+        if (track !== "all" && a.id !== track) return;
+        if (!a.path.some(function (c) { return c.course === course; })) return;
+        var read = a.path.filter(function (c) { return doneFor(c.course).has(c.id); }).length;
+        card.appendChild(el("div", { class: "progress-extra", text: "Artifact " + a.num + ": " + read + " of " + a.path.length + " read before starting" }));
+      });
     }
     document.querySelectorAll(".nav-list a[data-id]").forEach(function (a) {
       a.classList.toggle("done", done.has(a.dataset.id));
@@ -435,7 +473,9 @@
     repeat: '<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>',
     cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
     x: '<path d="M6 6l12 12M18 6 6 18"/>',
-    chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 21l1.9-5.4A8 8 0 1 1 21 12z"/>'
+    chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 21l1.9-5.4A8 8 0 1 1 21 12z"/>',
+    merge: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10M6 7c0 3 3 5 10 5"/>',
+    list: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="m4 6 1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/>'
   };
   function icon(name) {
     var span = el("span", { class: "icon", "aria-hidden": "true" });
@@ -444,7 +484,9 @@
   }
 
   var SITE_LINKS = [
-    ["curriculum.html", "Curriculum", "map"],
+    ["curriculum.html", "Artifact track", "map"],
+    ["contributing.html", "Contributing", "merge"],
+    ["evidence.html", "Evidence log", "list"],
     ["glossary.html", "Glossary", "book"],
     ["review.html", "Review", "repeat"],
     ["lab-machine.html", "Lab machine", "cpu"]
@@ -476,12 +518,16 @@
     }), function (v) { return currentTheme() === v; }, applyTheme);
     var sketch = segmented("Diagrams", [["on", "Hand-drawn"], ["off", "Clean"]],
       function (v) { return (v === "on") === sketchOn(); }, function (v) { applySketch(v === "on"); });
-    var spine = segmented("Chapters", [["all", "All"], ["spine", "Builder spine"]],
-      function (v) { return (v === "spine") === spineOnly; }, function (v) { applySpine(v === "spine"); });
-    segs.push(themes, sketch, spine);
+    var tracks = segmented("Artifact track", [["all", "All"]].concat(ARTIFACTS.map(function (a) { return [a.id, String(a.num)]; })),
+      function (v) { return v === track; }, applyTrack);
+    Array.prototype.forEach.call(tracks.children, function (b) {
+      var a = artifactById(b.dataset.value);
+      b.title = a ? "Artifact " + a.num + ": " + a.title + ". Show only the chapters it needs." : "Show every chapter";
+    });
+    segs.push(themes, sketch, tracks);
     section("Theme", themes);
     section("Diagrams", sketch);
-    if (!course || course.spine) section("Chapters", spine);
+    if (ARTIFACTS.length) section("Artifact track", tracks);
     var links = el("nav", { class: "settings-links", "aria-label": "Site" }, SITE_LINKS.map(function (l) {
       return el("a", { href: root + "/" + l[0] }, [icon(l[2]), document.createTextNode(l[1])]);
     }));
@@ -577,9 +623,9 @@
       el("span", { class: "part", text: "Part " + current.part + " · " + PARTS[current.part].title }),
       el("span", { text: "Chapter " + chapterNum(current) }),
       el("span", { class: "badge " + current.depth, text: DEPTH[current.depth] }),
-      current.spine === undefined ? null : el("span", { class: "badge " + (current.spine ? "spine" : "elective"),
-        title: current.spine ? "On the builder spine: needed on the way to evolution and self-improving systems" : "Elective: useful context, not needed for the builder spine",
-        text: current.spine ? "Spine" : "Elective" }),
+      el("span", { class: "badge " + (current.role === "reading" ? "reading" : "track"), title: roleText(current),
+        text: current.role === "before" ? "Artifact " + artifactNums(current.tracks) + " · read first"
+          : current.role === "while" ? "Artifact " + artifactNums(current.tracks) + " · while building" : "Reading" }),
       el("span", { text: "≈ " + minutes + " min read" })
     ];
     head.insertBefore(el("div", { class: "chapter-eyebrow" }, eyebrow.filter(Boolean)), head.firstChild);
@@ -649,18 +695,14 @@
     var prev = items[idx - 1], next = items[idx + 1];
     if (!next && currentKind === "lab" && CASES.length) next = CASES[0];
     if (!next && (currentKind === "lab" || currentKind === "case") && STUDIOS.length) next = STUDIOS[0];
-    // Spine only: walk the builder spine, across course boundaries.
-    if (spineOnly && currentKind === "chapter" && course.spine) {
-      var path = spinePath(), at = path.indexOf(current);
-      if (at === -1) {
-        // An elective: step to the nearest spine chapters around it.
-        var later = path.filter(function (c) { return c.course === course && CHAPTERS.indexOf(c) > idx; });
-        var earlier = path.filter(function (c) { return c.course === course && CHAPTERS.indexOf(c) < idx; });
-        prev = earlier[earlier.length - 1] || prev;
-        next = later[0] || next;
-      } else {
+    // A chosen track: walk the artifact's reading list, across courses.
+    var endOfTrack = false;
+    if (track !== "all" && currentKind === "chapter") {
+      var path = trackPath(track), at = path.indexOf(current);
+      if (at !== -1) {
         prev = path[at - 1];
         next = path[at + 1];
+        endOfTrack = !next;
       }
     }
     if (prev) pager.appendChild(el("a", { class: "prev", href: href(prev) }, [
@@ -668,6 +710,9 @@
     ]));
     if (next) pager.appendChild(el("a", { class: "next", href: href(next) }, [
       el("small", { text: "Next →" }), el("span", { class: "title", text: longLabel(next) })
+    ]));
+    else if (endOfTrack) pager.appendChild(el("a", { class: "next", href: root + "/curriculum.html#artifact-" + artifactById(track).num }, [
+      el("small", { text: "Next →" }), el("span", { class: "title", text: "Start building Artifact " + artifactById(track).num })
     ]));
     else pager.appendChild(el("a", { class: "next", href: root + "/glossary.html" }, [
       el("small", { text: "Next →" }), el("span", { class: "title", text: "Glossary" })
@@ -682,7 +727,12 @@
     var lastOfPart = partChapters[partChapters.length - 1] === current;
     var labs = lastOfPart ? LABS.filter(function (l) { return l.afterPart === current.part; }) : [];
     var studios = lastOfPart ? STUDIOS.filter(function (l) { return l.afterPart === current.part; }) : [];
-    var cases = CASES.filter(function (c) { return (c.related || []).indexOf(current.id) !== -1; });
+    var cases = [];
+    COURSES.forEach(function (co) {
+      (co.cases || []).forEach(function (c) {
+        if ((c.related || []).some(function (id) { return itemById(id, co) === current; })) cases.push(c);
+      });
+    });
     function box(cls, title, intro, list) {
       var ul = el("ul");
       list.forEach(function (x) {
@@ -693,7 +743,7 @@
     if (labs.length) box("lab", "Ready to build", "You now know enough for " + (labs.length > 1 ? "these labs" : "this lab") + ". Building it is the fastest way to make Part " + current.part + " stick.", labs);
     var benches = BENCHES.filter(function (w) { return w.chapters.indexOf(current.id) !== -1; });
     if (benches.length) box("workbench", "Measure it for real", "Predict the number from this chapter, then measure it with real tools. "
-      + (benches.some(function (w) { return w.machine === "gpu"; }) ? "Some need a rented GPU; each page says what it costs." : "Your laptop is enough."), benches);
+      + (benches.some(function (w) { return w.machine === "gpu"; }) ? "Some need a rented GPU; each page says what it costs." : "The lab VM is enough."), benches);
     if (studios.length) box("studio", "Design it", "Put this part to work on an interview-style design problem. Sketch your own answer first, then compare.", studios);
     var tools = ((course.tools) || []).filter(function (t) { return t.chapters.indexOf(current.id) !== -1; });
     if (tools.length) {
@@ -719,18 +769,17 @@
       var grid = el("div", { class: "road-grid" });
       var inPart = CHAPTERS.filter(function (c) { return c.part === p; });
       inPart.forEach(function (c) {
-        grid.appendChild(el("a", { class: "road-card" + (c.spine === false ? " elective" : ""), href: href(c) }, [
+        grid.appendChild(el("a", { class: "road-card role-" + c.role, href: href(c), title: roleText(c), "data-tracks": c.tracks.join(" ") }, [
           el("div", { class: "top" }, [
             el("span", { class: "num", "data-done-id": c.id, "data-label": "Ch " + chapterNum(c), text: "Ch " + chapterNum(c) }),
-            c.spine === false ? el("span", { class: "badge elective", text: "Elective" }) : null,
+            c.role === "reading" ? el("span", { class: "badge reading", text: "Reading" }) : el("span", { class: "badge track", text: "Artifact " + artifactNums(c.tracks) }),
             el("span", { class: "badge " + c.depth, text: DEPTH[c.depth] })
           ]),
           el("div", { class: "title", text: c.title }),
           el("div", { class: "blurb", text: c.blurb })
         ]));
       });
-      var allElective = inPart.length && inPart.every(function (c) { return c.spine === false; });
-      host.appendChild(el("section", { class: "road-part" + (allElective ? " elective-part" : "") }, [
+      host.appendChild(el("section", { class: "road-part", "data-tracks": tracksOf(inPart) }, [
         el("span", { class: "road-dot", text: String(p) }),
         el("h2", { text: part.title }),
         el("p", { text: part.blurb }),
@@ -740,7 +789,7 @@
 
     var blurbs = course.roadmapBlurbs || {};
     [["Hands-on labs", blurbs.labs || "Build the ideas yourself in Python. Each lab says which part to finish first.", LABS, "L"],
-     ["Workbench", blurbs.workbench || "The same ideas with the real tools, on your laptop or a rented GPU: predict a number from the chapter, measure it, compare.", BENCHES, "W"],
+     ["Workbench", blurbs.workbench || "The same ideas with the real tools, on the lab VM or a rented GPU: predict a number from the chapter, measure it, compare.", BENCHES, "W"],
      ["Case studies", blurbs.cases || "Real systems and real incidents, each built around one pattern.", CASES, "C"],
      ["Design studios", blurbs.studios || "Interview-style design problems that use what the course taught. Design first, then compare.", STUDIOS, "S"]].forEach(function (g) {
       if (!g[2].length) return;
@@ -768,7 +817,8 @@
     var cont = document.getElementById("continue-btn");
     if (!cont || !course) return;
     if (!cont.dataset.label) cont.dataset.label = cont.textContent;
-    var list = spineOnly && course.spine && course.spine.length ? CHAPTERS.filter(function (c) { return c.spine; }) : CHAPTERS;
+    var onTrack = track === "all" ? [] : trackPath(track).filter(function (c) { return c.course === course; });
+    var list = onTrack.length ? onTrack : CHAPTERS;
     cont.href = href(list[0]);
     cont.textContent = cont.dataset.label;
     var firstTodo = list.find(function (c) { return !done.has(c.id); });
@@ -802,13 +852,85 @@
         var bar = el("div", { class: "bar" }, [el("span")]);
         bar.firstChild.style.width = Math.round((n / all.length) * 100) + "%";
         kids.push(el("div", { class: "meta", text: counts }), bar, el("div", { class: "meta", text: n ? n + " of " + all.length + " done" : "Not started" }));
-        if (co.spine) kids.push(el("div", { class: "meta spine-meta", text: co.spine.length
-          ? "Builder spine: " + co.spine.length + " of " + co.chapters.length + " chapters"
-          : "Elective course: off the builder spine" }));
+        var nb = co.chapters.filter(function (c) { return c.role === "before"; }).length;
+        var nw = co.chapters.filter(function (c) { return c.role === "while"; }).length;
+        kids.push(el("div", { class: "meta track-meta", text: nb + nw
+          ? "Artifact track: " + nb + " to read first, " + nw + " to open while building"
+          : "Reading only" }));
       }
       host.appendChild(el("li", { class: "hub-step" + (planned ? " planned" : "") }, [
         el(planned ? "div" : "a", planned ? { class: "road-card hub-card" } : { class: "road-card hub-card", href: courseHome(co) }, kids)
       ]));
+    });
+  }
+
+  /* ---------- the artifact track page (curriculum.html) ----------
+     One section per artifact: what it replicates and extends, its gate
+     (ticks saved per artifact), the chapters to read before starting with
+     done ticks from course progress, what to open while building, and the
+     labs, workbenches and cases that build it. */
+
+  function buildArtifactTrack() {
+    var host = document.getElementById("artifact-track");
+    if (!host) return;
+    function itemList(ids, ordered) {
+      var ul = el(ordered ? "ol" : "ul", { class: "artifact-list" });
+      ids.forEach(function (id) {
+        var x = itemById(id);
+        if (!x) return;
+        var isDone = doneFor(x.course).has(x.id);
+        ul.appendChild(el("li", { class: isDone ? "done" : "" }, [
+          el("a", { href: href(x), text: longLabel(x) }),
+          isDone ? el("span", { class: "tick", "aria-label": "done", text: " ✓" }) : null
+        ]));
+      });
+      return ul;
+    }
+    function links(rows) {
+      var ul = el("ul", { class: "artifact-list" });
+      rows.forEach(function (r) {
+        ul.appendChild(el("li", null, [r[1] ? el("a", { href: r[1], target: "_blank", rel: "noopener", text: r[0] }) : el("span", { text: r[0] })]));
+      });
+      return ul;
+    }
+    ARTIFACTS.forEach(function (a) {
+      var key = "cs-gate:" + a.id, ticks = load(key, []) || [];
+      var gate = el("ul", { class: "gate" });
+      a.gate.forEach(function (g, i) {
+        var box = el("input", { type: "checkbox", "aria-label": g });
+        box.checked = !!ticks[i];
+        box.addEventListener("change", function () { ticks[i] = box.checked; save(key, ticks); });
+        gate.appendChild(el("li", null, [el("label", null, [box, document.createTextNode(" " + g)])]));
+      });
+      var read = a.path.filter(function (c) { return doneFor(c.course).has(c.id); }).length;
+      var follow = el("button", { class: "btn primary", type: "button", text: "Follow this track →" });
+      follow.addEventListener("click", function () {
+        applyTrack(a.id);
+        var first = a.path.find(function (c) { return !doneFor(c.course).has(c.id); }) || a.path[0];
+        if (first) location.href = href(first);
+      });
+      var kids = [
+        el("div", { class: "artifact-head" }, [
+          el("span", { class: "road-dot", text: String(a.num) }),
+          el("h3", { text: "Artifact " + a.num + ": " + a.title }),
+          el("span", { class: "artifact-meta", text: "Months " + a.months + " · " + a.cost })
+        ]),
+        el("p", { text: a.what }),
+        el("p", null, [el("strong", { text: "Replicates: " }), el("a", { href: a.replicates.href, target: "_blank", rel: "noopener", text: a.replicates.text })]),
+        el("p", null, [el("strong", { text: "The extension: " }), document.createTextNode(a.extension)]),
+        el("div", { class: "artifact-cols" }, [
+          el("div", null, [el("h4", { text: "Done when" }), gate,
+            el("h4", { text: "Read before starting (" + read + " of " + a.path.length + ")" }),
+            a.warmup ? el("p", { class: "artifact-note", text: "Week one warm-up first, then the rest in order." }) : null,
+            itemList((a.warmup || []).concat((a.before || []).filter(function (id) { return (a.warmup || []).indexOf(id) === -1; })), true)]),
+          el("div", null, [el("h4", { text: "Open while building" }), itemList(a["while"] || []),
+            el("h4", { text: "Build it with" }), itemList(a.build || []),
+            el("h4", { text: "Primary sources" }), links(a.read || []),
+            (a.open || []).length ? el("h4", { text: "Keep open" }) : null, (a.open || []).length ? links(a.open) : null])
+        ]),
+        follow
+      ];
+      host.appendChild(el("section", { class: "artifact" + (track === a.id ? " chosen" : ""), id: "artifact-" + a.num, "data-artifact": a.id }, kids));
     });
   }
 
@@ -1024,9 +1146,11 @@
     buildFooter();
     buildRoadmap();
     buildHub();
+    buildArtifactTrack();
     buildReadingBar();
     wireMeasureTables();
     refreshProgress();
+    markOffTrack();
     loadSketch();
     loadGlossaryHover();
     loadAsk();

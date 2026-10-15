@@ -137,7 +137,9 @@
     { id: "19", part: 6, depth: "core",  file: "19-efficient-attention.html", title: "Efficient Attention",                      blurb: "Multi-query and grouped-query attention, sliding windows and FlashAttention's memory trick." },
     { id: "20", part: 6, depth: "intro", file: "20-mixture-of-experts.html",  title: "Mixture of Experts",                       blurb: "Routing tokens to a few of many experts: more parameters for the same compute, and the catches." },
     { id: "21", part: 6, depth: "core",  file: "21-vision-language.html",     title: "Vision-Language Models",                   blurb: "Patches, image encoders, projectors and how a language model learns to read a picture." },
-    { id: "22", part: 6, depth: "intro", file: "22-beyond-attention.html",    title: "Beyond Attention",                         blurb: "State-space models, linear attention and hybrids, and what they trade away." }
+    { id: "22", part: 6, depth: "intro", file: "22-beyond-attention.html",    title: "Beyond Attention",                         blurb: "State-space models, linear attention and hybrids, and what they trade away." },
+    { id: "23", part: 6, depth: "intro", file: "23-interpretability-basics.html", title: "Interpretability Basics", blurb: "Reading what a network computes: probes, the residual stream, attention patterns and sparse features, as reading." },
+    { id: "24", part: 6, depth: "intro", file: "24-learned-optimisers.html", title: "Learned Optimisers & In-Context Learning", blurb: "Optimisers that are themselves trained, and in-context learning read as a learned learning algorithm." }
   ];
   var DL_LABS = [
     { id: "L1", file: "lab-01-mlp.html",          title: "A Neural Network from Scratch",     afterPart: 1, related: ["01", "02", "03"], blurb: "Matrix ops, a two-layer network, backprop by hand and a training loop on a toy dataset." },
@@ -384,6 +386,7 @@
     { id: "05", part: 2, depth: "core",  file: "05-open-ended-algorithms.html", title: "Open-Ended Algorithms",                  blurb: "POET and co-evolving problems with solutions, and what 'open-ended' means." },
     { id: "06", part: 2, depth: "core",  file: "06-interestingness.html",     title: "Models of Interestingness",                blurb: "Using foundation models to judge what is new and worth learning: OMNI and successors." },
     { id: "07", part: 2, depth: "core",  file: "07-lifelong-agents.html",     title: "Lifelong Agents & Skill Libraries",        blurb: "Voyager's curriculum, skills as code and agents that accumulate abilities." },
+    { id: "22", part: 2, depth: "intro", file: "22-coevolution-pbt.html",     title: "Co-evolution & Population-Based Training", blurb: "Populations that train each other: co-evolution, POET-style curricula and population-based training." },
     { id: "08", part: 3, depth: "deep",  file: "08-inference-time-search.html", title: "Inference-Time Search",                  blurb: "Best-of-n, self-consistency, tree search over answers, verifiers and adaptive branching." },
     { id: "09", part: 3, depth: "deep",  file: "09-program-evolution.html",   title: "LLM-Guided Program Evolution",             blurb: "FunSearch and AlphaEvolve: language models as mutation operators with automatic evaluators." },
     { id: "10", part: 3, depth: "core",  file: "10-evolution-frameworks.html", title: "Open Evolution Frameworks",               blurb: "Inside OpenEvolve and ShinkaEvolve: islands, archives, novelty rejection and sample efficiency." },
@@ -427,6 +430,112 @@
     { id: "evotorch", name: "Evolution-strategy libraries",  chapters: ["02"],                   blurb: "CMA-ES and friends for black-box optimisation." }
   ];
 
+  /* ---------- A9: Research Engineering on Small Proxies ---------- */
+  var RE_PARTS = [
+    { title: "Orientation",            blurb: "What an artifact is, what Artifact 1 must show, and how to use this course while building it." },
+    { title: "The Loop",               blurb: "A research loop as a program: propose, run under a budget, keep or revert, and the runner that makes it safe." },
+    { title: "Measurement",            blurb: "Noise floors, seeds, proxies that transfer and ablations that isolate one change." },
+    { title: "Shipping",               blurb: "The write-up a reviewer reads first, and the one command that reproduces it." }
+  ];
+  var RE_CHAPTERS = [
+    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",        title: "Start Here",                              blurb: "Four artifacts instead of a finished curriculum, Artifact 1's gate, and which chapters to open when." },
+    { id: "01", part: 1, depth: "deep",  file: "01-research-loop.html",     title: "The Research Loop as a Program",          blurb: "autoresearch's program.md, train.py and run store, and keep-or-revert as a state machine under a fixed time budget." },
+    { id: "02", part: 2, depth: "deep",  file: "02-proxies-noise.html",     title: "Proxies, Noise Floors & Seeds",           blurb: "How much a five-minute score moves on its own, paired tests over seeds, and the gap between the proxy and held-out data." },
+    { id: "03", part: 2, depth: "core",  file: "03-scaling-mup.html",       title: "Scaling Laws & μP Transfer for Proxies",  blurb: "What a tiny run predicts about a big one, compute-optimal sizing, and why μP lets hyperparameters transfer." },
+    { id: "04", part: 2, depth: "core",  file: "04-ablations-tracking.html", title: "Ablation Design & Run Tracking",         blurb: "One change at a time, factorial designs, a run-store schema and deterministic replay." },
+    { id: "05", part: 1, depth: "core",  file: "05-rust-runner.html",       title: "A Runner in Rust, Read from Python",      blurb: "Why the runner, sandbox and run store move to Rust, and enough Rust to read and change them." },
+    { id: "06", part: 3, depth: "core",  file: "06-write-up.html",          title: "The Write-Up",                            blurb: "A two-to-six-page report with one claim, its number and its budget, negative results and a one-command reproduction." }
+  ];
+  var RE_LABS = [
+    { id: "L1", file: "lab-01-keep-or-revert.html", title: "A Keep-or-Revert Research Loop", afterPart: 2, related: ["01", "02", "04"], blurb: "A run store, a noise floor, paired keep-or-revert decisions and a proxy-versus-held-out gap that warns before the loop overfits." }
+  ];
+  var RE_CASES = [
+    { id: "C1", file: "case-01-modded-nanogpt.html", title: "modded-nanogpt: a Speedrun as a Research Record", pattern: "A public record with full provenance", related: ["02", "03", "04"], blurb: "How a community turned 'train GPT-2 faster' into a ledger of verified, reproducible gains." }
+  ];
+  var RE_TOOLS = [
+    { id: "autoresearch", name: "autoresearch",   chapters: ["01", "02"], blurb: "Karpathy's single-file research loop: an agent edits train.py, runs it for five minutes and keeps what helps." },
+    { id: "nanochat",     name: "nanochat",       chapters: ["01", "03"], blurb: "A small, complete chat-model training stack whose train.py is autoresearch's inner task." },
+    { id: "modded-nanogpt", name: "modded-nanogpt", chapters: ["03", "04"], blurb: "The GPT-2 speedrun: records, logs and the tricks that survived scrutiny." },
+    { id: "cargo",        name: "Rust and cargo", chapters: ["05"],       blurb: "The Rust toolchain, for building and testing the runner." }
+  ];
+
+  /* ---------- A10: Harness & Evaluator Engineering ---------- */
+  var HE_PARTS = [
+    { title: "Orientation",            blurb: "Why the harness around a model is now a research object of its own." },
+    { title: "Harnesses",              blurb: "From context to workflow to a harness that improves itself, and tree search over experiments." },
+    { title: "Evaluators",             blurb: "Public and private splits, attested results, hacking rate, and verifying a kernel speed-up end to end." },
+    { title: "Benchmarks",             blurb: "The benchmarks research agents are judged on, and how to run them under a budget." }
+  ];
+  var HE_CHAPTERS = [
+    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                         blurb: "Artifacts 2 and 3, what they need from this course, and what it borrows from A6." },
+    { id: "01", part: 1, depth: "deep",  file: "01-harness-engineering.html", title: "Harness Engineering as Research",    blurb: "The ladder from context engineering to workflows to self-improving harnesses, with the systems on each rung." },
+    { id: "02", part: 1, depth: "deep",  file: "02-aide-tree-search.html",    title: "Tree Search over Experiments: AIDE", blurb: "Draft, debug and improve nodes, a selection rule, and when tree search beats greedy hill-climbing." },
+    { id: "03", part: 2, depth: "deep",  file: "03-splits-attestation.html",  title: "Public & Private Splits",            blurb: "An evaluator outside the agent's reach, hidden splits, typed and attested results, and hacking rate as a metric." },
+    { id: "04", part: 2, depth: "core",  file: "04-kernels-for-agents.html",  title: "Kernel Engineering for Agents",      blurb: "Triton first and CUDA at reading level, and how to check that an agent's claimed speed-up is real." },
+    { id: "05", part: 3, depth: "core",  file: "05-research-benchmarks.html", title: "Benchmarks for Research Agents",     blurb: "MLE-bench, PaperBench, RE-Bench, FML-Bench and KernelBench: what each measures and its Lite subset." }
+  ];
+  var HE_LABS = [
+    { id: "L1", file: "lab-01-greedy-vs-tree.html", title: "Greedy versus Tree Search", afterPart: 2, related: ["02", "03"], blurb: "A toy task with public and private splits, a greedy climber and an AIDE-style tree, compared over seeds, plus a hacking probe." }
+  ];
+  var HE_CASES = [
+    { id: "C1", file: "case-01-fml-bench-aide.html", title: "FML-Bench and AIDE²: When Search Beats Greedy", pattern: "A null result worth extending", related: ["01", "02", "05"], blurb: "A benchmark that found greedy as good as tree search, and the improver built on top of it." }
+  ];
+  var HE_TOOLS = [
+    { id: "aideml",      name: "AIDE (aideml)",   chapters: ["02"],       blurb: "Weco's open tree-search agent for machine-learning engineering tasks." },
+    { id: "fml-bench",   name: "FML-Bench",       chapters: ["02", "05"], blurb: "A benchmark of machine-learning research tasks for automated research agents." },
+    { id: "kernelbench", name: "KernelBench",     chapters: ["04", "05"], blurb: "GPU kernel-writing tasks scored on correctness and speed-up." },
+    { id: "triton",      name: "Triton",          chapters: ["04"],       blurb: "A Python language for GPU kernels; the first thing to read in an agent-written kernel." }
+  ];
+
+  /* ---------- A11: AI Control & Sandbox Security ---------- */
+  var CTL_PARTS = [
+    { title: "Orientation",            blurb: "Why a research loop needs a security model of its own." },
+    { title: "Boundaries",             blurb: "Who may write what, what the box may reach, and results the agent cannot forge." },
+    { title: "Monitoring",             blurb: "Reading transcripts for misbehaviour, and what to do when the loop does something it should not." }
+  ];
+  var CTL_CHAPTERS = [
+    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",       title: "Start Here",                             blurb: "Artifact 3's evaluator-hardening kit, and the control ideas it rests on." },
+    { id: "01", part: 1, depth: "core",  file: "01-threat-model.html",     title: "The Threat Model of a Research Loop",    blurb: "Proposer against evaluator, the write boundary, and everything an agent with a key and a box can reach." },
+    { id: "02", part: 1, depth: "deep",  file: "02-egress-sandbox.html",   title: "Deny-by-Default Egress & Sandboxes",     blurb: "Allowlists, an egress proxy, filesystem and resource limits, applied to a loop that runs for days." },
+    { id: "03", part: 1, depth: "deep",  file: "03-attested-results.html", title: "Attested Tool Results",                  blurb: "Typed result envelopes, hashes and signatures, the evaluator as a separate principal, and tamper-evident logs." },
+    { id: "04", part: 2, depth: "deep",  file: "04-transcript-monitor.html", title: "Monitoring Transcripts Offline",       blurb: "Trusted and untrusted monitors, audit budgets, and the edits to flag: tests, logs and timeouts." },
+    { id: "05", part: 2, depth: "core",  file: "05-incident-playbook.html", title: "Incident Playbooks for Autonomous Loops", blurb: "Kill switches, budget caps, rollback and disclosure, written before you need them." }
+  ];
+  var CTL_LABS = [
+    { id: "L1", file: "lab-01-attest-and-monitor.html", title: "Attest and Monitor a Research Loop", afterPart: 2, related: ["03", "04"], blurb: "Signed result envelopes, an evaluator behind a process boundary, a hash-chained log and an offline monitor, scored by hacking rate." }
+  ];
+  var CTL_CASES = [
+    { id: "C1", file: "case-01-hugging-face-incident.html", title: "The OpenAI and Hugging Face Incident", pattern: "A sandbox that leaked", related: ["01", "02", "05"], blurb: "What an agent reached that it should not have, and the controls the post-mortem recommends." }
+  ];
+  var CTL_TOOLS = [
+    { id: "bubblewrap", name: "bubblewrap",              chapters: ["02"], blurb: "Unprivileged Linux sandboxes built from namespaces." },
+    { id: "docker",     name: "Docker (rootless)",       chapters: ["02"], blurb: "Containers without a root daemon, for running untrusted candidates." },
+    { id: "mitmproxy",  name: "mitmproxy",               chapters: ["02", "04"], blurb: "An inspecting HTTP proxy, used here as an allowlisting egress gate and a traffic log." },
+    { id: "sigstore",   name: "Sigstore and minisign",   chapters: ["03"], blurb: "Signing tools for results and artefacts, read for their design." }
+  ];
+
+  /* ---------- A12: Measuring Recursive Self-Improvement ---------- */
+  var RSI_PARTS = [
+    { title: "Orientation",            blurb: "What a claim of self-improvement must show, and why measurement is the last artifact." },
+    { title: "Criteria",               blurb: "The conditions a self-improvement claim must meet, automation levels, and how to read published claims." },
+    { title: "Economics",              blurb: "What a loop costs, what it returns, and when it pays for itself." }
+  ];
+  var RSI_CHAPTERS = [
+    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",       title: "Start Here",                          blurb: "Artifact 4, the ignition test, and the standards every artifact is held to." },
+    { id: "01", part: 1, depth: "deep",  file: "01-level-one.html",        title: "What Counts as Self-Improvement",     blurb: "A fair baseline, a sustained trend, generalisation and a fixed budget: four conditions and how to test each." },
+    { id: "02", part: 1, depth: "core",  file: "02-automation-levels.html", title: "Automation Levels for AI Research",  blurb: "Taxonomies of how much of AI research is automated, the published estimates, and how to score your own loop." },
+    { id: "03", part: 2, depth: "deep",  file: "03-loop-economics.html",   title: "The Economics of a Loop",             blurb: "Cost per accepted improvement, returns that diminish or compound, and the elasticities that decide which." },
+    { id: "04", part: 1, depth: "core",  file: "04-reading-claims.html",   title: "Reading Self-Improvement Claims",     blurb: "An audit checklist for papers and posts, applied to the systems of 2025 and 2026." },
+    { id: "05", part: 2, depth: "intro", file: "05-reading-pack.html",     title: "Reading Pack: Meta-Learning & Beyond", blurb: "Learned optimisers, in-context learning as meta-learning, interpretability and co-evolution, as reading." }
+  ];
+  var RSI_LABS = [
+    { id: "L1", file: "lab-01-level-one-checker.html", title: "The Level-1 Checker", afterPart: 2, related: ["01", "03"], blurb: "Read a loop's run log and decide, condition by condition, whether it shows self-improvement within its budget." }
+  ];
+  var RSI_CASES = [
+    { id: "C1", file: "case-01-weco-aide2.html", title: "Weco's Claim of Recursive Self-Improvement", pattern: "Reading a self-improvement claim", related: ["01", "04"], blurb: "An outer agent that rewrote its own research agent, and what the evidence does and does not show." }
+  ];
+  var RSI_TOOLS = [];
+
 
 
   window.CS_DEPTH_LABEL = { deep: "Deep dive", core: "Core", intro: "Quick intro" };
@@ -435,32 +544,37 @@
   window.CS_COURSES = [
     { id: "mlf", dir: "ml-foundations", track: "ai", num: "A0", mark: "MF", title: "Math & Code for Machine Learning", subtitle: "the toolkit at the point of need",
       tagline: "Arrays, linear algebra, derivatives and autodiff, probability, information theory and the statistics of experiments, taught as each later course needs them.",
-      status: "done", parts: MLF_PARTS, chapters: MLF_CHAPTERS, labs: MLF_LABS, cases: MLF_CASES, studios: MLF_STUDIOS, tools: MLF_TOOLS,
-      spine: ["00", "01", "02", "04", "20", "21", "22", "05", "06", "08", "09", "10", "12", "13", "14", "15"] },
+      status: "done", parts: MLF_PARTS, chapters: MLF_CHAPTERS, labs: MLF_LABS, cases: MLF_CASES, studios: MLF_STUDIOS, tools: MLF_TOOLS },
     { id: "ml", dir: "ml", track: "ai", num: "A1", mark: "ML", title: "Machine Learning & Data Science", subtitle: "models you can trust",
       tagline: "Framing, metrics, linear models, trees and boosting, unsupervised learning, validation, leakage, calibration, features and proving value.",
-      status: "done", parts: ML_PARTS, chapters: ML_CHAPTERS, labs: ML_LABS, cases: ML_CASES, studios: ML_STUDIOS, tools: ML_TOOLS,
-      spine: ["01", "02", "04", "05", "06", "07", "13", "14"] },
+      status: "done", parts: ML_PARTS, chapters: ML_CHAPTERS, labs: ML_LABS, cases: ML_CASES, studios: ML_STUDIOS, tools: ML_TOOLS },
     { id: "dl", dir: "deep-learning", track: "ai", num: "A2", mark: "DL", title: "Deep Learning & Transformers", subtitle: "from a neuron to a GPT",
       tagline: "Backpropagation, training dynamics, embeddings, attention, the Transformer, tokenisation, decoding, scaling laws and modern architectures.",
-      status: "done", parts: DL_PARTS, chapters: DL_CHAPTERS, labs: DL_LABS, cases: DL_CASES, studios: DL_STUDIOS, tools: DL_TOOLS,
-      spine: ["01", "02", "03", "04", "05", "06", "09", "10", "11", "12", "13", "14", "15", "16"] },
+      status: "done", parts: DL_PARTS, chapters: DL_CHAPTERS, labs: DL_LABS, cases: DL_CASES, studios: DL_STUDIOS, tools: DL_TOOLS },
     { id: "llm", dir: "llm-training", track: "ai", num: "A3", mark: "LT", title: "Training, Post-training & Serving LLMs", subtitle: "the life of a model",
       tagline: "Pretraining data and parallelism, RL foundations, fine-tuning, LoRA, RLHF, DPO and GRPO, merging, quantisation and serving engines.",
-      status: "done", parts: LLM_PARTS, chapters: LLM_CHAPTERS, labs: LLM_LABS, cases: LLM_CASES, studios: LLM_STUDIOS, tools: LLM_TOOLS,
-      spine: ["06", "07", "08", "09", "10", "11", "12", "13", "14", "16"] },
+      status: "done", parts: LLM_PARTS, chapters: LLM_CHAPTERS, labs: LLM_LABS, cases: LLM_CASES, studios: LLM_STUDIOS, tools: LLM_TOOLS },
     { id: "agt", dir: "agents", track: "ai", num: "A4", mark: "AG", title: "Agents, Tools & Protocols", subtitle: "models that act",
       tagline: "The tool loop, tool design, function calling, MCP and A2A, context engineering, workflows, multi-agent systems, deep research, computer use and agent security.",
-      status: "done", parts: AGT_PARTS, chapters: AGT_CHAPTERS, labs: AGT_LABS, cases: AGT_CASES, studios: AGT_STUDIOS, tools: AGT_TOOLS,
-      spine: ["01", "02", "03", "04", "05", "10", "11", "13", "18", "19", "20"] },
+      status: "done", parts: AGT_PARTS, chapters: AGT_CHAPTERS, labs: AGT_LABS, cases: AGT_CASES, studios: AGT_STUDIOS, tools: AGT_TOOLS },
     { id: "evl", dir: "evals", track: "ai", num: "A6", mark: "EV", title: "Evals, Guardrails & Safe Operation", subtitle: "knowing that it works",
       tagline: "Error analysis, LLM judges, eval statistics, domain benchmarks, agent evals, hallucination, prompt injection, guardrails, observability and governance.",
-      status: "done", parts: EVL_PARTS, chapters: EVL_CHAPTERS, labs: EVL_LABS, cases: EVL_CASES, studios: EVL_STUDIOS, tools: EVL_TOOLS,
-      spine: ["01", "02", "03", "04", "06", "07", "08"] },
+      status: "done", parts: EVL_PARTS, chapters: EVL_CHAPTERS, labs: EVL_LABS, cases: EVL_CASES, studios: EVL_STUDIOS, tools: EVL_TOOLS },
     { id: "oe", dir: "open-ended", track: "ai", num: "A7", mark: "OE", title: "Search, Evolution & Self-Improving Agents", subtitle: "systems that keep discovering",
       tagline: "MCTS, evolution, novelty and quality-diversity, open-ended algorithms, LLM-guided program evolution, meta agents and the integrity of self-improvement.",
-      status: "done", parts: OE_PARTS, chapters: OE_CHAPTERS, labs: OE_LABS, cases: OE_CASES, studios: OE_STUDIOS, tools: OE_TOOLS,
-      spine: ["00", "19", "01", "02", "20", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "21", "14", "15", "16", "17", "18"] },
+      status: "done", parts: OE_PARTS, chapters: OE_CHAPTERS, labs: OE_LABS, cases: OE_CASES, studios: OE_STUDIOS, tools: OE_TOOLS },
+    { id: "re", dir: "research-eng", track: "ai", num: "A9", mark: "RE", title: "Research Engineering on Small Proxies", subtitle: "the loop behind Artifact 1",
+      tagline: "Research loops as programs, noise floors and seeds, proxies that transfer, ablations, a Rust runner and the write-up a reviewer reads first.",
+      status: "building", parts: RE_PARTS, chapters: RE_CHAPTERS, labs: RE_LABS, cases: RE_CASES, studios: [], tools: RE_TOOLS },
+    { id: "he", dir: "harness-eng", track: "ai", num: "A10", mark: "HE", title: "Harness & Evaluator Engineering", subtitle: "Artifacts 2 and 3",
+      tagline: "Harness engineering as research, tree search over experiments, public and private splits, kernels for agents and the benchmarks research agents face.",
+      status: "building", parts: HE_PARTS, chapters: HE_CHAPTERS, labs: HE_LABS, cases: HE_CASES, studios: [], tools: HE_TOOLS },
+    { id: "ctl", dir: "control", track: "ai", num: "A11", mark: "CT", title: "AI Control & Sandbox Security", subtitle: "the walls of Artifact 3",
+      tagline: "The threat model of a research loop, deny-by-default egress, attested results, transcript monitoring and incident playbooks.",
+      status: "building", parts: CTL_PARTS, chapters: CTL_CHAPTERS, labs: CTL_LABS, cases: CTL_CASES, studios: [], tools: CTL_TOOLS },
+    { id: "rsi", dir: "rsi-measurement", track: "ai", num: "A12", mark: "RS", title: "Measuring Recursive Self-Improvement", subtitle: "the case Artifact 4 makes",
+      tagline: "What counts as self-improvement, automation levels for AI research, the economics of a loop and how to read the claims.",
+      status: "building", parts: RSI_PARTS, chapters: RSI_CHAPTERS, labs: RSI_LABS, cases: RSI_CASES, studios: [], tools: RSI_TOOLS }
   ];
 
   /* Workbench: the chapters' ideas with real tools on a real machine (page
@@ -479,33 +593,103 @@
         blurb: "Group-relative advantages on arithmetic with a checkable answer: reward curves, response length and a reward hack." }
     ],
     dl: [
-      { id: "W1", file: "w01-pytorch.html", title: "PyTorch by Hand", machine: "laptop", chapters: ["05"], time: "1 h",
+      { id: "W1", file: "w01-pytorch.html", title: "PyTorch by Hand", machine: "vm", chapters: ["05"], time: "1 h",
         blurb: "Tensors, autograd and a training loop, checked against the micrograd-style engine you built." },
-      { id: "W2", file: "w02-char-gpt.html", title: "Train a Character GPT", machine: "laptop", chapters: ["12", "16"], time: "1 h, +1 h on a GPU", cost: "GPU part: about an hour",
+      { id: "W2", file: "w02-char-gpt.html", title: "Train a Character GPT", machine: "vm", chapters: ["12", "16"], time: "1 h",
         blurb: "Chapter 12's GPT in PyTorch on Tiny Shakespeare; predict FLOPs and time, then scale it on a GPU." },
-      { id: "W3", file: "w03-tiktoken.html", title: "Real Tokenisers", machine: "laptop", chapters: ["13"], time: "45 min",
+      { id: "W3", file: "w03-tiktoken.html", title: "Real Tokenisers", machine: "vm", chapters: ["13"], time: "45 min",
         blurb: "tiktoken and a Hugging Face tokenizer on the same texts: tokens per word, languages, numbers and code." },
       { id: "W4", file: "w04-attention-kernels.html", title: "Attention Kernels, Benchmarked", machine: "gpu", chapters: ["19", "09"], time: "1 h", cost: "about an hour of a GPU",
         blurb: "Naive attention against PyTorch's fused kernel: predict memory traffic, measure time and peak memory as length grows." },
-      { id: "W5", file: "w05-word-vectors.html", title: "Word Vectors from Real Text", machine: "laptop", chapters: ["06"], time: "1 h",
+      { id: "W5", file: "w05-word-vectors.html", title: "Word Vectors from Real Text", machine: "vm", chapters: ["06"], time: "1 h",
         blurb: "Skip-gram with negative sampling in PyTorch on text8; analogies, neighbours and what the loss curve says." }
     ],
     agt: [
-      { id: "W1", file: "w01-local-model-agent.html", title: "Your Agent Loop on a Local Model", machine: "laptop", chapters: ["01", "02"], time: "1 h",
+      { id: "W1", file: "w01-local-model-agent.html", title: "Your Agent Loop on a Local Model", machine: "vm", chapters: ["01", "02"], time: "1 h",
         blurb: "Lab 1's loop against a model running in Ollama: what changes when the scripted model becomes a real one." },
-      { id: "W2", file: "w02-real-embedders.html", title: "Real Embedders and a Reranker", machine: "laptop", chapters: ["23"], time: "1 h",
+      { id: "W2", file: "w02-real-embedders.html", title: "Real Embedders and a Reranker", machine: "vm", chapters: ["23"], time: "1 h",
         blurb: "sentence-transformers and a cross-encoder on a small corpus: recall and nDCG against the stand-in embedder." }
     ],
     evl: [
-      { id: "W1", file: "w01-real-judge.html", title: "A Real Judge, Calibrated", machine: "laptop", chapters: ["03", "04"], time: "1.5 h",
+      { id: "W1", file: "w01-real-judge.html", title: "A Real Judge, Calibrated", machine: "vm", chapters: ["03", "04"], time: "1.5 h",
         blurb: "A local model as LLM judge: measure position bias and agreement with labels, with confidence intervals." }
     ],
     oe: [
-      { id: "W1", file: "w01-funsearch-local.html", title: "Program Evolution with a Real Model", machine: "laptop", chapters: ["09", "16"], time: "2 h",
+      { id: "W1", file: "w01-funsearch-local.html", title: "Program Evolution with a Real Model", machine: "vm", chapters: ["09", "16"], time: "2 h",
         blurb: "Lab 3's bin-packing evolver with a local model writing the mutations, scored on held-out instances." },
       { id: "W2", file: "w02-funsearch-gpu.html", title: "Evolution at Scale on a GPU", machine: "gpu", chapters: ["09", "15"], time: "3 h", cost: "about three hours of a 24 GB card",
         blurb: "The same evolver served by vLLM: hundreds of samples a minute, islands, and the evaluator hacks that appear at scale." }
+    ],
+    re: [
+      { id: "W1", file: "w01-autoresearch-cpu.html", title: "autoresearch on a CPU Proxy", machine: "vm", chapters: ["01", "02"], time: "3 h",
+        blurb: "Run the real autoresearch loop with a CPU-sized nanochat on the lab VM: seconds per experiment, the noise floor, and what the GPU budget would buy." }
+    ],
+    he: [
+      { id: "W1", file: "w01-aide-one-task.html", title: "AIDE on One Task, CPU-Sized", machine: "vm", chapters: ["02", "05"], time: "2 h", cost: "a few dollars of API calls",
+        blurb: "The real aideml agent on a small tabular task: nodes per hour, cost per node, and greedy against tree on the same budget." }
+    ],
+    ctl: [
+      { id: "W1", file: "w01-locked-down-sandbox.html", title: "A Locked-Down Research Sandbox", machine: "vm", chapters: ["02", "03"], time: "2 h",
+        blurb: "A separate user, an allowlisting egress proxy and A9's loop inside it: one blocked exfiltration, and the overhead measured." }
+    ],
+    rsi: [
+      { id: "W1", file: "w01-improver-elasticity.html", title: "An Improver's Elasticity, Measured", machine: "vm", chapters: ["03"], time: "2 h", cost: "a few dollars of API calls",
+        blurb: "A10's lab agent at three budgets: gain against cost, fitted, and what it says about returns to spending." }
     ]
   };
   window.CS_COURSES.forEach(function (co) { co.workbenches = WORKBENCHES[co.id] || []; });
+
+  /* ---------- The artifact track ----------
+     Four public artifacts replace the builder spine. Each lists, in order,
+     the chapters to read before starting ("before"), the chapters to open
+     while stuck ("while"), and the labs, workbenches, cases and studios that
+     build it ("build"). Ids are "course:chapter" or "course:L1/W1/C1/S1".
+     A chapter in no list is reading: kept, never required. */
+  window.CS_ARTIFACTS = [
+    { id: "A1", num: 1, title: "autoresearch-rs", short: "A research loop",
+      replicates: { text: "karpathy/autoresearch", href: "https://github.com/karpathy/autoresearch" },
+      what: "Karpathy's autoresearch loop with the runner, sandbox and run store rewritten in Rust; the inner task is nanochat's train.py under a fixed five-minute budget.",
+      extension: "A keep-or-revert loop that also logs the gap between proxy and held-out gain for every experiment, so overfitting to the five-minute proxy is measured, not assumed.",
+      gate: ["100 or more overnight experiments on one GPU", "A chart of proxy gain against held-out gain", "A two-to-three-page write-up with seeds and the noise floor"],
+      cost: "$150 to $300", months: "1 to 3",
+      warmup: ["mlf:20", "mlf:21", "mlf:22", "oe:19", "oe:02"],
+      before: ["mlf:04", "mlf:15", "mlf:17", "dl:12", "dl:14", "dl:16", "dl:17", "dl:18", "re:00", "re:01", "re:02", "re:03", "re:04", "re:05", "re:06"],
+      while: ["mlf:16", "mlf:18", "dl:03", "dl:13", "llm:02", "llm:05", "llm:22", "evl:04"],
+      build: ["mlf:L5", "mlf:L6", "dl:L4", "re:L1", "dl:W2", "re:W1", "dl:C4", "dl:C7", "re:C1"],
+      read: [["autoresearch README and program.md", "https://github.com/karpathy/autoresearch"], ["modded-nanogpt record log", "https://github.com/KellerJordan/modded-nanogpt"], ["Hoffmann et al., Training Compute-Optimal Large Language Models (Chinchilla)", "https://arxiv.org/abs/2203.15556"], ["Yang et al., Tensor Programs V (μTransfer)", "https://arxiv.org/abs/2203.03466"]],
+      open: [["METR's RE-Bench tasks, including the scaling-law task", "https://github.com/METR/ai-rd-tasks"]] },
+    { id: "A2", num: 2, title: "mini-FML search study", short: "Search versus greedy",
+      replicates: { text: "FML-Bench's finding that greedy search matches tree search", href: "https://github.com/qrzou/FML-bench" },
+      what: "An AIDE-style tree-search agent run on three FML-Bench tasks, compared head to head with greedy hill-climbing.",
+      extension: "Reproduce the greedy-versus-tree result on three tasks with three seeds, then test one hypothesis the paper leaves open, such as whether a gap appears when good ideas are rare.",
+      gate: ["Paired results with confidence intervals", "A pull request to FML-Bench adding your agent or metric"],
+      cost: "$300 to $600", months: "4 to 7",
+      before: ["oe:01", "agt:02", "agt:04", "agt:10", "agt:18", "agt:20", "he:00", "he:01", "he:02", "he:05", "evl:04", "evl:06", "oe:08", "oe:11", "oe:16"],
+      while: ["agt:05", "agt:11", "agt:23", "oe:12", "evl:03", "evl:07", "llm:14", "dl:23", "dl:24"],
+      build: ["oe:L1", "agt:L1", "oe:L4", "he:L1", "evl:L1", "agt:W1", "he:W1", "agt:C2", "he:C1", "oe:C4", "evl:C6", "oe:S1"],
+      read: [["FML-Bench repository and paper", "https://github.com/qrzou/FML-bench"], ["Jiang et al., AIDE: AI-Driven Exploration in the Space of Code", "https://arxiv.org/abs/2502.13138"], ["Harness engineering for self-improvement (as linked in the roadmap)", "https://lilithai.dev/radar/harness-engineering-for-self-improvement?lang=en"]],
+      open: [["Agentic Context Engineering (ACE), Meta-Harness and STOP; see A10 chapter 1", ""]] },
+    { id: "A3", num: 3, title: "evaluator-hardening kit", short: "Hardened evaluators",
+      replicates: { text: "proxy-only gains and hidden-test hardening on kernel benchmarks", href: "https://scalingintelligence.stanford.edu/pubs/kernelbench.pdf" },
+      what: "A KernelBench subset where you first break the grader, then harden it, and measure the hacking rate before and after.",
+      extension: "A reusable Python library (typed, attested tool results; hidden splits; end-to-end timing) that drops into Artifact 2's agent, with hacking rate as a first-class metric.",
+      gate: ["Hacking rate measured on 20 or more kernels, before and after hardening", "One upstream pull request to a kernel benchmark or to ShinkaEvolve"],
+      cost: "$200 to $400", months: "7 to 10",
+      before: ["oe:15", "oe:16", "oe:17", "llm:13", "llm:04", "he:03", "he:04", "evl:07", "agt:19", "ctl:00", "ctl:01", "ctl:02", "ctl:03", "ctl:04", "ctl:05"],
+      while: ["evl:03", "evl:04", "evl:02", "evl:08", "evl:16", "dl:19"],
+      build: ["oe:L6", "agt:L7", "ctl:L1", "evl:L2", "ctl:W1", "evl:W1", "oe:W2", "ctl:C1", "evl:C2", "evl:C4", "dl:C5"],
+      read: [["Ouyang et al., KernelBench", "https://scalingintelligence.stanford.edu/pubs/kernelbench.pdf"], ["OpenAI, the Hugging Face incident and the road ahead", "https://openai.com/index/hugging-face-incident-and-the-road-ahead/"]],
+      open: [["Redwood Research's AI-control papers", "https://www.redwoodresearch.org/research"], ["GPU MODE lectures on Triton", "https://github.com/gpu-mode/lectures"]] },
+    { id: "A4", num: 4, title: "AIDE²-in-miniature", short: "An improver of improvers",
+      replicates: { text: "Weco's AIDE² outer loop", href: "https://www.weco.ai/blog/first-evidence-of-recursive-self-improvement" },
+      what: "An outer agent rewrites your Artifact 2 agent on a six-task mix (three FML-Bench tasks, two autoresearch configurations, one KernelBench pair), scored on private splits under a fixed dollar budget.",
+      extension: "Apply the four Level-1 conditions to your own loop, then an ignition test: swap the discovered agent into the outer loop and report whether it is a better improver.",
+      gate: ["A paper-style write-up with ablations and negative results", "Released code", "A result someone else can reproduce for under $500"],
+      cost: "$800 to $1,500", months: "11 to 17",
+      before: ["oe:02", "oe:04", "oe:09", "oe:10", "oe:12", "oe:13", "oe:21", "oe:14", "rsi:00", "rsi:01", "rsi:02", "rsi:03", "rsi:04"],
+      while: ["oe:05", "oe:07", "oe:22", "llm:14", "llm:16", "dl:24", "mlf:18", "rsi:05"],
+      build: ["oe:L3", "oe:L5", "oe:L7", "rsi:L1", "oe:W1", "rsi:W1", "oe:C3", "oe:C6", "oe:C7", "rsi:C1", "oe:S2", "oe:S3"],
+      read: [["Weco, first evidence of recursive self-improvement", "https://www.weco.ai/blog/first-evidence-of-recursive-self-improvement"], ["Zhang et al., Darwin Gödel Machine", "https://arxiv.org/abs/2505.22954"], ["Lange et al., ShinkaEvolve", "https://arxiv.org/abs/2509.19349"]],
+      open: [["Epoch AI, toward an O*NET for AI R&D", "https://epoch.ai/gradient-updates/toward-an-onet-for-ai-rnd"], ["Anthropic, measuring the pace of AI development", "https://www.anthropic.com/institute/measuring-pace-of-ai-development"]] }
+  ];
 })();
