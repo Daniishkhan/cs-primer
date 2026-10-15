@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workbench 1: autoresearch on a CPU Proxy · Research Engineering on Small Proxies</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="re" data-workbench="W1">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Workbench 1: autoresearch on a CPU Proxy</h1>
+  <p class="lede">Karpathy's autoresearch is a loop in which an agent edits one training file, trains for a fixed five minutes on a GPU, keeps the edit if <code>val_bpb</code> went down and undoes it otherwise. The lab VM has no GPU. Here you cut the real <code>train.py</code> down until it runs on sixteen CPU cores, with every change written down, and then run the real loop on it. You measure what the loop's own log cannot tell you: how long an experiment takes, how far the score moves when nothing changed, and whether the "improvements" survive a re-run on seeds the loop never used.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why measure it</p>
+  <p>This workbench is the groundwork for <strong>Artifact 1, autoresearch-rs</strong>. Before you rewrite the runner, sandbox and run store in Rust, you should know the numbers it has to reproduce: seconds per experiment, the noise floor, and what the stock keep rule does with that noise. <a href="../chapters/01-research-loop.html">Chapter 1</a> describes the loop; <a href="../chapters/02-proxies-noise.html">chapter 2</a> says that a single comparison of two noisy scores is a coin toss when nothing changed. Both are easy to read and easy to believe too much. A <span class="term">proxy</span> here is a cheap stand-in for the thing you care about (a 30-second CPU run in place of a five-minute GPU run). The <span class="term">noise floor</span> is how far the score moves when nothing is changed. A <span class="term">wall-clock budget</span> is a limit in seconds, not steps. After this page you can say, with measured numbers, how much of an autoresearch log is signal.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">What you need</p>
+  <ul>
+    <li><strong>Machine:</strong> the lab VM (16 vCPUs, 64 GB, Python 3.12, PyTorch CPU, <code>uv</code>). No GPU. The scripts were run there and nowhere else.</li>
+    <li><strong>Disk and downloads:</strong> 351 MB for four data shards (three for training and the pinned validation shard) plus the tokeniser, and three small Python packages (<code>rustbpe</code>, <code>pyarrow</code>, <code>requests</code>).</li>
+    <li><strong>Time:</strong> about three hours with reading. The 24 noise runs took 20 minutes; the 30-experiment loop with its confirmation took 41 minutes with the time budget and 35 with the step budget.</li>
+    <li><strong>Optional:</strong> an OpenAI API key, for the proposer that asks a small chat model for the next edit. One call measured 486 tokens, so a 30-experiment loop is about 15,000 tokens, far below the few dollars you might budget. Without a key, use <code>--proposer random</code>.</li>
+    <li><strong>A shared machine.</strong> The VM was also running other people's jobs while I measured. Its load average was between 12 and 30 on 16 vCPUs, and every table below has a <code>load</code> column so you can see it. Your numbers will differ, and that is part of the lesson.</li>
+  </ul>
+</div>
+
+<h2>Predict before you run</h2>
+<p>Autoresearch fixes the <em>time</em> and lets the amount of training vary. How much training a budget buys is a division: the machine's peak speed times the fraction of it you actually use (the <span class="term">model FLOPs utilisation</span>, MFU), times the seconds, divided by the FLOPs one token costs. The rule of thumb that a token costs about six FLOPs per parameter, forward and backward, is the "6ND" rule of <a href="../../deep-learning/chapters/16-resource-accounting.html">A2 chapter 16</a>; the script <code>h100_budget.py</code> below uses autoresearch's own count, which adds the attention term.</p>
+<div class="eq-display" data-tex="D = \frac{F_{\text{peak}} \times \text{MFU} \times t}{C}">D = (F<sub>peak</sub> &times; MFU &times; t) / C</div>
+<p>Here <em>D</em> is the number of training tokens, <em>F</em><sub>peak</sub> the peak FLOP/s (989.5 trillion, the constant <code>train.py</code> divides by), <em>t</em> the budget in seconds and <em>C</em> the FLOPs per token. The noise side of the page rests on <a href="../chapters/02-proxies-noise.html#eq-paired-t">the paired test of chapter 2</a>: a difference is believed only when it is large against the spread of differences.</p>
+<div class="callout predict">
+  <p class="callout-title">Your prediction</p>
+  <p>Write down four numbers before you read on. (1) The published setting is a depth-8, width-512 model, 50.3 million parameters, 239 million FLOPs per token (computed below). At 25%, 40% and 50% MFU, how many tokens and optimiser steps does 300 seconds buy on one H100? (2) The CPU proxy here is a 5-million-parameter model trained for 30 seconds. How long will one whole experiment take on this VM, including start-up and the final evaluation? (3) Run the unmodified baseline six times with nothing changed. What standard deviation of <code>val_bpb</code> do you expect, (a) with the same seed and a time budget, (b) with new seeds and a time budget, (c) with the same seed and a step budget, (d) with new seeds and a step budget? (4) In 30 experiments with the stock keep rule, how many do you expect to be kept, and if you re-run the first and last kept versions on fresh seeds, does the last one win?</p>
+</div>
+<details class="deeper">
+  <summary>Check my reasoning, then the measurements below</summary>
+  <p>The H100 arithmetic is the formula above; the only guess is MFU, and the script prints the real <code>mfu_percent</code> when you run <code>train.py</code> on a GPU. For the noise I reasoned from the mechanism. A seed fixes the initial weights and the order of the data; a step budget fixes how many updates happen. So (c), the same seed and the same number of steps, should repeat bit for bit if the CPU kernels are deterministic, and its standard deviation should be zero. (d) adds seed noise only. (a) adds a different number of steps each run, because the budget is seconds and the machine is shared; (b) adds both. If throughput noise were large, (a) and (b) would show a bigger spread than (d). For (4) I had no prior: the stock rule keeps any lower score, so with noise this size I expected several keeps that are not real. The measurements below say how it turned out.</p>
+</details>
+
+<h2>Set up: a CPU copy of autoresearch, and exactly what changed</h2>
+<p>Autoresearch's <code>train.py</code> will not run on a CPU as published. It loads FlashAttention 3 through the <code>kernels</code> package, which needs an NVIDIA card; it calls <code>torch.cuda</code> in several places; and <code>prepare.py</code>, which holds the data loader and the evaluation, pins memory and puts buffers on the GPU. A CPU port is therefore a set of edits, and the first rule of this page is that <strong>the edits are listed, applied by a script that refuses to run if the upstream file has moved on, and shown as a diff</strong>. Two further warnings. <code>prepare.py</code> says its evaluation is "DO NOT CHANGE", because it is the fixed metric; I changed its constants (the context length and the number of validation tokens) to make a CPU run possible, so <strong>the <code>val_bpb</code> numbers here are not comparable with anyone else's</strong>, including numbers from a GPU run of the real thing. And I used the repository as it stood on 15 October 2026: commit <code>228791f</code> of 25 March 2026.</p>
+<ol class="steps">
+  <li><strong>Get the code and the packages.</strong> The lab VM already has PyTorch for the CPU; add three small packages that <code>prepare.py</code> imports.</li>
+</ol>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">mkdir -p ~/work/re-build &amp;&amp; cd ~/work/re-build</span>
+<span class="prompt">$ </span><span class="cmd">git clone --depth 1 https://github.com/karpathy/autoresearch.git</span>
+<span class="prompt">$ </span><span class="cmd">uv pip install --python ~/lab/bin/python rustbpe pyarrow requests</span>
+<span class="prompt">$ </span><span class="cmd">cp -r autoresearch ar-cpu &amp;&amp; rm -rf ar-cpu/.git</span></code></pre>
+<ol class="steps" start="2">
+  <li><strong>Apply the patch.</strong> <a href="code/w01/cpu_patch.py"><code>cpu_patch.py</code></a> makes 22 exact string replacements. It stops with an error if any string is missing or occurs a different number of times than expected. The full diff is in <a href="code/w01/cpu_patch.diff"><code>cpu_patch.diff</code></a>.</li>
+</ol>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">cd ~/work/re-build</span>
+<span class="prompt">$ </span><span class="cmd">python3 cpu_patch.py ar-cpu</span></code></pre>
+<pre class="terminal" data-title="output (lab VM)"><code>prepare.py  shorter context
+prepare.py  time budget from the environment, 30 s by default
+prepare.py  validation slice of 262,144 tokens, not about 21M
+prepare.py  no pinned host memory
+prepare.py  the 'GPU' buffer lives on the CPU
+prepare.py  plain synchronous copy
+prepare.py  token byte table on the CPU
+train.py    drop the CUDA-only FlashAttention 3 import
+train.py    call the stand-in
+train.py    no torch.compile on the optimiser kernels
+train.py    no torch.compile on the model
+train.py    CPU device, bfloat16 autocast, seed from the environment
+train.py    nothing to synchronise on a CPU
+train.py    no GPU memory to report
+train.py    8K tokens per optimiser step, not 524K
+train.py    model width 32 x depth, not 64 x depth
+train.py    head dimension 64, not 128
+train.py    4 layers, not 8
+train.py    32 sequences of 256 tokens per forward pass
+train.py    LR schedule can follow steps instead of seconds
+train.py    stop after AR_STEPS steps when it is set
+train.py    read AR_STEPS (0 means: use the time budget)
+22 changes applied to ar-cpu</code></pre>
+<p>The changes, grouped by what they are for. The last column says why each was needed or chosen.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>What changed, and why</th></tr></thead>
+  <tbody>
+    <tr><td><code>prepare.py</code></td><td>Shorter context</td></tr>
+    <tr><td><code>prepare.py</code></td><td>Time budget from the environment, 30 s by default</td></tr>
+    <tr><td><code>prepare.py</code></td><td>Validation slice of 262,144 tokens, not about 21M</td></tr>
+    <tr><td><code>prepare.py</code></td><td>No pinned host memory</td></tr>
+    <tr><td><code>prepare.py</code></td><td>The 'GPU' buffer lives on the CPU</td></tr>
+    <tr><td><code>prepare.py</code></td><td>Plain synchronous copy</td></tr>
+    <tr><td><code>prepare.py</code></td><td>Token byte table on the CPU</td></tr>
+    <tr><td><code>train.py</code></td><td>Drop the CUDA-only FlashAttention 3 import</td></tr>
+    <tr><td><code>train.py</code></td><td>Call the stand-in</td></tr>
+    <tr><td><code>train.py</code></td><td>No torch.compile on the optimiser kernels</td></tr>
+    <tr><td><code>train.py</code></td><td>No torch.compile on the model</td></tr>
+    <tr><td><code>train.py</code></td><td>CPU device, bfloat16 autocast, seed from the environment</td></tr>
+    <tr><td><code>train.py</code></td><td>Nothing to synchronise on a CPU</td></tr>
+    <tr><td><code>train.py</code></td><td>No GPU memory to report</td></tr>
+    <tr><td><code>train.py</code></td><td>8K tokens per optimiser step, not 524K</td></tr>
+    <tr><td><code>train.py</code></td><td>Model width 32 x depth, not 64 x depth</td></tr>
+    <tr><td><code>train.py</code></td><td>Head dimension 64, not 128</td></tr>
+    <tr><td><code>train.py</code></td><td>4 layers, not 8</td></tr>
+    <tr><td><code>train.py</code></td><td>32 sequences of 256 tokens per forward pass</td></tr>
+    <tr><td><code>train.py</code></td><td>LR schedule can follow steps instead of seconds</td></tr>
+    <tr><td><code>train.py</code></td><td>Stop after AR_STEPS steps when it is set</td></tr>
+    <tr><td><code>train.py</code></td><td>Read AR_STEPS (0 means: use the time budget)</td></tr>
+  </tbody>
+</table></div>
+<p>In diff terms: <code>prepare.py</code> 14 lines changed and <code>train.py</code> 56, which is 40 insertions and 30 deletions in all. The model code, the optimiser, the schedules, the metric and the loop are untouched. The longest single edit is the replacement attention function, a masked <code>scaled_dot_product_attention</code> that does what the FlashAttention call did (causal attention over the last <code>window</code> tokens), which I checked only by running it: I did not compare its outputs with the FA3 kernel.</p>
+<ol class="steps" start="3">
+  <li><strong>Prepare the data.</strong> Download three training shards and the pinned validation shard, and train the tokeniser. This is upstream's <code>prepare.py</code> with <code>--num-shards 3</code>; it is the one step that touches the network.</li>
+</ol>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">cd ar-cpu &amp;&amp; ~/lab/bin/python prepare.py --num-shards 3</span></code></pre>
+<pre class="terminal" data-title="output (lab VM, last lines)"><code>Data: downloading 4 shards (0 already exist)...
+  Downloaded shard_00001.parquet
+  Downloaded shard_06542.parquet
+  Downloaded shard_00002.parquet
+  Downloaded shard_00000.parquet
+Data: 4/4 shards ready at /home/ubuntu/.cache/autoresearch/data
+
+Tokenizer: training BPE tokenizer...
+Tokenizer: trained in 24.3s, saved to /home/ubuntu/.cache/autoresearch/tokenizer/tokenizer.pkl
+Tokenizer: building token_bytes lookup...
+Tokenizer: saved token_bytes to /home/ubuntu/.cache/autoresearch/tokenizer/token_bytes.pt
+Tokenizer: sanity check passed (vocab_size=8192)
+
+Done! Ready to train.</code></pre>
+<p>The default of ten shards would be fine too. Three keep the download small, and 30-second runs read well under one of them. Note what is not changed: the tokeniser (vocabulary 8,192), the dataset (the ClimbMix shards upstream uses), the model code, Muon with AdamW, the schedules, the metric function and the keep rule. What is changed is the scale: context 256 instead of 2,048, a 4-layer model 128 wide instead of 8 layers 512 wide, 8,192 tokens per step instead of 524,288, 30 seconds instead of 300, and a validation slice of 262,144 tokens instead of about 21 million.</p>
+
+<h2>Run it</h2>
+<h3>One experiment</h3>
+<p>First run <code>train.py</code> once by hand to see the real output format and time it. The program prints one line per step, then a block after <code>---</code>; the loop reads that block.</p>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">AR_SEED=42 OMP_NUM_THREADS=4 ~/lab/bin/python train.py | tr '\r' '\n' | tail -22</span></code></pre>
+<pre class="terminal" data-title="output (lab VM, 16 vCPU, shared, load 26.09)"><code>step 00029 (60.5%) | loss: 6.441078 | lrm: 0.79 | dt: 991ms | tok/sec: 8,270 | mfu: 0.0% | epoch: 1 | remaining: 11s    
+step 00030 (63.8%) | loss: 6.412544 | lrm: 0.72 | dt: 967ms | tok/sec: 8,469 | mfu: 0.0% | epoch: 1 | remaining: 10s    
+step 00031 (67.0%) | loss: 6.387794 | lrm: 0.66 | dt: 1129ms | tok/sec: 7,255 | mfu: 0.0% | epoch: 1 | remaining: 9s    
+step 00032 (70.8%) | loss: 6.359469 | lrm: 0.58 | dt: 988ms | tok/sec: 8,292 | mfu: 0.0% | epoch: 1 | remaining: 8s    
+step 00033 (74.1%) | loss: 6.335457 | lrm: 0.52 | dt: 1083ms | tok/sec: 7,563 | mfu: 0.0% | epoch: 1 | remaining: 7s    
+step 00034 (77.7%) | loss: 6.313928 | lrm: 0.45 | dt: 1085ms | tok/sec: 7,553 | mfu: 0.0% | epoch: 1 | remaining: 6s    
+step 00035 (81.3%) | loss: 6.285290 | lrm: 0.37 | dt: 1027ms | tok/sec: 7,976 | mfu: 0.0% | epoch: 1 | remaining: 5s    
+step 00036 (84.7%) | loss: 6.264520 | lrm: 0.31 | dt: 998ms | tok/sec: 8,205 | mfu: 0.0% | epoch: 1 | remaining: 4s    
+step 00037 (88.0%) | loss: 6.236291 | lrm: 0.24 | dt: 1146ms | tok/sec: 7,147 | mfu: 0.0% | epoch: 1 | remaining: 2s    
+step 00038 (91.9%) | loss: 6.210266 | lrm: 0.16 | dt: 1075ms | tok/sec: 7,622 | mfu: 0.0% | epoch: 1 | remaining: 1s    
+step 00039 (95.4%) | loss: 6.187127 | lrm: 0.09 | dt: 951ms | tok/sec: 8,615 | mfu: 0.0% | epoch: 1 | remaining: 0s    
+step 00040 (98.6%) | loss: 6.174845 | lrm: 0.03 | dt: 985ms | tok/sec: 8,320 | mfu: 0.0% | epoch: 1 | remaining: 0s    
+---
+val_bpb:          2.205265
+training_seconds: 30.6
+total_seconds:    58.2
+peak_vram_mb:     0.0
+mfu_percent:      0.01
+total_tokens_M:   0.3
+num_steps:        41
+num_params_M:     5.0
+depth:            4
+
+real	0m59.749s
+user	1m40.563s
+sys	1m18.462s</code></pre>
+<h3>The measurement script</h3>
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>run <code>train.py</code> as a subprocess with the seed, the time budget and an optional step budget in its environment, and parse the summary block</li>
+  <li><code>noise</code>: run the unmodified baseline 6 times in each of four cells (time or step budget, same seed or new seeds) and print the spread</li>
+  <li>edit one constant of <code>train.py</code> per experiment; a rule or a small chat model chooses which</li>
+  <li><code>loop</code>: run it, keep it if <code>val_bpb</code> is strictly lower than the best so far, otherwise put the old file back (the stock rule)</li>
+  <li>write one line per experiment to <code>results.tsv</code>, with the steps, the wall time and the machine load beside the score</li>
+  <li>afterwards, re-run the first and the last kept version on fresh seeds, paired by seed, and report the gain and its <em>t</em> value</li>
+</ol></div>
+<pre class="terminal" data-title="autoresearch_cpu.py" data-run="off"><code>"""autoresearch on a CPU proxy: run the loop, then measure its noise.
+
+Run on the lab VM, after cpu_patch.py and prepare.py (see the page):
+
+    python3 autoresearch_cpu.py noise --repo ~/work/re-build/ar-cpu
+    python3 autoresearch_cpu.py loop  --repo ~/work/re-build/ar-cpu \
+        --experiments 30 --proposer api      # or --proposer random
+
+noise  runs the unmodified baseline several times in four conditions
+       (time or step budget, same seed or new seeds) and prints how far
+       val_bpb moves with nothing changed.
+loop   is autoresearch's loop: propose one edit to a hyperparameter
+       constant in train.py, run it, keep it if val_bpb is strictly
+       lower than the best so far, otherwise put the old file back.
+       Then it re-runs the first and the last kept version on fresh
+       seeds, to see whether the "improvement" holds. With --fixed-steps
+       every run stops after --steps optimiser steps, not after --budget
+       seconds.
+
+Needs: Python 3.9+, a patched autoresearch checkout, the standard
+library only. --proposer api needs OPENAI_API_KEY in the environment
+(source ~/.config/lab.env); it is read, never printed or written.
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+# ── 1. Settings ──────────────────────────────────────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("cmd", choices=["noise", "loop"])
+ap.add_argument("--repo", default=os.path.expanduser("~/work/re-build/ar-cpu"))
+ap.add_argument("--budget", type=int, default=30)     # seconds of training
+ap.add_argument("--steps", type=int, default=30)      # step-budget runs
+ap.add_argument("--seeds", type=int, default=6)       # noise: runs per cell
+ap.add_argument("--threads", type=int, default=4)     # OMP_NUM_THREADS
+ap.add_argument("--experiments", type=int, default=30)
+ap.add_argument("--proposer", choices=["random", "api"], default="random")
+ap.add_argument("--model", default="gpt-5.4-nano")
+ap.add_argument("--confirm", type=int, default=5)     # loop: fresh seeds
+ap.add_argument("--fixed-steps", action="store_true")  # loop: step budget
+ap.add_argument("--seed", type=int, default=0)        # proposer's own seed
+ap.add_argument("--out", default="w01_out")
+args, _ = ap.parse_known_args()        # notebooks pass their own flags
+os.makedirs(args.out, exist_ok=True)
+TRAIN = os.path.join(args.repo, "train.py")
+FIXED = args.cmd == "loop" and args.fixed_steps
+STAT = re.compile(r"^(\w+):\s+(-?[\d.]+)\s*$", re.M)
+
+
+# ── 2. One training run, as a subprocess ─────────────────────────────
+def run_train(seed, budget=None, steps=0):
+    """Run train.py once. Returns a dict, with val_bpb None on a crash."""
+    steps = steps or (args.steps if FIXED else 0)
+    env = dict(os.environ, AR_SEED=str(seed), OMP_NUM_THREADS=str(
+        args.threads), AR_BUDGET=str(budget or args.budget),
+        AR_STEPS=str(steps))
+    load1 = os.getloadavg()[0]
+    t0 = time.time()
+    try:
+        done = subprocess.run([sys.executable, "train.py"], cwd=args.repo,
+                              env=env, capture_output=True, text=True,
+                              timeout=20 * (budget or args.budget))
+        text = done.stdout.split("---")[-1] if "---" in done.stdout else ""
+    except subprocess.TimeoutExpired:
+        text = ""
+    stats = {k: float(v) for k, v in STAT.findall(text)}
+    return {"seed": seed, "val_bpb": stats.get("val_bpb"),
+            "steps": int(stats.get("num_steps", 0)),
+            "train_s": stats.get("training_seconds"),
+            "wall_s": round(time.time() - t0, 1), "load1": round(load1, 1)}
+
+
+def mean(xs):
+    return sum(xs) / len(xs)
+
+
+def sd(xs):
+    m = mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+# ── 3. noise: nothing changed, how much does val_bpb move? ───────────
+def noise():
+    cells = [("time budget, same seed", dict(), lambda i: 42),
+             ("time budget, new seeds", dict(), lambda i: i + 1),
+             ("step budget, same seed", dict(steps=args.steps), lambda i: 42),
+             ("step budget, new seeds", dict(steps=args.steps),
+              lambda i: i + 1)]
+    print(f"{'condition':26s} {'mean':&gt;7s} {'sd':&gt;7s} {'range':&gt;7s} "
+          f"{'floor':&gt;7s} {'steps':&gt;6s} {'wall s':&gt;7s} {'load':&gt;5s}")
+    log = open(os.path.join(args.out, "noise.jsonl"), "w")
+    for name, kw, seed_of in cells:
+        runs = [run_train(seed_of(i), **kw) for i in range(args.seeds)]
+        for r in runs:
+            log.write(json.dumps(dict(r, cell=name)) + "\n")
+        log.flush()
+        v = [r["val_bpb"] for r in runs if r["val_bpb"] is not None]
+        if len(v) &lt; 2:
+            print(f"{name:26s} fewer than 2 runs finished")
+            continue
+        floor = 1.96 * math.sqrt(2) * sd(v)
+        print(f"{name:26s} {mean(v):7.4f} {sd(v):7.4f} "
+              f"{max(v) - min(v):7.4f} {floor:7.4f} "
+              f"{mean([r['steps'] for r in runs]):6.1f} "
+              f"{mean([r['wall_s'] for r in runs]):7.1f} "
+              f"{mean([r['load1'] for r in runs]):5.1f}")
+
+
+# ── 4. Editing train.py: one constant at a time ──────────────────────
+KNOBS = {   # name: (allowed values, or None for a free multiplier, lo, hi)
+    "EMBEDDING_LR": (None, 0.05, 3.0), "UNEMBEDDING_LR": (None, 0.0005, 0.05),
+    "MATRIX_LR": (None, 0.005, 0.3), "SCALAR_LR": (None, 0.05, 3.0),
+    "WEIGHT_DECAY": (None, 0.0, 1.0), "WARMDOWN_RATIO": (None, 0.1, 0.9),
+    "WARMUP_RATIO": ([0.0, 0.05, 0.1, 0.2], 0.0, 0.2),
+    "FINAL_LR_FRAC": ([0.0, 0.05, 0.1, 0.2], 0.0, 0.2),
+    "DEPTH": ([3, 4, 5, 6], 3, 6),
+}
+
+
+def read_knob(name):
+    for line in open(TRAIN):
+        m = re.match(rf"^{name}\s*=\s*([^#\n]+?)\s*(#.*)?$", line)
+        if m:
+            return eval(m.group(1), {})      # our own file, plain numbers
+    raise KeyError(name)
+
+
+def write_knob(name, value):
+    src = open(TRAIN).read()
+    new, n = re.subn(rf"^({name}\s*=\s*)[^#\n]+?(\s*(#.*)?)$",
+                     lambda m: m.group(1) + repr(value) + m.group(2),
+                     src, count=1, flags=re.M)
+    assert n == 1, name
+    open(TRAIN, "w").write(new)
+
+
+# ── 5. Two proposers: a rule, and a small model ──────────────────────
+class RandomProposer:
+    """Stand-in for the agent: scale one constant by a random factor."""
+
+    def __init__(self, seed):
+        self.rng = random.Random(seed)
+
+    def propose(self, history):
+        name = self.rng.choice(sorted(KNOBS))
+        allowed, lo, hi = KNOBS[name]
+        cur = read_knob(name)
+        if allowed:
+            value = self.rng.choice([v for v in allowed if v != cur])
+        else:
+            value = cur * self.rng.choice([0.5, 0.7, 1.4, 2.0])
+            value = round(min(hi, max(lo, value)), 6)
+        return name, value, "random rescale"
+
+
+class ApiProposer:
+    """A small chat model reads the constants and the results table."""
+
+    def __init__(self, model, fallback):
+        self.model, self.fallback = model, fallback
+        self.tokens = 0
+
+    def propose(self, history):
+        knobs = {k: read_knob(k) for k in KNOBS}
+        rows = "\n".join(f"{h['name']}={h['value']} -&gt; {h['val_bpb']} "
+                         f"({h['status']})" for h in history[-12:])
+        prompt = (
+            "You tune a tiny GPT trained for 30 seconds on a CPU. Lower "
+            "val_bpb is better. Current constants:\n"
+            f"{json.dumps(knobs)}\nRecent experiments:\n{rows or 'none'}\n"
+            "Change exactly ONE constant to a new number. Reply with JSON "
+            'only: {"name": ..., "value": ..., "why": "one sentence"}. '
+            f"Names allowed: {sorted(KNOBS)}.")
+        body = {"model": self.model, "max_completion_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}]}
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json",
+                     "authorization": "Bearer " + os.environ["OPENAI_API_KEY"]})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                reply = json.loads(r.read())
+            self.tokens += reply["usage"]["total_tokens"]
+            data = json.loads(re.search(r"\{.*\}", reply["choices"][0][
+                "message"]["content"], re.S).group(0))
+            name, value = data["name"], float(data["value"])
+            allowed, lo, hi = KNOBS[name]
+            if name == "DEPTH":
+                value = int(value)
+            assert lo &lt;= value &lt;= hi and value != read_knob(name)
+            return name, value, str(data.get("why", ""))[:80]
+        except Exception as e:                    # bad reply: use the rule
+            name, value, why = self.fallback.propose(history)
+            return name, value, f"fallback ({type(e).__name__})"
+
+
+# ── 6. loop: keep if strictly lower, else put the old file back ──────
+def loop():
+    rule = RandomProposer(args.seed)
+    prop = rule if args.proposer == "random" else ApiProposer(args.model, rule)
+    tsv = open(os.path.join(args.out, "results.tsv"), "w")
+    tsv.write("exp\tstatus\tval_bpb\tsteps\twall_s\tload1\tchange\twhy\n")
+    first_src = open(TRAIN).read()
+    base = run_train(42)
+    best, history = base["val_bpb"], []
+    tsv.write(f"0\tkeep\t{best:.6f}\t{base['steps']}\t{base['wall_s']}\t"
+              f"{base['load1']}\tbaseline\t\n")
+    print(f"exp  0 keep    {best:.4f}  baseline, {base['steps']} steps")
+    for i in range(1, args.experiments + 1):
+        name, value, why = prop.propose(history)
+        before = open(TRAIN).read()
+        write_knob(name, value)
+        r = run_train(42)
+        v = r["val_bpb"]
+        status = "crash" if v is None else "keep" if v &lt; best else "discard"
+        if status == "keep":
+            best = v
+        else:
+            open(TRAIN, "w").write(before)             # revert
+        history.append(dict(name=name, value=value, val_bpb=v, status=status))
+        tsv.write(f"{i}\t{status}\t{v if v is None else f'{v:.6f}'}\t"
+                  f"{r['steps']}\t{r['wall_s']}\t{r['load1']}\t"
+                  f"{name}={value}\t{why}\n")
+        tsv.flush()
+        print(f"exp {i:2d} {status:7s} "
+              f"{'-' if v is None else f'{v:.4f}'}  {name}={value}")
+    if args.proposer == "api":
+        print(f"API tokens used by the proposer: {prop.tokens:,}")
+    last_src = open(TRAIN).read()
+    confirm(first_src, last_src)
+
+
+def confirm(first_src, last_src):
+    """Fresh seeds, paired by seed: does the kept version beat the first?"""
+    diffs = []
+    for k in range(args.confirm):
+        seed = 1000 + k
+        open(TRAIN, "w").write(first_src)
+        a = run_train(seed)["val_bpb"]
+        open(TRAIN, "w").write(last_src)
+        b = run_train(seed)["val_bpb"]
+        if a is not None and b is not None:
+            diffs.append(a - b)
+            print(f"confirm seed {seed}: first {a:.4f}  last {b:.4f}  "
+                  f"gain {a - b:+.4f}")
+    if len(diffs) &gt; 1:
+        t = mean(diffs) / (sd(diffs) / math.sqrt(len(diffs)))
+        print(f"mean gain {mean(diffs):+.4f}  sd {sd(diffs):.4f}  "
+              f"t = {t:.2f} on {len(diffs)} paired seeds")
+    open(TRAIN, "w").write(last_src)
+
+
+if __name__ == "__main__":
+    {"noise": noise, "loop": loop}[args.cmd]()</code></pre>
+<p>The script is <a href="code/w01/autoresearch_cpu.py"><code>autoresearch_cpu.py</code></a>, with a paired notebook, <a href="code/w01/autoresearch_cpu.ipynb"><code>autoresearch_cpu.ipynb</code></a>. It keeps the stock rule on purpose: lower is kept, equal or worse is reverted, one run on each side, seed 42. The stand-in proposer only changes numeric constants (the learning rates, weight decay, the warm-down fraction, the depth); the real agent edits code, so what it can find is far richer, but the loop around it is identical.</p>
+
+<h3>Part 1: the noise floor of the baseline</h3>
+<p>Run the baseline six times in each of four conditions. A <em>time budget</em> stops each run after 30 seconds of training, as upstream does (upstream does not count the first ten steps against the budget, nor does this port). A <em>step budget</em> stops after 30 steps, via the optional <code>AR_STEPS</code> switch added by the patch.</p>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">python3 autoresearch_cpu.py noise --repo run-noise --seeds 6</span></code></pre>
+<pre class="terminal" data-title="output (lab VM, 16 vCPU, shared, load 20 to 24)"><code>condition                     mean      sd   range   floor  steps  wall s  load
+time budget, same seed      2.1817  0.0213  0.0565  0.0589   46.2    56.1  23.8
+time budget, new seeds      2.1974  0.0208  0.0603  0.0577   45.8    54.7  22.7
+step budget, same seed      2.2777  0.0000  0.0000  0.0000   30.0    45.2  22.5
+step budget, new seeds      2.2965  0.0220  0.0541  0.0610   30.0    38.9  19.7</code></pre>
+
+<h3>What you should see: the noise</h3>
+<p>The first row is the key one: <strong>the same seed, the same code, a 30-second budget, and the score still moved</strong>. Its six scores ranged from 2.1396 to 2.1961. The step column explains why: the budget is in seconds, the VM was shared, and the runs completed between 43 and 56 optimiser steps. The run that got 56 steps scored 2.1396; the five that got 43 to 46 scored between 2.18 and 2.20. More steps in the same time meant a better score, and the number of steps depended on what else the machine was doing.</p>
+<p>Row 3 is the opposite case. With a <strong>step budget</strong> and the same seed, all six runs gave 2.277715 exactly: standard deviation zero. The CPU kernels are deterministic here, so a run is a pure function of its seed and step count. That is also the property that Lab 1's replay needs. Row 4 adds new seeds: the spread comes back, 0.022, and the scores split into two groups (three near 2.279 and three between 2.305 and 2.332), so six seeds is a small sample and the sd itself is uncertain by roughly a third either way.</p>
+<p>Rows 1, 2 and 4 all have a standard deviation near 0.021 and a single-comparison floor near 0.06 (1.96 &times; &radic;2 &times; sd, as in Lab 1). With six runs per cell I cannot say that the time budget adds noise on top of seed noise, only that each source alone is about 0.02, and the two overlap. What I can say is that <strong>two single runs of the same code on this machine differ by more than 0.06 in about one comparison in twenty</strong>, and that any claim below that needs repeats. Compare the size of the effects the loop will chase: weight decay or a learning rate nudged by 10 or 20% moves this proxy by less than the floor.</p>
+
+<h3>Part 2: the loop, with a small chat model as the proposer</h3>
+<p>Now the real loop. The proposer is <code>gpt-5.4-nano</code> (the API reported the dated model <code>gpt-5.4-nano-2026-03-17</code>): it is shown the current constants and the last twelve results and asked for one change as JSON. One of the 30 replies was unusable and the script fell back to its random rule. The loop uses the stock keep rule and seed 42, exactly as upstream does, and the time budget.</p>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">source ~/.config/lab.env   # OPENAI_API_KEY, never printed</span>
+<span class="prompt">$ </span><span class="cmd">python3 autoresearch_cpu.py loop --repo run-api --experiments 30 --proposer api</span></code></pre>
+<pre class="terminal" data-title="output (lab VM, 16 vCPU, shared, load 10 to 48)"><code>exp  0 keep    2.2006  baseline, 42 steps
+exp  1 discard 2.2097  WEIGHT_DECAY=0.1
+exp  2 discard 2.2256  WEIGHT_DECAY=0.15
+exp  3 discard 2.2274  WEIGHT_DECAY=0.3
+exp  4 discard 2.2193  WEIGHT_DECAY=0.12
+exp  5 discard 2.2026  WEIGHT_DECAY=0.08
+exp  6 keep    2.1972  WEIGHT_DECAY=0.06
+exp  7 discard 2.1992  SCALAR_LR=0.45
+exp  8 discard 2.2010  SCALAR_LR=0.55
+exp  9 discard 2.1995  WEIGHT_DECAY=0.07
+exp 10 keep    2.1543  UNEMBEDDING_LR=0.006
+exp 11 discard 2.1791  WEIGHT_DECAY=0.065
+exp 12 discard 2.1814  EMBEDDING_LR=0.5
+exp 13 discard 2.1778  EMBEDDING_LR=0.4
+exp 14 discard 2.1864  WEIGHT_DECAY=0.05
+exp 15 discard 2.1785  SCALAR_LR=0.6
+exp 16 discard 2.1974  WARMDOWN_RATIO=0.9
+exp 17 discard 2.1829  EMBEDDING_LR=0.65
+exp 18 discard 2.1781  EMBEDDING_LR=0.55
+exp 19 discard 2.1740  EMBEDDING_LR=0.25
+exp 20 discard 2.1772  EMBEDDING_LR=0.45
+exp 21 discard 2.2217  DEPTH=5
+exp 22 discard 2.1775  EMBEDDING_LR=0.35
+exp 23 discard 2.1791  EMBEDDING_LR=0.3
+exp 24 discard 2.2192  UNEMBEDDING_LR=0.003
+exp 25 discard 2.1749  EMBEDDING_LR=0.58
+exp 26 discard 2.1918  WARMDOWN_RATIO=0.7
+exp 27 discard 2.1810  MATRIX_LR=0.06
+exp 28 discard 2.1893  WEIGHT_DECAY=0.04
+exp 29 discard 2.1866  EMBEDDING_LR=0.5
+exp 30 discard 2.1868  EMBEDDING_LR=0.42
+confirm seed 1000: first 2.2665  last 2.2355  gain +0.0309
+confirm seed 1001: first 2.2118  last 2.1901  gain +0.0217
+confirm seed 1002: first 2.2389  last 2.2147  gain +0.0242
+confirm seed 1003: first 2.2165  last 2.1917  gain +0.0247
+confirm seed 1004: first 2.2596  last 2.2253  gain +0.0343
+mean gain +0.0272  sd 0.0053  t = 11.54 on 5 paired seeds</code></pre>
+<p>The log, reduced to the experiments that were kept, and the summary of the whole file:</p>
+<pre class="terminal" data-title="output (lab VM): the kept rows of out-api/results.tsv"><code>exp   val_bpb  steps   load  change
+  0    2.2006     42   12.4  baseline
+  6    2.1972     43   15.2  WEIGHT_DECAY=0.06
+ 10    2.1543     49   13.0  UNEMBEDDING_LR=0.006</code></pre>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">python3 results_summary.py out-api/results.tsv 0.0589</span></code></pre>
+<pre class="terminal" data-title="output (lab VM)"><code>31 rows: 3 keep, 28 discard, 0 crash
+baseline 2.2006, best 2.1543, gain 0.0463
+gain / noise floor 0.0589: 0.79
+longest run without a keep: 20</code></pre>
+<p>Read it as a reviewer would, not as a result. The loop reports a gain of 0.0463 bits per byte, from 2.2006 to 2.1543, with two keeps. Look at the step counts. The baseline got 42 steps; the second keep, <code>UNEMBEDDING_LR=0.006</code>, got <strong>49</strong>, on a quieter machine (load 13). The 20 runs after it got 37 to 44 steps and none of them could beat it; the nearest, <code>EMBEDDING_LR=0.25</code>, scored 2.1740 at 44 steps. Across the 31 runs the correlation between the number of steps and <code>val_bpb</code> is &minus;0.81: most of the variation in this log is how many steps the run happened to complete. The loop then spent twenty experiments, a third of an hour, failing to beat a lucky run. Both kept changes are also smaller than the single-comparison floor of 0.059 (the gain is 0.79 of it).</p>
+<p>The confirmation answers a different question: is the final version better than the first on seeds the loop never used? It re-runs both on five fresh seeds, paired by seed:</p>
+<pre class="terminal" data-title="output (lab VM): the end of the loop"><code>confirm seed 1000: first 2.2665  last 2.2355  gain +0.0309
+confirm seed 1001: first 2.2118  last 2.1901  gain +0.0217
+confirm seed 1002: first 2.2389  last 2.2147  gain +0.0242
+confirm seed 1003: first 2.2165  last 2.1917  gain +0.0247
+confirm seed 1004: first 2.2596  last 2.2253  gain +0.0343
+mean gain +0.0272  sd 0.0053  t = 11.54 on 5 paired seeds</code></pre>
+<p>It is. On fresh seeds the final version is better on all five, by 0.0272 on average (sd 0.0053, a paired <em>t</em> of 11.5 on 4 degrees of freedom, against 2.776 needed). So the loop did find something real: the combination of a lower weight decay and a higher unembedding learning rate helps this proxy. But the gain on fresh seeds is 0.027, about 59% of the 0.046 that the log claimed, and each fresh-seed gain is smaller than the stock rule's single-comparison floor. A paired test over seeds sees what a single comparison cannot. Two cautions. This is the proxy: I did not check it against anything larger. And the confirmation also used the time budget, so its gains include whatever throughput the two runs happened to get.</p>
+
+<h3>Part 3: the same loop with the machine's noise removed</h3>
+<p>Run the same loop with a step budget: every run takes exactly 30 optimiser steps, whatever the machine is doing, and the proposer is the seeded random rule (no API calls). The seed is still 42 for every experiment, as upstream, so a candidate and the best differ only by the edit. With a step budget and a fixed seed a run is repeatable bit for bit, so the stock rule has <em>no</em> run-to-run noise to be fooled by. That is a good place to ask a sharper question: do kept experiments that win on seed 42 also win on other seeds?</p>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">python3 autoresearch_cpu.py loop --repo run-rand --experiments 30 --proposer random --fixed-steps</span></code></pre>
+<pre class="terminal" data-title="output (lab VM, 16 vCPU, shared, load 24 to 49)"><code>exp  0 keep    2.2777  baseline, 30 steps
+exp  1 discard 2.3086  WARMDOWN_RATIO=0.9
+exp  2 discard 2.2911  DEPTH=5
+exp  3 keep    2.2768  WEIGHT_DECAY=0.4
+exp  4 discard 2.2914  WARMDOWN_RATIO=0.7
+exp  5 discard 2.2996  WARMUP_RATIO=0.1
+exp  6 keep    2.2752  MATRIX_LR=0.028
+exp  7 discard 2.2757  SCALAR_LR=0.35
+exp  8 discard 2.2781  EMBEDDING_LR=0.84
+exp  9 keep    2.2752  WEIGHT_DECAY=0.28
+exp 10 discard 2.2764  SCALAR_LR=0.25
+exp 11 discard 2.2783  EMBEDDING_LR=0.84
+exp 12 discard 2.3285  WARMUP_RATIO=0.2
+exp 13 discard 2.2783  EMBEDDING_LR=0.84
+exp 14 discard 2.2891  WARMDOWN_RATIO=0.7
+exp 15 discard 2.2787  MATRIX_LR=0.056
+exp 16 discard 2.3285  WARMUP_RATIO=0.2
+exp 17 discard 2.2764  SCALAR_LR=0.25
+exp 18 discard 2.2755  WEIGHT_DECAY=0.14
+exp 19 discard 2.2826  EMBEDDING_LR=1.2
+exp 20 discard 2.3096  DEPTH=6
+exp 21 discard 2.2943  WARMUP_RATIO=0.1
+exp 22 discard 2.2768  MATRIX_LR=0.0392
+exp 23 keep    2.2736  EMBEDDING_LR=0.42
+exp 24 discard 2.2891  MATRIX_LR=0.0196
+exp 25 keep    2.2615  FINAL_LR_FRAC=0.2
+exp 26 discard 2.2714  WARMUP_RATIO=0.05
+exp 27 discard 2.2630  EMBEDDING_LR=0.588
+exp 28 keep    2.2613  WEIGHT_DECAY=0.56
+exp 29 discard 2.2627  EMBEDDING_LR=0.588
+exp 30 keep    2.2610  WEIGHT_DECAY=0.784
+confirm seed 1000: first 2.3480  last 2.2807  gain +0.0673
+confirm seed 1001: first 2.2746  last 2.2654  gain +0.0092
+confirm seed 1002: first 2.2991  last 2.3188  gain -0.0196
+confirm seed 1003: first 2.2769  last 2.2608  gain +0.0161
+confirm seed 1004: first 2.3407  last 2.2926  gain +0.0481
+mean gain +0.0242  sd 0.0341  t = 1.59 on 5 paired seeds</code></pre>
+<p>The log, as before: the summary of the file, the kept experiments, and the confirmation of the first and last kept versions on five fresh seeds.</p>
+<pre class="terminal" data-title="output (lab VM): the kept rows of out-rand/results.tsv"><code>exp   val_bpb  steps   load  change
+  0    2.2777     30   49.1  baseline
+  3    2.2768     30   40.8  WEIGHT_DECAY=0.4
+  6    2.2752     30   41.6  MATRIX_LR=0.028
+  9    2.2752     30   38.7  WEIGHT_DECAY=0.28
+ 23    2.2736     30   35.2  EMBEDDING_LR=0.42
+ 25    2.2615     30   33.3  FINAL_LR_FRAC=0.2
+ 28    2.2613     30   32.6  WEIGHT_DECAY=0.56
+ 30    2.2610     30   33.3  WEIGHT_DECAY=0.784</code></pre>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">python3 results_summary.py out-rand/results.tsv 0.061</span></code></pre>
+<pre class="terminal" data-title="output (lab VM)"><code>31 rows: 8 keep, 23 discard, 0 crash
+baseline 2.2777, best 2.2610, gain 0.0167
+gain / noise floor 0.061: 0.27
+longest run without a keep: 13</code></pre>
+<pre class="terminal" data-title="output (lab VM): the end of the loop"><code>confirm seed 1000: first 2.3480  last 2.2807  gain +0.0673
+confirm seed 1001: first 2.2746  last 2.2654  gain +0.0092
+confirm seed 1002: first 2.2991  last 2.3188  gain -0.0196
+confirm seed 1003: first 2.2769  last 2.2608  gain +0.0161
+confirm seed 1004: first 2.3407  last 2.2926  gain +0.0481
+mean gain +0.0242  sd 0.0341  t = 1.59 on 5 paired seeds</code></pre>
+<p>Three things stand out. <strong>First, determinism pays.</strong> With a step budget, an experiment repeated from the same state gives the same score to six decimals. Three of the 30 proposals were exact repeats of an earlier one (experiments 13, 16 and 17 returned the scores of 11, 12 and 10), and the loop ran them again for nothing. The run store of <a href="../labs/lab-01-keep-or-revert.html">Lab 1</a>, keyed by config hash and seed, would have served them from cache. <strong>Second, the logged gain is tiny.</strong> Seven experiments were kept, but six of them moved the score by 0.0016 or less; one, <code>FINAL_LR_FRAC=0.2</code>, accounts for 0.0121 of the total 0.0167. That total is 0.27 of the noise floor for new seeds (0.061), so a single seed-42 comparison would call every one of these keeps a win and the noise table says a new seed could erase them.</p>
+<p><strong>Third, the confirmation did not confirm.</strong> On five fresh seeds the last version beat the first on four and lost on one (seed 1002, &minus;0.0196). The mean gain is +0.0242, but the standard deviation is 0.0341, so <em>t</em> = 1.59 on 4 degrees of freedom, well short of the 2.776 needed. I cannot tell from five seeds whether the final version is better, equal or worse than the baseline. Compare Part 2: there the logged gain was 0.79 of the floor, fresh seeds showed 59% of it, and the paired difference was consistent (<em>t</em> = 11.5). Here the logged claim is a quarter of the floor and the fresh seeds do not settle it. Both are the same lesson: the number to believe is the paired difference on seeds the loop did not use, with its spread.</p>
+
+<div class="callout note">
+  <p class="callout-title">What the five-minute H100 budget buys: not run here</p>
+  <p>I have no GPU, so nothing below was measured on an H100. This is arithmetic from numbers in <code>train.py</code> itself, with one assumption marked as such. <a href="code/w01/h100_budget.py"><code>h100_budget.py</code></a> builds autoresearch's own model class on PyTorch's meta device for the published setting (depth 8, width 512, vocabulary 8,192, 2,048-token context, 524,288 tokens per step) and for this page's CPU proxy, and converts FLOPs per token into tokens per budget, using the <code>989.5e12</code> FLOP/s that the script uses for its utilisation figure. The utilisation (MFU) is a guess; the script prints the real <code>mfu_percent</code> at the end of a GPU run.</p>
+<pre class="terminal" data-title="terminal (lab VM)"><code><span class="prompt">$ </span><span class="cmd">python3 h100_budget.py --repo ~/work/re-build/ar-cpu</span></code></pre>
+<pre class="terminal" data-title="output (lab VM, CPU only: arithmetic, no GPU)"><code>H100 (published): depth 8, width 512, 50.3 M parameters (29.4 M that count for scaling)
+  FLOPs per token (fwd+bwd): 239.1 M, batch 524,288 tokens
+  at 25% MFU:    310 M tokens,   592 steps, 10.6 tokens per scaling parameter
+  at 40% MFU:    497 M tokens,   947 steps, 16.9 tokens per scaling parameter
+  at 50% MFU:    621 M tokens,  1184 steps, 21.1 tokens per scaling parameter
+  Chinchilla-style target: 20 tokens per parameter = 587 M tokens
+CPU proxy (here): depth 4, width 128, 5.0 M parameters (1.8 M that count for scaling)
+  FLOPs per token (fwd+bwd): 12.0 M, batch 8,192 tokens</code></pre>
+  <p>If an H100 sustains 40% of peak, 300 seconds buys about 497 million tokens, 947 optimiser steps, and about 17 tokens per scaling parameter, a little under the Chinchilla-style 20 per parameter that nanochat's help text gives. The range is 310 to 621 million tokens for 25% to 50%, so the published setting is plausibly close to compute-optimal for its size, which is a reasonable thing for a time-budgeted search loop to be. The CPU proxy here is a very different regime: 41 steps and about 0.3 million tokens, roughly 0.2 tokens per scaling parameter against the Chinchilla-style 20, so it is nowhere near converged and its scores mostly measure how fast a model learns in its first few dozen steps. The README's own estimate is about 12 experiments an hour on the GPU. On this VM an experiment cost about 59 seconds with the time budget and about 50 with the step budget (means over the two loops), so about 60 an hour.</p>
+  <p>Fill in the table when you run the real thing on a GPU, from the end-of-run summary block. The predictions are the 40% MFU case above.</p>
+  <div class="table-wrap"><table class="measure-table">
+    <thead><tr><th>Quantity</th><th>Predicted</th><th>Measured</th><th>Ratio</th></tr></thead>
+    <tbody>
+      <tr data-predict="947"><td>Optimiser steps in 300 s (<code>num_steps</code>)</td><td>947</td><td><input name="h100_steps"></td><td class="ratio"></td></tr>
+      <tr data-predict="497"><td>Training tokens, millions (<code>total_tokens_M</code>)</td><td>497</td><td><input name="h100_tokens"></td><td class="ratio"></td></tr>
+      <tr data-predict="40"><td>Model FLOPs utilisation, % (<code>mfu_percent</code>)</td><td>40</td><td><input name="h100_mfu"></td><td class="ratio"></td></tr>
+    </tbody>
+  </table></div>
+</div>
+
+<h2>Break it</h2>
+<p>Three experiments, each with a prediction. I ran none of them: they are for you, and my predictions are reasoning from the numbers above, not results.</p>
+<ol class="steps">
+  <li><strong>Make the loop paired.</strong> Port <code>keep_or_revert</code> from Lab 1 into the loop: run each candidate and the best on three seeds and keep only on a significant paired gain. Prediction: with three seeds the test has two degrees of freedom and needs <em>t</em> &gt; 4.3, so it keeps almost nothing at this noise level (the seven small keeps of Part 3 all vanish), at three times the cost per experiment. Which of the two time budgets does it hurt more?</li>
+  <li><strong>Lengthen the budget.</strong> Run <code>noise</code> with <code>--budget 120</code>. Prediction: the number of steps in a run scales up by about four, the relative spread in the step count shrinks a little, and the sd of <code>val_bpb</code> falls, but not by a factor of four, because seed noise does not shrink with a longer run. Does the step-budget row with new seeds move?</li>
+  <li><strong>Put the cache in.</strong> Add Lab 1's <code>RunStore</code> to <code>run_train</code> and key a run by config hash and seed. Prediction: in the step-budget loop 3 of 30 experiments become free, and in the time-budget loop none do, because the same edit gives a different score each time. Why does the cache help in one case and not in the other?</li>
+</ol>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>Autoresearch's budget is wall-clock time, its seed is fixed at 42 and its keep rule is one comparison. On a shared CPU, that makes a run's score depend on how many steps it happened to complete: across the 31 runs of the first loop, steps and <code>val_bpb</code> correlated at &minus;0.81.</li>
+    <li>With nothing changed, the baseline's standard deviation was about 0.021 (single-comparison floor about 0.06), and the same seed with a step budget repeated to six decimals.</li>
+    <li>The stock rule kept two changes in 30 experiments and logged a gain of 0.046. On five fresh paired seeds the gain was 0.027 (<em>t</em> = 11.5): real, and about 59% of what the log claimed.</li>
+    <li>With a step budget the loop kept seven changes for a logged gain of 0.017, 0.27 of the floor, and the fresh-seed confirmation (+0.024, <em>t</em> = 1.59) could not settle it.</li>
+    <li>An experiment cost about a minute on the VM. A deterministic loop re-ran 3 of 30 proposals for nothing; a run store would have caught them.</li>
+    <li>The H100 numbers on this page are arithmetic, not measurements: about 500 million tokens and about 950 steps in five minutes at an assumed 40% utilisation.</li>
+  </ul>
+</div>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+</body>
+</html>
