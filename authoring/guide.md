@@ -1,12 +1,12 @@
 # Authoring guide: Zero to AI Systems
 
-This guide is the contract for every page of Zero to AI Systems (courses A0 to A8). New pages must be indistinguishable from the existing ones in format, voice and quality. Read this whole file before writing anything, then read the sample pages it names.
+This guide is the contract for every page of Zero to AI Systems (courses A0 to A12). New pages must be indistinguishable from the existing ones in format, voice and quality. Read this whole file before writing anything, then read the sample pages it names.
 
 Site root: `/Users/danish/Desktop/projects/cs-refresh/networking/` (all paths below are relative to it).
 
 ## 1. What already exists and what you must not touch
 
-- `assets/js/catalog.js` is the single source of truth: every course, part, chapter, lab, case, studio and tool, with ids, file names, titles, blurbs, depth and `related` links. **Do not edit it.** If you believe a title or blurb is wrong, say so in your final report; the coordinator changes it.
+- `assets/js/catalog.js` is the single source of truth: every course, part, chapter, lab, case, studio, workbench and tool, with ids, file names, titles, blurbs, depth and `related` links, and `CS_ARTIFACTS`, the four artifacts and the chapters each needs (section 17). **Parallel authors do not edit it.** If you believe a title or blurb is wrong, say so in your final report; the coordinator changes it (README.md, "Adding a page", is the coordinator's checklist).
 - `assets/js/main.js`, `quiz.js`, `stepper.js`, `studio.js`, `sketch.js`, `assets/css/main.css`, `assets/css/theme.css`: shared. **Do not edit.**
 - `authoring/link-index.md`: every page on the site with its exact path, title and blurb. Use it for every cross-link. Never invent a file name.
 - `lab-support/llm.py`: the shared stand-in model module for labs (section 8).
@@ -21,12 +21,16 @@ The courses (id, folder):
 | A2 Deep Learning & Transformers | dl | deep-learning/ |
 | A3 Training, Post-training & Serving LLMs | llm | llm-training/ |
 | A4 Agents, Tools & Protocols | agt | agents/ |
-| A5 Retrieval, Search & Document AI | ret | retrieval/ |
 | A6 Evals, Guardrails & Safe Operation | evl | evals/ |
 | A7 Search, Evolution & Self-Improving Agents | oe | open-ended/ |
-| A8 Applied AI Delivery Studio | aid | ai-delivery/ |
+| A9 Research Engineering on Small Proxies | re | research-eng/ |
+| A10 Harness & Evaluator Engineering | he | harness-eng/ |
+| A11 AI Control & Sandbox Security | ctl | control/ |
+| A12 Measuring Recursive Self-Improvement | rsi | rsi-measurement/ |
 
-The path is **broad**: it trains a general AI systems / applied AI engineer, not a candidate for one company. Use examples from many domains (finance, health, law, government, retail, software). Mention specific companies only as sources or case material. Write in English; do not build Japanese-specific content.
+There is no A5 or A8: those courses were removed in October 2026 (only Dense Retrieval survives, as A4 chapter 23). Never link to `retrieval/` or `ai-delivery/`.
+
+The path is built around **four public artifacts** (section 17): a reader works through it to produce research a frontier lab would read. Examples still come from many domains, and companies appear only as sources or case material. Write in English; do not build Japanese-specific content.
 
 ## 2. Read these sample pages first
 
@@ -40,7 +44,7 @@ Open and read at least the ones for the kind of page you are writing. They are t
 
 ## 3. Voice and style (strict)
 
-- **British English** spelling: behaviour, optimise, colour, modelling, labelled, analyse, centre, licence (noun). Keep proper names and code identifiers as they are (`optimizer.step()`, "Optimizer" in a library name).
+- **British English** spelling (one exception: "artifact", the project's term for the four public results, as in "the artifact track"): behaviour, optimise, colour, modelling, labelled, analyse, centre, licence (noun). Keep proper names and code identifiers as they are (`optimizer.step()`, "Optimizer" in a library name).
 - **No em-dashes (—) anywhere.** Use a colon, a comma, parentheses sparingly, or a new sentence. En-dashes only inside numeric ranges, and prefer "to" ("5 to 10").
 - Written for someone with **no prior knowledge of the topic** but who has done the earlier courses. **Define every term the first time it appears**, wrapped in `<span class="term">…</span>` at the defining mention. Remind briefly of terms from earlier courses with a link.
 - First principles before patterns. Explain *why* a mechanism works, then *how*, then *what goes wrong*. Every abstraction gets a concrete example with numbers.
@@ -53,7 +57,7 @@ Open and read at least the ones for the kind of page you are writing. They are t
     <p>… what is true now, with sources, and what is likely to change …</p>
   </div>
   ```
-  The durable concept (the loop, the trade-off, the maths) is the main text. Today is 14 October 2026.
+  The durable concept (the loop, the trade-off, the maths) is the main text. Today is 15 October 2026.
 - Analogies: one good analogy per chapter at most two, in `callout analogy`, always ending with `<p><em>Where it breaks down:</em> …</p>`.
 - Avoid hype words: "revolutionary", "game-changing", "magic", "simply", "just" (as in "just do X").
 - Cite people and papers by name and year in prose ("Vaswani et al., 2017"), with the paper title on first mention. Put links in the chapter's Further reading list.
@@ -189,7 +193,7 @@ Diagrams are hand-written inline SVG that the site's theme colours and (optional
 ```
 
 - Width 760 (or up to 900 for wide figures). Never hard-code colours: use classes. Fills+strokes: `box` (neutral), `fs-COLOR s-COLOR sw-2` with COLOR in blue, cyan, teal, green, yellow, orange, red, pink, purple. Solid fills (dots, bars): `f-COLOR`. Text: `t-sm`, `t-xs`, `t-bold`, `t-muted`, `t-faint`, `mono`, `t-dark` (on a solid fill), `tc-COLOR` (coloured text). Lines: `line`, `line-thin`, `line-dash`, `line s-COLOR`, `sw-2`. Arrowheads: `class="arrowhead"` (or `arrowhead f-COLOR`).
-- **Marker and gradient ids must be unique on the page**: prefix with a course code and chapter/page number plus a letter: `ahMF09a`, `ahAG02b`, `ahRET13c`, `ahEVL-L1a`. (Course codes: MF, ML, DL, LT, AG, RS, EV, OE, AD.)
+- **Marker and gradient ids must be unique on the page**: prefix with a course code and chapter/page number plus a letter: `ahMF09a`, `ahAG02b`, `ahRET13c`, `ahEVL-L1a`. (Course codes: MF, ML, DL, LT, AG, EV, OE, RE, HE, CT, RM.)
 - Leave room: text must not overflow boxes at `t-sm` (about 7.5 px per character). Keep labels short; put detail in the caption.
 - Colour meaning, used consistently across the path: green = inputs/data/clients, blue = computation/services/models, purple = stored state (stores, memory, indexes, weights), orange = queues/streams/flows in motion, cyan = caches/context/retrieved items, red = failures/attacks/errors, yellow = the thing being followed or highlighted.
 - Plots: draw axes, ticks and data as SVG paths/rects from numbers you computed (compute them with a script, then write the coordinates). Label axes.
@@ -240,7 +244,7 @@ A lab is a page (`<dir>/labs/lab-NN-name.html`) plus code in `<dir>/labs/code/la
 - An optional final section on the page, "Run it against a real model", may show how to set `LAB_MODEL` and what to look for; check.py never uses a real model.
 - **Verify before you finish**: run `python3 check.py` (every milestone must show "not implemented yet", none may crash) and `python3 check.py solution` (all ✔). Paste both real outputs into the lab page (the initial one near the top, the final one at the end). Delete any `__pycache__` you create.
 
-The lab page follows `design/labs/lab-01-estimation.html`: lede, `callout why` ("Why this lab matters"), a `callout note` on determinism and requirements, "What you'll build" (a diagram plus `ol.steps` of the milestones), "Before you start" (file table linking `code/labNN/starter.py`, `check.py`, `solution.py`, and the first check output), then one `h2` per milestone containing explanation, then
+The lab page follows `open-ended/labs/lab-03-program-evolution.html`: lede, `callout why` ("Why this lab matters"), a `callout note` on determinism and requirements, "What you'll build" (a diagram plus `ol.steps` of the milestones), "Before you start" (file table linking `code/labNN/starter.py`, `check.py`, `solution.py`, and the first check output), then one `h2` per milestone containing explanation, then
 ```html
 <div class="milestone">
   <p class="milestone-title">Your task</p>
@@ -360,7 +364,7 @@ Inline maths in prose is optional: `<span class="tex" data-tex="r_\theta(x, y)">
 A **workbench** repeats a chapter's idea with the real tools on a real machine (PyTorch, Hugging Face, TRL, vLLM, Ollama, scikit-learn). Labs stay standard-library-only and toy-sized; workbenches are where the reader meets the tools practitioners use, and **measures** something the chapter predicts. Reference: `llm-training/workbench/w01-kv-cache.html` and `llm-training/workbench/code/w01/kv_cache.py`.
 
 - **Files.** Page `<course>/workbench/wNN-name.html` with `<body … data-workbench="WN">`; code in `<course>/workbench/code/wNN/` (one or two `.py` scripts, plus helper data if any); a paired notebook generated with `python3 authoring/py2ipynb.py SCRIPT.py` (never hand-edit the `.ipynb`). The catalog entry (id, file, title, machine, chapters, time, cost, blurb) is in the `WORKBENCHES` block at the end of `assets/js/catalog.js`; the h1 is "Workbench N: Title".
-- **Machine.** `laptop` (Apple MPS or CPU; models up to a few hundred million parameters; Ollama for local language models), `linux`, or `gpu` (one 24 GB NVIDIA card, rented; see `lab-machine.html#gpu` and `workbench/wb`). Requirements are `workbench/requirements.txt` (both) and `workbench/requirements-gpu.txt` (bitsandbytes, TRL, vLLM: Linux + CUDA only).
+- **Machine.** `vm` (the lab VM: one large rented CPU machine, 16 to 32 cores and 64 to 128 GB, Ubuntu, PyTorch CPU and Ollama; see `lab-machine.html` and `workbench/vm`) or `gpu` (one 24 GB NVIDIA card, rented later; see `lab-machine.html#gpu` and `workbench/wb`). **Nothing is written for, or run on, a laptop.** Requirements are `workbench/requirements.txt` (both) and `workbench/requirements-gpu.txt` (bitsandbytes, TRL, vLLM: CUDA only). Authors run workbench scripts on the lab VM over SSH and paste that output, labelled `output (lab VM, …)`.
 - **Page skeleton**, in order: `chapter-head` (h1, lede); `callout why` "Why measure it"; `callout note` "What you need" (machine, disk, time; GPU time in hours, no dollar figures outside a dated State of play box); h2 **Predict before you run**: the chapter's formula as an `eq-display` linking the chapter's anatomy block, the inputs from the model's real config, a `callout predict` asking the reader to work it out, and the answer in a `details.deeper`; h2 **Set up** / **Run it**: a `callout idea` box, the script as `<pre class="terminal" data-title="NAME.py" data-run="off">`, links to the `.py` and `.ipynb`; real output in `<pre class="terminal" data-title="output (WHERE IT RAN)">`; h3 **What you should see**: each output line explained; for GPU parts, a `measure-table` (see below); h2 **Break it**: 2 to 4 experiments, each with a prediction first; `callout key`.
 - **Honesty rule for output.** Paste only output you produced by running the script. GPU-only parts cannot be run on the authoring machine: say so in a `callout note` titled "Not run here", give **predictions computed from published configs and the chapter's formulas** (show the arithmetic), and give the reader a measurement table. Never invent a measured number, a loss curve or a timing. Qualitative expectations ("the third ratio comes in below 1, because…") must follow from the mechanism or from a cited source.
 - **Measurement tables** persist what the reader types and show measured ÷ predicted:
@@ -370,6 +374,22 @@ A **workbench** repeats a chapter's idea with the real tools on a real machine (
     <tbody><tr data-predict="224"><td>Cache per 4,096-token sequence, MiB</td><td>224</td><td><input name="seq_mib"></td><td class="ratio"></td></tr></tbody>
   </table></div>
   ```
-- **Scripts.** Section 5's style (≤ 80 columns, docstring with usage, `# ── N. Title ───` banners). `args, _ = ap.parse_known_args()` so the notebook runs. Pick the device in order CUDA, MPS, CPU. Laptop defaults must finish in minutes on a laptop; a flag (`--model`, `--sweep`, `--full`) scales up for the GPU. Pin models by Hugging Face id and say how big the download is. Seed everything.
+- **Scripts.** Section 5's style (≤ 80 columns, docstring with usage, `# ── N. Title ───` banners). `args, _ = ap.parse_known_args()` so the notebook runs. Pick the device in order CUDA, then CPU. Defaults must finish in minutes on the lab VM; a flag (`--model`, `--sweep`, `--full`) scales up for the GPU. Pin models by Hugging Face id and say how big the download is. Seed everything.
 - **Models and datasets.** Prefer small, open, ungated ones (SmolLM2, Qwen2.5 0.5B to 7B, GPT-2, Tiny Shakespeare, text8, GSM8K). Read sizes and architecture numbers from the real `config.json` and `model.safetensors.index.json`, not from memory.
+
+## 17. The artifact track
+
+The path exists to produce **four artifacts**, each a replication of one published result at small scale plus one honest extension, released as code and a write-up (`curriculum.html` has the full roadmap; `CS_ARTIFACTS` in `catalog.js` holds the data):
+
+| # | Artifact | Courses it leans on |
+|---|---|---|
+| 1 | autoresearch-rs: Karpathy's autoresearch loop with a Rust runner, logging the proxy-versus-held-out gap | A0, A2, A9 |
+| 2 | mini-FML search study: AIDE-style tree search against greedy hill-climbing on FML-Bench tasks | A4, A6, A7, A10 |
+| 3 | evaluator-hardening kit: break a KernelBench grader, harden it, measure the hacking rate | A3, A6, A7, A10, A11 |
+| 4 | AIDE²-in-miniature: an outer agent that rewrites the Artifact 2 agent, judged by Weco's four Level-1 conditions | A7, A12 |
+
+- Each chapter is **before** (read before starting an artifact), **while** (open while building it) or **reading** (kept, never required). `main.js` derives this from the artifact lists and shows it as a badge; do not write it into pages.
+- New chapters in A9 to A12 say in their `callout why` which artifact step they serve and what the reader can build after it. Their lab is literally a step of that artifact, so the artifact repository and the course share code.
+- Every claim of improvement in a page, lab or workbench follows the **standards** the artifacts must meet: a fair baseline with the same budget, a sustained trend rather than one lucky accept, scores on data the loop never saw, a stated budget; the evaluator outside the proposer's write boundary; public and private splits; hacking rate reported next to the score; three seeds or more with confidence intervals and a paired test.
+- Material dated after mid-2026 is new to most readers and to your training: fetch the primary source before writing about it (section 13). If it cannot be fetched, say so in the page and keep the claim out of the main text.
 

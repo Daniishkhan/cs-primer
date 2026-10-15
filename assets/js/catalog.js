@@ -24,7 +24,7 @@
     { title: "Working Practice",       blurb: "Reading papers, paying for compute, writing things down and working with AI assistants." }
   ];
   var MLF_CHAPTERS = [
-    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                               blurb: "What AI systems engineers build, the nine courses, and how to use them without drowning." },
+    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                               blurb: "What AI systems engineers build, the courses and the four artifacts they lead to, and how to use them without drowning." },
     { id: "01", part: 1, depth: "core",  file: "01-python-numerics.html",     title: "Python for Numerical Work",                blurb: "Numbers, lists and loops, why pure Python is slow for maths, and the idea of vectorising." },
     { id: "02", part: 1, depth: "deep",  file: "02-numpy-arrays.html",        title: "NumPy, Arrays & Broadcasting",             blurb: "Shapes, strides, axes and broadcasting: the mental model behind every tensor library." },
     { id: "03", part: 1, depth: "core",  file: "03-data-wrangling.html",      title: "Data Wrangling: pandas, SQL & Tidy Data",  blurb: "Loading, joining, grouping and cleaning tables, and the questions to ask any dataset." },
@@ -454,7 +454,7 @@
   ];
   var RE_TOOLS = [
     { id: "autoresearch", name: "autoresearch",   chapters: ["01", "02"], blurb: "Karpathy's single-file research loop: an agent edits train.py, runs it for five minutes and keeps what helps." },
-    { id: "nanochat",     name: "nanochat",       chapters: ["01", "03"], blurb: "A small, complete chat-model training stack whose train.py is autoresearch's inner task." },
+    { id: "nanochat",     name: "nanochat",       chapters: ["01", "03"], blurb: "A small, complete chat-model training stack; autoresearch's single-file train.py is cut from its training run." },
     { id: "modded-nanogpt", name: "modded-nanogpt", chapters: ["03", "04"], blurb: "The GPT-2 speedrun: records, logs and the tricks that survived scrutiny." },
     { id: "cargo",        name: "Rust and cargo", chapters: ["05"],       blurb: "The Rust toolchain, for building and testing the runner." }
   ];
@@ -648,7 +648,7 @@
   window.CS_ARTIFACTS = [
     { id: "A1", num: 1, title: "autoresearch-rs", short: "A research loop",
       replicates: { text: "karpathy/autoresearch", href: "https://github.com/karpathy/autoresearch" },
-      what: "Karpathy's autoresearch loop with the runner, sandbox and run store rewritten in Rust; the inner task is nanochat's train.py under a fixed five-minute budget.",
+      what: "Karpathy's autoresearch loop with the runner, sandbox and run store rewritten in Rust; the inner task is autoresearch's single-file train.py, a small nanochat-style training run, under a fixed five-minute budget.",
       extension: "A keep-or-revert loop that also logs the gap between proxy and held-out gain for every experiment, so overfitting to the five-minute proxy is measured, not assumed.",
       gate: ["100 or more overnight experiments on one GPU", "A chart of proxy gain against held-out gain", "A two-to-three-page write-up with seeds and the noise floor"],
       cost: "$150 to $300", months: "1 to 3",
@@ -670,7 +670,7 @@
       read: [["FML-Bench repository and paper", "https://github.com/qrzou/FML-bench"], ["Jiang et al., AIDE: AI-Driven Exploration in the Space of Code", "https://arxiv.org/abs/2502.13138"], ["Harness engineering for self-improvement (as linked in the roadmap)", "https://lilithai.dev/radar/harness-engineering-for-self-improvement?lang=en"]],
       open: [["Agentic Context Engineering (ACE), Meta-Harness and STOP; see A10 chapter 1", ""]] },
     { id: "A3", num: 3, title: "evaluator-hardening kit", short: "Hardened evaluators",
-      replicates: { text: "proxy-only gains and hidden-test hardening on kernel benchmarks", href: "https://scalingintelligence.stanford.edu/pubs/kernelbench.pdf" },
+      replicates: { text: "visible-versus-held-out test gaps and hidden-test hardening on kernel benchmarks", href: "https://scalingintelligence.stanford.edu/pubs/kernelbench.pdf" },
       what: "A KernelBench subset where you first break the grader, then harden it, and measure the hacking rate before and after.",
       extension: "A reusable Python library (typed, attested tool results; hidden splits; end-to-end timing) that drops into Artifact 2's agent, with hacking rate as a first-class metric.",
       gate: ["Hacking rate measured on 20 or more kernels, before and after hardening", "One upstream pull request to a kernel benchmark or to ShinkaEvolve"],

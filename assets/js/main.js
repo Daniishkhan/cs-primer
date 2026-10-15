@@ -664,7 +664,7 @@
   /* Standalone reference pages (toolbox, lab machine) get a TOC but no pager. */
   function buildReferenceHead() {
     var page = body.dataset.page;
-    if (page !== "toolbox" && page !== "lab-machine" && page !== "curriculum") return;
+    if (["toolbox", "lab-machine", "curriculum", "contributing", "evidence"].indexOf(page) === -1) return;
     var head = document.querySelector(".chapter-head");
     var article = document.querySelector("article.prose");
     if (head && article) buildToc(article, head, "On this page");
@@ -871,7 +871,7 @@
      labs, workbenches and cases that build it. */
 
   function buildArtifactTrack() {
-    var host = document.getElementById("artifact-track");
+    var host = document.getElementById("artifact-track-sections");
     if (!host) return;
     function itemList(ids, ordered) {
       var ul = el(ordered ? "ol" : "ul", { class: "artifact-list" });

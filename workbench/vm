@@ -1,0 +1,78 @@
+#!/bin/sh
+# vm: the lab VM for the Workbench pages, one rented CPU machine on AWS EC2.
+#
+#   vm create    launch it: Ubuntu 24.04, an SSH key, a security group open
+#                only to your IP, an Elastic IP and an idle-stop alarm
+#   vm start     start a stopped VM          vm stop    stop it (disk stays)
+#   vm status    state, type and address     vm ip      allow your current IP
+#   vm ssh       open a shell                vm sync    copy the site's code to ~/zts
+#   vm jupyter   JupyterLab on the VM, forwarded to http://localhost:8888
+#   vm resize T  stop, change the instance type to T, start again
+#
+# Needs: the AWS CLI, logged in (aws sts get-caller-identity works), plus ssh
+# and rsync. Settings come from ~/.config/wb.env if it exists:
+#   WB_VM_TYPE    instance type for "create", default m7i.4xlarge (16 vCPU, 64 GB)
+#   WB_VM_REGION  default us-east-1
+#   WB_VM_DISK    root disk in GB, default 500
+#   WB_VM_KEY     SSH private key, default ~/.ssh/zero_to_ai_vm_ed25519
+# "vm create" writes WB_VM_ID and WB_VM_HOST into ~/.config/wb.env.
+# The VM costs money while it runs. The alarm stops it after an hour under
+# 5% CPU, which is a safety net, not a plan: run "vm stop" when you finish.
+set -eu
+
+ENV=$HOME/.config/wb.env
+[ -f "$ENV" ] && . "$ENV"
+REGION=${WB_VM_REGION:-us-east-1}
+TYPE=${WB_VM_TYPE:-m7i.4xlarge}
+DISK=${WB_VM_DISK:-500}
+KEY=${WB_VM_KEY:-$HOME/.ssh/zero_to_ai_vm_ed25519}
+NAME=zero-to-ai-lab-vm
+SITE=$(cd "$(dirname "$0")/.." && pwd)
+AWS="aws --region $REGION"
+
+need_id() { [ -n "${WB_VM_ID:-}" ] || { echo "no VM yet: run 'vm create'" >&2; exit 1; }; }
+host() { need_id; echo "ubuntu@$($AWS ec2 describe-instances --instance-ids "$WB_VM_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"; }
+remember() { mkdir -p "$(dirname "$ENV")"; touch "$ENV"; grep -v "^$1=" "$ENV" > "$ENV.tmp" || true; echo "$1=$2" >> "$ENV.tmp"; mv "$ENV.tmp" "$ENV"; }
+myip() { curl -fsS https://checkip.amazonaws.com; }
+
+case "${1:-status}" in
+create)
+  [ -z "${WB_VM_ID:-}" ] || { echo "already have $WB_VM_ID (vm status)" >&2; exit 1; }
+  [ -f "$KEY" ] || ssh-keygen -t ed25519 -N "" -C "$NAME" -f "$KEY" -q
+  $AWS ec2 describe-key-pairs --key-names "$NAME" >/dev/null 2>&1 ||
+    $AWS ec2 import-key-pair --key-name "$NAME" --public-key-material "fileb://$KEY.pub" >/dev/null
+  VPC=$($AWS ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+  SG=$($AWS ec2 describe-security-groups --filters Name=group-name,Values="$NAME" --query 'SecurityGroups[0].GroupId' --output text)
+  if [ "$SG" = "None" ]; then
+    SG=$($AWS ec2 create-security-group --group-name "$NAME" --description "Zero to AI lab VM: SSH from owner IP only" --vpc-id "$VPC" --query GroupId --output text)
+    $AWS ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$(myip)/32" >/dev/null
+  fi
+  AMI=$($AWS ssm get-parameters --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query 'Parameters[0].Value' --output text)
+  ID=$($AWS ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$NAME" --security-group-ids "$SG" \
+    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$DISK,VolumeType=gp3,DeleteOnTermination=true}" \
+    --user-data "file://$SITE/workbench/setup-vm.sh" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=project,Value=zero-to-ai}]" \
+    --query 'Instances[0].InstanceId' --output text)
+  $AWS ec2 wait instance-running --instance-ids "$ID"
+  ALLOC=$($AWS ec2 allocate-address --domain vpc --query AllocationId --output text)
+  $AWS ec2 associate-address --instance-id "$ID" --allocation-id "$ALLOC" >/dev/null
+  $AWS cloudwatch put-metric-alarm --alarm-name "$NAME-idle-stop" --namespace AWS/EC2 --metric-name CPUUtilization \
+    --dimensions "Name=InstanceId,Value=$ID" --statistic Average --period 300 --evaluation-periods 12 \
+    --threshold 5 --comparison-operator LessThanThreshold --alarm-actions "arn:aws:automate:${REGION}:ec2:stop"
+  remember WB_VM_ID "$ID"; remember WB_VM_REGION "$REGION"; remember WB_VM_KEY "$KEY"
+  WB_VM_ID=$ID; remember WB_VM_HOST "$(host)"
+  echo "created $ID; setup takes about five minutes (it touches ~/SETUP_DONE when finished): vm ssh" ;;
+start)  need_id; $AWS ec2 start-instances --instance-ids "$WB_VM_ID" >/dev/null; $AWS ec2 wait instance-running --instance-ids "$WB_VM_ID"; echo "running at $(host)" ;;
+stop)   need_id; $AWS ec2 stop-instances --instance-ids "$WB_VM_ID" >/dev/null; echo "stopping $WB_VM_ID (the disk is kept and still billed)" ;;
+status) need_id; $AWS ec2 describe-instances --instance-ids "$WB_VM_ID" --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,State.Name,PublicIpAddress]' --output text ;;
+ip)     need_id; SG=$($AWS ec2 describe-instances --instance-ids "$WB_VM_ID" --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+        $AWS ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$(myip)/32" >/dev/null && echo "allowed $(myip)" ;;
+ssh)    shift; exec ssh -i "$KEY" "$(host)" "$@" ;;
+sync)   rsync -az --delete -e "ssh -i $KEY" --exclude .git --exclude graft --exclude __pycache__ "$SITE/" "$(host):zts/" && echo "synced to ~/zts" ;;
+jupyter) exec ssh -i "$KEY" -L 8888:localhost:8888 "$(host)" '~/lab/bin/jupyter lab --no-browser --port 8888 --notebook-dir ~/zts' ;;
+resize) need_id; [ -n "${2:-}" ] || { echo "usage: vm resize TYPE" >&2; exit 1; }
+        $AWS ec2 stop-instances --instance-ids "$WB_VM_ID" >/dev/null; $AWS ec2 wait instance-stopped --instance-ids "$WB_VM_ID"
+        $AWS ec2 modify-instance-attribute --instance-id "$WB_VM_ID" --instance-type "{\"Value\":\"$2\"}"
+        $AWS ec2 start-instances --instance-ids "$WB_VM_ID" >/dev/null; $AWS ec2 wait instance-running --instance-ids "$WB_VM_ID"; echo "now $2 at $(host)" ;;
+*) sed -n '2,21p' "$0"; exit 1 ;;
+esac

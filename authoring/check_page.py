@@ -20,7 +20,7 @@ AMERICAN = ["behavior", "color", "optimiz", "analyz", "modeling", "modeled", "la
             "centered", "favorite", "organiz", "recogniz", "summariz", "normaliz", "tokeniz", "visualiz",
             "generaliz", "regulariz", "minimiz", "maximiz", "prioritiz", "utiliz", "initializ", "parameteriz",
             "quantiz", "randomiz", "categoriz", "characteriz", "standardiz", "memoriz", "serializ", "license ",
-            "catalog ", "defense", "artifact", "gray"]
+            "catalog ", "defense", "gray"]  # "artifact" is the project's term (the artifact track)
 
 
 def catalog():

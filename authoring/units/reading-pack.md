@@ -1,0 +1,21 @@
+# Unit: reading-pack
+
+Three new **reading-only** chapters (depth intro, 1,200 to 2,200 words each), the roadmap's "literacy pack": read alongside Artifacts 2 and 3, never required.
+
+## Your assignment: chapters
+- `deep-learning/chapters/23-interpretability-basics.html` (course `dl`, chapter `23`, part 6) · **Interpretability Basics**: the residual stream as a shared channel, linear probes, attention patterns, activation patching and sparse autoencoder features, at the level of ARENA's first two chapters (fetch arena.education / the ARENA curriculum and cite what you read). One small NumPy example (a probe on synthetic activations) with real output.
+- `deep-learning/chapters/24-learned-optimisers.html` (course `dl`, chapter `24`, part 6) · **Learned Optimisers & In-Context Learning**: optimisers that are themselves trained (Andrychowicz et al. 2016, VeLO 2022), and in-context learning read as a learned learning algorithm (Garg et al. 2022; von Oswald et al. 2023, transformers learn in-context by gradient descent). One small example with real output.
+- `open-ended/chapters/22-coevolution-pbt.html` (course `oe`, chapter `22`, part 2) · **Co-evolution & Population-Based Training**: competitive and cooperative co-evolution, Red Queen dynamics, POET-style co-evolving curricula (A7 chapter 05 already covers POET; link to it rather than repeat it), population-based training (Jaderberg et al. 2017), and why these ideas matter for loops that improve their own harness. One small standard-library example with real output.
+
+Each needs `glossary-src/dl-23.json`, `dl-24.json`, `oe-22.json`. The `callout why` says plainly that this is reading for the literacy pack and which artifact it helps. Diagram marker ids use `DL` and `OE`.
+
+## Process
+1. Read `authoring/guide.md` in full (section 17, the artifact track, is new), then the sample pages it lists for your page type. Read `RSI Artifact-First Roadmap.md` at the site root: it is the reason these pages exist. Skim `authoring/link-index.md` for this course and the courses it builds on; take every cross-link path from it.
+2. Research before writing. Everything dated after mid-2025 must be fetched from the primary source (WebFetch/WebSearch): the arXiv abstract page, the repository README, the official post. Record what you fetched. If a source cannot be fetched, say so in the page (a `callout note` "What I could and could not read" in cases; a sentence in chapters) and keep the claim out of the main text. Never invent numbers, quotes, dates or URLs. Several links in the roadmap may be wrong or point at mirrors: check each one. Use `$TMPDIR/reading-pack/` for scratch work.
+3. Write the pages. Every code example's output is real output from running it (chapter and lab code is standard-library Python, NumPy at most, run locally with `python3`). Workbench scripts run **only on the lab VM** (below), never on this Mac.
+4. Run `python3 authoring/check_page.py <your files>` and `node authoring/check_tex.js <pages with maths>`; fix every ERROR and the reasonable WARNs (sentence length, unexpanded acronyms, missing analogy).
+5. Do not edit `assets/js/catalog.js`, shared JS/CSS, or files outside your assignment. Do not run git commands that change state. Remove any `__pycache__` you create.
+6. Report back in under 200 words: files written, approximate words, what you fetched and what you could not verify, any catalog change you recommend.
+
+## The lab VM (workbench authors only)
+SSH: `ssh -i ~/.ssh/zero_to_ai_vm_ed25519 ubuntu@32.199.227.194` (run outside the sandbox). Ubuntu 24.04, 16 vCPU, 64 GB, Python 3.12 venv at `~/lab` (activated by `~/.bashrc`: PyTorch CPU, transformers, datasets, tokenizers, tiktoken, scikit-learn, matplotlib, jupyterlab), Ollama installed, `uv` at `~/.local/bin/uv` for anything else. Work in `~/work/reading-pack/`. Copy code with `scp`/`rsync`. An OpenAI key for tests is on the VM: `source ~/.config/lab.env` sets `OPENAI_API_KEY`. Never print it, copy it off the VM, or write it into any file in the repo. Prefer `gpt-5.4-mini` or `gpt-5.4-nano` to keep cost down. Label output blocks `output (lab VM, 16 vCPU, …)`. A CloudWatch alarm stops the VM after an hour under 5% CPU; if SSH fails, say so in your report rather than starting it yourself.
