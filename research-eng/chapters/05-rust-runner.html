@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Runner in Rust, Read from Python · Research Engineering on Small Proxies</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="re" data-chapter="05">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>A Runner in Rust, Read from Python</h1>
+  <p class="lede">In Artifact 1 the part of the loop that runs an experiment, enforces its deadline, reads the score and decides keep or revert is rewritten in Rust. This chapter explains why that part, and only that part, is worth moving, and teaches the Rust you need to read it and change it by comparing it, line by line, with the same program in Python. Every listing here was compiled and run.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>This chapter serves the Rust-runner step of Artifact 1. In the original autoresearch, the runner is the agent following a paragraph of instructions: it types the command, waits, greps the log and resets git. The artifact replaces that with a small program that does the same things deterministically, so the agent proposes and the runner disposes. After the chapter you can read a 75-line Rust runner, say what each piece does in Python terms, build it with <code>rustc</code> or <code>cargo</code>, and change its deadline, its decision rule or its output format. You also know exactly what it does not protect you from, which is the subject of <a href="../../control/chapters/02-egress-sandbox.html">A11 chapter 2</a>. It assumes the loop of <a href="01-research-loop.html">chapter 01</a> and the run-store schema of <a href="04-ablations-tracking.html">chapter 04</a>, and uses ideas from <a href="../../ml-foundations/chapters/22-running-candidates.html">A0 chapter 22</a> (timeouts and separate processes).</p>
+</div>
+
+<h2>Why move the runner at all</h2>
+
+<p>Start with the honest comparison. The runner is a <span class="term">supervisor</span>: a program whose job is to start another program, watch it, limit it and report on it. Its job here is small: start a child process, give it a deadline, collect its output, parse one number, compare it, and write a row. Python does this well. The listing below is the whole thing in 25 lines, using the standard library's <code>subprocess</code>. The Rust version that follows is 76 lines. If the only goal were to get the job done, Python would win.</p>
+
+<pre class="terminal" data-title="runner.py"><code>"""The same runner in Python, for comparison."""
+import subprocess, sys
+
+def main(argv):
+    limit, best, log = float(argv[1]), float(argv[2]), argv[3]
+    cmd = argv[argv.index("--") + 1:]
+    try:                                       # run with a hard deadline
+        with open(log, "w") as out:
+            done = subprocess.run(cmd, stdout=out, stderr=out, timeout=limit,
+                                  env={"PATH": "/usr/bin:/bin"})
+        label = "exit %d" % done.returncode
+        code = done.returncode
+    except subprocess.TimeoutExpired:
+        label, code = "timeout", None
+    bpb = None
+    for line in open(log):                     # grep "^val_bpb:" run.log
+        if line.startswith("val_bpb:"):
+            bpb = float(line.split(":")[1])
+    if code == 0 and bpb is not None:
+        status = "Keep" if bpb &lt; best else "Discard"
+    else:
+        status = "Crash"
+    print("%s\t%.6f\t%s" % (status, bpb or 0.0, label))
+
+main(sys.argv)</code></pre>
+
+<p>The case for Rust is about what kind of program this is, not about speed (a runner spends its life waiting). Three properties matter.</p>
+
+<ol class="steps">
+  <li><strong>It is the trusted part of an untrusted loop.</strong> The runner sits between a proposer that writes code and the machine. It must not crash on odd input, must not hang, and must not be influenced by the Python environment that the proposed code runs in. A compiled binary has no import path to shadow and no interpreter configuration to inherit. The agent can edit <code>train.py</code>, but it does not change what the runner is made of.</li>
+  <li><strong>It runs for days.</strong> A supervisor that leaks a file handle or leaves zombie processes fails at hour 30 of a run, not in the first test. Rust's ownership rules, introduced below, make these specific mistakes hard to write.</li>
+  <li><strong>The compiler checks that every case is handled.</strong> The runner's central decision has four situations (finished with a score, finished without one, exited with an error, timed out). In Rust a <code>match</code> that forgets one does not compile. Section "Enums and match" shows the actual compiler message.</li>
+</ol>
+
+<p>The cost is real: more lines, a compile step, and a learning curve. A reasonable plan is the one the artifact follows: prototype in Python (chapter 01 and Lab 1), then rewrite the runner once its behaviour is pinned down, and keep the Python as a test oracle. Both programs should print the same row for the same inputs, and the next sections show that they do.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 310" role="img" aria-label="The agent asks the Rust runner to run an experiment. The runner spawns train.py as a child process with a clean environment, polls it against a deadline, kills and reaps it if needed, parses the log, decides, and appends a row to the run store.">
+    <defs><marker id="ahRE05a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="80" width="150" height="80" rx="8" class="fs-green s-green sw-2"/><text x="95" y="117" text-anchor="middle" class="t-sm t-bold">Agent</text><text x="95" y="134" text-anchor="middle" class="t-xs t-muted">proposes a diff</text>
+    <rect x="250" y="40" width="230" height="160" rx="8" class="fs-blue s-blue sw-2"/><text x="365" y="124" text-anchor="middle" class="t-sm t-bold">Rust runner</text>
+    <text x="270" y="96" text-anchor="start" class="t-xs">1 spawn, clean env</text>
+    <text x="270" y="118" text-anchor="start" class="t-xs">2 poll to a deadline</text>
+    <text x="270" y="140" text-anchor="start" class="t-xs">3 kill and reap</text>
+    <text x="270" y="162" text-anchor="start" class="t-xs">4 parse the log</text>
+    <text x="270" y="184" text-anchor="start" class="t-xs">5 decide, append row</text>
+    <rect x="560" y="80" width="180" height="80" rx="8" class="fs-cyan s-cyan sw-2"/><text x="650" y="117" text-anchor="middle" class="t-sm t-bold">train.py</text><text x="650" y="134" text-anchor="middle" class="t-xs t-muted">child process</text>
+    <rect x="250" y="240" width="230" height="50" rx="8" class="fs-purple s-purple sw-2"/><text x="365" y="262" text-anchor="middle" class="t-sm t-bold">run store</text><text x="365" y="279" text-anchor="middle" class="t-xs t-muted">results.tsv or SQLite</text>
+    <line x1="172" y1="120" x2="248" y2="120" class="line" marker-end="url(#ahRE05a)"/>
+    <line x1="482" y1="120" x2="558" y2="120" class="line" marker-end="url(#ahRE05a)"/>
+    <line x1="365" y1="202" x2="365" y2="238" class="line" marker-end="url(#ahRE05a)"/>
+    <text x="210" y="108" text-anchor="middle" class="t-xs t-muted">run</text>
+    <text x="520" y="108" text-anchor="middle" class="t-xs t-muted">spawn</text>
+    <text x="645" y="200" text-anchor="middle" class="t-xs tc-red">no keys, no network</text>
+    <text x="645" y="216" text-anchor="middle" class="t-xs t-muted">(not enforced by std alone)</text>
+  </svg>
+  <figcaption><strong>The runner is the trusted part.</strong> It sits between the proposer and the code it wrote, and it alone writes the run store. The chapter on <a href="../../control/chapters/02-egress-sandbox.html">deny-by-default egress and sandboxes</a> (A11) covers how much more a real sandbox needs.</figcaption>
+</figure>
+
+<h2>The runner, read from Python</h2>
+
+<p>Here is the full Rust listing. Read it once, ignoring what you do not know, and notice that its shape is the Python's: parse arguments, run with a deadline, read the log, decide, print. The headings after it explain each unfamiliar idea with a Python parallel.</p>
+
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>args: a time limit, the best score so far, a log path, then the command after <code>--</code></li>
+  <li>run: start the child with a clean environment; poll until it exits or the deadline passes; if late, kill it and reap it</li>
+  <li>parse: find a line starting with <code>val_bpb:</code> in the log</li>
+  <li>decide: exit 0 with a lower score is keep; exit 0 with a higher one is discard; anything else is crash</li>
+  <li>print one tab-separated row</li>
+</ol></div>
+
+<pre class="terminal" data-title="runner.rs"><code>//! runner: run one experiment under a deadline, then decide keep/discard/crash.
+//! usage: runner TIMEOUT_SECS BEST_BPB LOGFILE -- CMD [ARGS...]
+use std::env;
+use std::fs::File;
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+// ── 1. What can happen to a run, as a type the compiler checks ───────────
+enum Outcome {
+    Finished(i32), // exit code
+    TimedOut,
+}
+
+#[derive(Debug)]
+enum Status {
+    Keep,
+    Discard,
+    Crash,
+}
+
+// ── 2. Run the child with a clean environment and a hard deadline ────────
+fn run(cmd: &amp;[String], log: &amp;str, limit: Duration) -&gt; std::io::Result&lt;Outcome&gt; {
+    let out = File::create(log)?;
+    let mut child = Command::new(&amp;cmd[0])
+        .args(&amp;cmd[1..])
+        .env_clear() // nothing inherited: no keys, no tokens
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin")
+        .stdout(Stdio::from(out.try_clone()?))
+        .stderr(Stdio::from(out))
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if let Some(code) = child.try_wait()? {
+            return Ok(Outcome::Finished(code.code().unwrap_or(-1)));
+        }
+        if start.elapsed() &gt; limit {
+            child.kill()?; // SIGKILL; then reap so no zombie is left
+            child.wait()?;
+            return Ok(Outcome::TimedOut);
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+// ── 3. Read the metric out of the log, like grep "^val_bpb:" run.log ─────
+fn parse_bpb(log: &amp;str) -&gt; Option&lt;f64&gt; {
+    let text = std::fs::read_to_string(log).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("val_bpb:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+// ── 4. Decide: the only place a number turns into a status ───────────────
+fn decide(outcome: &amp;Outcome, bpb: Option&lt;f64&gt;, best: f64) -&gt; Status {
+    match (outcome, bpb) {
+        (Outcome::Finished(0), Some(v)) if v &lt; best =&gt; Status::Keep,
+        (Outcome::Finished(0), Some(_)) =&gt; Status::Discard,
+        _ =&gt; Status::Crash, // timeout, non-zero exit, or no metric printed
+    }
+}
+
+fn main() {
+    let a: Vec&lt;String&gt; = env::args().collect();
+    let sep = a.iter().position(|s| s == "--").expect("missing --");
+    let limit = Duration::from_secs_f64(a[1].parse().unwrap());
+    let best: f64 = a[2].parse().unwrap();
+    let outcome = run(&amp;a[sep + 1..], &amp;a[3], limit).expect("spawn failed");
+    let bpb = parse_bpb(&amp;a[3]);
+    let status = decide(&amp;outcome, bpb, best);
+    let label = match outcome {
+        Outcome::Finished(c) =&gt; format!("exit {}", c),
+        Outcome::TimedOut =&gt; "timeout".to_string(),
+    };
+    println!("{:?}\t{:.6}\t{}", status, bpb.unwrap_or(0.0), label);
+}</code></pre>
+
+<h3>Types, <code>let</code> and <code>mut</code></h3>
+
+<p>Rust is statically typed: every value has a type known at compile time, which the compiler usually infers. <code>let best: f64 = ...</code> is Python's <code>best = float(...)</code> with the type written down. Variables are immutable by default; <code>let mut child</code> opts in to change, like marking a Python variable as one you intend to reassign. The effect is that a reader can tell at a glance which values change.</p>
+
+<h3>Ownership and borrowing</h3>
+
+<p>This is the idea that makes Rust different. Every value has exactly one <span class="term">owner</span>, and when the owner goes out of scope the value is freed. Passing a value to a function <em>moves</em> it: the caller can no longer use it. If you only want to look, you pass a <span class="term">reference</span> (written <code>&amp;</code>), which <span class="term">borrows</span> the value without taking it. In Python, names are shared references and a garbage collector decides when memory is freed; in Rust the compiler decides, before the program runs. The first program below breaks the rule on purpose and the compiler explains it.</p>
+
+<pre class="terminal" data-title="move.rs (does not compile)"><code>fn save(row: String) -&gt; usize { row.len() }
+
+fn main() {
+    let row = String::from("keep\t0.9702");
+    let n = save(row);       // `row` is moved into save()
+    println!("{} bytes, row = {}", n, row);
+}</code></pre>
+<pre class="terminal" data-title="output (rustc 1.98.1, macOS)"><code>error[E0382]: borrow of moved value: `row`
+ --&gt; move.rs:6:39
+  |
+4 |     let row = String::from("keep\t0.9702");
+  |         --- move occurs because `row` has type `String`, which does not implement the `Copy` trait
+5 |     let n = save(row);       // `row` is moved into save()
+  |                  --- value moved here
+6 |     println!("{} bytes, row = {}", n, row);
+  |                                       ^^^ value borrowed here after move
+  |
+note: consider changing this parameter type in function `save` to borrow instead if owning the value isn't necessary
+ --&gt; move.rs:1:14
+  |
+1 | fn save(row: String) -&gt; usize { row.len() }
+  |    ----      ^^^^^^ this parameter takes ownership of the value
+  |    |
+  |    in this function
+help: consider cloning the value if the performance cost is acceptable
+  |
+5 |     let n = save(row.clone());       // `row` is moved into save()
+  |                     ++++++++
+error: aborting due to 1 previous error
+For more information about this error, try `rustc --explain E0382`.</code></pre>
+
+<p>The message is the lesson: <code>row</code> was moved into <code>save</code>, so it cannot be used afterwards. The note even suggests the fix, borrow instead of own. Changing the parameter to <code>&amp;str</code> and passing <code>&amp;row</code> lends the string for the call:</p>
+
+<pre class="terminal" data-title="move_fixed.rs"><code>fn save(row: &amp;str) -&gt; usize { row.len() }
+
+fn main() {
+    let row = String::from("keep\t0.9702");
+    let n = save(&amp;row);      // lend `row`; we still own it
+    println!("{} bytes, row = {:?}", n, row);
+}</code></pre>
+<pre class="terminal" data-title="output"><code>11 bytes, row = "keep\t0.9702"</code></pre>
+
+<p>In the runner, <code>fn run(cmd: &amp;[String], log: &amp;str, ...)</code> borrows its arguments: the caller keeps them. The same reasoning is why the runner cannot leave a log file handle open by accident: the <code>File</code> is owned by one place, and when that place ends the file closes.</p>
+
+<h3><code>Option</code>, <code>Result</code> and <code>?</code></h3>
+
+<p>Python signals "no value" with <code>None</code> and failure with exceptions, and nothing in the function signature warns you. Rust puts both in the type. An <code>Option&lt;f64&gt;</code> is either <code>Some(number)</code> or <code>None</code>; <code>parse_bpb</code> returns one because a log might have no score. A <span class="term"><code>Result&lt;T, E&gt;</code></span> is either <code>Ok(value)</code> or <code>Err(error)</code>; <code>run</code> returns one because starting a process can fail. You cannot use the number inside an <code>Option</code> without saying what to do for <code>None</code>. The <code>?</code> operator after a call means "if this failed, return the error from my function now", which is what an uncaught exception does, but visible in the code. In <code>parse_bpb</code> the chain <code>.ok()?</code> and <code>.and_then(...)</code> makes the same promise: any failure along the way becomes <code>None</code>, which the decision treats as a crash.</p>
+
+<h3>Enums and <code>match</code></h3>
+
+<p>An <span class="term">enum</span> is a type with a fixed list of variants, some carrying data: <code>Outcome::Finished(i32)</code> holds an exit code, <code>Outcome::TimedOut</code> holds nothing. In Python you would reach for a string constant or a class hierarchy and trust yourself to test every case. A <code>match</code> expression takes apart an enum, and the compiler checks that all cases are covered. The runner's <code>decide</code> function ends with a catch-all arm (<code>_ =&gt; Status::Crash</code>) on purpose. Remove it and replace it with only the timeout case, and the compiler refuses:</p>
+
+<pre class="terminal" data-title="output (compiling a variant of runner.rs without the catch-all)"><code>error[E0004]: non-exhaustive patterns: `(&amp;Outcome::Finished(i32::MIN..=-1_i32), _)` and `(&amp;Outcome::Finished(1_i32..=i32::MAX), _)` not covered
+  --&gt; bad.rs:56:11
+   |
+56 |     match (outcome, bpb) {
+   |           ^^^^^^^^^^^^^^ patterns `(&amp;Outcome::Finished(i32::MIN..=-1_i32), _)` and `(&amp;Outcome::Finished(1_i32..=i32::MAX), _)` not covered
+   |
+   = note: the matched value is of type `(&amp;Outcome, Option&lt;f64&gt;)`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+   |
+59 ~         (Outcome::TimedOut, _) =&gt; Status::Crash,
+60 ~         (&amp;Outcome::Finished(i32::MIN..=-1_i32), _) | (&amp;Outcome::Finished(1_i32..=i32::MAX), _) =&gt; todo!(),
+   |
+error: aborting due to 1 previous error
+For more information about this error, try `rustc --explain E0004`.</code></pre>
+
+<p>The compiler lists the unhandled case, an exit code below zero or above zero, and shows how to add an arm. That is the point of <code>decide</code> being the only place a number becomes a status: every way a run can end must be named, and a new variant added later (say, <code>OutOfMemory</code>) breaks the build everywhere it is not handled instead of falling through silently. The Python version's final <code>else: status = "Crash"</code> gives the same behaviour for today's cases, but nothing would flag an uncovered tomorrow.</p>
+
+<h3>Iterators and closures</h3>
+
+<p>The line <code>text.lines().find_map(|l| l.strip_prefix("val_bpb:"))</code> is a loop written as a pipeline. <code>lines()</code> yields each line, the closure <code>|l| ...</code> (like Python's <code>lambda l: ...</code>) returns the part after the prefix if the line has one, and <code>find_map</code> stops at the first line where it returned something. The Python equivalent is a <code>for</code> loop with an <code>if line.startswith("val_bpb:")</code> and a <code>break</code>. Pipelines like this are common in Rust because the compiler turns them into the same loop.</p>
+
+<h2>Running it</h2>
+
+<p>The runner's behaviour is checked against a stand-in training script, <code>fake_train.py</code>, that prints the same summary lines as the real <code>train.py</code> (<code>val_bpb:</code>, then <code>peak_vram_mb:</code>) and can be told to crash or hang. Build with <code>rustc -O runner.rs -o runner</code> (or <code>cargo build --release</code> from a <code>cargo new</code> project; I checked both) and run four cases: a better score than the best so far (0.9800), a worse one, a crash and a hang with a two-second deadline.</p>
+
+<pre class="terminal" data-title="fake_train.py"><code>import sys, time
+mode = sys.argv[1]
+if mode == "hang":
+    time.sleep(60)
+if mode == "crash":
+    print("step 41 loss nan"); sys.exit(1)
+print("step 100 loss 3.1")
+print("---")
+print("val_bpb:          %s" % sys.argv[2])
+print("peak_vram_mb:     44210.3")</code></pre>
+<pre class="terminal" data-title="output (Rust runner, rustc 1.98.1)"><code>$ PY=$(which python3)
+$ ./runner 2 0.9800 run.log -- $PY fake_train.py ok 0.9702
+Keep	0.970200	exit 0
+$ ./runner 2 0.9800 run.log -- $PY fake_train.py ok 0.9951
+Discard	0.995100	exit 0
+$ ./runner 2 0.9800 run.log -- $PY fake_train.py crash x
+Crash	0.000000	exit 1
+$ ./runner 2 0.9800 run.log -- $PY fake_train.py hang x
+Crash	0.000000	timeout</code></pre>
+
+<p>The four rows are exactly the four branches of the state machine from chapter 01: <code>Keep</code>, <code>Discard</code>, and two ways to <code>Crash</code>, one with an exit code of 1 and one with a timeout. The Python runner, given the same four commands, prints the same four rows:</p>
+
+<pre class="terminal" data-title="output (Python runner)"><code>$ PY=$(which python3)
+$ $PY runner.py 2 0.9800 run.log -- $PY fake_train.py ok 0.9702
+Keep	0.970200	exit 0
+$ $PY runner.py 2 0.9800 run.log -- $PY fake_train.py ok 0.9951
+Discard	0.995100	exit 0
+$ $PY runner.py 2 0.9800 run.log -- $PY fake_train.py crash x
+Crash	0.000000	exit 1
+$ $PY runner.py 2 0.9800 run.log -- $PY fake_train.py hang x
+Crash	0.000000	timeout</code></pre>
+
+<p>That agreement is the test that matters during the rewrite: the Rust runner is correct when it matches the Python one on every case, including the awkward ones you add. A hang is a good case to keep, because it is the one a naive runner fails: with no deadline, the loop would wait forever at 3 a.m.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 210" role="img" aria-label="The life of a run: spawn, poll with try_wait every 20 milliseconds, check whether it exited, check the deadline, and kill and wait if it is late. If neither, loop back to polling.">
+    <defs><marker id="ahRE05b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="60" width="124" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="82" y="87" text-anchor="middle" class="t-sm t-bold">spawn</text><text x="82" y="104" text-anchor="middle" class="t-xs t-muted">child starts</text>
+    <line x1="146" y1="90" x2="166" y2="90" class="line" marker-end="url(#ahRE05b)"/>
+    <rect x="168" y="60" width="124" height="60" rx="8" class="fs-yellow s-yellow sw-2"/><text x="230" y="87" text-anchor="middle" class="t-sm t-bold t-dark">try_wait</text><text x="230" y="104" text-anchor="middle" class="t-xs t-muted">every 20 ms</text>
+    <line x1="294" y1="90" x2="314" y2="90" class="line" marker-end="url(#ahRE05b)"/>
+    <rect x="316" y="60" width="124" height="60" rx="8" class="fs-green s-green sw-2"/><text x="378" y="87" text-anchor="middle" class="t-sm t-bold">exited?</text><text x="378" y="104" text-anchor="middle" class="t-xs t-muted">yes: read code</text>
+    <line x1="442" y1="90" x2="462" y2="90" class="line" marker-end="url(#ahRE05b)"/>
+    <rect x="464" y="60" width="124" height="60" rx="8" class="box"/><text x="526" y="87" text-anchor="middle" class="t-sm t-bold">deadline?</text><text x="526" y="104" text-anchor="middle" class="t-xs t-muted">no: loop again</text>
+    <line x1="590" y1="90" x2="610" y2="90" class="line" marker-end="url(#ahRE05b)"/>
+    <rect x="612" y="60" width="124" height="60" rx="8" class="fs-red s-red sw-2"/><text x="674" y="87" text-anchor="middle" class="t-sm t-bold">kill + wait</text><text x="674" y="104" text-anchor="middle" class="t-xs t-muted">reap, no zombie</text>
+    <polyline points="526,122 526,170 230,170 230,122" fill="none" class="line-dash" marker-end="url(#ahRE05b)"/>
+    <text x="300" y="190" text-anchor="middle" class="t-xs t-muted">not finished and not late: sleep and poll again</text>
+  </svg>
+  <figcaption><strong>A deadline is a loop, not a call.</strong> std offers no wait-with-timeout, so the runner polls. Killing a child and then waiting on it is what stops zombie processes piling up over a night.</figcaption>
+</figure>
+
+<p>The standard library has no "wait with a timeout" call for a child process. Its documentation lists <code>kill</code>, <code>try_wait</code>, <code>wait</code> and <code>wait_with_output</code>, and says that <code>try_wait</code> checks without blocking and, on Unix, reaps the process if it has exited. So the runner polls every 20 milliseconds, and when the deadline passes it kills the child and then calls <code>wait</code>. The second call matters. The documentation states that a terminated process that has not been waited on is still around as a <span class="term">zombie</span> (a dead process whose exit status nobody has collected), that too many zombies can exhaust process IDs, and that the standard library does not wait on children for you, even when the handle is dropped. A runner that killed but never waited would leak one process table entry per timeout, which over a night of hundreds of runs is a slow failure you would only find later.</p>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"The runner is written in Rust, so the loop is sandboxed." Rust gives the <em>runner</em> memory safety: no buffer overruns while parsing the log, no use-after-free. It does nothing about what the <em>child</em> can do. <code>env_clear()</code> removes inherited environment variables; the second listing below shows the child cannot see a secret exported to the runner. But the child is still an ordinary process of the same user. It can read your files, open network connections, and spawn processes of its own. Killing the child on a timeout does not kill a grandchild it started. Real containment needs operating-system features (user namespaces, resource limits, a network allowlist, a separate user) that the standard library does not expose and that belong to the sandboxing material in A11.</p>
+</div>
+
+<pre class="terminal" data-title="output (secret not inherited)"><code>$ SECRET_KEY=abc123 ./runner 2 0.98 probe.log -- $PY env_probe.py
+Keep	0.965000	exit 0
+$ cat probe.log
+child sees env keys: ['LC_CTYPE', 'PATH', '__CF_USER_TEXT_ENCODING']
+val_bpb:          0.9650</code></pre>
+
+<p>The probe prints the keys of the environment the child saw. <code>SECRET_KEY</code> is absent. The three keys it does see are <code>PATH</code> (set by the runner) and two that Python itself adds on macOS at start-up. The practical rule for the artifact is to clear the environment, then add back only what the experiment needs by name (a cache directory, say), never the reverse.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a foreman with a stopwatch</p>
+  <p>On a factory floor, the foreman hands each worker one job, starts a stopwatch, checks the finished part against the drawing, and either passes it or sends it to scrap. The foreman does not make parts; the foreman's job is to make sure the line keeps moving and the scrap bin is honest. The runner is the foreman and the agent is a very fast, sometimes careless worker.</p>
+  <p><em>Where it breaks down:</em> a foreman can see what the worker does with the tools. A runner sees only the exit code, the log and the clock. What the child did to the rest of the machine in between is invisible unless you add the sandboxing and monitoring covered in A11.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>The runner is a process supervisor, the same job that <code>systemd</code>, <code>supervisord</code> and container runtimes do. Spawn, watch, enforce a limit, kill, reap and report is the whole lifecycle, and zombie reaping, signal handling and timeouts are the problems every supervisor has to solve. If you have debugged a service that "runs forever but is stuck", or a CI job killed at 60 minutes with no log, you already know why a deadline belongs in the supervisor and not in the code it supervises: the supervised code is the thing that might not return.</p>
+</div>
+
+<h2>What else belongs in the Rust half</h2>
+
+<p>The listing handles the run. Three more pieces complete the Artifact 1 runner, and each has a Python prototype in the lab:</p>
+
+<ul>
+  <li><strong>The run store.</strong> The listing prints a row; a real runner appends it to the store of chapter 04. A tab-separated file needs only the standard library. A SQLite store needs a database crate such as <code>rusqlite</code>, which is the only external dependency the artifact should need; add it deliberately and pin its version.</li>
+  <li><strong>The held-out evaluation.</strong> After a keep, the runner runs the evaluation on the split the loop never reads and stores the second number next to the first, which is the gap column of chapter 02. Because the runner, not the agent, performs it, the agent cannot read or influence it.</li>
+  <li><strong>Resource limits and process groups.</strong> To kill the child's own children and cap memory and CPU time, the runner has to call operating-system interfaces directly. In Rust this normally means the <code>libc</code> or <code>nix</code> crates. I did not write or run that part for this chapter, and I would not trust a sketch of it; it is the first thing A11's lab asks you to build and test.</li>
+</ul>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Everything above was compiled on 15 October 2026 with <code>rustc 1.98.1 (48a229cea 2026-09-01)</code> on macOS. <code>cargo new</code> in that toolchain created a project with <code>edition = "2024"</code> in its <code>Cargo.toml</code>. The standard-library behaviour I quote (<code>kill</code>, <code>try_wait</code>, <code>wait</code>, zombies, no timeout variant) comes from the <a href="https://doc.rust-lang.org/std/process/struct.Child.html" target="_blank" rel="noopener">documentation of <code>std::process::Child</code></a>, which I fetched that day. Compiler messages change wording between releases; the text in the listings is what 1.98.1 printed. <strong>What may change:</strong> the compiler version, the wording of its errors and the default edition. The ownership and match rules this chapter relies on are stable parts of the language.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>1. Build the runner and rerun the four cases, then change the deadline in the hang case to 1 second. 2. Change <code>decide</code> so that a score within 0.0005 of the best is a discard rather than a keep (a minimum improvement), and add a Python-runner equivalent. Do the two still agree? 3. Add a fifth outcome, <code>OutOfMemory</code>, to the <code>Outcome</code> enum without touching <code>decide</code>, and read the compiler's complaint. 4. Add one more environment variable to the child by name, and confirm with the probe script that it appears. 5. Make the runner print the child's step count if the log contains a <code>num_steps:</code> line, and store it as a fifth column.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">rustc -O runner.rs -o runner</span>
+<span class="prompt">$</span> <span class="cmd">PY=$(which python3)</span>
+<span class="prompt">$</span> <span class="cmd">./runner 2 0.9800 run.log -- $PY fake_train.py ok 0.9702</span>
+<span class="prompt">$</span> <span class="cmd">./runner 2 0.9800 run.log -- $PY fake_train.py hang x</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>The runner is a supervisor: spawn, watch, enforce a deadline, reap, parse, decide, record. Python does it in 25 lines; Rust in 76. The reasons to move it are trust, longevity and exhaustive case handling, not speed.</li>
+    <li>Reading Rust from Python: <code>let mut</code> marks what changes; ownership and borrowing replace garbage collection; <code>Option</code> and <code>Result</code> put "no value" and "failed" in the type; an <code>enum</code> with <code>match</code> makes the compiler check every case.</li>
+    <li>The standard library has no wait-with-timeout. Poll <code>try_wait</code>, and on a deadline <code>kill</code> then <code>wait</code>; the second call stops zombies accumulating.</li>
+    <li>A Rust runner is memory safe but is not a sandbox. <code>env_clear()</code> hides secrets from the child; it does not stop the child reading files, using the network or leaving grandchildren behind.</li>
+    <li>Keep the Python runner as an oracle: the Rust one is right when it prints the same row for the same case, including hangs and crashes.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://doc.rust-lang.org/std/process/struct.Child.html" target="_blank" rel="noopener">The Rust standard library, <code>std::process::Child</code></a>. The exact semantics of <code>kill</code>, <code>try_wait</code>, <code>wait</code> and zombie processes.</li>
+  <li><a href="https://doc.rust-lang.org/book/" target="_blank" rel="noopener">Klabnik and Nichols, <em>The Rust Programming Language</em></a>. The free official book; chapters on ownership, enums and error handling cover this chapter's ideas in depth.</li>
+  <li><a href="https://github.com/karpathy/autoresearch" target="_blank" rel="noopener">Karpathy, <code>autoresearch</code></a>. The original loop whose runner this replaces: the command, the redirect, the grep and the ten-minute kill.</li>
+  <li><a href="../../ml-foundations/chapters/22-running-candidates.html">A0 chapter 22, Running Many Candidates Safely</a>. Timeouts, separate processes and archives, in Python.</li>
+  <li><a href="../../control/chapters/02-egress-sandbox.html">A11 chapter 2, Deny-by-Default Egress &amp; Sandboxes</a>. What a real sandbox adds to a runner.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="1">
+    <p class="q-text">The runner's child hangs. Which design catches it?</p>
+    <ol class="q-options">
+      <li>Call <code>child.wait()</code> and trust the child to finish.</li>
+      <li>Poll <code>try_wait</code> against a deadline, then <code>kill</code> and <code>wait</code>.</li>
+      <li>Use <code>env_clear()</code>.</li>
+      <li>Parse the log first.</li>
+    </ol>
+    <div class="q-explain"><code>wait</code> blocks forever on a hang. Clearing the environment is about secrets, and the log of a hung run has no score to parse yet. Polling with a deadline is the only option that returns control.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">What does the compiler do when <code>decide</code>'s <code>match</code> forgets a case of <code>Outcome</code>?</p>
+    <ol class="q-options">
+      <li>Treats it as a crash at run time.</li>
+      <li>Skips it silently.</li>
+      <li>Prints a warning and continues.</li>
+      <li>Refuses to compile and lists the unhandled patterns.</li>
+    </ol>
+    <div class="q-explain">The listing above shows error E0004, non-exhaustive patterns, naming the exit codes not covered. The point is that omission is caught before the program ever runs; Python would fall through silently.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Why does the runner call <code>child.wait()</code> after <code>child.kill()</code>?</p>
+    <ol class="q-options">
+      <li>To collect the exit status so the operating system can release the process entry; otherwise it stays as a zombie.</li>
+      <li>To give the child time to save its work.</li>
+      <li>Because <code>kill</code> sends a polite request that may be ignored.</li>
+      <li>To read the log.</li>
+    </ol>
+    <div class="q-explain">The documentation says a terminated but un-waited process remains a zombie and that std does not wait for you. <code>kill</code> is SIGKILL, which cannot be ignored or used to save work. Reading the log is a separate step.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A teammate says: "The runner is in Rust, so a malicious <code>train.py</code> cannot read our API keys." What is the most accurate response?</p>
+    <ol class="q-options">
+      <li>Correct, Rust prevents all unsafe behaviour.</li>
+      <li>Correct, because <code>env_clear()</code> blocks all file access.</li>
+      <li>Only partly: clearing the environment hides keys held in variables, but the child is a normal process that can read files, use the network and spawn others unless a sandbox stops it.</li>
+      <li>Incorrect, because Rust programs cannot clear the environment.</li>
+    </ol>
+    <div class="q-explain">The probe shows <code>SECRET_KEY</code> is not inherited, which is a real but narrow protection. Rust's safety guarantees apply to the runner's own memory, not to a separate process it launches. The standard library does clear environments, so the last option is false.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">In <code>save(row)</code> from the move example, what is the smallest change that makes the program compile and keeps <code>row</code> usable afterwards?</p>
+    <ol class="q-options">
+      <li>Make <code>row</code> a <code>mut</code> variable.</li>
+      <li>Have <code>save</code> borrow a <code>&amp;str</code> and call it with <code>&amp;row</code>.</li>
+      <li>Call <code>save</code> twice.</li>
+      <li>Delete the <code>println!</code>.</li>
+    </ol>
+    <div class="q-explain">Mutability does not affect moves. Borrowing lends the string for the call, so the caller still owns it. Deleting the print compiles but does not keep <code>row</code> usable, which is what was asked.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">When is the move from Python to Rust for the runner justified?</p>
+    <ol class="q-options">
+      <li>After the Python runner's behaviour is fixed by tests, because the Rust one is a long-running trusted component and the Python one remains the oracle.</li>
+      <li>Before writing any tests, to avoid Python's slowness.</li>
+      <li>Never; Python is always enough.</li>
+      <li>Only if the training itself moves to Rust.</li>
+    </ol>
+    <div class="q-explain">The runner spends its time waiting, so speed is not the reason. Rewriting after behaviour is pinned down means you know what correct looks like and can compare the two outputs. Training stays in Python regardless.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ablation Design &amp; Run Tracking · Research Engineering on Small Proxies</title>
+<script>try{var t=localStorage.getItem("nz-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../assets/css/theme.css">
+<link rel="stylesheet" href="../../assets/css/main.css">
+</head>
+<body data-root="../.." data-course="re" data-chapter="04">
+<div class="app">
+<aside id="sidebar" class="sidebar"></aside>
+<div class="main-col">
+<main class="content">
+<article class="prose">
+
+<header class="chapter-head">
+  <h1>Ablation Design &amp; Run Tracking</h1>
+  <p class="lede">After a night of keeps you hold a configuration that scores better than the baseline and a pile of changes nobody can separate. An ablation takes the pile apart to find which changes earned their place. This chapter covers how to design one so that interactions are visible, how much noise it can tolerate, and what a run store must record so that every number in a write-up can be traced to a row and replayed.</p>
+</header>
+
+<div class="callout why">
+  <p class="callout-title">Why this matters</p>
+  <p>Artifact 1 produces a run store with at least a hundred experiments and a claim that a loop found real improvements. A reviewer's first questions are "which of these changes mattered?" and "can I rerun row 37?". This chapter serves the Rust run-store step (<a href="05-rust-runner.html">chapter 05</a>) and the ablation behind the extension (<a href="06-write-up.html">chapter 06</a>). It builds on <a href="../../ml-foundations/chapters/04-reproducible-experiments.html">A0 chapter 4</a> (seeds and logs) and <a href="../../ml-foundations/chapters/22-running-candidates.html">A0 chapter 22</a> (caching by content hash and archives you can replay). After it you can design a two-level factorial experiment, read main effects and an interaction from it, say why one-change-at-a-time search misses things, and write a schema for SQLite, a small database engine that ships with Python, for a run store with a replay check. The lab's run store is this schema.</p>
+</div>
+
+<h2>What an ablation is</h2>
+
+<p>An <span class="term">ablation</span> removes or switches off one component of a system and measures how much worse (or better) it gets. The word comes from medicine, where tissue is removed to see what it did. In machine learning it answers "which parts of my recipe are doing the work?". The vocabulary is small:</p>
+
+<dl class="terms">
+  <dt><span class="term">Factor</span></dt><dd>One thing you can vary: the learning rate, whether a warm-down is used, the weight decay.</dd>
+  <dt><span class="term">Level</span></dt><dd>A value a factor takes. Two-level designs use "off" and "on", or "baseline" and "changed".</dd>
+  <dt><span class="term">Main effect</span></dt><dd>The average change in the score when a factor goes from its low level to its high level, averaged over the levels of the other factors.</dd>
+  <dt><span class="term">Interaction</span></dt><dd>A case where the effect of one factor depends on the level of another: two changes that help alone but not together, or only together.</dd>
+  <dt><span class="term">Confounding</span></dt><dd>When two changes are made together and cannot be separated afterwards. "I changed the optimiser and the data order" is confounded.</dd>
+</dl>
+
+<p>A research loop manufactures confounding. After a night, the kept configuration differs from the baseline by every accepted change, nine of them in the example of <a href="01-research-loop.html">chapter 01</a>. Each was accepted because it looked good against the configuration at that moment, in the order the agent tried them. That history is an unreliable guide to the contribution of each change, for the winner's-curse reason of <a href="02-proxies-noise.html">chapter 02</a> and because some accepted changes may have only mattered in the presence of an earlier one.</p>
+
+<h2>One at a time versus all corners</h2>
+
+<p>The natural way to find out which of three changes matters is to try them one at a time: add A, keep it if it helps, add B on top, and so on. It is cheap (one run per change) and it is exactly what the greedy loop does. Its blind spot is that it only ever visits some of the possible combinations. The alternative is a <span class="term">full factorial design</span>: run every combination of the factor levels. For three two-level factors that is 2 &times; 2 &times; 2 = 8 runs. In the picture below, the left square is the greedy path through two factors and the right cube is the factorial.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 290" role="img" aria-label="Left: a square with corners for A and B each on or off. A one-at-a-time search visits three corners and never visits B on with A off. Right: a cube with all eight corners of three factors run.">
+    
+    <text x="155" y="24" text-anchor="middle" class="t-sm t-bold">one at a time</text>
+    <rect x="80" y="40" width="150" height="150" class="box"/>
+    <circle cx="80" cy="190" r="9" class="f-blue"/>
+    <circle cx="230" cy="190" r="9" class="f-blue"/>
+    <circle cx="80" cy="40" r="9" class="f-red"/>
+    <circle cx="230" cy="40" r="9" class="f-blue"/>
+    <polyline points="80,190 230,190 230,40" fill="none" class="line-dash s-blue sw-2"/>
+    <text x="80" y="226" text-anchor="middle" class="t-xs t-muted">A off</text>
+    <text x="230" y="226" text-anchor="middle" class="t-xs t-muted">A on</text>
+    <text x="50" y="44" text-anchor="middle" class="t-xs t-muted">B on</text>
+    <text x="50" y="194" text-anchor="middle" class="t-xs t-muted">B off</text>
+    <text x="155" y="248" text-anchor="middle" class="t-xs tc-red">red corner (B on, A off) is never run</text>
+    <text x="540" y="24" text-anchor="middle" class="t-sm t-bold">full factorial, 2 x 2 x 2</text>
+    <polygon points="440,120 570,120 570,250 440,250" class="box"/>
+    <polygon points="500,60 630,60 630,190 500,190" class="box"/>
+    <line x1="440" y1="120" x2="500" y2="60" class="line"/>
+    <line x1="570" y1="120" x2="630" y2="60" class="line"/>
+    <line x1="570" y1="250" x2="630" y2="190" class="line"/>
+    <line x1="440" y1="250" x2="500" y2="190" class="line"/>
+    <circle cx="440" cy="120" r="9" class="f-green"/>
+    <circle cx="570" cy="120" r="9" class="f-green"/>
+    <circle cx="570" cy="250" r="9" class="f-green"/>
+    <circle cx="440" cy="250" r="9" class="f-green"/>
+    <circle cx="500" cy="60" r="9" class="f-green"/>
+    <circle cx="630" cy="60" r="9" class="f-green"/>
+    <circle cx="630" cy="190" r="9" class="f-green"/>
+    <circle cx="500" cy="190" r="9" class="f-green"/>
+    <text x="505" y="286" text-anchor="middle" class="t-xs t-muted">A: left off, right on</text>
+    <text x="654" y="126" text-anchor="start" class="t-xs t-muted">C on</text>
+    <text x="422" y="254" text-anchor="end" class="t-xs t-muted">B off</text>
+    <text x="422" y="124" text-anchor="end" class="t-xs t-muted">B on</text>
+    <text x="540" y="308" text-anchor="middle" class="t-xs tc-green">all 8 corners: 3 main effects and every interaction</text>
+  </svg>
+  <figcaption><strong>Which corners you visit decides what you can learn.</strong> The greedy path tests A, then B on top of A, and never sees B alone. The factorial runs every corner, so interactions are estimable.</figcaption>
+</figure>
+
+<p>The experiment below makes the difference concrete. The simulated truth, which the script knows and the experimenter does not, is that A (a higher learning rate) lowers the score by 0.004, B (a longer warm-down) lowers it by 0.003, C (more weight decay) does nothing, and A and B <em>interact</em>: both fix the same problem, so together they help 0.005 less than the sum of their separate effects. Noise has a standard deviation of 0.0008. The script runs the greedy search, then the eight-run factorial, and estimates each effect as the average score at the high level minus the average at the low level.</p>
+
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>greedy: baseline; baseline + A (keep if lower); then + B on top of A (keep if lower)</li>
+  <li>factorial: one run at each of the 8 corners of (A, B, C)</li>
+  <li>effect of a factor &larr; mean score where it is on &minus; mean where it is off</li>
+  <li>interaction A &times; B &larr; mean where A and B agree &minus; mean where they differ</li>
+</ol></div>
+
+<pre class="terminal" data-title="factorial.py"><code>"""One-at-a-time versus a 2^3 factorial design, on a simulated score.
+
+Three binary changes: A = higher learning rate, B = longer warm-down,
+C = more weight decay. True effects on val_bpb (negative helps):
+A -0.004, B -0.003, C 0, and an A x B interaction of +0.005 (they fix the
+same problem, so together they help less than the sum). Noise sd 0.0008.
+"""
+import itertools
+import random
+
+SIGMA = 0.0008
+rng = random.Random(5)
+
+def score(a, b, c):                       # each argument is 0 or 1
+    return (0.9200 - 0.004 * a - 0.003 * b + 0.005 * a * b
+            + rng.gauss(0, SIGMA))
+
+# ── 1. One-at-a-time, greedy: try A, keep it, then try B on top ──────────
+base = score(0, 0, 0)
+a_only = score(1, 0, 0)
+print("OFAT  baseline %.4f  +A %.4f  (%s)" %
+      (base, a_only, "keep A" if a_only &lt; base else "revert"))
+with_b = score(1, 1, 0)
+print("OFAT  +A+B %.4f vs +A %.4f  (%s)" %
+      (with_b, a_only, "keep B" if with_b &lt; a_only else "revert B"))
+
+# ── 2. Full factorial: all 8 corners, one run each ───────────────────────
+runs = {cell: score(*cell) for cell in itertools.product((0, 1), repeat=3)}
+print("\n A B C   val_bpb")
+for cell, v in runs.items():
+    print(" %d %d %d   %.4f" % (*cell, v))
+
+# ── 3. Effects from contrasts: mean at high minus mean at low ────────────
+def effect(sign):                         # sign(cell) is +1 or -1
+    hi = [v for c, v in runs.items() if sign(c) &gt; 0]
+    lo = [v for c, v in runs.items() if sign(c) &lt; 0]
+    return sum(hi) / len(hi) - sum(lo) / len(lo)
+
+print("\neffect (negative helps), standard error about %.4f" %
+      (SIGMA * (2 / 4) ** 0.5))
+for name, f in (("A", lambda c: 2 * c[0] - 1), ("B", lambda c: 2 * c[1] - 1),
+                ("C", lambda c: 2 * c[2] - 1),
+                ("A x B", lambda c: (2 * c[0] - 1) * (2 * c[1] - 1))):
+    print("  %-5s %+.4f" % (name, effect(f)))</code></pre>
+<pre class="terminal" data-title="output"><code>OFAT  baseline 0.9191  +A 0.9151  (keep A)
+OFAT  +A+B 0.9185 vs +A 0.9151  (revert B)
+
+ A B C   val_bpb
+ 0 0 0   0.9182
+ 0 0 1   0.9199
+ 0 1 0   0.9152
+ 0 1 1   0.9179
+ 1 0 0   0.9162
+ 1 0 1   0.9171
+ 1 1 0   0.9176
+ 1 1 1   0.9183
+
+effect (negative helps), standard error about 0.0006
+  A     -0.0005
+  B     -0.0006
+  C     +0.0015
+  A x B +0.0019</code></pre>
+
+<p>The greedy search accepts A and then rejects B, because B on top of A scored 0.9185, worse than A alone at 0.9151. It concludes that B is useless. In truth B helps by 0.003 on its own; the interaction cancelled that benefit once A was present. The greedy path never ran B without A, so it could not see this. A different order (B first) would have kept B and then rejected A. The answer depended on the order the ideas arrived in, which is a bad property for a conclusion.</p>
+
+<p>The factorial gets the whole picture from eight runs, each used several times. The A &times; B interaction is estimated at +0.0019: positive means the score goes up (worse) when both are on, matching the planted +0.005 diluted by the way contrasts average the corners. The main effects of A and B are small and negative (they help, on average over the other factor's levels), and each is estimated with a standard error of about 0.0006, from the formula for a difference of two four-run means.</p>
+
+<p>Notice the row for C. It shows +0.0015, which is 2.6 standard errors from zero, and in truth C does nothing. This is not a bug. With four effects estimated from one noisy table, there is a real chance that one of them looks significant. If you test four independent effects at the 5% level, the chance that at least one looks significant is about 1 &minus; 0.95<sup>4</sup> &asymp; 19%. This is the multiple-comparisons problem of chapter 02 again, in a small design. Two remedies are standard: replicate the experiment on fresh seeds (the same eight corners again) and require an effect to persist, and keep the number of factors small enough that you can afford replication.</p>
+
+<details class="deeper"><summary>Go deeper <span class="hint">optional</span></summary>
+<p>A full factorial grows as 2<sup>k</sup>: 8 runs for three factors, 128 for seven. A <span class="term">fractional factorial</span> runs a carefully chosen subset (half, a quarter) and accepts that some effects are confounded with each other, typically high-order interactions that are assumed negligible. In a five-minute loop, 2<sup>7</sup> runs is a night's budget, so for a handful of kept changes you can afford the full design; for twenty you cannot, and you would instead remove kept changes in groups (leave-one-out, or halves) and follow up on the ones that matter.</p>
+<p>The reverse direction is often more useful at the end of a night. Start from the final kept configuration and switch off each kept change in turn, paired over seeds. A change whose removal costs nothing was not earning its place and can be deleted, which the "simpler is better" rule of <code>program.md</code> rewards. A change whose removal costs more than the noise floor has evidence behind it that does not depend on the order in which the loop found it.</p>
+</details>
+
+<div class="callout warn">
+  <p class="callout-title">Common misconception</p>
+  <p>"Each kept change was tested, so the final configuration is the sum of independent gains." The change was tested <em>once, in the configuration of the moment, against one noisy baseline</em>. The sum of the reported gains is not the gain of the final configuration: the earlier example reported a gain 4.5 times the true one. Gains from different changes can overlap, as A and B did, and some changes were accepted on luck. The only reliable statement about the final configuration is a direct paired comparison of it against the baseline on fresh seeds.</p>
+</div>
+
+<h2>Run tracking: a row that can be replayed</h2>
+
+<p>The experiments above are only as useful as their record. A run store is a table with one row per run, and its purpose is to make three things possible later: finding the runs behind any number in a write-up, comparing runs that should be comparable, and rerunning a run to check it. Each purpose dictates columns.</p>
+
+<ul>
+  <li><strong>The config, exactly.</strong> Store the full configuration, in a canonical form (sorted keys, no whitespace), plus its hash. The same configuration always gives the same hash, so repeated runs of one config group together, and a cache keyed by hash (<a href="../../ml-foundations/chapters/22-running-candidates.html">A0 chapter 22</a>) can skip work already done.</li>
+  <li><strong>The seed and the code version.</strong> The seed fixes the randomness. The code version (the git commit of <code>train.py</code>) fixes the program. Without both, a stored config is a recipe for a different dish.</li>
+  <li><strong>The environment.</strong> Library versions, the GPU model and driver, and the step count actually reached under the time budget. Chapter 02 showed that the step count is a source of noise; store it.</li>
+  <li><strong>The outcome.</strong> A status (keep, discard, crash), the proxy score, the held-out score, the time taken, and the parent run (the kept run whose config this one edited). The parent column turns the table into a tree you can walk back from any kept run to the baseline.</li>
+</ul>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 245" role="img" aria-label="A chain: config, canonical JSON, sha1 hash, runs table, replay. Below: the columns kept per run, and a note that a replay that differs signals an undeclared source of randomness.">
+    <defs><marker id="ahRE04b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+    <rect x="20" y="50" width="124" height="60" rx="8" class="fs-green s-green sw-2"/><text x="82" y="77" text-anchor="middle" class="t-sm t-bold">config</text><text x="82" y="94" text-anchor="middle" class="t-xs t-muted">a dict</text>
+    <line x1="146" y1="80" x2="166" y2="80" class="line" marker-end="url(#ahRE04b)"/>
+    <rect x="168" y="50" width="124" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="230" y="77" text-anchor="middle" class="t-sm t-bold">canonical JSON</text><text x="230" y="94" text-anchor="middle" class="t-xs t-muted">sorted keys</text>
+    <line x1="294" y1="80" x2="314" y2="80" class="line" marker-end="url(#ahRE04b)"/>
+    <rect x="316" y="50" width="124" height="60" rx="8" class="fs-blue s-blue sw-2"/><text x="378" y="77" text-anchor="middle" class="t-sm t-bold">sha1 hash</text><text x="378" y="94" text-anchor="middle" class="t-xs t-muted">cfg_hash</text>
+    <line x1="442" y1="80" x2="462" y2="80" class="line" marker-end="url(#ahRE04b)"/>
+    <rect x="464" y="50" width="124" height="60" rx="8" class="fs-purple s-purple sw-2"/><text x="526" y="77" text-anchor="middle" class="t-sm t-bold">runs table</text><text x="526" y="94" text-anchor="middle" class="t-xs t-muted">one row per run</text>
+    <line x1="590" y1="80" x2="610" y2="80" class="line" marker-end="url(#ahRE04b)"/>
+    <rect x="612" y="50" width="124" height="60" rx="8" class="fs-yellow s-yellow sw-2"/><text x="674" y="77" text-anchor="middle" class="t-sm t-bold t-dark">replay</text><text x="674" y="94" text-anchor="middle" class="t-xs t-muted">re-run, compare</text>
+    <text x="380" y="150" text-anchor="middle" class="t-xs t-muted">the same config always gives the same bytes, so the same hash</text>
+    <rect x="20" y="170" width="330" height="56" rx="8" class="box"/><text x="185" y="195" text-anchor="middle" class="t-sm t-bold">columns kept per run</text><text x="185" y="212" text-anchor="middle" class="t-xs t-muted">parent, seed, status, proxy, held-out, seconds</text>
+    <rect x="400" y="170" width="340" height="56" rx="8" class="fs-red s-red sw-2"/><text x="570" y="195" text-anchor="middle" class="t-sm t-bold">if replay differs</text><text x="570" y="212" text-anchor="middle" class="t-xs t-muted">an undeclared source of randomness</text>
+  </svg>
+  <figcaption><strong>Make a run recoverable from its row.</strong> The hash identifies the config, the seed fixes the randomness, and the row stores the result. Replay is the test that you declared everything.</figcaption>
+</figure>
+
+<p>The script builds this table in SQLite (part of the Python standard library, and the same engine you will use from Rust). It records a baseline, three seeds of one candidate and a second candidate, then asks the questions a reviewer would ask: how many runs per config, with what mean proxy and held-out scores and what gap. Finally it replays a stored row and checks that the result is identical.</p>
+
+<div class="callout idea"><p class="callout-title">The idea</p>
+<ol>
+  <li>canonical form of a config &larr; JSON with sorted keys; cfg_hash &larr; first 8 hex digits of its sha1</li>
+  <li>every run inserts one row: parent, hash, config, seed, status, proxy, held-out, seconds</li>
+  <li>group by cfg_hash to see replicates; compute the mean gap between held-out and proxy</li>
+  <li>replay: read a row back, rerun its config with its seed, compare the numbers</li>
+</ol></div>
+
+<pre class="terminal" data-title="runstore.py"><code>"""A run store in SQLite: one row per run, replayable from its config."""
+import hashlib
+import json
+import random
+import sqlite3
+
+# ── 1. Schema: everything needed to replay a run, and to judge it ────────
+SCHEMA = """
+CREATE TABLE runs (
+  run_id     INTEGER PRIMARY KEY,
+  parent_id  INTEGER REFERENCES runs(run_id),  -- the kept run it edits
+  cfg_hash   TEXT NOT NULL,                    -- sha1 of canonical config
+  config     TEXT NOT NULL,                    -- canonical JSON
+  seed       INTEGER NOT NULL,
+  status     TEXT CHECK (status IN ('keep','discard','crash')),
+  proxy_bpb  REAL, heldout_bpb REAL,           -- NULL when it crashed
+  seconds    REAL
+);
+CREATE INDEX runs_hash ON runs(cfg_hash);"""
+
+def canon(cfg):                               # same dict -&gt; same bytes
+    return json.dumps(cfg, sort_keys=True, separators=(",", ":"))
+
+def train(cfg, seed):                         # deterministic stand-in
+    r = random.Random(canon(cfg) + str(seed))
+    base = 0.90 + 9 * (cfg["lr"] - 0.03) ** 2
+    return base + r.gauss(0, 0.003), base + 0.004 + r.gauss(0, 0.003)
+
+db = sqlite3.connect(":memory:")
+db.executescript(SCHEMA)
+
+# ── 2. Record runs, including three seeds of the same config ─────────────
+def record(parent, cfg, seed, status):
+    proxy, held = train(cfg, seed)
+    h = hashlib.sha1(canon(cfg).encode()).hexdigest()[:8]
+    cur = db.execute("INSERT INTO runs VALUES (NULL,?,?,?,?,?,?,?,?)",
+                     (parent, h, canon(cfg), seed, status, proxy, held, 301.5))
+    return cur.lastrowid
+
+root = record(None, {"lr": 0.05, "depth": 8}, 0, "keep")
+for seed in (0, 1, 2):
+    record(root, {"lr": 0.04, "depth": 8}, seed, "discard")
+record(root, {"lr": 0.035, "depth": 8}, 0, "keep")
+
+# ── 3. Queries a reviewer would ask ──────────────────────────────────────
+print("per config: runs, mean proxy, mean held-out, mean gap")
+for row in db.execute("""SELECT cfg_hash, config, COUNT(*), AVG(proxy_bpb),
+        AVG(heldout_bpb), AVG(heldout_bpb - proxy_bpb)
+        FROM runs GROUP BY cfg_hash ORDER BY MIN(run_id)"""):
+    print("  %s %-24s n=%d  %.4f  %.4f  gap %+.4f" % row)
+
+# ── 4. Replay: re-run a stored row from its config and compare ───────────
+run_id, cfg_json, seed, stored = db.execute(
+    "SELECT run_id, config, seed, proxy_bpb FROM runs WHERE run_id = 3"
+).fetchone()
+again, _ = train(json.loads(cfg_json), seed)
+print("replay of run %d: stored %.6f, again %.6f, identical: %s" %
+      (run_id, stored, again, stored == again))</code></pre>
+<pre class="terminal" data-title="output"><code>per config: runs, mean proxy, mean held-out, mean gap
+  aef45ea1 {"depth":8,"lr":0.05}    n=1  0.9026  0.9062  gap +0.0035
+  86e8fd4f {"depth":8,"lr":0.04}    n=3  0.9030  0.9040  gap +0.0010
+  3f9b4c3c {"depth":8,"lr":0.035}   n=1  0.9062  0.9098  gap +0.0036
+replay of run 3: stored 0.905935, again 0.905935, identical: True</code></pre>
+
+<p>Three runs of the lr 0.04 config sit under one hash with their mean scores, and the gap column (held-out minus proxy, so positive means the held-out score is worse) is recorded next to the score it qualifies. The replay line is the test of the design: re-running run 3 from its stored config and seed gives the identical number, 0.905935, because every source of randomness was declared. In this script that is trivial, since the stand-in is seeded from the config and seed. On a real GPU it is not, and the honest statement of the guarantee changes: with the same code, config, seed and library versions, a replay should land within the noise floor of the original (or exactly, if you enable deterministic kernels and accept the speed cost). A replay that differs by more than that signals an undeclared source of randomness, such as an unseeded data shuffle or a changed library version. Treat that as a bug to find before the night starts.</p>
+
+<div class="callout analogy">
+  <p class="callout-title">Analogy: a mixing desk</p>
+  <p>A sound engineer with a mixing desk of forty sliders knows that changing one slider at a time finds problems fast, and that two sliders can fight: raising the bass and lowering the low-mid might each sound better alone and muddy together. A good engineer writes down the position of every slider for each take, so a take can be recreated. A factorial design is a systematic pass over a few sliders; the run store is the sheet of slider positions.</p>
+  <p><em>Where it breaks down:</em> the engineer hears the result immediately and can undo it. A training run takes minutes and returns one noisy number, so you cannot tweak and listen. That is why the design has to be settled before you start.</p>
+</div>
+
+<div class="callout ds">
+  <p class="callout-title">Systems connection</p>
+  <p>A run store is an append-only log with a content-addressed key, the same pattern as a version-control object store or an event-sourced system. Rows are written once and never edited; a correction is a new row that points at the old one. The hash of the canonical config is a content address: equal inputs give equal keys, which is also what makes build caches and deduplicating storage work. The parent column is a pointer that makes the log a tree. If you have used a write-ahead log, an immutable audit trail or a package lockfile, you already know why "store what you ran, not what you meant to run" is the rule.</p>
+</div>
+
+<div class="callout note">
+  <p class="callout-title">State of play, October 2026</p>
+  <p>Two public records show these habits at work, both read on 15 October 2026. The <a href="https://github.com/KellerJordan/modded-nanogpt" target="_blank" rel="noopener">modded-nanogpt</a> README keeps a numbered table of records with, for each, a time, a description of what changed, a date and the contributors, and its listing credits individual techniques (for example the Muon optimiser, rotary embeddings, 8-bit floating-point (FP8) matrix multiplication and capturing a whole training step as a CUDA graph (CUDA is Nvidia's GPU programming platform)). Each record folder carries run logs, and the README requires enough of them to show significance (see chapter 02). nanochat's leaderboard likewise records for each entry the time, the validation score, a CORE score (a multi-task benchmark average), the metric in nanochat's README and a one-line description, such as "d26 +fp8" or "Dataset changed to NVIDIA ClimbMix". Neither is a schema you must copy. Both show the same habit: one row per claim, a description of the single change, and logs behind it. <strong>What may change:</strong> the records, scores and formats. The need for a row per run does not.</p>
+</div>
+
+<div class="callout try">
+  <p class="callout-title">Try it yourself</p>
+  <p>1. Run <code>factorial.py</code> after changing the random seed to 6, 7 and 8. Which effect looks significant each time, and is it ever C? 2. Duplicate the eight-corner block so each corner has two runs, and compute the standard error of an effect. By what factor did it shrink? 3. Add a column <code>git_commit</code> and a <code>steps</code> column to the schema in <code>runstore.py</code>, and write a query that lists runs whose step count is more than 5% below the median. 4. Break the replay on purpose: seed the stand-in with a fresh <code>random.Random()</code> and see the check fail. 5. Write a query that, for a kept run, walks the parent chain back to the baseline.</p>
+  <pre class="terminal" data-title="shell"><code><span class="prompt">$</span> <span class="cmd">python3 factorial.py</span>
+<span class="prompt">$</span> <span class="cmd">python3 runstore.py</span></code></pre>
+</div>
+
+<div class="callout key">
+  <p class="callout-title">Key takeaways</p>
+  <ul>
+    <li>An ablation toggles one component and measures the change. A loop's final configuration is a pile of confounded changes, so the ablation is how you earn the right to say which ones mattered.</li>
+    <li>One-at-a-time search visits few corners and can miss or reverse an effect through an interaction. A full factorial runs every combination and estimates main effects and interactions from the same runs.</li>
+    <li>With several effects estimated from one noisy table, one will often look significant by chance. Replicate on fresh seeds before believing it.</li>
+    <li>The sum of reported gains is not the gain of the final configuration. Compare the final configuration against the baseline directly, paired over seeds.</li>
+    <li>A run row stores the canonical config and its hash, the seed, the code version, the environment and step count, the status, the proxy and held-out scores and the parent. Replay a row to test that nothing random was left undeclared.</li>
+    <li>On a GPU, replay is exact only with deterministic kernels; otherwise expect agreement within the noise floor.</li>
+  </ul>
+</div>
+
+<h2>Further reading</h2>
+<ul class="sources">
+  <li><a href="https://github.com/KellerJordan/modded-nanogpt" target="_blank" rel="noopener">Jordan et al., <code>modded-nanogpt</code></a>. A public record log with a row per change and logs behind each; <a href="../cases/case-01-modded-nanogpt.html">Case 1</a> reads it as a research record.</li>
+  <li><a href="https://github.com/karpathy/nanochat" target="_blank" rel="noopener">Karpathy, <code>nanochat</code></a>. A leaderboard with one described change per entry.</li>
+  <li><a href="https://github.com/karpathy/autoresearch" target="_blank" rel="noopener">Karpathy, <code>autoresearch</code></a>. The <code>results.tsv</code> format: commit, val_bpb, memory, status, description.</li>
+  <li><a href="../../ml-foundations/chapters/04-reproducible-experiments.html">A0 chapter 4, Reproducible Experiments</a>, and <a href="../../ml-foundations/chapters/22-running-candidates.html">A0 chapter 22, Running Many Candidates Safely</a>. Seeds, pinned environments, hashes and replayable archives.</li>
+</ul>
+
+<section class="quiz">
+  <h2>Check your understanding</h2>
+  <div class="q" data-answer="2">
+    <p class="q-text">Why can a greedy one-change-at-a-time search wrongly reject a change that helps on its own?</p>
+    <ol class="q-options">
+      <li>Because it always runs the changes in the wrong order.</li>
+      <li>Because each change is tested with too many seeds.</li>
+      <li>Because the change is tested only on top of earlier accepted changes, and an interaction can cancel its benefit there.</li>
+      <li>Because ablations cannot detect help.</li>
+    </ol>
+    <div class="q-explain">B was tested only with A already on, where the interaction removed its benefit. The order is arbitrary rather than always wrong, and more seeds would not help the greedy path visit the missing corner.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">How many runs does a full factorial over four two-level factors need, and how many corners does one-change-at-a-time visit if it tests each change once?</p>
+    <ol class="q-options">
+      <li>16, and 5 (baseline plus four).</li>
+      <li>8, and 4.</li>
+      <li>4, and 16.</li>
+      <li>16, and 16.</li>
+    </ol>
+    <div class="q-explain">2<sup>4</sup> = 16 corners. The greedy search runs the baseline and then one extra run per change, 1 + 4 = 5, which visits only 5 of the 16 corners.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="q-text">In the factorial output, factor C (truly no effect) shows an effect of +0.0015 with a standard error of about 0.0006. What should you do?</p>
+    <ol class="q-options">
+      <li>Conclude that C hurts and remove it permanently.</li>
+      <li>Conclude that C has no effect because the true value was zero.</li>
+      <li>Ignore the whole table.</li>
+      <li>Treat it as a possible chance result among several estimated effects, and replicate on fresh seeds before acting.</li>
+    </ol>
+    <div class="q-explain">Four effects are estimated from one table, so the chance that at least one looks 2 standard errors out is about one in five. You cannot know the true value, which the script does but the experimenter does not. Acting on the first estimate would repeat the winner's-curse mistake; discarding the table wastes the other estimates.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="q-text">The reported gains of nine kept changes sum to 0.012, but a direct paired comparison of the final configuration against the baseline on fresh seeds gives 0.005. What is the most likely explanation?</p>
+    <ol class="q-options">
+      <li>The paired comparison is biased low.</li>
+      <li>Selection on noise inflated the individual gains, and some changes overlap, so the gains do not add.</li>
+      <li>The baseline changed.</li>
+      <li>Nine is too many changes to ablate.</li>
+    </ol>
+    <div class="q-explain">Both effects from chapter 02 and this chapter point the same way: kept gains are inflated by luck and gains can overlap through interactions. A paired comparison on fresh seeds is the unbiased check. The baseline is fixed by definition, and nine changes can be ablated in the leave-one-out way described above.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="q-text">Which column set is the minimum for a run row that can be replayed?</p>
+    <ol class="q-options">
+      <li>Canonical config, seed, code version, and the environment (including libraries and hardware).</li>
+      <li>Status and score only.</li>
+      <li>The agent's description of the idea and the score.</li>
+      <li>The hash of the score.</li>
+    </ol>
+    <div class="q-explain">Replay needs everything that determines the run: what to run, with which randomness, on which code and in which environment. A description or a score alone cannot recreate the run, and a hash of the score identifies nothing about how it was produced.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="q-text">A replay of a stored GPU run lands 0.0015 away from the original, inside a noise floor of 0.003. How should you read this?</p>
+    <ol class="q-options">
+      <li>The run store is broken.</li>
+      <li>The original run was wrong.</li>
+      <li>It is consistent with run-to-run nondeterminism; exact equality would need deterministic kernels, or a stricter bitwise check.</li>
+      <li>The replay proves the idea works.</li>
+    </ol>
+    <div class="q-explain">Within the noise floor means the replay is statistically consistent with the original. Bitwise equality is a stronger property you get only by removing nondeterminism. A single replay can neither prove nor disprove the idea; it checks that the record is complete.</div>
+  </div>
+</section>
+
+</article>
+</main>
+</div>
+</div>
+<script src="../../assets/js/catalog.js"></script>
+<script src="../../assets/js/main.js"></script>
+<script src="../../assets/js/quiz.js"></script>
+</body>
+</html>
