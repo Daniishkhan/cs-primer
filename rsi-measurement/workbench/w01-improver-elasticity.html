@@ -70,7 +70,7 @@
 <p>One seed is one trajectory of 32 proposals, and the 2- and 8-proposal points are read off the same trajectory when it reaches that step. That is how a loop with a stopping rule behaves: stopping at 8 is identical to the first 8 steps of a run that kept going. Twelve seeds run in parallel as separate processes. The script is <a href="code/w01/improver_elasticity.py"><code>code/w01/improver_elasticity.py</code></a>, and the same code split into cells is <a href="code/w01/improver_elasticity.ipynb"><code>improver_elasticity.ipynb</code></a>.</p>
 <div class="callout ds">
   <p class="callout-title">Systems connection</p>
-  <p>Three ordinary reliability habits matter here. Every paid reply is appended to a cache file the moment it arrives, so a crash loses nothing and a re-run is free and exactly reproducible. API calls retry with exponential backoff on rate limits and server errors. And model-written code is untrusted input: it is checked against a whitelist of syntax-tree nodes, run with a timer that interrupts a hang, and any failure counts as a rejected proposal and never crashes the loop. This is the thin first layer of defence; for anything adversarial you would add the process and network isolation of <a href="../../agents/chapters/20-sandboxing.html">sandboxes and permissions</a>.</p>
+  <p>Three ordinary reliability habits matter here. Every paid reply is appended to a cache file the moment it arrives, so a crash loses nothing and a re-run is free and exactly reproducible. API calls retry with exponential backoff on rate limits and server errors. And model-written code is untrusted input: it is checked against a whitelist of syntax-tree nodes, run in a separate process with CPU and memory limits that is killed after two seconds (a timer inside the same process cannot interrupt one long C-level operation), and any failure counts as a rejected proposal and never crashes the loop. This is the thin first layer of defence; for anything adversarial you would add the process and network isolation of <a href="../../agents/chapters/20-sandboxing.html">sandboxes and permissions</a>.</p>
 </div>
 <pre class="terminal" data-title="improver_elasticity.py" data-run="off"><code>"""An improver's elasticity: how much held-out gain does each dollar buy?
 
@@ -101,7 +101,8 @@ import math
 import os
 import random
 import re
-import signal
+import multiprocessing
+import resource
 import statistics
 import sys
 import time
@@ -176,30 +177,38 @@ def validate(src):
     return tree
 
 
-class Timeout(Exception):
-    pass
-
-
-def _alarm(signum, frame):
-    raise Timeout()
+def _score(src, insts, conn):
+    """Child process: hard CPU and memory limits, then score src."""
+    resource.setrlimit(resource.RLIMIT_CPU, (3, 3))            # seconds
+    resource.setrlimit(resource.RLIMIT_AS, (1 &lt;&lt; 30, 1 &lt;&lt; 30))  # 1 GiB
+    try:
+        space = {"__builtins__": BUILTINS}
+        exec(compile(validate(src), "&lt;candidate&gt;", "exec"), space)
+        fn = space["priority"]
+        conn.send(sum(pack(items, fn) for items in insts) / len(insts))
+    except Exception:                    # rejected or crashed
+        conn.send(None)
 
 
 def mean_bins(src, insts, seconds=2.0):
-    """Mean bins over insts, or None if src is rejected, crashes or hangs."""
+    """Mean bins over insts, or None if src is rejected, crashes or hangs.
+
+    The candidate runs in its own process with CPU and memory limits and
+    is killed after `seconds`, so even a single C-level operation that
+    never returns (9 ** 9 ** 9) cannot stall or exhaust the loop."""
+    ctx = multiprocessing.get_context("fork")
+    recv, send = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_score, args=(src, insts, send))
+    proc.start()
+    send.close()
     try:
-        tree = validate(src)
-        space = {"__builtins__": BUILTINS}
-        exec(compile(tree, "&lt;candidate&gt;", "exec"), space)
-        fn = space["priority"]
-        signal.signal(signal.SIGALRM, _alarm)
-        signal.setitimer(signal.ITIMER_REAL, seconds)
-        try:
-            total = sum(pack(items, fn) for items in insts)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        return total / len(insts)
-    except Exception:                    # a candidate never crashes the loop
-        return None
+        value = recv.recv() if recv.poll(seconds) else None
+    except EOFError:                     # the child died without answering
+        value = None
+    if proc.is_alive():
+        proc.kill()
+    proc.join()
+    return value
 
 
 # ── 3. The proposer: a model call, cached, with its cost ─────────────────

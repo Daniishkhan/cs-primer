@@ -27,7 +27,8 @@ import math
 import os
 import random
 import re
-import signal
+import multiprocessing
+import resource
 import statistics
 import sys
 import time
@@ -102,30 +103,38 @@ def validate(src):
     return tree
 
 
-class Timeout(Exception):
-    pass
-
-
-def _alarm(signum, frame):
-    raise Timeout()
+def _score(src, insts, conn):
+    """Child process: hard CPU and memory limits, then score src."""
+    resource.setrlimit(resource.RLIMIT_CPU, (3, 3))            # seconds
+    resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))  # 1 GiB
+    try:
+        space = {"__builtins__": BUILTINS}
+        exec(compile(validate(src), "<candidate>", "exec"), space)
+        fn = space["priority"]
+        conn.send(sum(pack(items, fn) for items in insts) / len(insts))
+    except Exception:                    # rejected or crashed
+        conn.send(None)
 
 
 def mean_bins(src, insts, seconds=2.0):
-    """Mean bins over insts, or None if src is rejected, crashes or hangs."""
+    """Mean bins over insts, or None if src is rejected, crashes or hangs.
+
+    The candidate runs in its own process with CPU and memory limits and
+    is killed after `seconds`, so even a single C-level operation that
+    never returns (9 ** 9 ** 9) cannot stall or exhaust the loop."""
+    ctx = multiprocessing.get_context("fork")
+    recv, send = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_score, args=(src, insts, send))
+    proc.start()
+    send.close()
     try:
-        tree = validate(src)
-        space = {"__builtins__": BUILTINS}
-        exec(compile(tree, "<candidate>", "exec"), space)
-        fn = space["priority"]
-        signal.signal(signal.SIGALRM, _alarm)
-        signal.setitimer(signal.ITIMER_REAL, seconds)
-        try:
-            total = sum(pack(items, fn) for items in insts)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        return total / len(insts)
-    except Exception:                    # a candidate never crashes the loop
-        return None
+        value = recv.recv() if recv.poll(seconds) else None
+    except EOFError:                     # the child died without answering
+        value = None
+    if proc.is_alive():
+        proc.kill()
+    proc.join()
+    return value
 
 
 # ── 3. The proposer: a model call, cached, with its cost ─────────────────
