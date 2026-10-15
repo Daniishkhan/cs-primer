@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from html.parser import HTMLParser
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CATALOG_JS = ("global.window={};require(process.argv[1]);"
@@ -220,6 +221,8 @@ def build(verify):
                 open(os.path.join(ddir, f"m{n}.py"), "w", encoding="utf-8").write(src)
                 card_path = os.path.join(ddir, f"m{n}.html")
                 card = open(card_path, encoding="utf-8").read().strip() if os.path.exists(card_path) else None
+                for problem in card_problems(card):
+                    print(f"  card {c['id']} {lab['id']} m{n}: {problem}")
                 milestones.append({
                     "n": n, "title": p["title"], "anchor": p["anchor"], "write": write,
                     "provided": [q for q in provided_all if q not in write and not q.startswith("_")],
@@ -255,6 +258,49 @@ def build(verify):
             print("  " + f)
         if failures:
             sys.exit(1)
+
+
+class _Checker(HTMLParser):
+    VOID = {"br", "hr", "img", "input", "path", "circle", "rect", "line", "polyline", "polygon", "use", "ellipse", "stop"}
+
+    def __init__(self):
+        super().__init__()
+        self.stack, self.errors = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in self.VOID:
+            self.stack.append(tag)
+        for k, v in attrs:
+            if k == "href" and v and v.startswith("../"):
+                self.errors.append(f"link {v} starts with ../ (cards live at the site root)")
+
+    def handle_endtag(self, tag):
+        if tag in self.VOID:
+            return
+        if self.stack and self.stack[-1] == tag:
+            self.stack.pop()
+        else:
+            self.errors.append(f"unexpected </{tag}>")
+
+
+def card_problems(card):
+    """Why a need-to-know card breaks its contract (authoring/drill-cards.md)."""
+    if card is None:
+        return []
+    out = []
+    if "—" in card:
+        out.append("contains an em-dash")
+    if "<!doctype" in card.lower() or "<body" in card.lower():
+        out.append("is a whole page, not a fragment")
+    p = _Checker()
+    p.feed(card)
+    out += p.errors
+    if p.stack:
+        out.append("unclosed <" + p.stack[-1] + ">")
+    words = len(re.findall(r"[A-Za-z][\w'-]*", re.sub(r"<pre.*?</pre>|<svg.*?</svg>|<[^>]+>", " ", card, flags=re.S)))
+    if words < 70 or words > 260:
+        out.append(f"{words} words of prose (aim for 100 to 200)")
+    return out
 
 
 def verify_drill(code_dir, src, n, label):

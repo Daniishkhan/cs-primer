@@ -151,7 +151,8 @@
   var labCache = {};
   function labDetails(lab) {
     if (!labCache[lab.key]) {
-      labCache[lab.key] = fetch(root + "/" + lab.dir + "drills/lab.json").then(function (r) {
+      // Revalidate rather than trust the HTTP cache: a new deploy's cards show up at once.
+      labCache[lab.key] = fetch(root + "/" + lab.dir + "drills/lab.json", { cache: "no-cache" }).then(function (r) {
         if (!r.ok) throw new Error(r.status + " " + lab.dir + "drills/lab.json");
         return r.json();
       });
@@ -236,7 +237,7 @@
       var card;
       if (m.card) {
         card = el("div", { class: "drill-card" }, [el("p", { class: "callout-title", text: "Need to know" })]);
-        card.insertAdjacentHTML("beforeend", rebase(m.card, lab));
+        card.insertAdjacentHTML("beforeend", m.card.replace(/(href|src)="(?!(?:[a-z]+:|#|\/|\.\/))/g, '$1="' + root + "/"));   // cards link from the site root
       } else {
         var paras = (m.explain.match(/<p>[\s\S]*?<\/p>/g) || []).slice(0, 2).join("");
         card = el("div", { class: "drill-card" }, [el("p", { class: "callout-title", text: "From the lab" })]);
