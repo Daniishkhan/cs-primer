@@ -633,8 +633,8 @@
         blurb: "A separate user, an allowlisting egress proxy and A9's loop inside it: one blocked exfiltration, and the overhead measured." }
     ],
     rsi: [
-      { id: "W1", file: "w01-improver-elasticity.html", title: "An Improver's Elasticity, Measured", machine: "vm", chapters: ["03"], time: "2 h", cost: "a few dollars of API calls",
-        blurb: "A10's lab agent at three budgets: gain against cost, fitted, and what it says about returns to spending." }
+      { id: "W1", file: "w01-improver-elasticity.html", title: "An Improver's Elasticity, Measured", machine: "vm", chapters: ["03"], time: "20 min", cost: "under a dollar of API calls",
+        blurb: "A small bin-packing improver with a real model as proposer, at several budgets: gain against cost, fitted, and what the elasticity says about returns to spending." }
     ]
   };
   window.CS_COURSES.forEach(function (co) { co.workbenches = WORKBENCHES[co.id] || []; });
