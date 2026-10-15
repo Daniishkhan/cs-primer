@@ -80,66 +80,28 @@
   /* ---------- A1: Machine Learning & Data Science ---------- */
   var ML_PARTS = [
     { title: "Orientation",            blurb: "What it means for a machine to learn, and why most of the work is not modelling." },
-    { title: "Framing Problems",       blurb: "Generalisation, metrics, exploratory analysis and baselines: deciding what to predict and how to judge it." },
-    { title: "Core Models",            blurb: "Linear models, regularisation, neighbours, trees and boosted ensembles." },
-    { title: "Unsupervised Learning",  blurb: "Finding structure without labels: clustering, projections and anomalies." },
-    { title: "Validation & Trust",     blurb: "Cross-validation, leakage, imbalance, calibration and explanations: whether to believe the number." },
-    { title: "Features & Competitions", blurb: "Feature engineering, time series, tabular foundation models and how competitions are won." },
-    { title: "From Model to Value",    blurb: "Proving a model helps in the real world, and keeping it helpful." }
+    { title: "Framing Problems",       blurb: "Generalisation and metrics: deciding what to predict and how to judge it." },
+    { title: "Validation",             blurb: "Cross-validation and leakage: whether to believe the number." }
   ];
   var ML_CHAPTERS = [
     { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                               blurb: "Learning from examples, the data-science loop, and where this course fits." },
     { id: "01", part: 1, depth: "deep",  file: "01-generalisation.html",      title: "What Learning Is: Generalisation",         blurb: "Training, validation and test sets, overfitting, underfitting and the no-free-lunch idea." },
     { id: "02", part: 1, depth: "deep",  file: "02-framing-metrics.html",     title: "Framing Problems & Choosing Metrics",      blurb: "Turning a business question into a prediction task with a metric that matches the cost of errors." },
-    { id: "03", part: 1, depth: "core",  file: "03-eda.html",                 title: "Exploratory Data Analysis",                blurb: "Distributions, missingness, duplicates, shifts between train and test, and the questions to ask first." },
-    { id: "04", part: 1, depth: "core",  file: "04-baselines.html",           title: "Baselines First",                          blurb: "Majority class, simple rules and linear models: the numbers every fancy model must beat." },
-    { id: "05", part: 2, depth: "deep",  file: "05-linear-models.html",       title: "Linear & Logistic Regression",             blurb: "Fitting lines and probabilities, gradient descent, and reading coefficients carefully." },
-    { id: "06", part: 2, depth: "deep",  file: "06-regularisation.html",      title: "Regularisation & the Bias-Variance Trade-off", blurb: "Why simpler models generalise, L1 and L2 penalties, and learning curves." },
-    { id: "07", part: 2, depth: "core",  file: "07-neighbours-bayes.html",    title: "Nearest Neighbours, Naive Bayes & Kernels", blurb: "Similarity-based and probabilistic classifiers, and the kernel trick in one picture." },
-    { id: "08", part: 2, depth: "deep",  file: "08-decision-trees.html",      title: "Decision Trees",                           blurb: "Splits, impurity, depth, and why a single tree is both readable and unstable." },
-    { id: "09", part: 2, depth: "deep",  file: "09-ensembles-boosting.html",  title: "Random Forests & Gradient Boosting",       blurb: "Bagging, boosting, XGBoost, LightGBM and CatBoost: why boosted trees rule tabular data." },
-    { id: "10", part: 3, depth: "core",  file: "10-clustering.html",          title: "Clustering",                               blurb: "k-means, hierarchical clustering and DBSCAN, and how to tell whether clusters are real." },
-    { id: "11", part: 3, depth: "core",  file: "11-dimensionality-reduction.html", title: "Dimensionality Reduction",             blurb: "PCA, t-SNE and UMAP: compressing and visualising high-dimensional data honestly." },
-    { id: "12", part: 3, depth: "core",  file: "12-anomaly-detection.html",   title: "Anomaly Detection",                        blurb: "Statistical, distance-based and isolation methods for finding the rare and the strange." },
-    { id: "13", part: 4, depth: "deep",  file: "13-cross-validation.html",    title: "Cross-Validation Done Right",              blurb: "k-fold, grouped, stratified and time-based splits that mirror how the model will be used." },
-    { id: "14", part: 4, depth: "deep",  file: "14-leakage.html",             title: "Leakage: The Silent Killer",               blurb: "Target leakage, train-test contamination and preprocessing leaks, and how to hunt them." },
-    { id: "15", part: 4, depth: "deep",  file: "15-imbalance-calibration.html", title: "Imbalance, Thresholds & Calibration",    blurb: "Rare positives, precision-recall trade-offs, choosing thresholds by cost, and calibrated probabilities." },
-    { id: "16", part: 4, depth: "core",  file: "16-interpretability.html",    title: "Interpreting Models",                      blurb: "Permutation importance, partial dependence and SHAP, and what explanations cannot tell you." },
-    { id: "17", part: 5, depth: "deep",  file: "17-feature-engineering.html", title: "Feature Engineering",                      blurb: "Encodings, aggregates, interactions, target encoding done safely, and features from domain knowledge." },
-    { id: "18", part: 5, depth: "core",  file: "18-time-series.html",         title: "Time Series Forecasting",                  blurb: "Trend, seasonality, lag features, backtesting and the forecasting baselines that are hard to beat." },
-    { id: "19", part: 5, depth: "intro", file: "19-tabular-deep-learning.html", title: "Tabular Deep Learning & Foundation Models", blurb: "Neural nets for tables, TabPFN-style foundation models, and when they beat boosted trees." },
-    { id: "20", part: 5, depth: "core",  file: "20-competitions.html",        title: "How Competitions Are Won",                 blurb: "Validation strategy, diverse models, stacking and the habits competition winners describe." },
-    { id: "21", part: 6, depth: "core",  file: "21-model-to-value.html",      title: "From Model to Value",                      blurb: "Offline metrics versus business outcomes, A/B tests, monitoring, drift and retraining." }
+    { id: "13", part: 2, depth: "deep",  file: "13-cross-validation.html",    title: "Cross-Validation Done Right",              blurb: "k-fold, grouped, stratified and time-based splits that mirror how the model will be used." },
+    { id: "14", part: 2, depth: "deep",  file: "14-leakage.html",             title: "Leakage: The Silent Killer",               blurb: "Target leakage, train-test contamination and preprocessing leaks, and how to hunt them." }
   ];
   var ML_LABS = [
-    { id: "L1", file: "lab-01-linear-models.html",  title: "Linear & Logistic Regression from Scratch", afterPart: 2, related: ["05", "06"], blurb: "Closed form and gradient descent, L1 and L2 penalties, and log-loss, all checked against hand values." },
-    { id: "L2", file: "lab-02-trees-boosting.html", title: "Trees & Gradient Boosting from Scratch",   afterPart: 2, related: ["08", "09"], blurb: "A CART tree, a random forest and a gradient-boosting regressor in plain Python." },
-    { id: "L3", file: "lab-03-unsupervised.html",   title: "k-means, PCA & Anomalies",                 afterPart: 3, related: ["10", "11", "12"], blurb: "k-means++ with restarts, PCA by power iteration, and an isolation-style anomaly score." },
-    { id: "L4", file: "lab-04-leakage-hunt.html",   title: "The Leakage Hunt",                         afterPart: 4, related: ["13", "14"], blurb: "Build a validation harness that catches four planted leaks, including one in preprocessing." },
-    { id: "L5", file: "lab-05-calibration.html",    title: "Thresholds & Calibration",                 afterPart: 4, related: ["15"],       blurb: "PR curves, cost-based thresholds, reliability diagrams, Platt scaling and isotonic regression." },
-    { id: "L6", file: "lab-06-features-stacking.html", title: "Feature Pipelines & Stacking",          afterPart: 5, related: ["17", "20"], blurb: "Leak-safe target encoding, out-of-fold predictions and a stacked ensemble that beats its parts." }
+    { id: "L4", file: "lab-04-leakage-hunt.html",   title: "The Leakage Hunt",                         afterPart: 2, related: ["13", "14"], blurb: "Build a validation harness that catches four planted leaks, including one in preprocessing." }
   ];
   var ML_CASES = [
-    { id: "C1", file: "case-01-netflix-prize.html",    title: "The Netflix Prize",                      pattern: "Ensembles vs deployability",  related: ["09", "20", "21"], blurb: "A million-dollar ensemble that won the competition and was never fully deployed." },
-    { id: "C2", file: "case-02-google-flu-trends.html", title: "Google Flu Trends",                     pattern: "Drift and spurious features", related: ["14", "21"],       blurb: "Search queries that predicted flu, until they did not, and what the post-mortems found." },
-    { id: "C3", file: "case-03-zillow-offers.html",    title: "Zillow Offers",                          pattern: "Model risk in a business",    related: ["18", "21"],       blurb: "An algorithmic home-buying business that shut down after its price forecasts met a turning market." },
-    { id: "C4", file: "case-04-amazon-recruiting.html", title: "A Recruiting Model That Learned Bias",  pattern: "Biased labels",               related: ["02", "16"],       blurb: "A CV-screening model trained on past hiring decisions, and why removing words did not fix it." },
-    { id: "C5", file: "case-05-xgboost.html",          title: "XGBoost: A System, Not Just an Algorithm", pattern: "Engineering wins benchmarks", related: ["09"],           blurb: "Sparsity-aware splits, cache-aware blocks and out-of-core training behind a competition favourite." },
-    { id: "C6", file: "case-06-competition-leaks.html", title: "Leaks That Won Competitions",           pattern: "Leakage",                     related: ["14", "20"],       blurb: "Row orders, IDs and timestamps that gave away the answer, and how organisers learned to prevent them." },
-    { id: "C7", file: "case-07-compas.html",           title: "COMPAS and Competing Definitions of Fair", pattern: "Calibration vs error balance", related: ["15", "16"],    blurb: "A risk score that was calibrated and still unequal in its errors, and why both sides were right." }
+    { id: "C2", file: "case-02-google-flu-trends.html", title: "Google Flu Trends",                     pattern: "Drift and spurious features", related: ["14"],       blurb: "Search queries that predicted flu, until they did not, and what the post-mortems found." },
+    { id: "C6", file: "case-06-competition-leaks.html", title: "Leaks That Won Competitions",           pattern: "Leakage",                     related: ["14"],       blurb: "Row orders, IDs and timestamps that gave away the answer, and how organisers learned to prevent them." }
   ];
   var ML_STUDIOS = [
-    { id: "S1", file: "studio-01-churn.html",       title: "Frame a Churn Prediction Problem",      afterPart: 1, related: ["02", "03", "04"], blurb: "From 'reduce churn' to a target, a prediction window, a metric, a baseline and an action." },
-    { id: "S2", file: "studio-02-fraud.html",       title: "Design a Fraud Detection Model",        afterPart: 4, related: ["13", "14", "15"], blurb: "Rare positives, delayed labels, adversaries and a review queue with limited capacity." },
-    { id: "S3", file: "studio-03-forecasting.html", title: "Design Demand Forecasting for a Retailer", afterPart: 5, related: ["17", "18"], blurb: "Thousands of products, promotions, stockouts and the decision the forecast feeds." }
+
   ];
   var ML_TOOLS = [
-    { id: "sklearn",  name: "scikit-learn",                 chapters: ["04", "05", "06", "07", "10", "11", "13"], blurb: "The reference library for classical ML, with a consistent fit/predict interface." },
-    { id: "gbdt",     name: "XGBoost, LightGBM & CatBoost", chapters: ["09", "17", "20"],             blurb: "The three boosted-tree libraries that dominate tabular problems." },
-    { id: "shap",     name: "SHAP",                         chapters: ["16"],                         blurb: "Per-prediction feature attributions, and plots to read them with care." },
-    { id: "tracking", name: "MLflow & Weights & Biases",    chapters: ["13", "21"],                   blurb: "Log every run's parameters, metrics and artefacts so results can be compared and reproduced." },
-    { id: "kaggle",   name: "Kaggle",                       chapters: ["20"],                         blurb: "Competitions, datasets, notebooks with free GPUs, and the forums where winners explain themselves." },
-    { id: "evidently", name: "Drift monitoring tools",      chapters: ["21"],                         blurb: "Compare live data with training data and alert on shifts." }
+
   ];
 
   /* ---------- A2: Deep Learning & Transformers from Scratch ---------- */
@@ -214,7 +176,7 @@
     { title: "Reinforcement Learning Foundations", blurb: "Bandits, MDPs, policy gradients and PPO: the RL a post-training engineer needs." },
     { title: "Post-training",          blurb: "Fine-tuning, LoRA, preference optimisation, reward models, RL with verifiable rewards and distillation." },
     { title: "Cheap Adaptation",       blurb: "Changing a model without full training: merging, evolution and adapters generated on demand." },
-    { title: "Inference",              blurb: "The KV cache, quantisation, serving engines, speculative decoding and the economics of a token." },
+    { title: "Inference Cost",         blurb: "What a token costs to produce, and how to meter a loop that spends them." },
     { title: "Judging Models",         blurb: "Did training help? Held-out evaluation for models you trained yourself." }
   ];
   var LLM_CHAPTERS = [
@@ -236,10 +198,6 @@
     { id: "15", part: 3, depth: "core",  file: "15-distillation.html",        title: "Distillation & Synthetic Data",            blurb: "Teaching small models with big ones, logit distillation, synthetic data and model collapse." },
     { id: "16", part: 4, depth: "core",  file: "16-model-merging.html",       title: "Model Merging & Evolutionary Merging",     blurb: "Averaging weights, task vectors, TIES and DARE, and searching for merge recipes by evolution." },
     { id: "17", part: 4, depth: "intro", file: "17-adapters-on-demand.html",  title: "Adapters on Demand",                       blurb: "Self-adaptive models and hypernetworks that generate adapters from a task description." },
-    { id: "18", part: 5, depth: "deep",  file: "18-kv-cache.html",            title: "The KV Cache & the Cost of Decoding",      blurb: "Prefill versus decode, why generation is memory-bound, and what the cache costs." },
-    { id: "19", part: 5, depth: "core",  file: "19-quantisation.html",        title: "Quantisation",                             blurb: "int8, int4 and fp8, per-channel scales, outliers, GPTQ and AWQ, and measuring the damage." },
-    { id: "20", part: 5, depth: "deep",  file: "20-serving-engines.html",     title: "Serving Engines",                          blurb: "Continuous batching, paged attention, prefix caching and how vLLM and SGLang work." },
-    { id: "21", part: 5, depth: "intro", file: "21-speculative-decoding.html", title: "Speculative Decoding & Other Speedups",   blurb: "Draft and verify, Medusa-style heads, and why the output is unchanged." },
     { id: "22", part: 5, depth: "core",  file: "22-token-economics.html",     title: "The Economics of a Token",                 blurb: "Throughput, latency, batch size and price: what a million tokens costs to serve." },
     { id: "23", part: 6, depth: "core",  file: "23-evaluating-models.html",   title: "Evaluating a Model You Trained",           blurb: "Held-out sets, evaluation harnesses, contamination checks and regressions on other skills." }
   ];
@@ -248,29 +206,24 @@
     { id: "L2", file: "lab-02-policy-gradient.html", title: "Policy Gradients & PPO",          afterPart: 2, related: ["06", "07", "08"], blurb: "REINFORCE with a baseline, then PPO's clipped objective with a KL penalty, on bandits and a gridworld." },
     { id: "L3", file: "lab-03-lora.html",           title: "LoRA from Scratch",                afterPart: 3, related: ["11"],             blurb: "Freeze a small model, train low-rank adapters, merge them back and compare parameter counts." },
     { id: "L4", file: "lab-04-dpo-grpo.html",       title: "DPO & GRPO on a Toy Policy",       afterPart: 3, related: ["12", "14"],       blurb: "Implement both losses on a policy over answers to arithmetic questions with a verifiable reward." },
-    { id: "L5", file: "lab-05-evolutionary-merge.html", title: "Evolutionary Model Merging",   afterPart: 4, related: ["16"],             blurb: "Merge task-specialised small models and evolve merge coefficients against a held-out task." },
-    { id: "L6", file: "lab-06-serving-sim.html",    title: "A Serving Simulator",              afterPart: 5, related: ["18", "20", "22"], blurb: "Simulate static and continuous batching with a paged KV cache, and measure throughput and latency." },
-    { id: "L7", file: "lab-07-quantisation.html",   title: "Quantise a Model",                 afterPart: 5, related: ["19"],             blurb: "Symmetric and asymmetric int8 and int4, per-channel scales and outlier handling, with error measured." }
+    { id: "L5", file: "lab-05-evolutionary-merge.html", title: "Evolutionary Model Merging",   afterPart: 4, related: ["16"],             blurb: "Merge task-specialised small models and evolve merge coefficients against a held-out task." }
   ];
   var LLM_CASES = [
     { id: "C1", file: "case-01-instructgpt.html",   title: "InstructGPT: RLHF in Practice",     pattern: "Learning from human preferences", related: ["10", "12"], blurb: "A smaller model that labellers preferred to one a hundred times larger." },
     { id: "C2", file: "case-02-deepseek-r1.html",   title: "DeepSeek-R1",                       pattern: "RL with verifiable rewards",      related: ["14", "15"], blurb: "Reasoning that emerged from reinforcement learning on checkable problems, then distilled into small models." },
     { id: "C3", file: "case-03-llama3-training.html", title: "Training Llama 3 at Scale",       pattern: "Reliability of training clusters", related: ["03", "05"], blurb: "Thousands of GPUs, hundreds of interruptions and the engineering that kept the run on track." },
-    { id: "C4", file: "case-04-vllm.html",          title: "vLLM and PagedAttention",           pattern: "Virtual memory for the KV cache", related: ["18", "20"], blurb: "Borrowing operating-system paging to stop wasting most of a GPU's cache memory." },
     { id: "C5", file: "case-05-evolutionary-merge.html", title: "Evolving Model Merges",        pattern: "Search over recipes",             related: ["16"],       blurb: "Evolutionary search that combined existing open models into new capabilities without gradient training." },
     { id: "C6", file: "case-06-sycophancy-rollback.html", title: "The Sycophancy Rollback",     pattern: "Reward signals with side effects", related: ["13"],      blurb: "A model update that became too eager to please, and what its developer said went wrong." },
     { id: "C7", file: "case-07-alpaca.html",        title: "Alpaca & Self-Instruct",            pattern: "Distillation from a stronger model", related: ["15", "10"], blurb: "Fifty-two thousand generated instructions, a few hundred dollars and a lesson about imitation." }
   ];
   var LLM_STUDIOS = [
     { id: "S1", file: "studio-01-domain-adaptation.html", title: "Adapt a Model for a Specialist Domain", afterPart: 3, related: ["10", "11", "23"], blurb: "Prompting, retrieval, fine-tuning or all three, under a fixed budget, with the evaluation that decides." },
-    { id: "S2", file: "studio-02-reasoning-model.html",  title: "Post-train a Small Reasoning Model",    afterPart: 3, related: ["14", "15"], blurb: "Pick the base model, reward, data and compute, and plan how you will catch reward hacking." },
-    { id: "S3", file: "studio-03-serving-platform.html", title: "Design an LLM Serving Platform",        afterPart: 5, related: ["18", "20", "22"], blurb: "Many models, many tenants, latency targets and a GPU bill: batching, routing, caching and autoscaling." }
+    { id: "S2", file: "studio-02-reasoning-model.html",  title: "Post-train a Small Reasoning Model",    afterPart: 3, related: ["14", "15"], blurb: "Pick the base model, reward, data and compute, and plan how you will catch reward hacking." }
   ];
   var LLM_TOOLS = [
     { id: "hf",      name: "Hugging Face transformers, TRL & PEFT", chapters: ["10", "11", "12", "14"], blurb: "Load models, fine-tune with LoRA and run SFT, DPO and GRPO trainers." },
     { id: "unsloth", name: "Unsloth",                        chapters: ["11", "14"],             blurb: "Memory-efficient fine-tuning and RL that fits on a single consumer or free GPU." },
-    { id: "vllm",    name: "vLLM & SGLang",                  chapters: ["18", "20", "22"],       blurb: "High-throughput open-source serving engines." },
-    { id: "llamacpp", name: "llama.cpp & Ollama",            chapters: ["19"],                   blurb: "Run quantised models locally on a laptop CPU or GPU." },
+    { id: "vllm",    name: "vLLM & SGLang",                  chapters: ["22"],       blurb: "High-throughput open-source serving engines." },
     { id: "lm-eval", name: "lm-evaluation-harness",          chapters: ["23"],                   blurb: "Run standard benchmarks on any model the same way every time." },
     { id: "nvidia-smi", name: "nvidia-smi & nvtop",          chapters: ["02", "05"],             blurb: "See GPU memory, utilisation and temperature while something runs." }
   ];
@@ -299,6 +252,7 @@
     { id: "10", part: 3, depth: "deep",  file: "10-context-engineering.html", title: "Context Engineering",                      blurb: "Context as a budget: selection, compaction, just-in-time retrieval and context rot." },
     { id: "11", part: 3, depth: "core",  file: "11-memory.html",              title: "Memory: Notes, Retrieval & Skills",        blurb: "Scratchpads, notes files, episodic and semantic memory, and libraries of reusable skills." },
     { id: "12", part: 3, depth: "core",  file: "12-long-context.html",        title: "Long Context versus Retrieval",            blurb: "When to put everything in the window, when to retrieve, and how to measure the difference." },
+    { id: "23", part: 3, depth: "deep",  file: "23-dense-retrieval.html",    title: "Dense Retrieval",                 blurb: "Embeddings for search, contrastive training with in-batch negatives, and when a vector index beats keywords." },
     { id: "13", part: 4, depth: "deep",  file: "13-workflow-patterns.html",   title: "Workflow Patterns",                        blurb: "Chaining, routing, parallelising, orchestrator-workers and evaluator-optimiser loops as plain code." },
     { id: "14", part: 4, depth: "deep",  file: "14-multi-agent.html",         title: "Multi-Agent Systems",                      blurb: "Orchestrators and sub-agents, token costs, coordination failures and when one agent is better." },
     { id: "15", part: 4, depth: "deep",  file: "15-durable-execution.html",   title: "Durable Execution for Agents",             blurb: "Event logs, checkpoints, idempotent side effects, resumption and human approval gates." },
@@ -342,71 +296,6 @@
     { id: "containers", name: "Docker sandboxes",              chapters: ["20", "18"],             blurb: "Give an agent a disposable machine with only the access it needs." }
   ];
 
-  /* ---------- A5: Retrieval, Search & Document AI ---------- */
-  var RET_PARTS = [
-    { title: "Orientation",            blurb: "Why getting the right evidence in front of a model is most of the work." },
-    { title: "Lexical Search",         blurb: "Analysers, inverted indexes, BM25 and query understanding." },
-    { title: "Measuring Retrieval",    blurb: "Relevance metrics, test collections and public benchmarks, before any model choice." },
-    { title: "Dense Retrieval",        blurb: "Embeddings, rerankers, late interaction, learned sparse vectors and hybrid search." },
-    { title: "Vector Indexes",         blurb: "Approximate nearest-neighbour search and retrieval with filters and permissions." },
-    { title: "The RAG System",         blurb: "Retrieval-augmented generation end to end: chunking, rewriting, citations and failure modes." },
-    { title: "Document AI",            blurb: "PDFs, layout, OCR, tables and forms, and retrieving pages as images." }
-  ];
-  var RET_CHAPTERS = [
-    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                               blurb: "Search, retrieval and RAG, and the documents they have to cope with." },
-    { id: "01", part: 1, depth: "core",  file: "01-text-analysis.html",       title: "Text Analysis",                            blurb: "Tokenising, normalising, stemming and analysers, and why index and query must agree." },
-    { id: "02", part: 1, depth: "deep",  file: "02-bm25.html",                title: "Inverted Indexes & BM25",                  blurb: "Postings, term frequency, document frequency and length normalisation, derived and tuned." },
-    { id: "03", part: 1, depth: "core",  file: "03-query-understanding.html", title: "Query Understanding",                      blurb: "Spelling correction, synonyms, expansion, intent and the long tail of queries." },
-    { id: "04", part: 2, depth: "deep",  file: "04-relevance-metrics.html",   title: "Relevance Metrics",                        blurb: "Precision, recall, MRR, MAP and nDCG: what each rewards and which question it answers." },
-    { id: "05", part: 2, depth: "deep",  file: "05-test-collections.html",    title: "Building a Test Collection",               blurb: "Queries, judgements, pooling and guidelines: a gold set you can trust in a week." },
-    { id: "06", part: 2, depth: "core",  file: "06-retrieval-benchmarks.html", title: "Public Benchmarks & Their Limits",        blurb: "BEIR, MTEB and domain benchmarks as shortlist filters, not decisions." },
-    { id: "07", part: 3, depth: "deep",  file: "07-dense-retrieval.html",     title: "Dense Retrieval",                          blurb: "Bi-encoders, contrastive training, hard negatives and fine-tuning an embedder." },
-    { id: "08", part: 3, depth: "core",  file: "08-rerankers.html",           title: "Rerankers",                                blurb: "Cross-encoders and LLM rerankers: precision at the top for a price." },
-    { id: "09", part: 3, depth: "core",  file: "09-late-interaction-sparse.html", title: "Late Interaction & Learned Sparse",    blurb: "ColBERT's token-level matching and SPLADE's learned term weights." },
-    { id: "10", part: 3, depth: "deep",  file: "10-hybrid-search.html",       title: "Hybrid Search & Rank Fusion",              blurb: "Combining lexical and dense results with reciprocal rank fusion and score normalisation." },
-    { id: "11", part: 4, depth: "deep",  file: "11-ann-indexes.html",         title: "Approximate Nearest-Neighbour Search",     blurb: "HNSW, IVF and product quantisation, and the recall, latency and memory triangle." },
-    { id: "12", part: 4, depth: "core",  file: "12-filters-permissions.html", title: "Filters, Metadata & Permissions",          blurb: "Pre- and post-filtering, tenant isolation and document-level access control in retrieval." },
-    { id: "13", part: 5, depth: "deep",  file: "13-rag-end-to-end.html",      title: "RAG End to End",                           blurb: "Ingest, index, retrieve, assemble, generate and cite: the whole pipeline and its knobs." },
-    { id: "14", part: 5, depth: "deep",  file: "14-chunking.html",            title: "Chunking & Contextual Retrieval",          blurb: "Fixed, structural and semantic chunks, chunk context, and parent-child retrieval." },
-    { id: "15", part: 5, depth: "core",  file: "15-agentic-retrieval.html",   title: "Query Rewriting, Agentic Retrieval & GraphRAG", blurb: "Decomposing questions, iterative search, knowledge graphs and when each pays off." },
-    { id: "16", part: 5, depth: "deep",  file: "16-grounded-citations.html",  title: "Grounded Answers & Citations",             blurb: "Making every claim traceable to a span, and checking that the span supports it." },
-    { id: "17", part: 5, depth: "deep",  file: "17-rag-failures.html",        title: "How RAG Fails",                            blurb: "Missed retrieval, wrong chunk, ignored context, stale sources and confident synthesis." },
-    { id: "18", part: 6, depth: "deep",  file: "18-pdf-layout.html",          title: "PDFs & Layout",                            blurb: "What a PDF really contains, born-digital versus scanned, reading order and layout analysis." },
-    { id: "19", part: 6, depth: "deep",  file: "19-ocr.html",                 title: "OCR: Classical Engines to Vision-Language Models", blurb: "Detection and recognition, Tesseract to VLM-based OCR, error rates and hallucinated text." },
-    { id: "20", part: 6, depth: "core",  file: "20-tables-forms.html",        title: "Tables, Forms & Key-Value Extraction",     blurb: "Table structure recognition, form fields, schemas and validating extracted values." },
-    { id: "21", part: 6, depth: "core",  file: "21-visual-retrieval.html",    title: "Visual Document Retrieval",                blurb: "Embedding page images directly with ColPali-style models, and when that beats OCR." },
-    { id: "22", part: 6, depth: "intro", file: "22-multilingual.html",        title: "Multilingual & Multi-Script Documents",    blurb: "Scripts without spaces, mixed languages, right-to-left text and cross-lingual retrieval." }
-  ];
-  var RET_LABS = [
-    { id: "L1", file: "lab-01-bm25.html",           title: "A Search Engine with BM25",         afterPart: 1, related: ["01", "02"],       blurb: "An analyser, an inverted index, BM25 scoring and top-k retrieval, tested on a small corpus." },
-    { id: "L2", file: "lab-02-retrieval-eval.html", title: "A Retrieval Evaluation Harness",    afterPart: 2, related: ["04", "05"],       blurb: "Precision, recall, MRR and nDCG from judgements, with confidence intervals and a paired comparison." },
-    { id: "L3", file: "lab-03-hybrid.html",         title: "Hybrid Retrieval & Reranking",      afterPart: 3, related: ["07", "08", "10"], blurb: "Dense vectors, BM25, reciprocal rank fusion and a reranker, each measured with your harness." },
-    { id: "L4", file: "lab-04-hnsw.html",           title: "HNSW from Scratch",                 afterPart: 4, related: ["11"],             blurb: "Build a hierarchical navigable small-world graph and chart recall against search effort." },
-    { id: "L5", file: "lab-05-rag-citations.html",  title: "RAG with Verified Citations",       afterPart: 5, related: ["13", "14", "16"], blurb: "Chunk, retrieve, answer with citations and reject any answer whose quotes are not in the source." },
-    { id: "L6", file: "lab-06-document-pipeline.html", title: "A Document Understanding Pipeline", afterPart: 6, related: ["18", "19", "20"], blurb: "From OCR boxes to reading order, sections and tables, with character error rate measured." }
-  ];
-  var RET_CASES = [
-    { id: "C1", file: "case-01-contextual-retrieval.html", title: "Contextual Retrieval",     pattern: "Context before embedding",   related: ["14", "10"], blurb: "Prepending chunk context, hybrid search and reranking, and the failure rates each step removed." },
-    { id: "C2", file: "case-02-bert-search.html",   title: "BERT Comes to Web Search",          pattern: "Understanding queries",      related: ["03", "07"], blurb: "When a search engine started reading the little words in queries." },
-    { id: "C3", file: "case-03-lost-in-the-middle.html", title: "Lost in the Middle",           pattern: "Long context is not free",   related: ["13", "agt:12"], blurb: "Models that used evidence at the start and end of the context and missed it in the middle." },
-    { id: "C4", file: "case-04-air-canada.html",    title: "The Chatbot's Promise: Air Canada", pattern: "Grounded answers are a liability question", related: ["16", "17"], blurb: "A tribunal held an airline to a refund policy its chatbot made up." },
-    { id: "C5", file: "case-05-faiss.html",         title: "FAISS: Billion-Scale Similarity Search", pattern: "Compressed vectors",    related: ["11"],       blurb: "Product quantisation and GPU search that made nearest neighbours over billions of vectors practical." },
-    { id: "C6", file: "case-06-colpali.html",       title: "ColPali: Retrieving Pages as Images", pattern: "Skip the OCR",            related: ["21", "09"], blurb: "Embedding page screenshots directly, and a benchmark built to test it." },
-    { id: "C7", file: "case-07-open-document-parsers.html", title: "Open Document Conversion Pipelines", pattern: "Layout models + OCR", related: ["18", "19", "20"], blurb: "How Docling and olmOCR turn PDFs into structured text, and how they were evaluated." }
-  ];
-  var RET_STUDIOS = [
-    { id: "S1", file: "studio-01-enterprise-search.html", title: "Design Enterprise Search with Permissions", afterPart: 4, related: ["10", "11", "12"], blurb: "Many sources, per-document access control, freshness and relevance across a whole company." },
-    { id: "S2", file: "studio-02-policy-assistant.html",  title: "Design a Policy & Regulation Assistant",   afterPart: 5, related: ["13", "16", "17"], blurb: "Answers people will act on, from a corpus that changes, with citations a reviewer can check." },
-    { id: "S3", file: "studio-03-document-processing.html", title: "Design a Document-Processing Pipeline", afterPart: 6, related: ["18", "19", "20"], blurb: "Millions of scanned forms and invoices a month, with extraction accuracy and human review." }
-  ];
-  var RET_TOOLS = [
-    { id: "opensearch", name: "Elasticsearch & OpenSearch",   chapters: ["01", "02", "10"],       blurb: "The standard open-source search engines, with BM25, analysers and vector search." },
-    { id: "vector-dbs", name: "pgvector, Qdrant & friends",   chapters: ["11", "12"],             blurb: "Vector indexes inside Postgres or as dedicated databases." },
-    { id: "sbert",    name: "sentence-transformers",          chapters: ["07", "08"],             blurb: "Load, run and fine-tune embedding models and cross-encoders." },
-    { id: "ir-eval",  name: "ranx & pytrec_eval",              chapters: ["04", "05"],             blurb: "Standard implementations of retrieval metrics to check your own against." },
-    { id: "docling",  name: "Docling, Marker & MinerU",       chapters: ["18", "20"],             blurb: "Open-source PDF-to-structure converters." },
-    { id: "ocr",      name: "Tesseract & PaddleOCR",          chapters: ["19", "22"],             blurb: "Classical and deep-learning OCR engines you can run locally." }
-  ];
 
   /* ---------- A6: Evals, Guardrails & Safe Operation ---------- */
   var EVL_PARTS = [
@@ -459,7 +348,7 @@
     { id: "C4", file: "case-04-attacker-moves-second.html", title: "The Attacker Moves Second",  pattern: "Adaptive attacks",            related: ["13", "14"], blurb: "Published prompt-injection defences re-tested against attackers who adapt, and what survived." },
     { id: "C5", file: "case-05-tau-bench.html",      title: "tau-bench: Agents with Simulated Users", pattern: "End-state grading",     related: ["08"],       blurb: "Grading an agent by the database it leaves behind, and reliability measured as pass^k." },
     { id: "C6", file: "case-06-leaderboard-illusion.html", title: "The Leaderboard Illusion",    pattern: "Rankings can be gamed",       related: ["09"],       blurb: "Private testing, selective disclosure and sampling rates behind a popular model arena." },
-    { id: "C7", file: "case-07-ai-overviews.html",   title: "Glue on Pizza: Search Answers Go Wrong", pattern: "Bad sources, confident answers", related: ["11", "17", "ret:17"], blurb: "AI-generated search summaries that repeated jokes and satire as fact, and the fixes that followed." }
+    { id: "C7", file: "case-07-ai-overviews.html",   title: "Glue on Pizza: Search Answers Go Wrong", pattern: "Bad sources, confident answers", related: ["11", "17"], blurb: "AI-generated search summaries that repeated jokes and satire as fact, and the fixes that followed." }
   ];
   var EVL_STUDIOS = [
     { id: "S1", file: "studio-01-eval-program.html", title: "Design the Eval Program for an Assistant", afterPart: 2, related: ["01", "03", "06"], blurb: "Who labels, what is measured, how often, which numbers block a release and who signs off." },
@@ -482,8 +371,7 @@
     { title: "Open-Endedness",         blurb: "Algorithms that keep inventing new problems, judges of interestingness and lifelong agents." },
     { title: "LLMs as Search Operators", blurb: "Inference-time search, program evolution and evolving prompts and agents." },
     { title: "Meta Agents",            blurb: "Agents that design agents, improve their own code and run experiments." },
-    { title: "Integrity",              blurb: "Evaluator hacking, held-out evaluation and safety for systems that change themselves." },
-    { title: "Applied",                blurb: "When evolutionary search earns its place in a real product." }
+    { title: "Integrity",              blurb: "Evaluator hacking, held-out evaluation and safety for systems that change themselves." }
   ];
   var OE_CHAPTERS = [
     { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                               blurb: "Objectives, search and open-ended discovery, and what this course builds." },
@@ -506,8 +394,7 @@
     { id: "14", part: 4, depth: "core",  file: "14-automated-science.html",   title: "Automated Science",                        blurb: "The AI Scientist: ideas, experiments, papers and automated review, and their limits." },
     { id: "15", part: 5, depth: "deep",  file: "15-evaluator-hacking.html",   title: "Evaluator Hacking & Reward Hacking",       blurb: "Search finds every loophole in the scorer: famous examples and how to harden evaluators." },
     { id: "16", part: 5, depth: "deep",  file: "16-held-out-evaluation.html", title: "Held-Out Evaluation for Self-Improvers",   blurb: "Separate search, selection and test sets, and the statistics of picking the best of many." },
-    { id: "17", part: 5, depth: "core",  file: "17-self-modification-safety.html", title: "Safety of Self-Modifying Systems",     blurb: "Sandboxes, lineage tracking, human oversight and objectives that resist gaming." },
-    { id: "18", part: 6, depth: "core",  file: "18-search-in-products.html",  title: "Search Inside Real Products",              blurb: "Evolving prompts, rules and heuristics for a business, and when simpler methods win." }
+    { id: "17", part: 5, depth: "core",  file: "17-self-modification-safety.html", title: "Safety of Self-Modifying Systems",     blurb: "Sandboxes, lineage tracking, human oversight and objectives that resist gaming." }
   ];
   var OE_LABS = [
     { id: "L1", file: "lab-01-mcts.html",           title: "Bandits & Monte Carlo Tree Search", afterPart: 1, related: ["01"],             blurb: "Epsilon-greedy, UCB and Thompson sampling, then MCTS that plays a small game well." },
@@ -540,68 +427,6 @@
     { id: "evotorch", name: "Evolution-strategy libraries",  chapters: ["02"],                   blurb: "CMA-ES and friends for black-box optimisation." }
   ];
 
-  /* ---------- A8: Applied AI Delivery Studio (capstone) ---------- */
-  var AID_PARTS = [
-    { title: "Orientation",            blurb: "What applied and forward-deployed AI engineers actually do all day." },
-    { title: "Discovery",              blurb: "Interviews, requirements under ambiguity, expert knowledge and whether AI is the right tool." },
-    { title: "Building the Proof",     blurb: "Prototypes that test the riskiest assumption, evaluation plans and model choices." },
-    { title: "Domains",                blurb: "Finance, healthcare, law and government: what each one cares about and forbids." },
-    { title: "Delivery",               blurb: "From proof of concept to production, restricted environments, cost and security review." },
-    { title: "Productisation & Communication", blurb: "Turning research into products, writing for customers, and getting hired." }
-  ];
-  var AID_CHAPTERS = [
-    { id: "00", part: 0, depth: "intro", file: "00-start-here.html",          title: "Start Here",                               blurb: "The applied AI engineer's job, and how the studios in this capstone work." },
-    { id: "01", part: 1, depth: "deep",  file: "01-discovery-interviews.html", title: "Discovery Interviews",                    blurb: "Asking about past behaviour, not opinions; finding the real problem behind the requested feature." },
-    { id: "02", part: 1, depth: "deep",  file: "02-requirements-ambiguity.html", title: "Requirements Under Ambiguity",          blurb: "Turning a vague goal into decisions, constraints and success metrics both sides sign." },
-    { id: "03", part: 1, depth: "deep",  file: "03-expert-knowledge.html",    title: "Capturing Expert Knowledge",               blurb: "Shadowing, think-aloud sessions and worked examples: turning tacit judgement into rubrics and data." },
-    { id: "04", part: 1, depth: "core",  file: "04-feasibility.html",         title: "Is AI the Right Tool?",                    blurb: "Feasibility, error tolerance, data availability and risk: a triage before anyone builds." },
-    { id: "05", part: 2, depth: "deep",  file: "05-riskiest-assumption.html", title: "Prototype the Riskiest Assumption",        blurb: "Build the smallest thing that could prove you wrong, in days, not months." },
-    { id: "06", part: 2, depth: "deep",  file: "06-evaluation-plans.html",    title: "Evaluation Plans Customers Trust",         blurb: "Gold sets from the customer's own work, agreed metrics and comparison with the current process." },
-    { id: "07", part: 2, depth: "core",  file: "07-choosing-models.html",     title: "Choosing Models",                          blurb: "Frontier APIs, open-weight models and on-premises deployment, chosen by evidence and constraints." },
-    { id: "08", part: 3, depth: "core",  file: "08-finance.html",             title: "Finance",                                  blurb: "Lending, research, compliance and wealth management, with model risk management and audit." },
-    { id: "09", part: 3, depth: "core",  file: "09-healthcare.html",          title: "Healthcare & Life Sciences",               blurb: "Clinical documentation, patient safety, medical-device rules and protected health data." },
-    { id: "10", part: 3, depth: "core",  file: "10-legal.html",               title: "Legal & Compliance",                       blurb: "Contracts, discovery and research, privilege and confidentiality, and verifying every citation." },
-    { id: "11", part: 3, depth: "core",  file: "11-public-sector.html",       title: "Public Sector & Government",               blurb: "Citizen services, analysts and caseworkers, procurement, transparency and accountability." },
-    { id: "12", part: 4, depth: "deep",  file: "12-poc-to-production.html",   title: "From Proof of Concept to Production",      blurb: "Why most pilots stall, production gates, integration, support and change management." },
-    { id: "13", part: 4, depth: "core",  file: "13-restricted-environments.html", title: "Restricted Environments",              blurb: "On-premises and air-gapped deployment, data residency and a limited menu of approved models." },
-    { id: "14", part: 4, depth: "core",  file: "14-cost-roi.html",            title: "Cost Models & Return on Investment",       blurb: "Unit economics per task, total cost of ownership and an honest return-on-investment case." },
-    { id: "15", part: 4, depth: "core",  file: "15-security-review.html",     title: "Security Reviews for AI Systems",          blurb: "The questions a customer's security team will ask, and the evidence pack that answers them." },
-    { id: "16", part: 5, depth: "core",  file: "16-research-to-product.html", title: "Turning Research into Products",           blurb: "From a paper and a repository to an interface, SLOs, documentation and support." },
-    { id: "17", part: 5, depth: "deep",  file: "17-writing-for-customers.html", title: "Writing for Customers",                  blurb: "Status reports, analysis memos and presenting a failure honestly to the people paying." },
-    { id: "18", part: 5, depth: "deep",  file: "18-getting-hired.html",       title: "Take-Homes, Portfolios & Interviews",      blurb: "What applied AI teams test, how to scope a take-home, and a portfolio that proves judgement." },
-    { id: "19", part: 5, depth: "intro", file: "19-where-next.html",          title: "Where Next",                               blurb: "Keeping up without drowning, and the next steps after this path." }
-  ];
-  var AID_LABS = [
-    { id: "L1", file: "lab-01-brief-to-eval.html",  title: "From Brief to Evaluation Kit",      afterPart: 2, related: ["02", "06"],       blurb: "Turn a customer brief and sample documents into a validated gold set, rubric and acceptance thresholds." },
-    { id: "L2", file: "lab-02-cost-model.html",     title: "A Cost & Latency Model",            afterPart: 4, related: ["14", "07"],       blurb: "Price a workload across models, caching and batching, and find the cheapest option that meets the bar." },
-    { id: "L3", file: "lab-03-pii-pipeline.html",   title: "A PII Redaction & Audit Pipeline",  afterPart: 4, related: ["13", "15"],       blurb: "Detect and redact personal data, keep reversible tokens for authorised users and log every access." },
-    { id: "L4", file: "lab-04-take-home.html",      title: "A Take-Home, End to End",           afterPart: 5, related: ["05", "06", "18"], blurb: "A timed document-QA system graded by hidden tests, with the memo that goes with it." }
-  ];
-  var AID_CASES = [
-    { id: "C1", file: "case-01-klarna.html",        title: "Klarna's AI Assistant",             pattern: "Automation claims meet customers", related: ["06", "12"], blurb: "An assistant said to do the work of hundreds of agents, and the later decision to bring humans back." },
-    { id: "C2", file: "case-02-morgan-stanley.html", title: "A Research Assistant for Financial Advisers", pattern: "Evals before rollout", related: ["06", "08"], blurb: "An assistant over a firm's own research library, gated by an evaluation framework built with experts." },
-    { id: "C3", file: "case-03-nyc-mycity.html",    title: "A City's Chatbot Gives Illegal Advice", pattern: "Public-sector accountability", related: ["11", "04"], blurb: "A government business-advice chatbot that told owners they could break the law." },
-    { id: "C4", file: "case-04-forward-deployed.html", title: "The Forward-Deployed Engineer",  pattern: "Engineers embedded with customers", related: ["01", "12"], blurb: "How embedding engineers with customers became a model for AI companies." },
-    { id: "C5", file: "case-05-legal-ai-rollout.html", title: "Rolling Out AI in a Law Firm",   pattern: "Expert users, verification culture", related: ["10", "03"], blurb: "Pilots, verification rules and adoption when every answer must be checked by a professional." },
-    { id: "C6", file: "case-06-bank-lending-workflow.html", title: "An Expert Workflow for Bank Lending", pattern: "Decompose expert reasoning", related: ["03", "08"], blurb: "A loan-document assistant built by structuring expert judgement, with feedback loops calibrated to reviewers." }
-  ];
-  var AID_STUDIOS = [
-    { id: "S1", file: "studio-01-contract-review.html",  title: "Take-Home: Contract Clause Review",   afterPart: 2, related: ["05", "06", "10"], blurb: "A legal team wants risky clauses flagged in supplier contracts. Scope it, build the proof, report." },
-    { id: "S2", file: "studio-02-analyst-assistant.html", title: "Take-Home: An Analyst's Research Assistant", afterPart: 2, related: ["05", "06", "08"], blurb: "Answer questions over annual reports with numbers that tie to the page they came from." },
-    { id: "S3", file: "studio-03-claims-triage.html",    title: "Take-Home: Insurance Claims Triage", afterPart: 3, related: ["04", "06"],       blurb: "Route incoming claims with attachments, and decide what never goes to a model." },
-    { id: "S4", file: "studio-04-citizen-services.html", title: "Take-Home: Citizen Services Q&A",    afterPart: 3, related: ["11", "06"],       blurb: "A government help service that must be accurate, accessible and accountable." },
-    { id: "S5", file: "studio-05-clinical-notes.html",   title: "Take-Home: Clinical Note Summaries", afterPart: 3, related: ["09", "06"],       blurb: "Summaries clinicians can trust, with omissions measured as carefully as errors." },
-    { id: "S6", file: "studio-06-support-automation.html", title: "Take-Home: Support Automation with Refunds", afterPart: 4, related: ["12", "14", "15"], blurb: "Automate part of a support queue with money at stake, and prove the savings." },
-    { id: "S7", file: "studio-07-coding-assistant-rollout.html", title: "Take-Home: Rolling Out a Coding Assistant", afterPart: 4, related: ["12", "14"], blurb: "A 300-engineer company wants AI coding tools. Plan the rollout and measure the effect honestly." },
-    { id: "S8", file: "studio-08-productise-research.html", title: "Take-Home: Productise a Research Prototype", afterPart: 5, related: ["16", "17"], blurb: "A promising research repository, a customer who wants it next quarter, and everything in between." }
-  ];
-  var AID_TOOLS = [
-    { id: "demo-uis", name: "Gradio & Streamlit",            chapters: ["05"],                   blurb: "A usable demo in an afternoon, so customers react to something real." },
-    { id: "fastapi",  name: "FastAPI",                       chapters: ["12", "16"],             blurb: "Typed Python web APIs with generated documentation." },
-    { id: "compose",  name: "Docker Compose",                chapters: ["13", "12"],             blurb: "Package a whole system so a customer can run it inside their own network." },
-    { id: "pii-tools", name: "Presidio for redaction",       chapters: ["15", "09"],             blurb: "Detect and anonymise personal data before it leaves a boundary." },
-    { id: "writing",  name: "Writing & diagram tools",       chapters: ["17", "18"],             blurb: "Markdown, Mermaid and a memo template for status reports and analysis write-ups." }
-  ];
 
 
   window.CS_DEPTH_LABEL = { deep: "Deep dive", core: "Core", intro: "Quick intro" };
@@ -628,10 +453,6 @@
       tagline: "The tool loop, tool design, function calling, MCP and A2A, context engineering, workflows, multi-agent systems, deep research, computer use and agent security.",
       status: "done", parts: AGT_PARTS, chapters: AGT_CHAPTERS, labs: AGT_LABS, cases: AGT_CASES, studios: AGT_STUDIOS, tools: AGT_TOOLS,
       spine: ["01", "02", "03", "04", "05", "10", "11", "13", "18", "19", "20"] },
-    { id: "ret", dir: "retrieval", track: "ai", num: "A5", mark: "RS", title: "Retrieval, Search & Document AI", subtitle: "the right evidence, with a source",
-      tagline: "BM25, relevance metrics, dense and hybrid retrieval, vector indexes, RAG with citations, and PDFs, OCR, tables and visual retrieval.",
-      status: "done", parts: RET_PARTS, chapters: RET_CHAPTERS, labs: RET_LABS, cases: RET_CASES, studios: RET_STUDIOS, tools: RET_TOOLS,
-      spine: ["07", "11"] },
     { id: "evl", dir: "evals", track: "ai", num: "A6", mark: "EV", title: "Evals, Guardrails & Safe Operation", subtitle: "knowing that it works",
       tagline: "Error analysis, LLM judges, eval statistics, domain benchmarks, agent evals, hallucination, prompt injection, guardrails, observability and governance.",
       status: "done", parts: EVL_PARTS, chapters: EVL_CHAPTERS, labs: EVL_LABS, cases: EVL_CASES, studios: EVL_STUDIOS, tools: EVL_TOOLS,
@@ -640,10 +461,6 @@
       tagline: "MCTS, evolution, novelty and quality-diversity, open-ended algorithms, LLM-guided program evolution, meta agents and the integrity of self-improvement.",
       status: "done", parts: OE_PARTS, chapters: OE_CHAPTERS, labs: OE_LABS, cases: OE_CASES, studios: OE_STUDIOS, tools: OE_TOOLS,
       spine: ["00", "19", "01", "02", "20", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "21", "14", "15", "16", "17", "18"] },
-    { id: "aid", dir: "ai-delivery", track: "ai", num: "A8", mark: "AD", title: "Applied AI Delivery Studio", subtitle: "capstone: from brief to production",
-      tagline: "Discovery, requirements under ambiguity, prototypes, evaluation plans, domains, production delivery, security reviews, writing for customers and getting hired.",
-      status: "done", parts: AID_PARTS, chapters: AID_CHAPTERS, labs: AID_LABS, cases: AID_CASES, studios: AID_STUDIOS, tools: AID_TOOLS,
-      spine: [] }
   ];
 
   /* Workbench: the chapters' ideas with real tools on a real machine (page
@@ -652,8 +469,6 @@
      (the least the page needs); cost is for the GPU part at rented prices. */
   var WORKBENCHES = {
     llm: [
-      { id: "W1", file: "w01-kv-cache.html", title: "The KV Cache, Measured", machine: "laptop", chapters: ["18"], time: "20 min, +1 h on a GPU", cost: "GPU part: about an hour of a 24 GB card",
-        blurb: "Predict the cache from config.json, read the real tensors, then find how many 4k conversations fit on one GPU." },
       { id: "W2", file: "w02-training-memory.html", title: "Where Training Memory Goes", machine: "gpu", chapters: ["02"], time: "1 h", cost: "about an hour of a 24 GB card",
         blurb: "Weights, gradients, optimiser state and activations: predict each, then watch max_memory_allocated step by step." },
       { id: "W3", file: "w03-lora-qlora.html", title: "LoRA, then QLoRA, on a Real Model", machine: "gpu", chapters: ["11"], time: "2 h", cost: "about two hours of a 24 GB card",
@@ -661,13 +476,7 @@
       { id: "W4", file: "w04-dpo.html", title: "DPO on a Small Preference Set", machine: "gpu", chapters: ["12"], time: "2 h", cost: "about two hours of a 24 GB card",
         blurb: "Train with TRL's DPO on a few thousand pairs and watch the implicit reward margin chapter 12 derives." },
       { id: "W5", file: "w05-grpo.html", title: "GRPO on a Verifiable Task", machine: "gpu", chapters: ["14"], time: "3 h", cost: "about three hours of a 24 GB card",
-        blurb: "Group-relative advantages on arithmetic with a checkable answer: reward curves, response length and a reward hack." },
-      { id: "W6", file: "w06-quantisation.html", title: "Quantise and Measure Perplexity", machine: "gpu", chapters: ["19"], time: "1.5 h", cost: "about 90 minutes of a 24 GB card",
-        blurb: "16, 8 and 4 bits: predict the memory, measure it, and measure what perplexity pays for it." },
-      { id: "W7", file: "w07-serving.html", title: "Serve with vLLM and Load-Test It", machine: "gpu", chapters: ["20", "18"], time: "2 h", cost: "about two hours of a 24 GB card",
-        blurb: "A real serving engine under load: throughput, time to first token and the latency knee, against chapter 20's model." },
-      { id: "W8", file: "w08-speculative.html", title: "Speculative Decoding, Timed", machine: "gpu", chapters: ["21"], time: "1 h", cost: "about an hour of a 24 GB card",
-        blurb: "A small draft model and a large target: predict the speed-up from the acceptance rate, then time it." }
+        blurb: "Group-relative advantages on arithmetic with a checkable answer: reward curves, response length and a reward hack." }
     ],
     dl: [
       { id: "W1", file: "w01-pytorch.html", title: "PyTorch by Hand", machine: "laptop", chapters: ["05"], time: "1 h",
@@ -681,17 +490,11 @@
       { id: "W5", file: "w05-word-vectors.html", title: "Word Vectors from Real Text", machine: "laptop", chapters: ["06"], time: "1 h",
         blurb: "Skip-gram with negative sampling in PyTorch on text8; analogies, neighbours and what the loss curve says." }
     ],
-    ml: [
-      { id: "W1", file: "w01-scikit-learn.html", title: "The Same Models in scikit-learn", machine: "laptop", chapters: ["05", "06", "09"], time: "1.5 h",
-        blurb: "Your lab code against scikit-learn on the same data: coefficients, cross-validation and boosting, compared number by number." }
-    ],
-    ret: [
-      { id: "W1", file: "w01-real-embedders.html", title: "Real Embedders and a Reranker", machine: "laptop", chapters: ["07", "08"], time: "1 h",
-        blurb: "sentence-transformers and a cross-encoder on the course corpus: recall and nDCG against the stand-in embedder." }
-    ],
     agt: [
       { id: "W1", file: "w01-local-model-agent.html", title: "Your Agent Loop on a Local Model", machine: "laptop", chapters: ["01", "02"], time: "1 h",
-        blurb: "Lab 1's loop against a model running in Ollama: what changes when the scripted model becomes a real one." }
+        blurb: "Lab 1's loop against a model running in Ollama: what changes when the scripted model becomes a real one." },
+      { id: "W2", file: "w02-real-embedders.html", title: "Real Embedders and a Reranker", machine: "laptop", chapters: ["23"], time: "1 h",
+        blurb: "sentence-transformers and a cross-encoder on a small corpus: recall and nDCG against the stand-in embedder." }
     ],
     evl: [
       { id: "W1", file: "w01-real-judge.html", title: "A Real Judge, Calibrated", machine: "laptop", chapters: ["03", "04"], time: "1.5 h",
@@ -702,10 +505,6 @@
         blurb: "Lab 3's bin-packing evolver with a local model writing the mutations, scored on held-out instances." },
       { id: "W2", file: "w02-funsearch-gpu.html", title: "Evolution at Scale on a GPU", machine: "gpu", chapters: ["09", "15"], time: "3 h", cost: "about three hours of a 24 GB card",
         blurb: "The same evolver served by vLLM: hundreds of samples a minute, islands, and the evaluator hacks that appear at scale." }
-    ],
-    aid: [
-      { id: "W1", file: "w01-serverless-endpoint.html", title: "Deploy a Model as a Serverless Endpoint", machine: "gpu", chapters: ["12"], time: "2 h", cost: "pay per request, plus build time",
-        blurb: "Package a quantised model as a RunPod Serverless worker: cold starts, scaling to zero and cost per thousand requests." }
     ]
   };
   window.CS_COURSES.forEach(function (co) { co.workbenches = WORKBENCHES[co.id] || []; });
