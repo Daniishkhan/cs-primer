@@ -221,6 +221,20 @@ def m2():
         "the candidate could read the signing key")
     assert "HOME" not in seen_env and "PATH" not in seen_env, (
         f"the candidate inherited an environment: {seen_env}")
+    # The key also sits in /proc/<evaluator pid>/environ. A candidate of
+    # the same user must not be able to read it there (Linux only).
+    if sys.platform.startswith("linux"):
+        peek = ("import os\ntry:\n    data = open('/proc/%d/environ' % "
+                "os.getppid(), 'rb').read()\n    print('READ', "
+                "b'EVAL_KEY' in data)\nexcept OSError as e:\n    "
+                "print('DENIED', type(e).__name__)\n" + labcore.STUB)
+        seen_proc = genuine_reply(peek, t.task_id, 0)["diagnostics"]["stdout"]
+        assert "READ True" not in seen_proc and KEY.hex() not in seen_proc, (
+            "the candidate read the key from /proc/<evaluator>/environ; "
+            "the evaluator must pop EVAL_KEY and make itself non-dumpable")
+        proc_note = "; /proc/<pid>/environ closed to the candidate"
+    else:
+        proc_note = "; /proc check skipped (not Linux)"
     # The loop must pass only EVAL_KEY to the evaluator.
     fd, path = tempfile.mkstemp()
     os.close(fd)
@@ -248,7 +262,8 @@ def m2():
     raises("task", lambda: run(t.fast_src, 0, evaluator_cmd=canned(other)))
     raises("format", lambda: run(t.fast_src, 0, evaluator_cmd=canned("oops")))
     return ("pass, wrong-answer and timeout verdicts verified; a faked clock, "
-            "a printed envelope and a key hunt all fail;\n"
+            "a printed envelope and a key hunt all fail"
+            f"{proc_note};\n"
             f"5 lying evaluators rejected (slow candidate killed from outside "
             f"in {slow_s:.2f} s)")
 

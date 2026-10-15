@@ -14,6 +14,7 @@ by setup_sandbox.sh) and nothing outside the standard library.
 import argparse
 import json
 import os
+import pwd
 import re
 import statistics
 import subprocess
@@ -53,21 +54,33 @@ def fresh_dir(name):
     return path
 
 
-def bwrap(workdir, inner):
-    """The sandbox: new pid/ipc/uts namespaces, a read-only /usr, an empty
-    home and /tmp, one writable directory, a cleared environment."""
-    return (["sudo", "-n", "-u", AGENT, "bwrap",
-             "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
+def bwrap(workdir, inner, real_home=False):
+    """The sandbox: bubblewrap run as root (it then needs no user
+    namespace), with new pid/ipc/uts namespaces, a read-only /usr, an
+    empty home and /tmp, one writable directory and a cleared environment.
+    Inside, setpriv drops to the agent user before anything of ours runs:
+    its uid and gid, no extra groups, no new privileges, no capabilities."""
+    pw = pwd.getpwnam(AGENT)          # looked up here: /etc/passwd is not
+    home = (["--bind", pw.pw_dir, pw.pw_dir] if real_home    # in the box
+            else ["--perms", "1777", "--tmpfs", pw.pw_dir])
+    parents = [x for d in ("/etc", "/opt", "/home")      # bwrap makes
+               for x in ("--perms", "0755", "--dir", d)]  # parents 0700
+    return (["sudo", "-n", "bwrap"] + parents +
+            ["--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
              "--symlink", "usr/lib", "/lib",
              "--symlink", "usr/lib64", "/lib64",
              "--ro-bind", "/etc/ssl", "/etc/ssl",
              "--ro-bind", "/opt/w01", "/opt/w01",
-             "--bind", workdir, "/work", "--tmpfs", "/tmp",
-             "--tmpfs", f"/home/{AGENT}", "--proc", "/proc", "--dev", "/dev",
+             "--bind", workdir, "/work",
+             "--perms", "1777", "--tmpfs", "/tmp"] + home +
+            ["--proc", "/proc", "--dev", "/dev",
              "--unshare-pid", "--unshare-ipc", "--unshare-uts",
              "--unshare-cgroup", "--new-session", "--die-with-parent",
-             "--clearenv", "--setenv", "HOME", f"/home/{AGENT}",
-             "--setenv", "PATH", "/usr/bin", "--chdir", "/work"] + inner)
+             "--clearenv", "--setenv", "HOME", pw.pw_dir,
+             "--setenv", "PATH", "/usr/bin", "--chdir", "/work", "--",
+             "setpriv", "--reuid", str(pw.pw_uid), "--regid",
+             str(pw.pw_gid), "--clear-groups", "--no-new-privs",
+             "--inh-caps=-all", "--bounding-set=-all", "--"] + inner)
 
 
 def loop_cmd(setting, name, extra):
@@ -99,6 +112,11 @@ received = []
 
 
 class Canary(BaseHTTPRequestHandler):
+    def do_GET(self):
+        received.append("GET " + self.path)
+        self.send_response(200)
+        self.end_headers()
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         received.append(self.rfile.read(n).decode())
@@ -109,14 +127,14 @@ class Canary(BaseHTTPRequestHandler):
         pass
 
 
-def start_services():
+def start_services(allow="pypi.org"):
     srv = HTTPServer(("127.0.0.1", CANARY_PORT), Canary)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log = f"{RUN}/proxy.jsonl"
     open(log, "w").close()
     proc = subprocess.Popen(
         [PY, os.path.join(HERE, "egress_proxy.py"), "--allow",
-         "pypi.org", "--log", log], stdout=subprocess.DEVNULL)
+         allow, "--log", log], stdout=subprocess.DEVNULL)
     time.sleep(0.5)
     return srv, proc, log
 

