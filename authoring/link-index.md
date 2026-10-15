@@ -2,6 +2,40 @@
 
 Paths are from the site root. From a page in `<course>/chapters/`, link to another page as `../../<path>` (same course: `../chapters/…`, `../labs/…`). Ids in the form `course:chapter` (`oe:15`) are what `related` and the artifact lists use.
 
+## Leg 1 · From Five Rides to a Learning Loop  (id "taxi", folder taxi/)
+
+- taxi/index.html · course roadmap
+
+Part 0: Numbers that describe a ride
+- taxi/chapters/01-a-guess.html · ch 01 · intro · A Guess, and How Wrong It Is: Five real rides, a fare formula with two knobs, and a number that says how wrong it is.
+- taxi/chapters/02-a-ride-is-a-vector.html · ch 02 · intro · A Ride Is a Vector: A ride as a list of numbers, and the dot product: one weighted sum is a model.
+- taxi/chapters/03-many-rides-are-a-matrix.html · ch 03 · intro · Many Rides Are a Matrix: All 6,367 rides at once: rows, columns, shapes, and why a tensor exists.
+- taxi/chapters/04-a-loss.html · ch 04 · intro · A Loss: One number for how wrong the model is over every ride: the mean squared error.
+
+Part 1: Learning the knobs
+- taxi/chapters/05-the-loss-surface.html · ch 05 · intro · The Loss Surface: Turn one knob and watch the loss: a curve with a bottom, and the idea of looking for it.
+- taxi/chapters/06-downhill-by-nudging.html · ch 06 · intro · Downhill by Nudging: The slope by nudging each weight, and a step against it: gradient descent, by hand.
+- taxi/chapters/07-the-exact-gradient.html · ch 07 · intro · The Exact Gradient: The slope from the formula instead of nudging, and the check that both agree.
+- taxi/chapters/08-a-training-loop.html · ch 08 · intro · A Training Loop: Step after step, the loss falls; with the wrong learning rate it explodes.
+- taxi/chapters/09-features-on-the-same-scale.html · ch 09 · intro · Features on the Same Scale: Miles and minutes live on different scales; standardise them and the loop behaves.
+
+Part 2: Autograd
+- taxi/chapters/10-a-number-that-remembers.html · ch 10 · intro · A Number That Remembers How It Was Made: A Value that records its parents and its operation: the seed of autograd.
+- taxi/chapters/11-how-much-each-input-mattered.html · ch 11 · intro · How Much Each Input Mattered: The local gradient of +, * and relu: what each parent contributed.
+- taxi/chapters/12-backward.html · ch 12 · intro · Backward: Order the graph, then walk it in reverse with the chain rule: autograd.
+- taxi/chapters/13-the-linear-model-on-value.html · ch 13 · intro · The Linear Model, Rebuilt on Value: The same loss on Values; autograd's gradient agrees with step 7 to four decimals.
+
+Part 3: A bigger model, honestly measured
+- taxi/chapters/14-rides-the-model-never-saw.html · ch 14 · intro · Rides the Model Never Saw: Hold rides out, measure there, and see where a straight line fails.
+- taxi/chapters/15-a-small-network.html · ch 15 · intro · A Small Network: One hidden layer and a bend: a network that could draw a curve through the fares, if the fares need one.
+- taxi/chapters/16-training-in-batches.html · ch 16 · intro · Training in Batches: Shuffle, batch, step: the training loop every library runs.
+
+Part 4: Experiments you can trust
+- taxi/chapters/17-the-noise-floor.html · ch 17 · intro · The Noise Floor: Run it five times and see how much the score moves on its own.
+- taxi/chapters/18-a-run-store.html · ch 18 · intro · A Run Store: Every run logged as one line, with a hash of its configuration.
+- taxi/chapters/19-keep-or-revert.html · ch 19 · intro · Keep or Revert: Keep a change only when it beats the best by more than the noise.
+- taxi/chapters/20-the-loop.html · ch 20 · intro · The Loop: A search that proposes, runs, logs and keeps or reverts: Artifact 1 in miniature.
+
 ## A0 · Math & Code for Machine Learning  (id "mlf", folder ml-foundations/)
 
 - ml-foundations/index.html · course roadmap

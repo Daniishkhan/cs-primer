@@ -478,7 +478,9 @@
     if (this.printed) this.show("printed");
   };
 
-  Cell.prototype.toggleEdit = function () {
+  // quiet: open without taking focus (a page that opens the editor on load
+  // must not scroll the reader down to it).
+  Cell.prototype.toggleEdit = function (quiet) {
     var self = this;
     if (this.cm) {            // Done: back to the highlighted view of the current code
       var src = this.cm.getValue();
@@ -526,7 +528,7 @@
       self.cm.on("change", function () {
         save(self.key, self.refreshEdited() ? self.cm.getValue() : null);
       });
-      self.cm.focus();
+      if (!quiet) self.cm.focus();
       self.setEditLabel("Done");
     }, function () {
       self.setEditLabel("Edit");

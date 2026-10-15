@@ -28,6 +28,8 @@ The courses (id, folder):
 | A11 AI Control & Sandbox Security | ctl | control/ |
 | A12 Measuring Recursive Self-Improvement | rsi | rsi-measurement/ |
 
+Before the courses comes **Leg 1** (id `taxi`, folder `taxi/`, catalog track `"leg"`): a build-along of twenty step pages that grows one program from five taxi rides to a learning loop. Its pages follow `authoring/legs.md`, not the chapter skeleton below.
+
 There is no A5 or A8: those courses were removed in October 2026 (only Dense Retrieval survives, as A4 chapter 23). Never link to `retrieval/` or `ai-delivery/`.
 
 The path is built around **four public artifacts** (section 17): a reader works through it to produce research a frontier lab would read. Examples still come from many domains, and companies appear only as sources or case material. Write in English; do not build Japanese-specific content.

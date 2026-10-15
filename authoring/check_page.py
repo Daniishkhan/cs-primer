@@ -269,7 +269,33 @@ def lint(path, cat, out):
             continue
         if not (0 <= ans < q["options"]):
             errs.append(f"quiz question {n}: data-answer={ans} but {q['options']} options")
-    if kind == "chapter" and len(p.qs) < 4:
+    leg = bool(course and course["track"] == "leg")
+    if kind == "chapter" and leg:
+        # A leg's step page: one program grown one function at a time, checked in the page.
+        entry = next((e for e in course["chapters"] if e["file"] == os.path.basename(rel)), None)
+        m = re.search(r'<div class="step-workspace"([^>]*)>', src)
+        if not m:
+            errs.append('step page has no <div class="step-workspace">')
+        else:
+            attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1)))
+            if entry and attrs.get("data-step") != str(int(entry["id"])):
+                errs.append(f'step-workspace data-step should be "{int(entry["id"])}", is {attrs.get("data-step")!r}')
+            if attrs.get("data-dir") != "../code/":
+                errs.append('step-workspace data-dir should be "../code/"')
+            for f in attrs.get("data-files", "").split():
+                if not os.path.exists(os.path.join(ROOT, course["dir"], "code", f)):
+                    errs.append(f"step-workspace data-files names a missing file: {f}")
+            if entry:
+                stub = os.path.join(ROOT, course["dir"], "code", "drills", f"s{int(entry['id']):02d}.py")
+                if not os.path.exists(stub):
+                    errs.append(f"missing {os.path.relpath(stub, ROOT)} (run authoring/build_leg.py)")
+        for need, msg in (("Your move", 'no "Your move" section'), ("The library way", 'no "The library way" section'),
+                          ("What you have now", 'no "What you have now" section')):
+            if need not in src:
+                warns.append(msg)
+        if p.qs:
+            warns.append("step pages have no quiz")
+    elif kind == "chapter" and len(p.qs) < 4:
         warns.append(f"only {len(p.qs)} quiz questions")
     if p.qs:
         answers = [q["answer"] for q in p.qs]
@@ -285,7 +311,7 @@ def lint(path, cat, out):
     if hits:
         warns.append("possible American spellings in prose: " + ", ".join(hits))
     words = len(re.findall(r"[A-Za-z][A-Za-z'-]*", prose_clean))
-    if kind == "chapter":
+    if kind == "chapter" and not leg:
         if "term" not in p.classes:
             warns.append('no <span class="term"> definitions')
         if "callout key" not in src:
@@ -368,9 +394,9 @@ def main(argv):
         for f in ("index.html", "toolbox.html"):
             if os.path.exists(os.path.join(d, f)):
                 paths.append(os.path.join(d, f))
-    if "--all-ai" in argv:
+    if "--all-ai" in argv or "--all-legs" in argv:
         for co in cat:
-            if co["track"] != "ai":
+            if co["track"] != ("ai" if "--all-ai" in argv else "leg"):
                 continue
             d = os.path.join(ROOT, co["dir"])
             for sub in ("chapters", "labs", "cases", "studios"):

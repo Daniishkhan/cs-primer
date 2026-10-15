@@ -430,6 +430,38 @@
     { id: "evotorch", name: "Evolution-strategy libraries",  chapters: ["02"],                   blurb: "CMA-ES and friends for black-box optimisation." }
   ];
 
+
+  /* ---------- Leg 1: From Five Rides to a Learning Loop ---------- */
+  var TAXI_PARTS = [
+    { title: "Numbers that describe a ride", blurb: "Five rides, a vector, a matrix, a loss: the model as a formula with knobs." },
+    { title: "Learning the knobs", blurb: "The loss surface, the slope, the step, the loop, and the scale of the features." },
+    { title: "Autograd", blurb: "A number that remembers how it was made, and a gradient that falls out of it." },
+    { title: "A bigger model, honestly measured", blurb: "Held-out rides, a small network, batches, and a fair comparison with the line." },
+    { title: "Experiments you can trust", blurb: "Noise floors, a run store, keep or revert, and the loop that improves the model." }
+  ];
+  var TAXI_CHAPTERS = [
+    { id: "01", part: 0, depth: "intro", file: "01-a-guess.html", title: "A Guess, and How Wrong It Is", blurb: "Five real rides, a fare formula with two knobs, and a number that says how wrong it is." },
+    { id: "02", part: 0, depth: "intro", file: "02-a-ride-is-a-vector.html", title: "A Ride Is a Vector", blurb: "A ride as a list of numbers, and the dot product: one weighted sum is a model." },
+    { id: "03", part: 0, depth: "intro", file: "03-many-rides-are-a-matrix.html", title: "Many Rides Are a Matrix", blurb: "All 6,367 rides at once: rows, columns, shapes, and why a tensor exists." },
+    { id: "04", part: 0, depth: "intro", file: "04-a-loss.html", title: "A Loss", blurb: "One number for how wrong the model is over every ride: the mean squared error." },
+    { id: "05", part: 1, depth: "intro", file: "05-the-loss-surface.html", title: "The Loss Surface", blurb: "Turn one knob and watch the loss: a curve with a bottom, and the idea of looking for it." },
+    { id: "06", part: 1, depth: "intro", file: "06-downhill-by-nudging.html", title: "Downhill by Nudging", blurb: "The slope by nudging each weight, and a step against it: gradient descent, by hand." },
+    { id: "07", part: 1, depth: "intro", file: "07-the-exact-gradient.html", title: "The Exact Gradient", blurb: "The slope from the formula instead of nudging, and the check that both agree." },
+    { id: "08", part: 1, depth: "intro", file: "08-a-training-loop.html", title: "A Training Loop", blurb: "Step after step, the loss falls; with the wrong learning rate it explodes." },
+    { id: "09", part: 1, depth: "intro", file: "09-features-on-the-same-scale.html", title: "Features on the Same Scale", blurb: "Miles and minutes live on different scales; standardise them and the loop behaves." },
+    { id: "10", part: 2, depth: "intro", file: "10-a-number-that-remembers.html", title: "A Number That Remembers How It Was Made", blurb: "A Value that records its parents and its operation: the seed of autograd." },
+    { id: "11", part: 2, depth: "intro", file: "11-how-much-each-input-mattered.html", title: "How Much Each Input Mattered", blurb: "The local gradient of +, * and relu: what each parent contributed." },
+    { id: "12", part: 2, depth: "intro", file: "12-backward.html", title: "Backward", blurb: "Order the graph, then walk it in reverse with the chain rule: autograd." },
+    { id: "13", part: 2, depth: "intro", file: "13-the-linear-model-on-value.html", title: "The Linear Model, Rebuilt on Value", blurb: "The same loss on Values; autograd's gradient agrees with step 7 to four decimals." },
+    { id: "14", part: 3, depth: "intro", file: "14-rides-the-model-never-saw.html", title: "Rides the Model Never Saw", blurb: "Hold rides out, measure there, and see where a straight line fails." },
+    { id: "15", part: 3, depth: "intro", file: "15-a-small-network.html", title: "A Small Network", blurb: "One hidden layer and a bend: a network that could draw a curve through the fares, if the fares need one." },
+    { id: "16", part: 3, depth: "intro", file: "16-training-in-batches.html", title: "Training in Batches", blurb: "Shuffle, batch, step: the training loop every library runs." },
+    { id: "17", part: 4, depth: "intro", file: "17-the-noise-floor.html", title: "The Noise Floor", blurb: "Run it five times and see how much the score moves on its own." },
+    { id: "18", part: 4, depth: "intro", file: "18-a-run-store.html", title: "A Run Store", blurb: "Every run logged as one line, with a hash of its configuration." },
+    { id: "19", part: 4, depth: "intro", file: "19-keep-or-revert.html", title: "Keep or Revert", blurb: "Keep a change only when it beats the best by more than the noise." },
+    { id: "20", part: 4, depth: "intro", file: "20-the-loop.html", title: "The Loop", blurb: "A search that proposes, runs, logs and keeps or reverts: Artifact 1 in miniature." }
+  ];
+
   /* ---------- A9: Research Engineering on Small Proxies ---------- */
   var RE_PARTS = [
     { title: "Orientation",            blurb: "What an artifact is, what Artifact 1 must show, and how to use this course while building it." },
@@ -542,6 +574,9 @@
 
   /* status: "done" | "building" | "planned". Planned courses appear on the hub only. */
   window.CS_COURSES = [
+    { id: "taxi", dir: "taxi", track: "leg", num: "Leg 1", mark: "L1", title: "From Five Rides to a Learning Loop", subtitle: "one program, twenty steps",
+      tagline: "Start with five real taxi rides and a guess at the fare. Add one function at a time, each checked on the real rides, until the program is a loop that improves its own model: tensors, loss, gradients, autograd, a network, and an honest search.",
+      status: "building", parts: TAXI_PARTS, chapters: TAXI_CHAPTERS, labs: [], cases: [], studios: [], tools: [] },
     { id: "mlf", dir: "ml-foundations", track: "ai", num: "A0", mark: "MF", title: "Math & Code for Machine Learning", subtitle: "the toolkit at the point of need",
       tagline: "Arrays, linear algebra, derivatives and autodiff, probability, information theory and the statistics of experiments, taught as each later course needs them.",
       status: "done", parts: MLF_PARTS, chapters: MLF_CHAPTERS, labs: MLF_LABS, cases: MLF_CASES, studios: MLF_STUDIOS, tools: MLF_TOOLS },

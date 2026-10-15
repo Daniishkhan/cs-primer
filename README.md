@@ -74,9 +74,13 @@ Formulas are typeset with the vendored [KaTeX](https://katex.org). The equations
 
 **Workbench** pages repeat a chapter's idea with the real tools on a real machine: predict a number from the chapter, measure it, compare (measurement tables keep what you type). Nothing runs on your own computer: each page is badged *The lab VM* (one rented CPU machine on AWS, 16 to 32 cores) or *A GPU box* (a rented 24 GB card, later). `workbench/vm` creates, starts, stops and connects to the VM, with SSH open to your IP address only and an alarm that stops a forgotten VM; `workbench/setup-vm.sh` is its first-boot setup. `workbench/wb` rents a GPU on RunPod for the GPU pages. See `lab-machine.html`.
 
+### Legs: one program, one step at a time
+
+A **leg** is the front door: a build-along in which one program grows from a real dataset to a learning loop, one function per page. Leg 1, `taxi/` ("From Five Rides to a Learning Loop"), starts from five real New York taxi rides and a guess at the fare and ends, twenty steps later, with a loop that proposes changes to its own model, logs every run and keeps only improvements that beat the noise floor: tensors, a loss, gradients by nudging and by formula, an autograd engine, a small network trained in batches, held-out data, and an honest search. Every step page shows the program as it stands, the wall it has hit, the smallest idea that gets past it, the function to write (checked in the page on all 6,367 rides, with real numbers printed), and, collapsed, the same step in PyTorch run on the lab VM. A pass marks the step complete. `taxi/code/project.py` is the complete program, `check.py` its per-step checker, and `python3 authoring/build_leg.py taxi --verify` cuts it into the per-step files the pages load (`taxi/code/drills/sNN.py`). `authoring/legs.md` is the contract for writing a step.
+
 ### Practice: learn by doing
 
-`practice.html` is the front door. It turns every lab milestone into a **drill**: a file with everything written except one function, a checker that says ✔ or ✘ in the browser, the least theory needed to try (a need-to-know card), hints on failure, the solution behind a click, and the lab's explanation and chapter as the "why" afterwards. Drills come in the order the four artifacts need them. Attempts, hints shown and drills passed are saved in the browser; when every drill of a lab passes, the lab counts as complete in its course. `python3 authoring/build_drills.py` generates the drills from the labs (`<course>/labs/code/labNN/drills/`: one `mN.py` per milestone, `lab.json`, and the cards `mN.html` that authors write to `authoring/drill-cards.md`); `--verify` runs every drill's check.
+`practice.html` turns every lab milestone into a **drill**: a file with everything written except one function, a checker that says ✔ or ✘ in the browser, the least theory needed to try (a need-to-know card), hints on failure, the solution behind a click, and the lab's explanation and chapter as the "why" afterwards. Drills come in the order the four artifacts need them. Attempts, hints shown and drills passed are saved in the browser; when every drill of a lab passes, the lab counts as complete in its course. `python3 authoring/build_drills.py` generates the drills from the labs (`<course>/labs/code/labNN/drills/`: one `mN.py` per milestone, `lab.json`, and the cards `mN.html` that authors write to `authoring/drill-cards.md`); `--verify` runs every drill's check.
 
 ### Review and search
 
@@ -114,7 +118,8 @@ Labs use Python 3.9+ and the standard library only, and are deterministic (see a
 ## Project layout
 
 ```
-index.html                  hub: the front door to Practice, all courses and progress
+index.html                  hub: Leg 1 first, then Practice, all courses and progress
+taxi/                       Leg 1: twenty step pages (chapters/), the program, checker, data and PyTorch mirrors (code/)
 practice.html               Practice: one drill at a time, in artifact order
 glossary.html               searchable glossary, with a course filter
 curriculum.html             the artifact track: four artifacts, gates, roadmap, standards
@@ -141,6 +146,7 @@ assets/js/sketch.js         hand-drawn rendering of diagrams (Rough.js)
 assets/js/runner.js         code cells: copy, edit (CodeMirror), run (Pyodide in a worker); lab workspaces
 assets/js/equations.js      typeset maths (KaTeX) and equation anatomy blocks
 assets/js/review.js         spaced review of every quiz; progress export/import
+assets/js/leg.js            a leg's step pages: the program at that step in the editor, Check runs the step, a pass marks it done
 assets/js/practice.js       Practice: mounts one drill (runner.js workspace), hints, pass detection, the queue
 assets/js/drills-data.js    generated: every drill in artifact order (authoring/build_drills.py)
 assets/js/ask.js            ask about this page: selection chip, tutor panel, streaming from OpenAI, Anthropic or Ollama
@@ -160,6 +166,6 @@ authoring/                  guide, link index and its builder, page linter, rend
 
 The sidebar, table of contents, page header, "mark complete" box, cross-links and previous/next links are generated automatically.
 
-3. Re-run `python3 authoring/build_study.py` so the page's quiz joins the Review page and its sections join search, `python3 authoring/build_glossary.py` if you added glossary terms, and `python3 authoring/build_link_index.py`; then `python3 authoring/check_page.py PAGE` to lint it (it also checks every formula). After adding or changing a lab, run `python3 authoring/build_drills.py --verify` so its milestones become drills.
+3. Re-run `python3 authoring/build_study.py` so the page's quiz joins the Review page and its sections join search, `python3 authoring/build_glossary.py` if you added glossary terms, and `python3 authoring/build_link_index.py`; then `python3 authoring/check_page.py PAGE` to lint it (it also checks every formula). After adding or changing a lab, run `python3 authoring/build_drills.py --verify` so its milestones become drills. After changing a leg's `project.py`, run `python3 authoring/build_leg.py <leg> --verify` to regenerate its step files.
 
 To remove pages, run `python3 authoring/remove_pages.py --page PATH ...` (or `--dir COURSE`): it prints what it would delete and which links it would unwrap, and changes files only with `--apply`.

@@ -39,7 +39,7 @@
   var ARTIFACTS = window.CS_ARTIFACTS || [];
   var KIND_LIST = { L: "labs", W: "workbenches", C: "cases", S: "studios" };
   COURSES.forEach(function (co) {
-    (co.chapters || []).forEach(function (c) { c.tracks = []; c.role = "reading"; });
+    (co.chapters || []).forEach(function (c) { c.tracks = []; c.role = co.track === "ai" ? "reading" : "step"; });
   });
   ARTIFACTS.forEach(function (a) {
     var seen = [];
@@ -57,6 +57,7 @@
   if (!ARTIFACTS.some(function (a) { return a.id === track; })) track = "all";
   document.documentElement.dataset.track = track;
   var course = COURSES.find(function (co) { return co.id === body.dataset.course; }) || null;
+  var LEG = !!(course && course.track === "leg");   // a build-along: one program, one step per page
   var CHAPTERS = course ? course.chapters : [];
   var PARTS = course ? course.parts : [];
   var LABS = course ? course.labs || [] : [];
@@ -65,6 +66,7 @@
   var BENCHES = course ? course.workbenches || [] : [];
   var COLLECTION = { chapter: CHAPTERS, lab: LABS, "case": CASES, studio: STUDIOS, workbench: BENCHES };
   var NOUN = { chapter: "chapter", lab: "lab", "case": "case study", studio: "design studio", workbench: "workbench" };
+  if (LEG) NOUN.chapter = "step";   // a leg's chapters are steps
   // Workbenches: real tools on a real machine. The machine decides the badge.
   var MACHINE = { vm: "The lab VM", gpu: "A GPU box" };
   var currentKind = body.dataset.lab ? "lab" : body.dataset["case"] ? "case" : body.dataset.studio ? "studio"
@@ -121,7 +123,7 @@
     else if (ch.kind === "case") s = "Case " + ch.id.slice(1) + ": " + ch.title;
     else if (ch.kind === "studio") s = "Studio " + ch.id.slice(1) + ": " + ch.title;
     else if (ch.kind === "workbench") s = "Workbench " + ch.id.slice(1) + ": " + ch.title;
-    else s = chapterNum(ch) + ". " + ch.title;
+    else s = (ch.course.track === "leg" ? "Step " + chapterNum(ch) + ": " : chapterNum(ch) + ". ") + ch.title;
     return ch.course !== course ? ch.course.title + ", " + s : s;
   }
   /* "05" = chapter 5 of this course; "oe:05" = chapter 5 of course oe;
@@ -141,6 +143,7 @@
     return ids.map(function (id) { return id.slice(1); }).join(", ");
   }
   function roleText(c) {
+    if (c.role === "step") return "A step of the leg";
     if (c.role === "before") return "Artifact" + (c.tracks.length > 1 ? "s " : " ") + artifactNums(c.tracks) + ": read before starting";
     if (c.role === "while") return "Artifact" + (c.tracks.length > 1 ? "s " : " ") + artifactNums(c.tracks) + ": open while building";
     return "Reading: not needed for any artifact";
@@ -261,7 +264,7 @@
       '<span><span class="nav-depth intro" style="display:inline-block"></span> Quick intro</span>' +
       (course && CHAPTERS.some(function (c) { return c.role === "reading"; }) ? '<span class="legend-reading">Dimmed: reading only, not needed for any artifact</span>' : "") });
 
-    var foot = [course ? legend : null];
+    var foot = [course && !LEG ? legend : null];
     if (course && (course.tools || []).length) {
       foot.push(el("a", { class: "foot-link", href: root + "/" + course.dir + "/toolbox.html" }, [
         icon("tool"), document.createTextNode("Course toolbox")
@@ -427,7 +430,7 @@
     var n = CHAPTERS.filter(function (c) { return done.has(c.id); }).length;
     if (card) {
       card.innerHTML = "";
-      card.appendChild(el("div", { text: n + " of " + total + " chapters complete" }));
+      card.appendChild(el("div", { text: n + " of " + total + " " + NOUN.chapter + "s complete" }));
       var bar = el("div", { class: "bar" }, [el("span")]);
       bar.firstChild.style.width = Math.round((n / total) * 100) + "%";
       card.appendChild(bar);
@@ -621,11 +624,17 @@
       el("span", { class: "badge case", text: "Pattern: " + current.pattern }),
       el("span", { text: "≈ " + minutes + " min read" })
     ];
+    else if (LEG) eyebrow = [
+      el("span", { class: "part", text: course.num + " · Part " + current.part + " · " + PARTS[current.part].title }),
+      el("span", { text: "Step " + chapterNum(current) + " of " + CHAPTERS.length }),
+      el("span", { class: "badge lab", text: "Build it" }),
+      el("span", { text: "≈ " + minutes + " min read, longer to build" })
+    ];
     else eyebrow = [
       el("span", { class: "part", text: "Part " + current.part + " · " + PARTS[current.part].title }),
       el("span", { text: "Chapter " + chapterNum(current) }),
       el("span", { class: "badge " + current.depth, text: DEPTH[current.depth] }),
-      el("span", { class: "badge " + (current.role === "reading" ? "reading" : "track"), title: roleText(current),
+      current.role === "step" ? null : el("span", { class: "badge " + (current.role === "reading" ? "reading" : "track"), title: roleText(current),
         text: current.role === "before" ? "Artifact " + artifactNums(current.tracks) + " · read first"
           : current.role === "while" ? "Artifact " + artifactNums(current.tracks) + " · while building" : "Reading" }),
       el("span", { text: "≈ " + minutes + " min read" })
@@ -716,6 +725,9 @@
     else if (endOfTrack) pager.appendChild(el("a", { class: "next", href: root + "/curriculum.html#artifact-" + artifactById(track).num }, [
       el("small", { text: "Next →" }), el("span", { class: "title", text: "Start building Artifact " + artifactById(track).num })
     ]));
+    else if (LEG) pager.appendChild(el("a", { class: "next", href: root + "/curriculum.html#artifact-1" }, [
+      el("small", { text: "Next →" }), el("span", { class: "title", text: "The leg is done. Start Artifact 1" })
+    ]));
     else pager.appendChild(el("a", { class: "next", href: root + "/glossary.html" }, [
       el("small", { text: "Next →" }), el("span", { class: "title", text: "Glossary" })
     ]));
@@ -773,9 +785,9 @@
       inPart.forEach(function (c) {
         grid.appendChild(el("a", { class: "road-card role-" + c.role, href: href(c), title: roleText(c), "data-tracks": c.tracks.join(" ") }, [
           el("div", { class: "top" }, [
-            el("span", { class: "num", "data-done-id": c.id, "data-label": "Ch " + chapterNum(c), text: "Ch " + chapterNum(c) }),
-            c.role === "reading" ? el("span", { class: "badge reading", text: "Reading" }) : el("span", { class: "badge track", text: "Artifact " + artifactNums(c.tracks) }),
-            el("span", { class: "badge " + c.depth, text: DEPTH[c.depth] })
+            el("span", { class: "num", "data-done-id": c.id, "data-label": (LEG ? "Step " : "Ch ") + chapterNum(c), text: (LEG ? "Step " : "Ch ") + chapterNum(c) }),
+            c.role === "step" ? null : c.role === "reading" ? el("span", { class: "badge reading", text: "Reading" }) : el("span", { class: "badge track", text: "Artifact " + artifactNums(c.tracks) }),
+            LEG ? null : el("span", { class: "badge " + c.depth, text: DEPTH[c.depth] })
           ]),
           el("div", { class: "title", text: c.title }),
           el("div", { class: "blurb", text: c.blurb })
@@ -825,6 +837,7 @@
     cont.textContent = cont.dataset.label;
     var firstTodo = list.find(function (c) { return !done.has(c.id); });
     if (list.some(function (c) { return done.has(c.id); }) && firstTodo) { cont.href = href(firstTodo); cont.textContent = "Continue: " + firstTodo.title + " →"; }
+    else if (!firstTodo && LEG) { cont.href = root + "/curriculum.html#artifact-1"; cont.textContent = "All twenty steps done! Start Artifact 1 →"; }
     else if (!firstTodo) { cont.href = root + "/glossary.html"; cont.textContent = "All done! Review the glossary →"; }
   }
 
@@ -833,20 +846,22 @@
   function buildHub() {
     var mainHost = document.getElementById("hub");
     var aiHost = document.getElementById("hub-ai");
-    if (!mainHost && !aiHost) return;
+    var legHost = document.getElementById("hub-legs");
+    if (!mainHost && !aiHost && !legHost) return;
     COURSES.forEach(function (co) {
-      var host = co.track === "ai" ? aiHost : mainHost;
+      var leg = co.track === "leg";
+      var host = co.track === "ai" ? aiHost : leg ? legHost : mainHost;
       if (!host) return;
       var planned = co.status === "planned";
       var top = el("div", { class: "top" }, [
         el("span", { class: "hub-mark", text: co.mark }),
-        el("span", { class: "num", text: "Course " + courseNum(co) }),
+        el("span", { class: "num", text: leg ? co.num : "Course " + courseNum(co) }),
         el("span", { class: "badge " + co.status, text: { done: "Ready", building: "New", planned: "Coming soon" }[co.status] })
       ]);
       var kids = [top, el("div", { class: "title", text: co.title }), el("div", { class: "sub", text: co.subtitle }), el("div", { class: "blurb", text: co.tagline })];
       if (!planned) {
         var d = doneFor(co);
-        var counts = [[co.chapters, "chapters"], [co.labs, "labs"], [co.workbenches || [], "workbenches"], [co.cases, "case studies"], [co.studios || [], "studios"]]
+        var counts = [[co.chapters, leg ? "steps" : "chapters"], [co.labs, "labs"], [co.workbenches || [], "workbenches"], [co.cases, "case studies"], [co.studios || [], "studios"]]
           .filter(function (g) { return g[0].length; })
           .map(function (g) { return g[0].length + " " + g[1]; }).join(" · ");
         var all = co.chapters.concat(co.labs, co.cases, co.studios || [], co.workbenches || []);
@@ -856,8 +871,8 @@
         kids.push(el("div", { class: "meta", text: counts }), bar, el("div", { class: "meta", text: n ? n + " of " + all.length + " done" : "Not started" }));
         var nb = co.chapters.filter(function (c) { return c.role === "before"; }).length;
         var nw = co.chapters.filter(function (c) { return c.role === "while"; }).length;
-        kids.push(el("div", { class: "meta track-meta", text: nb + nw
-          ? "Artifact track: " + nb + " to read first, " + nw + " to open while building"
+        kids.push(el("div", { class: "meta track-meta", text: leg ? "One program that grows; every step checked on real data"
+          : nb + nw ? "Artifact track: " + nb + " to read first, " + nw + " to open while building"
           : "Reading only" }));
       }
       host.appendChild(el("li", { class: "hub-step" + (planned ? " planned" : "") }, [
@@ -1090,6 +1105,16 @@
     document.body.appendChild(s);
   }
 
+  // A leg's step pages (leg.js): the growing program, checked one step at a time.
+  function loadLeg() {
+    if (!ASSETS || !document.querySelector(".step-workspace")) return;
+    window.NZ = window.NZ || {};
+    window.NZ.markDone = function (id) { if (course) setDone(id, true); };
+    var s = document.createElement("script");
+    s.src = ASSETS + "js/leg.js";
+    document.body.appendChild(s);
+  }
+
   // Glossary hover cards (glossary-hover.js) on AI-path pages.
   function loadGlossaryHover() {
     if (!ASSETS || !course || course.track !== "ai" || !document.querySelector("article.prose")) return;
@@ -1168,6 +1193,7 @@
     loadSketch();
     loadGlossaryHover();
     loadAsk();
+    loadLeg();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
