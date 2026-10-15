@@ -74,6 +74,10 @@ Formulas are typeset with the vendored [KaTeX](https://katex.org). The equations
 
 **Workbench** pages repeat a chapter's idea with the real tools on a real machine: predict a number from the chapter, measure it, compare (measurement tables keep what you type). Nothing runs on your own computer: each page is badged *The lab VM* (one rented CPU machine on AWS, 16 to 32 cores) or *A GPU box* (a rented 24 GB card, later). `workbench/vm` creates, starts, stops and connects to the VM, with SSH open to your IP address only and an alarm that stops a forgotten VM; `workbench/setup-vm.sh` is its first-boot setup. `workbench/wb` rents a GPU on RunPod for the GPU pages. See `lab-machine.html`.
 
+### Practice: learn by doing
+
+`practice.html` is the front door. It turns every lab milestone into a **drill**: a file with everything written except one function, a checker that says ✔ or ✘ in the browser, the least theory needed to try (a need-to-know card), hints on failure, the solution behind a click, and the lab's explanation and chapter as the "why" afterwards. Drills come in the order the four artifacts need them. Attempts, hints shown and drills passed are saved in the browser; when every drill of a lab passes, the lab counts as complete in its course. `python3 authoring/build_drills.py` generates the drills from the labs (`<course>/labs/code/labNN/drills/`: one `mN.py` per milestone, `lab.json`, and the cards `mN.html` that authors write to `authoring/drill-cards.md`); `--verify` runs every drill's check.
+
 ### Review and search
 
 `review.html` asks the quiz questions of the pages you have finished, ten at a time, on a spaced-repetition schedule, and exports or imports all your progress. ⌘/Ctrl + K (or `/`) searches every page and section heading.
@@ -94,7 +98,8 @@ Your browser's localStorage keeps:
 - the theme choice: Tokyo Night, Catppuccin Mocha or high-contrast Gruvbox Dark;
 - your edits to code cells (until you press Reset);
 - workbench measurements and the review schedule (back them up from the Review page);
-- the Ask panel: your provider, model and key, and the thread for each page.
+- the Ask panel: your provider, model and key, and the thread for each page;
+- Practice: drills passed (with dates), attempts, hints shown, and your code in each drill.
 
 ## Labs
 
@@ -109,7 +114,8 @@ Labs use Python 3.9+ and the standard library only, and are deterministic (see a
 ## Project layout
 
 ```
-index.html                  hub: all courses and progress
+index.html                  hub: the front door to Practice, all courses and progress
+practice.html               Practice: one drill at a time, in artifact order
 glossary.html               searchable glossary, with a course filter
 curriculum.html             the artifact track: four artifacts, gates, roadmap, standards
 contributing.html           upstream repositories and the rules that get pull requests merged
@@ -135,6 +141,8 @@ assets/js/sketch.js         hand-drawn rendering of diagrams (Rough.js)
 assets/js/runner.js         code cells: copy, edit (CodeMirror), run (Pyodide in a worker); lab workspaces
 assets/js/equations.js      typeset maths (KaTeX) and equation anatomy blocks
 assets/js/review.js         spaced review of every quiz; progress export/import
+assets/js/practice.js       Practice: mounts one drill (runner.js workspace), hints, pass detection, the queue
+assets/js/drills-data.js    generated: every drill in artifact order (authoring/build_drills.py)
 assets/js/ask.js            ask about this page: selection chip, tutor panel, streaming from OpenAI, Anthropic or Ollama
 assets/js/*-data.js         generated: review-data, search-data (authoring/build_study.py), glossary-data
 assets/js/widgets/          one script per interactive widget
@@ -152,6 +160,6 @@ authoring/                  guide, link index and its builder, page linter, rend
 
 The sidebar, table of contents, page header, "mark complete" box, cross-links and previous/next links are generated automatically.
 
-3. Re-run `python3 authoring/build_study.py` so the page's quiz joins the Review page and its sections join search, `python3 authoring/build_glossary.py` if you added glossary terms, and `python3 authoring/build_link_index.py`; then `python3 authoring/check_page.py PAGE` to lint it (it also checks every formula).
+3. Re-run `python3 authoring/build_study.py` so the page's quiz joins the Review page and its sections join search, `python3 authoring/build_glossary.py` if you added glossary terms, and `python3 authoring/build_link_index.py`; then `python3 authoring/check_page.py PAGE` to lint it (it also checks every formula). After adding or changing a lab, run `python3 authoring/build_drills.py --verify` so its milestones become drills.
 
 To remove pages, run `python3 authoring/remove_pages.py --page PATH ...` (or `--dir COURSE`): it prints what it would delete and which links it would unwrap, and changes files only with `--apply`.

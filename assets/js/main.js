@@ -474,6 +474,7 @@
     cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
     x: '<path d="M6 6l12 12M18 6 6 18"/>',
     chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 21l1.9-5.4A8 8 0 1 1 21 12z"/>',
+    target: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 4V2M12 22v-2M4 12H2M22 12h-2"/>',
     merge: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10M6 7c0 3 3 5 10 5"/>',
     list: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="m4 6 1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/>'
   };
@@ -484,6 +485,7 @@
   }
 
   var SITE_LINKS = [
+    ["practice.html", "Practice", "target"],
     ["curriculum.html", "Artifact track", "map"],
     ["contributing.html", "Contributing", "merge"],
     ["evidence.html", "Evidence log", "list"],
@@ -1059,13 +1061,23 @@
     return null;
   }
 
-  // Runnable code cells (runner.js) are loaded only on pages that have scripts.
-  function loadRunner() {
-    if (!ASSETS || !document.querySelector('article pre[data-title*=".py"], .lab-workspace')) return;
-    window.NZ = { assets: ASSETS, highlightPython: highlightPython };
-    var s = document.createElement("script");
-    s.src = ASSETS + "js/runner.js";
-    document.body.appendChild(s);
+  // Runnable code cells (runner.js) are loaded only on pages that have
+  // scripts, or on demand (NZ.ensureRunner, used by Practice).
+  var runnerLoading = null;
+  function loadRunner(force) {
+    if (!ASSETS || (!force && !document.querySelector('article pre[data-title*=".py"], .lab-workspace'))) return null;
+    if (runnerLoading) return runnerLoading;
+    window.NZ = window.NZ || {};
+    window.NZ.assets = ASSETS;
+    window.NZ.highlightPython = highlightPython;
+    runnerLoading = new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      s.src = ASSETS + "js/runner.js";
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error("runner.js did not load")); };
+      document.body.appendChild(s);
+    });
+    return runnerLoading;
   }
 
   // Typeset maths (equations.js + vendored KaTeX) only on pages that have some.
@@ -1135,6 +1147,8 @@
   }
 
   function init() {
+    window.NZ = window.NZ || {};
+    window.NZ.ensureRunner = function () { return loadRunner(true); };
     highlightCode();
     loadRunner();
     loadEquations();

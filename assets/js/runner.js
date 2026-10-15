@@ -316,12 +316,13 @@
     this.name = SCRIPT_TITLE.exec(this.title)[1];
     this.target = opts.run || this.name;
     this.extra = opts.extra || [];
+    this.defaultArgs = opts.args;
     this.runLabel = opts.label || "Run";
     this.original = (pre.querySelector("code") || pre).textContent;
     // Saved edits are keyed by file name (and which copy of it on the page),
     // so adding or reordering other blocks does not lose them.
     var copy = pageFiles.filter(function (f) { return f.cell.title === this.title; }, this).length;
-    this.key = "nz-code:" + location.pathname + ":" + this.title + (copy ? ":" + copy : "");
+    this.key = opts.key || "nz-code:" + location.pathname + ":" + this.title + (copy ? ":" + copy : "");
     var legacy = "nz-code:" + location.pathname + ":" + index + ":" + this.title;
     if (load(this.key) == null && load(legacy) != null) {
       save(this.key, load(legacy));
@@ -370,7 +371,7 @@
       this.argsInput = el("input", {
         type: "text", class: "cell-args-input", spellcheck: "false",
         "aria-label": "Command-line arguments", placeholder: "arguments",
-        value: this.target === this.name ? exampleArgs(this.name) : ""
+        value: this.defaultArgs != null ? String(this.defaultArgs) : this.target === this.name ? exampleArgs(this.name) : ""
       });
       actions.push(el("label", { class: "cell-args", title: "Command-line arguments (sys.argv)" }, [
         el("span", { class: "cell-args-label", text: "args" }), this.argsInput
@@ -652,6 +653,9 @@
         self.setStatus(same ? "ok" : "warn", (same ? "✓ Matches the printed output" : "Differs from the printed output") + " · " + took,
                        same ? "✓ Matches · " + took : "Differs · " + took);
       } else self.setStatus("ok", "Done · " + took, "✓ Done · " + took);
+      // Pages that build on a cell (Practice) listen for the result.
+      self.cell.dispatchEvent(new CustomEvent("cell-done", { bubbles: true,
+        detail: { stdout: stdout, failed: failed, stopped: hitLimit || !engine.mode, ms: ms } }));
     }, function (e) {
       clearTimeout(slow);
       clearTimeout(limit);
@@ -678,6 +682,8 @@
   function workspace(box) {
     var dir = box.getAttribute("data-dir");
     var edit = box.getAttribute("data-edit") || "starter.py";
+    // Practice drills show a generated file but save and run it as starter.py.
+    var editSrc = box.getAttribute("data-edit-src") || edit;
     var names = (box.getAttribute("data-files") || "").split(/\s+/).filter(Boolean);
     var note = el("p", { class: "lab-ws-note", text: "Loading the lab's files…" });
     box.appendChild(note);
@@ -687,7 +693,7 @@
         + "Or download the files above and run python3 check.py.";
       return Promise.resolve();
     }
-    return Promise.all([edit].concat(names).map(function (n) { return fetchText(dir + n); }))
+    return Promise.all([editSrc].concat(names).map(function (n) { return fetchText(dir + n); }))
       .then(function (srcs) {
         var extra = names.map(function (n, i) { return { name: n, src: srcs[i + 1] }; });
         var all = srcs.join("\n");
@@ -698,12 +704,17 @@
         note.remove();
         box.appendChild(pre);
         highlight(pre, srcs[0]);
-        var cell = new Cell(pre, index++, { run: "check.py", extra: extra, label: "Check", local: local });
+        var cell = new Cell(pre, index++, { run: "check.py", extra: extra, label: "Check", local: local,
+          args: box.getAttribute("data-args"), key: box.getAttribute("data-key") });
         pageFiles.push({ name: cell.name, cell: cell });
         if (local) box.classList.add("is-local");
+        return cell;
       })
       .catch(function (e) {
+        console.error("runner.js workspace:", e);
         note.textContent = "Could not load the lab's files (" + e.message + "). Download them above and run python3 check.py.";
+        if (!note.parentNode) box.appendChild(note);
+        throw e;
       });
   }
 
@@ -717,4 +728,7 @@
     pageFiles.push({ name: cell.name, cell: cell });
   });
   document.querySelectorAll(".lab-workspace").forEach(workspace);
+  // Practice mounts a workspace per drill after the page has loaded.
+  window.NZ = window.NZ || {};
+  window.NZ.workspace = workspace;
 })();
