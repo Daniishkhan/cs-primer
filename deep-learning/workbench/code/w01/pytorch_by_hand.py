@@ -19,8 +19,6 @@ args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 torch.manual_seed(args.seed)

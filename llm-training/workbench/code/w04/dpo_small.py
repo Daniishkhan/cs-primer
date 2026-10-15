@@ -2,7 +2,7 @@
 formula, train with TRL's DPOTrainer, then read the implicit reward margin
 and the preference accuracy back out of the model, by hand and from TRL.
 
-Laptop (SmolLM2-135M-Instruct, a few hundred pairs, about 5 minutes):
+Lab VM (SmolLM2-135M-Instruct, a few hundred pairs, about 30 minutes on the CPU):
     python dpo_small.py
 GPU box (0.5B model, more pairs, bf16 autocast):
     python dpo_small.py --model Qwen/Qwen2.5-0.5B-Instruct --pairs 2000 \
@@ -42,8 +42,6 @@ args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 random.seed(0)
@@ -54,7 +52,7 @@ class PlainLogProb:
     """Stand-in for TRL's Triton kernel, which exists on Linux + CUDA only.
 
     TRL 1.15 computes per-token log-probabilities in a fused kernel. Where
-    Triton is missing (a Mac), the import fails and training crashes. This
+    Triton is missing (CPU only), the import fails and training crashes. This
     does the same sums with ordinary PyTorch: slower and hungrier, same
     numbers. Skipped on a GPU box, where the real kernel is present."""
 

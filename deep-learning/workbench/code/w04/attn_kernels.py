@@ -5,7 +5,7 @@ Chapter 19 says the naive version writes a T x T score matrix and its
 softmax to memory, and that FlashAttention never does. The script predicts
 the memory from that sentence, then measures peak memory and time.
 
-Laptop (Apple MPS or CPU):
+Lab VM (CPU):
     python attn_kernels.py
     python attn_kernels.py --device cpu
 GPU box (adds CUDA's flash, memory-efficient and math backends, 16-bit):
@@ -27,7 +27,7 @@ ap.add_argument("--lengths", type=int, nargs="+",
                 default=[256, 512, 1024, 2048, 4096])
 ap.add_argument("--heads", type=int, default=8)
 ap.add_argument("--dim", type=int, default=64)        # head width d_k
-ap.add_argument("--device", default="auto")           # auto: CUDA, MPS, CPU
+ap.add_argument("--device", default="auto")           # auto: CUDA, CPU
 ap.add_argument("--repeats", type=int, default=5)
 args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
@@ -35,8 +35,6 @@ if args.device != "auto":
     DEVICE = args.device
 elif torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -52,8 +50,6 @@ def mib(n):
 def sync():
     if DEVICE == "cuda":
         torch.cuda.synchronize()
-    elif DEVICE == "mps":
-        torch.mps.synchronize()
 
 
 # ── 2. The two implementations ───────────────────────────────────────────
@@ -116,7 +112,7 @@ def peak_bytes(fn, T):
             return None
         torch.cuda.synchronize()
         return torch.cuda.max_memory_allocated() - base
-    # MPS has no peak counter, so use the CPU: add up the profiler's
+    # No CUDA peak counter here, so use the CPU: add up the profiler's
     # allocations and frees in time order and keep the maximum.
     q, k, v = make(T, "cpu", DTYPE)
     with profile(activities=[ProfilerActivity.CPU],

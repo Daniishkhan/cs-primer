@@ -2,7 +2,7 @@
 activations from chapter 2's accounting, then add up the real tensors after
 one training step and compare.
 
-Laptop (SmolLM2-135M, 32-bit floats, CPU or Apple's MPS):
+Lab VM (SmolLM2-135M, 32-bit floats, CPU):
     python training_memory.py
 GPU box (a 0.5B model, with CUDA's own peak counters per phase):
     python training_memory.py --model Qwen/Qwen2.5-0.5B --batch 4 --seq 512
@@ -29,8 +29,6 @@ args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 DTYPE = torch.float32 if args.dtype == "fp32" else torch.bfloat16
@@ -84,8 +82,6 @@ def allocated():
     """Bytes the allocator holds now (None on CPU, which has no counter)."""
     if DEVICE == "cuda":
         return torch.cuda.memory_allocated()
-    if DEVICE == "mps":
-        return torch.mps.current_allocated_memory()
 
 
 def peak():

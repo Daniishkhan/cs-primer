@@ -4,7 +4,7 @@ Chapter 12's model on Tiny Shakespeare, with chapter 16's rule C = 6ND. The
 script predicts the parameter count and the training FLOPs, trains, then
 turns the measured tokens per second into an achieved FLOP/s.
 
-Laptop (the chapter's 108,352-weight model, 3,000 steps):
+Lab VM (the chapter's 108,352-weight model, 3,000 steps):
     python char_gpt.py
 GPU box (nanoGPT's 10.8M-weight Shakespeare model; give your card's
 datasheet peak to get the utilisation):
@@ -28,7 +28,7 @@ ap.add_argument("--steps", type=int, default=3000)
 ap.add_argument("--batch", type=int, default=32)
 ap.add_argument("--peak-tflops", type=float, default=0.0)  # optional
 ap.add_argument("--seed", type=int, default=1337)
-ap.add_argument("--device", default="auto")      # auto: CUDA, MPS, CPU
+ap.add_argument("--device", default="auto")      # auto: CUDA, CPU
 args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
 SIZES = {                              # vocab V is read from the data
@@ -42,8 +42,6 @@ if args.device != "auto":
     DEVICE = args.device
 elif torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 torch.manual_seed(args.seed)
@@ -52,8 +50,6 @@ torch.manual_seed(args.seed)
 def sync():
     if DEVICE == "cuda":
         torch.cuda.synchronize()
-    elif DEVICE == "mps":
-        torch.mps.synchronize()
 
 
 # ── 2. Data: characters to ids, 90% train and 10% validation ─────────────

@@ -3,7 +3,7 @@ GRPOTrainer, compute one group's advantages by hand next to the trainer's
 own, then reward the format alone and watch the reward climb while the
 accuracy does not.
 
-Laptop (SmolLM2-135M-Instruct, about 5 minutes per run):
+Lab VM (SmolLM2-135M-Instruct, about 5 minutes per run on the CPU):
     python grpo_arith.py                    # reward = correct answers
     python grpo_arith.py --reward format    # reward = the format only
 GPU box (a 0.5B model, bigger groups, 24 GB card):
@@ -45,8 +45,6 @@ args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 random.seed(0)
@@ -55,7 +53,7 @@ torch.manual_seed(0)
 
 class PlainLogProb:
     """Stand-in for TRL's Triton kernel (Linux + CUDA only). Same sums in
-    ordinary PyTorch, for a Mac. Not used where the real kernel exists."""
+    ordinary PyTorch, for CPU-only machines. Not used where the real kernel exists."""
 
     @staticmethod
     def apply(hidden, weight, bias, targets, temperature, chunk, softcap,

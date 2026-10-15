@@ -31,8 +31,6 @@ args, _ = ap.parse_known_args()
 
 if torch.cuda.is_available():
     DEVICE, DTYPE = "cuda", torch.bfloat16
-elif torch.backends.mps.is_available():
-    DEVICE, DTYPE = "mps", torch.float16
 else:
     DEVICE, DTYPE = "cpu", torch.float32
 tok = AutoTokenizer.from_pretrained(args.model)

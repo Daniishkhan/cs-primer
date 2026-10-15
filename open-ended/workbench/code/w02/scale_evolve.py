@@ -1,7 +1,7 @@
 """Evolution at scale: many model calls in flight, islands, and a pool of
 worker processes that score the candidates. Measures samples per minute.
 
-Laptop (a small model behind any OpenAI-compatible server; sweeps workers):
+Lab VM (a small model behind any OpenAI-compatible server; sweeps workers):
     python scale_evolve.py --base-url http://127.0.0.1:8000/v1 \\
         --model Qwen/Qwen2.5-0.5B-Instruct --workers 1,2,4,8
 GPU box (vLLM serving a 7B model, 64 requests in flight):

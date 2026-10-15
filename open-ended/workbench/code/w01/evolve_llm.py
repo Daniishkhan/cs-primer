@@ -1,7 +1,7 @@
 """Program evolution with a real model: Lab 3's loop, with a language model
 writing the new priority() functions instead of a scripted editor.
 
-The model is any OpenAI-compatible server. Ollama on a laptop (default):
+The model is any OpenAI-compatible server. Ollama on the lab VM (default):
     ollama pull qwen2.5-coder:7b
     python evolve_llm.py --model qwen2.5-coder:7b
 vLLM on a GPU box, or `transformers serve` (any OpenAI-compatible server):

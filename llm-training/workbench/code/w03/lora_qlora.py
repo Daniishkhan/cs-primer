@@ -2,7 +2,7 @@
 check it against PEFT, fine-tune a small model end to end, and predict what
 the 4-bit version would need on a GPU.
 
-Laptop (SmolLM2-135M, LoRA, under a minute after the download):
+Lab VM (SmolLM2-135M, LoRA, about ten minutes on the CPU):
     python lora_qlora.py
 Prediction only for a bigger model (reads config.json, downloads no weights):
     python lora_qlora.py --model Qwen/Qwen2.5-1.5B --predict-only
@@ -33,8 +33,6 @@ args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 TARGETS = args.targets.split(",")

@@ -3,11 +3,11 @@
 Chapter 6 factorised a count matrix on text8 and described word2vec's
 negative-sampling loss. Here that loss trains the vectors directly, on a
 slice of text8 (the first 20 million characters, about 3.4 million words;
-the full file is 100 million and would take hours on a laptop). The script
+the full file is 100 million and would take about five times as long). The script
 predicts the loss at step 0, trains, then asks the same questions chapter
 6 asked: nearest neighbours and analogies.
 
-    python word_vectors.py                   # a few minutes on a laptop
+    python word_vectors.py                   # about nine minutes on the lab VM
     python word_vectors.py --chars 100000000 --epochs 1   # the full text
 
 Needs: torch, numpy (workbench/requirements.txt). Downloads about 0.3 MB
@@ -39,8 +39,6 @@ args, _ = ap.parse_known_args()        # notebooks pass their own flags
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 torch.manual_seed(args.seed)
